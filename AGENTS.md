@@ -51,6 +51,8 @@ cargo fmt
    **注意：带 `-setup` 的 Inno 安装包也满足该匹配**，挂资产时 exe 命名保持裸版优先。
 3. `powershell -File make-release.ps1 -Ver X.Y.Z` 一键产出 zip（便携）+ setup（Inno 安装包），
    并交叉校验 exe 版本号；`gh release create` 两个都挂。
+   **分发渠道 = GitHub release 一种**。不做"朋友包"本地副本，发版后无需复制/更新
+   任何本地交付文件（用户已明确取消，勿再生成项目文件夹里的 vX.Y.Z.zip 副本）。
 4. `git commit` + 打 tag `vX.Y.Z` + push。
 5. 版本号语义：改 UI/功能升 minor，修 bug 升 patch。
 
