@@ -28,10 +28,12 @@ Windows 桌面守护器：校验本地代理出口 IP → 通过才放行 Claude
 1. `cargo clippy -- -D warnings` 零警告；`cargo fmt --check` 必须通过。
 2. `cargo test` 必须通过；**修 bug 必须先补一个能复现的测试**再修。
 3. 不新增依赖，除非同时给出：体积增量、必要性、无更轻替代 三项说明。当前依赖面是刻意收敛的。
-4. 颜色/字号/圆角/字重只允许用 `theme.rs` 常量。Apple 风约束：无阴影、无渐变、
-   字重上限 600、唯一彩色填充是蓝 `BLUE`（按钮）、正文 17px、卡 28px 圆角、按钮全圆胶囊。
+4. 视觉只允许 `ui/app.css` `:root` tokens 与 v2-spec 标准（`docs/v2-spec.md`）：曲线/时长/
+   阴影/毛玻璃四组 token，字重 400/500/600，标题 -0.02em 字距，柔和双层阴影可以有，
+   硬阴影/渐变/700+ 字重没有。改视觉先改 token，再改组件。
 5. 子进程一律绝对路径（`guard::sys32()` / `SystemRoot`），禁止裸名（PATH 提权面）。
-6. `GuardApp` 是唯一有状态类型；新部件进 `widgets.rs` 且必须纯函数。
+6. 状态只在三处：`monitor.rs Shared`（Rust 侧）、`ui/main.js S`（前端侧）、`config.json`；
+   两边以 `StatusSnapshot`/`Config` 序列化为界，禁止第三份副本。
 7. UI 文案与代码注释用中文；标识符/日志关键字用英文。
 8. 任何 `unwrap/expect/panic` 只允许出现在程序启动期（配置目录创建等），运行路径一律返回错误。
 
@@ -51,6 +53,9 @@ cargo fmt
    **注意：带 `-setup` 的 Inno 安装包也满足该匹配**，挂资产时 exe 命名保持裸版优先。
 3. `powershell -File make-release.ps1 -Ver X.Y.Z` 一键产出 zip（便携）+ setup（Inno 安装包），
    并交叉校验 exe 版本号；`gh release create` 两个都挂。
+   **注意：exe 的 win32 版本资源被 tauri_build 补成 4 段（2.0.0.0），所以发布脚本用
+   `/DMyAppVersionStr=X.Y.Z` 把 3 段规范版注入 ISCC**——手动裸跑 ISCC 会产出
+   `v2.0.0.0-setup.exe`（4 段文件名），别直接挂。
    **分发渠道 = GitHub release 一种**。不做"朋友包"本地副本，发版后无需复制/更新
    任何本地交付文件（用户已明确取消，勿再生成项目文件夹里的 vX.Y.Z.zip 副本）。
 4. `git commit` + 打 tag `vX.Y.Z` + push。
@@ -59,11 +64,16 @@ cargo fmt
 ### Inno 安装包（claude-guard.iss，仓库根目录）
 
 - .iss **必须在根目录**：里面相对路径（`assets\`、`target\`、`installer\`）按 .iss 所在目录解析。
-- 版本号不写在 .iss 里：`GetVersionNumbersString('target\release\claude-guard.exe')`
-  直接读 exe（build.rs 从 Cargo.toml 注入），**先 build 再编安装包**。
+- 版本号不写在 .iss 里：发布脚本经 `/DMyAppVersionStr` 注入；无 define 时兜底读 exe。
+  **先 build 再编安装包**。
 - `AppId={{F5110E67-…}` 永不改（改了=系统认为是新软件，升级变双装）。
-- "应用与功能"里显示名取 `AppVerName`（"ClaudeGuard X.Y.Z"）；查注册表按
-  `*_is1` 后缀找，别按 DisplayName 精确匹配踩坑。
+- 卸载注册表键名 = **AppId GUID + `_is1`**（`{F5110E67-…}_is1`），不是 `ClaudeGuard_is1`；
+  查"应用与功能"按 `*_is1` 后缀找，别按 DisplayName 精确匹配踩坑。
+- `PrivilegesRequired=admin` → 全机器安装：桌面图标进 `C:\Users\Public\Desktop`，
+  开始菜单进 `C:\ProgramData\...\Start Menu\Programs\ClaudeGuard`——E2E 断言别查
+  per-user 路径。
+- v2 起安装前检测 WebView2 运行时（注册表 EdgeUpdate Clients `{F3017226-…}` 的 pv），
+  缺失报错指路不自动下载（保持零捆绑）。
 - 卸载**故意保留** `%APPDATA%\ClaudeGuard`（配置+日志）；安装/卸载前 taskkill 在
   `[Code]` 段，中文向导文案来自 `installer\ChineseSimplified.isl`（官方翻译，需 BOM，
   编辑后重补 BOM）。.iss 本身保持纯 ASCII。
@@ -94,10 +104,16 @@ cargo fmt
    用截图+像素扫描复核，不要凭想象改布局。窗口尺寸 API 传的是逻辑像素。
 9. tauri 权限：`core:default` 不含窗口操作，`capabilities/default.json` 需显式放行
    minimize/toggle-maximize/close/start-dragging/start-resize-dragging。
-10. v1 egui 时代条目已随模块删除失效（无字重字段等）；v1 行为基准全部迁入
+10. **release exe 带 requireAdministrator 清单**：UAC 提权后子进程拿的是注册表重建的
+    环境，**父 shell 的 `$env:` 传不进去**（CDP 调试口因此对 release 开不了；要用
+    CDP/像素调试一律跑 debug 构建）。也正因如此 release 运行时 `is_admin=true`，
+    管理员横幅只在 debug 出现——冒烟断言时记住这点。
+11. v1 egui 时代条目已随模块删除失效（无字重字段等）；v1 行为基准全部迁入
     `docs/PARITY-v2.md`，文案/状态机以它为准。
 
 ## 改 UI 的验收标准
 
 改任何可见元素，提交前必须：截图三视图（主屏/向导/设置）→ 视觉复核无乱码/无溢出/无风格漂移。
-风格漂移=出现了规范外颜色、阴影、渐变、居中大标题、700+ 字重。
+风格漂移=出现了 tokens 外的颜色、硬阴影、渐变、700+ 字重、规范曲线外的 easing。
+动效改动另过一遍收尾审查（时长区间/打断行为/reduced-motion 降级），模板见
+`docs/v2-spec.md` P1 节。
