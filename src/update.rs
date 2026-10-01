@@ -44,11 +44,12 @@ impl Release {
         self.tag_name.trim_start_matches('v')
     }
 
-    /// 找主程序资产: 名字含 ClaudeGuard 且以 .exe 结尾
+    /// 找主程序资产: 名字含 ClaudeGuard 且以 .exe 结尾, 但排除 Inno 安装包(-setup)——
+    /// 自更新下载的必须是裸版 exe, 拿到安装包会把它当主程序写盘。
     pub fn exe_asset(&self) -> Option<&Asset> {
-        self.assets
-            .iter()
-            .find(|a| a.name.ends_with(".exe") && a.name.contains("ClaudeGuard"))
+        self.assets.iter().find(|a| {
+            a.name.ends_with(".exe") && a.name.contains("ClaudeGuard") && !a.name.contains("-setup")
+        })
     }
 }
 
@@ -281,5 +282,11 @@ mod tests {
             "ClaudeGuard-v9.9.9.exe",
         ]);
         assert_eq!(r.exe_asset().unwrap().name, "ClaudeGuard-v9.9.9.exe");
+        // Inno 安装包(-setup.exe)混在资产里: 必须跳过, 只认裸版
+        let r = mk(&["ClaudeGuard-v9.9.9-setup.exe", "ClaudeGuard-v9.9.9.exe"]);
+        assert_eq!(r.exe_asset().unwrap().name, "ClaudeGuard-v9.9.9.exe");
+        // 只有安装包: 宁可不更新也不能拿它替换主程序
+        let r = mk(&["ClaudeGuard-v9.9.9-setup.exe"]);
+        assert!(r.exe_asset().is_none());
     }
 }

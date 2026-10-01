@@ -48,8 +48,24 @@ cargo fmt
 1. `Cargo.toml` 升版本 → build/test/clippy 全绿。
 2. release 资产**必须**命名 `ClaudeGuard-vX.Y.Z.exe`——更新器 `exe_asset()` 按
    "含 ClaudeGuard 且以 .exe 结尾"匹配，命名错了用户端检查更新会拿不到资产。
-3. `git commit` + 打 tag `vX.Y.Z` + push；`gh release create` 挂 exe（+可选 zip）。
-4. 版本号语义：改 UI/功能升 minor，修 bug 升 patch。
+   **注意：带 `-setup` 的 Inno 安装包也满足该匹配**，挂资产时 exe 命名保持裸版优先。
+3. `powershell -File make-release.ps1 -Ver X.Y.Z` 一键产出 zip（便携）+ setup（Inno 安装包），
+   并交叉校验 exe 版本号；`gh release create` 两个都挂。
+4. `git commit` + 打 tag `vX.Y.Z` + push。
+5. 版本号语义：改 UI/功能升 minor，修 bug 升 patch。
+
+### Inno 安装包（claude-guard.iss，仓库根目录）
+
+- .iss **必须在根目录**：里面相对路径（`assets\`、`target\`、`installer\`）按 .iss 所在目录解析。
+- 版本号不写在 .iss 里：`GetVersionNumbersString('target\release\claude-guard.exe')`
+  直接读 exe（build.rs 从 Cargo.toml 注入），**先 build 再编安装包**。
+- `AppId={{F5110E67-…}` 永不改（改了=系统认为是新软件，升级变双装）。
+- "应用与功能"里显示名取 `AppVerName`（"ClaudeGuard X.Y.Z"）；查注册表按
+  `*_is1` 后缀找，别按 DisplayName 精确匹配踩坑。
+- 卸载**故意保留** `%APPDATA%\ClaudeGuard`（配置+日志）；安装/卸载前 taskkill 在
+  `[Code]` 段，中文向导文案来自 `installer\ChineseSimplified.isl`（官方翻译，需 BOM，
+  编辑后重补 BOM）。.iss 本身保持纯 ASCII。
+- ISCC 路径：`C:\Users\daha\AppData\Local\Programs\Inno Setup 6\ISCC.exe`（per-user 安装）。
 
 ## 已知坑（别再踩）
 

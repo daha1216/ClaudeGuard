@@ -17,3 +17,5 @@ deploy-*.ps1
 make-zip.ps1
 
 make-release.ps1
+installer/*.exe
+installer/*.zip
