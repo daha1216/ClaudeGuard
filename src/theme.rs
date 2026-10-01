@@ -56,27 +56,33 @@ fn install_fonts(ctx: &egui::Context) {
 }
 
 fn apple_style(ctx: &egui::Context) {
-    let mut style = egui::Style::default();
-    style.visuals = egui::Visuals::light();
-    style.visuals.panel_fill = BG;
-    style.visuals.window_fill = CARD;
-    style.visuals.extreme_bg_color = CARD;
+    let mut v = egui::Visuals::light();
+    v.panel_fill = BG;
+    v.window_fill = CARD;
+    v.extreme_bg_color = CARD;
     // 输入框：白底 + 1px Fog 发丝线，聚焦时蓝描边（规范表面层级）
-    style.visuals.widgets.inactive.bg_fill = CARD;
-    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, SEP);
-    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TXT);
-    style.visuals.widgets.hovered.bg_fill = CARD;
-    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0x87, 0x87, 0x8A));
-    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, TXT);
-    style.visuals.widgets.active.bg_fill = CARD;
-    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, BLUE);
-    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, TXT);
-    style.visuals.selection.bg_fill = BLUE;
-    style.visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TXT2);
-    style.visuals.warn_fg_color = ORANGE;
-    style.visuals.error_fg_color = RED;
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    v.widgets.inactive.bg_fill = CARD;
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, SEP);
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TXT);
+    v.widgets.hovered.bg_fill = CARD;
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0x87, 0x87, 0x8A));
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, TXT);
+    v.widgets.active.bg_fill = CARD;
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, BLUE);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, TXT);
+    v.selection.bg_fill = BLUE;
+    v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TXT2);
+    v.warn_fg_color = ORANGE;
+    v.error_fg_color = RED;
+    let style = egui::Style {
+        visuals: v,
+        spacing: egui::Spacing {
+            item_spacing: egui::vec2(8.0, 8.0),
+            button_padding: egui::vec2(12.0, 6.0),
+            ..egui::Spacing::default()
+        },
+        ..egui::Style::default()
+    };
     ctx.set_style_of(egui::Theme::Light, style);
 }

@@ -20,13 +20,22 @@ pub struct StepResult {
 
 impl StepResult {
     fn pass(text: impl Into<String>) -> Self {
-        Self { state: StepState::Pass, text: text.into() }
+        Self {
+            state: StepState::Pass,
+            text: text.into(),
+        }
     }
     fn fail(text: impl Into<String>) -> Self {
-        Self { state: StepState::Fail, text: text.into() }
+        Self {
+            state: StepState::Fail,
+            text: text.into(),
+        }
     }
     fn skip() -> Self {
-        Self { state: StepState::Skip, text: "未检测".into() }
+        Self {
+            state: StepState::Skip,
+            text: "未检测".into(),
+        }
     }
 }
 
@@ -47,10 +56,11 @@ pub fn check_system_proxy(host: &str, port: u16) -> StepResult {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let key = match hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings") {
-        Ok(k) => k,
-        Err(e) => return StepResult::fail(format!("读取系统代理设置失败: {e}")),
-    };
+    let key =
+        match hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings") {
+            Ok(k) => k,
+            Err(e) => return StepResult::fail(format!("读取系统代理设置失败: {e}")),
+        };
     let enabled: u32 = key.get_value("ProxyEnable").unwrap_or(0);
     let server: String = key.get_value("ProxyServer").unwrap_or_default();
     let expected = format!("{host}:{port}");
@@ -77,7 +87,10 @@ pub fn check_port_connect(host: &str, port: u16, target: &str) -> (StepResult, O
     let mut stream = match TcpStream::connect_timeout(&sockaddr, Duration::from_secs(4)) {
         Ok(s) => s,
         Err(e) => {
-            return (StepResult::fail(format!("无法连接 {addr}，端口没有监听（{e}）")), None)
+            return (
+                StepResult::fail(format!("无法连接 {addr}，端口没有监听（{e}）")),
+                None,
+            )
         }
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
@@ -104,9 +117,15 @@ pub fn check_port_connect(host: &str, port: u16, target: &str) -> (StepResult, O
     let line = acc.lines().next().unwrap_or("");
     if line.starts_with("HTTP/") && line.contains(" 2") {
         let ms = t0.elapsed().as_millis();
-        (StepResult::pass(format!("CONNECT 握手成功（{ms} ms）")), Some(stream))
+        (
+            StepResult::pass(format!("CONNECT 握手成功（{ms} ms）")),
+            Some(stream),
+        )
     } else {
-        (StepResult::fail(format!("不是 HTTP 代理（响应: {line}）")), None)
+        (
+            StepResult::fail(format!("不是 HTTP 代理（响应: {line}）")),
+            None,
+        )
     }
 }
 
@@ -126,9 +145,16 @@ fn fetch_ipinfo(agent: &ureq::Agent) -> Result<(String, String), String> {
         .get("https://ipinfo.io/json")
         .call()
         .map_err(|e| format!("ipinfo: {e}"))?;
-    let text = resp.into_string().map_err(|e| format!("ipinfo read: {e}"))?;
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("ipinfo json: {e}"))?;
-    let ip = v.get("ip").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let text = resp
+        .into_string()
+        .map_err(|e| format!("ipinfo read: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("ipinfo json: {e}"))?;
+    let ip = v
+        .get("ip")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     let city = v.get("city").and_then(|x| x.as_str()).unwrap_or("");
     let country = v.get("country").and_then(|x| x.as_str()).unwrap_or("");
     let org = v.get("org").and_then(|x| x.as_str()).unwrap_or("");
@@ -145,8 +171,13 @@ fn fetch_ipify(agent: &ureq::Agent) -> Result<(String, String), String> {
         .call()
         .map_err(|e| format!("ipify: {e}"))?;
     let text = resp.into_string().map_err(|e| format!("ipify read: {e}"))?;
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("ipify json: {e}"))?;
-    let ip = v.get("ip").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("ipify json: {e}"))?;
+    let ip = v
+        .get("ip")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     if ip.is_empty() {
         return Err("ipify: no ip field".into());
     }
@@ -174,7 +205,8 @@ pub fn run_checks(cfg: &Config, mut log: impl FnMut(String)) -> CheckOutcome {
     }
 
     // 2. 端口 CONNECT 握手（隧道保持打开）
-    let (port_res, tunnel) = check_port_connect(&cfg.proxy_host, cfg.proxy_port, &cfg.connect_target);
+    let (port_res, tunnel) =
+        check_port_connect(&cfg.proxy_host, cfg.proxy_port, &cfg.connect_target);
     out.port = port_res;
     if out.port.state != StepState::Pass {
         out.reason = "端口不是可用代理".into();
@@ -183,9 +215,12 @@ pub fn run_checks(cfg: &Config, mut log: impl FnMut(String)) -> CheckOutcome {
     }
 
     // 3a. 网页出口（共享一个代理 Agent，失败再换 ipify）
-    let web = proxy_agent(cfg).map_err(|e| format!("agent: {e}")).and_then(|agent| {
-        fetch_ipinfo(&agent).or_else(|e1| fetch_ipify(&agent).map_err(|e2| format!("{e1} | {e2}")))
-    });
+    let web = proxy_agent(cfg)
+        .map_err(|e| format!("agent: {e}"))
+        .and_then(|agent| {
+            fetch_ipinfo(&agent)
+                .or_else(|e1| fetch_ipify(&agent).map_err(|e2| format!("{e1} | {e2}")))
+        });
     match web {
         Ok((ip, desc)) => {
             log(format!("egress(web): {ip} {desc}"));
@@ -199,7 +234,7 @@ pub fn run_checks(cfg: &Config, mut log: impl FnMut(String)) -> CheckOutcome {
             out.egress = StepResult::fail(format!("当前出口 {ip}（{desc}）"));
             out.reason = format!("出口 IP 是 {ip}，应为 {}", cfg.required_ip);
             log(format!("BLOCKED: {}", out.reason));
-            return out;
+            out
         }
         Err(err) => {
             // 3b. 网页查询失败 -> TCP 观察回退（tunnel 仍打开，迫使代理保持节点连接）
@@ -229,10 +264,23 @@ pub fn run_checks(cfg: &Config, mut log: impl FnMut(String)) -> CheckOutcome {
                     .collect::<Vec<_>>()
             };
             let shown: Vec<String> = egress.iter().take(5).cloned().collect();
-            out.egress = StepResult::fail(format!("未连接 {}，当前出口: {}", cfg.required_ip, shown.join(", ")));
+            out.egress = StepResult::fail(format!(
+                "未连接 {}，当前出口: {}",
+                cfg.required_ip,
+                shown.join(", ")
+            ));
             out.reason = "代理未连接指定节点".into();
-            log(format!("BLOCKED: {} (egress: {})", out.reason, egress.iter().take(8).cloned().collect::<Vec<_>>().join(", ")));
-            return out;
+            log(format!(
+                "BLOCKED: {} (egress: {})",
+                out.reason,
+                egress
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            out
         }
     }
 }

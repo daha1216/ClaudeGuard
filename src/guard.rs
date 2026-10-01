@@ -10,7 +10,11 @@ pub fn log_line(msg: &str) {
     let dir = crate::config::config_dir();
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("guard.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         use std::io::Write;
         let _ = writeln!(f, "{} {}", chrono_like_now(), msg);
     }
@@ -30,7 +34,31 @@ fn chrono_like_now() -> String {
 /// 数字逐段比较，避免字典序 "2.9" > "2.10" 的错误。
 fn version_key(name: &str) -> Vec<u64> {
     let seg = name.split('_').nth(1).unwrap_or("");
-    seg.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect()
+    seg.split('.')
+        .map(|p| p.parse::<u64>().unwrap_or(0))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 行为锁: 版本比较必须按数字段, 不许退回字典序。
+    #[test]
+    fn version_key_numeric_compare() {
+        let v9 = version_key("Claude_2.9.0.0_x64__hash");
+        let v10 = version_key("Claude_2.10.0.0_x64__hash");
+        let v10b = version_key("Claude_2.10.1.0_x64__hash");
+        let v3 = version_key("Claude_3.0.0.0_x64__hash");
+        assert!(v10 > v9, "2.10 必须大于 2.9（字典序会判错）");
+        assert!(v10b > v10);
+        assert!(v3 > v10);
+        assert_eq!(v9, vec![2, 9, 0, 0]);
+        // 非常规目录名不 panic, 缺段按 0 处理
+        assert_eq!(version_key("Claude___x"), vec![0]);
+        assert_eq!(version_key("Claude"), vec![0]);
+        assert_eq!(version_key("x_2.1_y"), vec![2, 1]);
+    }
 }
 
 /// 定位 Claude 安装目录（WindowsApps 下 Claude_ 开头，版本数值最大者）
@@ -83,7 +111,11 @@ fn collect_exes(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
             let p = e.path();
             if p.is_dir() {
                 collect_exes(&p, depth + 1, out);
-            } else if p.extension().map(|x| x.eq_ignore_ascii_case("exe")).unwrap_or(false) {
+            } else if p
+                .extension()
+                .map(|x| x.eq_ignore_ascii_case("exe"))
+                .unwrap_or(false)
+            {
                 out.push(p);
             }
         }
@@ -103,7 +135,10 @@ pub fn kill_claude() -> usize {
             .exe()
             .map(|p| {
                 let s = p.to_string_lossy().to_lowercase();
-                dir_s.as_ref().map(|d| s.starts_with(d.as_str())).unwrap_or(false)
+                dir_s
+                    .as_ref()
+                    .map(|d| s.starts_with(d.as_str()))
+                    .unwrap_or(false)
                     || (s.contains(r"\windowsapps\claude_") && s.ends_with("claude.exe"))
             })
             .unwrap_or(false);
@@ -146,20 +181,36 @@ pub fn firewall_quarantine() -> usize {
     let mut exes = Vec::new();
     collect_exes(&dir, 0, &mut exes);
     let mut added = 0usize;
-    log_line(&format!("quarantine: {} exes under {}", exes.len(), dir.display()));
+    log_line(&format!(
+        "quarantine: {} exes under {}",
+        exes.len(),
+        dir.display()
+    ));
     for exe in exes {
         let p = exe.to_string_lossy().to_string();
         if netsh(&[
-            "advfirewall", "firewall", "add", "rule",
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
             &format!("name={FW_RULE_OUT}"),
-            "dir=out", "action=block", "enable=yes", &format!("program={p}"),
+            "dir=out",
+            "action=block",
+            "enable=yes",
+            &format!("program={p}"),
         ]) {
             added += 1;
         }
         let _ = netsh(&[
-            "advfirewall", "firewall", "add", "rule",
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
             &format!("name={FW_RULE_IN}"),
-            "dir=in", "action=block", "enable=yes", &format!("program={p}"),
+            "dir=in",
+            "action=block",
+            "enable=yes",
+            &format!("program={p}"),
         ]);
     }
     log_line(&format!("quarantine: {added} outbound rules added"));
@@ -168,8 +219,20 @@ pub fn firewall_quarantine() -> usize {
 
 /// 解除隔离：删除全部 ClaudeGuard 规则
 pub fn firewall_release() -> bool {
-    let a = netsh(&["advfirewall", "firewall", "delete", "rule", &format!("name={FW_RULE_OUT}")]);
-    let b = netsh(&["advfirewall", "firewall", "delete", "rule", &format!("name={FW_RULE_IN}")]);
+    let a = netsh(&[
+        "advfirewall",
+        "firewall",
+        "delete",
+        "rule",
+        &format!("name={FW_RULE_OUT}"),
+    ]);
+    let b = netsh(&[
+        "advfirewall",
+        "firewall",
+        "delete",
+        "rule",
+        &format!("name={FW_RULE_IN}"),
+    ]);
     log_line(&format!("firewall release: out={a} in={b}"));
     a || b
 }
@@ -178,7 +241,13 @@ pub fn firewall_release() -> bool {
 pub fn firewall_active() -> bool {
     let check = |name: &str| {
         Command::new(sys32("netsh.exe"))
-            .args(["advfirewall", "firewall", "show", "rule", &format!("name={name}")])
+            .args([
+                "advfirewall",
+                "firewall",
+                "show",
+                "rule",
+                &format!("name={name}"),
+            ])
             .output()
             .map(|o| {
                 let text = String::from_utf8_lossy(&o.stdout);

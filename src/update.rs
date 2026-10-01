@@ -141,36 +141,41 @@ pub fn download(
 ) -> Result<PathBuf, String> {
     let tmp = std::env::temp_dir().join("ClaudeGuard-update.exe");
 
-    let do_download = |agent: &ureq::Agent, progress: &mut dyn FnMut(u64, u64)| -> Result<(), String> {
-        let resp = agent
-            .get(url)
-            .set("User-Agent", USER_AGENT)
-            .timeout(T_DOWNLOAD)
-            .call()
-            .map_err(|e| format!("下载失败: {e}"))?;
-        let mut reader = resp.into_reader();
-        let mut buf = Vec::with_capacity(expected_size as usize + 4096);
-        let mut chunk = [0u8; 65536];
-        loop {
-            let n = reader.read(&mut chunk).map_err(|e| format!("读取: {e}"))?;
-            if n == 0 {
-                break;
+    let do_download =
+        |agent: &ureq::Agent, progress: &mut dyn FnMut(u64, u64)| -> Result<(), String> {
+            let resp = agent
+                .get(url)
+                .set("User-Agent", USER_AGENT)
+                .timeout(T_DOWNLOAD)
+                .call()
+                .map_err(|e| format!("下载失败: {e}"))?;
+            let mut reader = resp.into_reader();
+            let mut buf = Vec::with_capacity(expected_size as usize + 4096);
+            let mut chunk = [0u8; 65536];
+            loop {
+                let n = reader.read(&mut chunk).map_err(|e| format!("读取: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                progress(buf.len() as u64, expected_size);
             }
-            buf.extend_from_slice(&chunk[..n]);
-            progress(buf.len() as u64, expected_size);
-        }
-        if expected_size > 0 && buf.len() as u64 != expected_size {
-            return Err(format!("大小不符: 期望 {expected_size}, 实得 {}", buf.len()));
-        }
-        std::fs::write(&tmp, &buf).map_err(|e| format!("写临时文件: {e}"))?;
-        Ok(())
-    };
+            if expected_size > 0 && buf.len() as u64 != expected_size {
+                return Err(format!(
+                    "大小不符: 期望 {expected_size}, 实得 {}",
+                    buf.len()
+                ));
+            }
+            std::fs::write(&tmp, &buf).map_err(|e| format!("写临时文件: {e}"))?;
+            Ok(())
+        };
 
     let prog = &mut progress;
     if let Some(agent) = agent_with_proxy(cfg) {
         if let Err(e1) = do_download(&agent, prog) {
             let p2 = &mut progress;
-            do_download(&agent_direct(), p2).map_err(|e2| format!("代理失败: {e1}; 直连失败: {e2}"))?;
+            do_download(&agent_direct(), p2)
+                .map_err(|e2| format!("代理失败: {e1}; 直连失败: {e2}"))?;
             return Ok(tmp);
         }
         return Ok(tmp);
@@ -241,5 +246,40 @@ mod tests {
         assert!(!is_newer("v1.2.1", "1.2.1"));
         assert!(!is_newer("v1.2.0", "1.2.1"));
         assert!(!is_newer("v1.2.1-beta", "1.2.1")); // 同号预发布不提示
+    }
+
+    /// 行为锁: release 资产匹配规则——名字含 ClaudeGuard 且以 .exe 结尾。
+    /// 资产命名偏离此规则时, 所有用户端的检查更新都会失败。
+    #[test]
+    fn exe_asset_matching() {
+        let mk = |names: &[&str]| Release {
+            tag_name: "v9.9.9".into(),
+            name: None,
+            body: None,
+            assets: names
+                .iter()
+                .map(|n| Asset {
+                    name: (*n).into(),
+                    size: 1,
+                    browser_download_url: String::new(),
+                })
+                .collect(),
+        };
+        // 规范命名: 命中
+        let r = mk(&["ClaudeGuard-v9.9.9.exe"]);
+        assert_eq!(r.exe_asset().unwrap().name, "ClaudeGuard-v9.9.9.exe");
+        // 小写连写不含 "ClaudeGuard": 不命中
+        let r = mk(&["claude-guard.exe"]);
+        assert!(r.exe_asset().is_none());
+        // zip / 源码包: 不命中
+        let r = mk(&["ClaudeGuard-v9.9.9.zip", "source.zip"]);
+        assert!(r.exe_asset().is_none());
+        // 多资产时仍取第一个命中 exe
+        let r = mk(&[
+            "checksums.txt",
+            "ClaudeGuard-v9.9.9.zip",
+            "ClaudeGuard-v9.9.9.exe",
+        ]);
+        assert_eq!(r.exe_asset().unwrap().name, "ClaudeGuard-v9.9.9.exe");
     }
 }

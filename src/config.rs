@@ -60,7 +60,8 @@ impl Config {
                 // 解析失败不再静默：记日志后回退默认，便于排查被覆盖的配置
                 Err(e) => {
                     crate::guard::log_line(&format!(
-                        "config parse failed ({}), falling back to defaults", e
+                        "config parse failed ({}), falling back to defaults",
+                        e
                     ));
                 }
             }
@@ -76,5 +77,53 @@ impl Config {
         let tmp = dir.join("config.json.tmp");
         fs::write(&tmp, text)?;
         fs::rename(&tmp, config_path())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 行为锁: 配置 JSON 往返无损。
+    #[test]
+    fn json_round_trip() {
+        let cfg = Config {
+            proxy_host: "127.0.0.1".into(),
+            proxy_port: 7890,
+            required_ip: "203.0.113.10".into(),
+            connect_target: "api.anthropic.com:443".into(),
+            app_id: "Claude_pzs8sxrjxfjjc!Claude".into(),
+            check_interval_secs: 15,
+            kill_on_fail: true,
+            quarantine_on_fail: true,
+            launch_on_pass: true,
+            close_to_tray: true,
+            auto_start_with_system: false,
+            first_run: false,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.required_ip, "203.0.113.10");
+        assert_eq!(back.proxy_port, 7890);
+        assert_eq!(back.check_interval_secs, 15);
+    }
+
+    /// 行为锁: 旧版本/缺字段的配置文件必须能读——serde(default) 兜底,
+    /// 加新字段时不许破坏已装用户的配置。
+    #[test]
+    fn old_config_still_loads() {
+        // v1.2 时代的最小配置(部分字段缺失)
+        let legacy = r#"{
+            "proxy_host": "127.0.0.1",
+            "proxy_port": 7890,
+            "required_ip": "203.0.113.10",
+            "connect_target": "api.anthropic.com:443",
+            "app_id": "Claude_pzs8sxrjxfjjc!Claude",
+            "first_run": false
+        }"#;
+        let cfg: Config = serde_json::from_str(legacy).expect("旧配置必须可解析");
+        assert_eq!(cfg.required_ip, "203.0.113.10");
+        assert_eq!(cfg.check_interval_secs, 15); // 缺省值兜底
+        assert!(cfg.kill_on_fail); //              缺省值兜底
     }
 }

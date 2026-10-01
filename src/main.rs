@@ -100,7 +100,9 @@ fn cmd_check() {
 
 fn run_gui(start_hidden: bool) {
     let png = include_bytes!("../assets/icon.png");
-    let img = image::load_from_memory(png).expect("decode icon").to_rgba8();
+    let img = image::load_from_memory(png)
+        .expect("decode icon")
+        .to_rgba8();
     let (w, h) = img.dimensions();
     let rgba = img.into_raw();
     let tray_img = tray_icon::Icon::from_rgba(rgba.clone(), w, h).expect("tray icon");
@@ -119,7 +121,7 @@ fn run_gui(start_hidden: bool) {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
         use windows::Win32::UI::WindowsAndMessaging::{
-            SM_CYSCREEN, SystemParametersInfoW, SYSTEM_PARAMETERS_INFO_ACTION,
+            SystemParametersInfoW, SM_CYSCREEN, SYSTEM_PARAMETERS_INFO_ACTION,
             SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
         };
         let mut rect = RECT::default();
@@ -138,11 +140,11 @@ fn run_gui(start_hidden: bool) {
         if phys_h > 0 {
             let scale = dpi as f32 / 96.0;
             let logical = phys_h as f32 / scale;
-            Some(((logical - 8.0).min(620.0)).max(420.0))
+            Some((logical - 8.0).clamp(420.0, 620.0))
         } else if GetSystemMetricsForDpi(SM_CYSCREEN, dpi) > 0 {
             // 工作区查询失败的兜底: 整屏高 - 56(旧公式)
             let logical = GetSystemMetricsForDpi(SM_CYSCREEN, dpi) as f32 / (dpi as f32 / 96.0);
-            Some(((logical - 56.0).min(620.0)).max(420.0))
+            Some((logical - 56.0).clamp(420.0, 620.0))
         } else {
             None
         }

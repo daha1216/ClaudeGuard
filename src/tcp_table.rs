@@ -39,14 +39,7 @@ fn table_rows() -> Vec<TcpConn> {
 
         let af_inet: u32 = 2; // AF_INET
         let mut size: u32 = 0;
-        let _ = GetExtendedTcpTable(
-            None,
-            &mut size,
-            false,
-            af_inet,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        );
+        let _ = GetExtendedTcpTable(None, &mut size, false, af_inet, TCP_TABLE_OWNER_PID_ALL, 0);
         if size == 0 {
             return Vec::new();
         }
@@ -71,12 +64,23 @@ fn table_rows() -> Vec<TcpConn> {
                 break;
             }
             let u32_at = |k: usize| -> u32 {
-                u32::from_le_bytes([buf[off + k], buf[off + k + 1], buf[off + k + 2], buf[off + k + 3]])
+                u32::from_le_bytes([
+                    buf[off + k],
+                    buf[off + k + 1],
+                    buf[off + k + 2],
+                    buf[off + k + 3],
+                ])
             };
             let state = u32_at(0);
             // 本地端口在偏移 8（网络序低 16 位）；对端地址在偏移 12；PID 在偏移 20
             let lp = u32_at(8) & 0xffff;
-            let remote_addr = format!("{}.{}.{}.{}", buf[off + 12], buf[off + 13], buf[off + 14], buf[off + 15]);
+            let remote_addr = format!(
+                "{}.{}.{}.{}",
+                buf[off + 12],
+                buf[off + 13],
+                buf[off + 14],
+                buf[off + 15]
+            );
             let pid = u32_at(20);
             let local_port = (((lp & 0xff) << 8) | ((lp >> 8) & 0xff)) as u16;
             out.push(TcpConn {

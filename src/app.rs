@@ -10,13 +10,11 @@ use crate::checks::{self, CheckOutcome, StepState};
 use crate::config::Config;
 use crate::guard::{self, TripResult};
 use crate::install;
-use crate::theme::{
-    BG, BLUE, BLUE_H, GREEN, GREEN_DEEP, LINK, MIST, ORANGE, RED, SEP, TXT, TXT2,
-};
+use crate::theme::{BG, BLUE, BLUE_H, GREEN, GREEN_DEEP, LINK, MIST, ORANGE, RED, SEP, TXT, TXT2};
 use crate::update;
 use crate::widgets::{
-    TitleAction, arc, banner, btext, capsule, card_p, chevron, hairline, ios_toggle,
-    ios_toggle_disabled, setting_row, text_link, title_bar,
+    arc, banner, btext, capsule, card_p, chevron, hairline, ios_toggle, ios_toggle_disabled,
+    setting_row, text_link, title_bar, TitleAction,
 };
 
 const TRAY_SHOW: &str = "cg_show";
@@ -60,15 +58,8 @@ enum UpdState {
     Idle,
     Checking,
     UpToDate,
-    Available {
-        ver: String,
-        url: String,
-        size: u64,
-    },
-    Downloading {
-        done: u64,
-        total: u64,
-    },
+    Available { ver: String, url: String, size: u64 },
+    Downloading { done: u64, total: u64 },
     Restarting,
     Failed(String),
 }
@@ -128,7 +119,11 @@ fn run_check(sh: &Shared, ctx: &egui::Context, purpose: Purpose) {
     sh.log(&format!(
         "result: passed={} reason={}",
         out.passed,
-        if out.reason.is_empty() { "-" } else { &out.reason }
+        if out.reason.is_empty() {
+            "-"
+        } else {
+            &out.reason
+        }
     ));
 
     // 只有"确实拿到了出口 IP 且不匹配"才熔断；网络查询失败不误杀
@@ -208,7 +203,11 @@ pub struct GuardApp {
 }
 
 impl GuardApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, start_hidden: bool, tray_img: tray_icon::Icon) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        start_hidden: bool,
+        tray_img: tray_icon::Icon,
+    ) -> Self {
         crate::theme::init(&cc.egui_ctx);
 
         let cfg = Config::load();
@@ -299,7 +298,11 @@ impl GuardApp {
             maximized: false,
             admin: guard::is_admin(),
             installed: install::is_installed(),
-            screen: if first_run { Screen::Wizard } else { Screen::Main },
+            screen: if first_run {
+                Screen::Wizard
+            } else {
+                Screen::Main
+            },
             wiz_page: 0,
             show_details: false,
             // 测试钩子: CG_SMOKE_SETTINGS 展开设置卡(截图验证用)
@@ -378,7 +381,11 @@ impl GuardApp {
     fn hero_state(&self) -> (RingState, String, String) {
         let (last, busy, tripped) = self.sh.snapshot();
         if busy {
-            return (RingState::Spin, "正在检查…".into(), "正在核对代理和出口 IP".into());
+            return (
+                RingState::Spin,
+                "正在检查…".into(),
+                "正在核对代理和出口 IP".into(),
+            );
         }
         if tripped.is_some() {
             let reason = last
@@ -386,20 +393,38 @@ impl GuardApp {
                 .map(|o| o.reason.clone())
                 .filter(|r| !r.is_empty())
                 .unwrap_or_else(|| "出口 IP 与约定不一致".into());
-            return (RingState::Fail, "已暂停 Claude".into(), format!("{reason} · 切回节点后自动恢复"));
+            return (
+                RingState::Fail,
+                "已暂停 Claude".into(),
+                format!("{reason} · 切回节点后自动恢复"),
+            );
         }
         if let Some(o) = last {
             if o.passed {
-                let desc = o.egress_desc.as_deref().unwrap_or("").chars().take(18).collect::<String>();
+                let desc = o
+                    .egress_desc
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .take(18)
+                    .collect::<String>();
                 return (
                     RingState::Pass,
                     "一切正常".into(),
                     format!("出口 {} {}", o.egress_ip.as_deref().unwrap_or("-"), desc),
                 );
             }
-            return (RingState::Fail, "没有通过检查".into(), plain_reason(&o.reason));
+            return (
+                RingState::Fail,
+                "没有通过检查".into(),
+                plain_reason(&o.reason),
+            );
         }
-        (RingState::Idle, "准备中".into(), "马上开始第一次检查".into())
+        (
+            RingState::Idle,
+            "准备中".into(),
+            "马上开始第一次检查".into(),
+        )
     }
 
     pub(crate) fn do_install(&mut self) {
@@ -433,56 +458,87 @@ impl GuardApp {
         let last = self.sh.last.lock().unwrap().clone();
 
         // —— 大状态圆环（居中；矮窗口用小一号的环） ——
-        let (blk, radius, rstroke, gs) = if compact { (104.0, 36.0, 6.5, 0.72) } else { (150.0, 52.0, 9.0, 1.0) };
+        let (blk, radius, rstroke, gs) = if compact {
+            (104.0, 36.0, 6.5, 0.72)
+        } else {
+            (150.0, 52.0, 9.0, 1.0)
+        };
         ui.add_space(if compact { 2.0 } else { 4.0 });
         ui.vertical_centered(|ui| {
             let (rrect, _) = ui.allocate_exact_size(egui::vec2(blk, blk), egui::Sense::hover());
             let c = rrect.center();
-        // 底环
-        arc(ui, c, radius, 0.0, std::f32::consts::TAU, rstroke, SEP);
-        let now = ui.ctx().input(|i| i.time) as f32;
-        match ring {
-            RingState::Spin => {
-                let a0 = now * 2.6;
-                for i in 0..3 {
-                    let s = a0 + i as f32 * (std::f32::consts::TAU / 3.0);
-                    arc(ui, c, radius, s, s + 1.4, rstroke, BLUE);
+            // 底环
+            arc(ui, c, radius, 0.0, std::f32::consts::TAU, rstroke, SEP);
+            let now = ui.ctx().input(|i| i.time) as f32;
+            match ring {
+                RingState::Spin => {
+                    let a0 = now * 2.6;
+                    for i in 0..3 {
+                        let s = a0 + i as f32 * (std::f32::consts::TAU / 3.0);
+                        arc(ui, c, radius, s, s + 1.4, rstroke, BLUE);
+                    }
+                    ui.ctx().request_repaint_after(Duration::from_millis(30));
                 }
-                ui.ctx().request_repaint_after(Duration::from_millis(30));
-            }
-            RingState::Pass => {
-                arc(ui, c, radius, 0.0, std::f32::consts::TAU, rstroke, GREEN);
-                // 矢量勾（避免字体缺字形）
-                let st = egui::Stroke::new(6.0 * gs, GREEN);
-                let a = egui::pos2(c.x - 17.0 * gs, c.y + 1.0 * gs);
-                let b = egui::pos2(c.x - 6.0 * gs, c.y + 13.0 * gs);
-                let d = egui::pos2(c.x + 18.0 * gs, c.y - 13.0 * gs);
-                ui.painter().line_segment([a, b], st);
-                ui.painter().line_segment([b, d], st);
-            }
-            RingState::Fail => {
-                arc(ui, c, radius, 0.0, std::f32::consts::TAU, rstroke, RED);
-                // 矢量感叹号
-                let st = egui::Stroke::new(6.0 * gs, RED);
-                ui.painter().line_segment([egui::pos2(c.x, c.y - 17.0 * gs), egui::pos2(c.x, c.y + 5.0 * gs)], st);
-                ui.painter().circle_filled(egui::pos2(c.x, c.y + 19.0 * gs), 4.0 * gs, RED);
-            }
-            RingState::Idle => {
-                // 三个灰点
-                for dx in [-14.0, 0.0, 14.0] {
-                    ui.painter().circle_filled(egui::pos2(c.x + dx * gs, c.y), 4.5 * gs, TXT2);
+                RingState::Pass => {
+                    arc(ui, c, radius, 0.0, std::f32::consts::TAU, rstroke, GREEN);
+                    // 矢量勾（避免字体缺字形）
+                    let st = egui::Stroke::new(6.0 * gs, GREEN);
+                    let a = egui::pos2(c.x - 17.0 * gs, c.y + 1.0 * gs);
+                    let b = egui::pos2(c.x - 6.0 * gs, c.y + 13.0 * gs);
+                    let d = egui::pos2(c.x + 18.0 * gs, c.y - 13.0 * gs);
+                    ui.painter().line_segment([a, b], st);
+                    ui.painter().line_segment([b, d], st);
+                }
+                RingState::Fail => {
+                    arc(ui, c, radius, 0.0, std::f32::consts::TAU, rstroke, RED);
+                    // 矢量感叹号
+                    let st = egui::Stroke::new(6.0 * gs, RED);
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(c.x, c.y - 17.0 * gs),
+                            egui::pos2(c.x, c.y + 5.0 * gs),
+                        ],
+                        st,
+                    );
+                    ui.painter()
+                        .circle_filled(egui::pos2(c.x, c.y + 19.0 * gs), 4.0 * gs, RED);
+                }
+                RingState::Idle => {
+                    // 三个灰点
+                    for dx in [-14.0, 0.0, 14.0] {
+                        ui.painter()
+                            .circle_filled(egui::pos2(c.x + dx * gs, c.y), 4.5 * gs, TXT2);
+                    }
                 }
             }
-        }
         });
         // 主/副标题（仿半粗 + Iron Gray）
         {
-            let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), if compact { 26.0 } else { 32.0 }), egui::Sense::hover());
-            btext(ui, r.center(), egui::Align2::CENTER_CENTER, &headline, if compact { 20.0 } else { 24.0 }, TXT);
+            let (r, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), if compact { 26.0 } else { 32.0 }),
+                egui::Sense::hover(),
+            );
+            btext(
+                ui,
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                &headline,
+                if compact { 20.0 } else { 24.0 },
+                TXT,
+            );
         }
         {
-            let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), if compact { 20.0 } else { 24.0 }), egui::Sense::hover());
-            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, &sub, egui::FontId::proportional(if compact { 13.0 } else { 14.0 }), TXT2);
+            let (r, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), if compact { 20.0 } else { 24.0 }),
+                egui::Sense::hover(),
+            );
+            ui.painter().text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                &sub,
+                egui::FontId::proportional(if compact { 13.0 } else { 14.0 }),
+                TXT2,
+            );
         }
         ui.add_space(if compact { 4.0 } else { 10.0 });
 
@@ -535,7 +591,15 @@ impl GuardApp {
             let last_ok = last.as_ref().map(|o| o.passed).unwrap_or(false);
             let has_result = last.is_some();
             if tripped {
-                if capsule(ui, "cta_recheck", "我已切回节点，重新检查", w, BLUE, BLUE_H, !busy) {
+                if capsule(
+                    ui,
+                    "cta_recheck",
+                    "我已切回节点，重新检查",
+                    w,
+                    BLUE,
+                    BLUE_H,
+                    !busy,
+                ) {
                     self.spawn_check(ui.ctx(), Purpose::Manual);
                 }
             } else if busy || !has_result {
@@ -551,10 +615,8 @@ impl GuardApp {
                 }
             }
             ui.add_space(if compact { 3.0 } else { 6.0 });
-            if last_ok && !tripped {
-                if text_link(ui, "link_recheck", "重新检查", 12.0, LINK) {
-                    self.spawn_check(ui.ctx(), Purpose::Manual);
-                }
+            if last_ok && !tripped && text_link(ui, "link_recheck", "重新检查", 12.0, LINK) {
+                self.spawn_check(ui.ctx(), Purpose::Manual);
             }
         });
         ui.add_space(if compact { 3.0 } else { 10.0 });
@@ -565,10 +627,26 @@ impl GuardApp {
             ui.horizontal(|ui| {
                 let open = self.show_details;
                 let label = "检查详情";
-                let tw = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(13.0), TXT2).size().x;
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(tw + 18.0, 20.0), egui::Sense::click());
-                ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.0), TXT2);
-                chevron(ui, egui::pos2(rect.left() + tw + 9.0, rect.center().y), open, TXT2);
+                let tw = ui
+                    .painter()
+                    .layout_no_wrap(label.to_string(), egui::FontId::proportional(13.0), TXT2)
+                    .size()
+                    .x;
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(tw + 18.0, 20.0), egui::Sense::click());
+                ui.painter().text(
+                    rect.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(13.0),
+                    TXT2,
+                );
+                chevron(
+                    ui,
+                    egui::pos2(rect.left() + tw + 9.0, rect.center().y),
+                    open,
+                    TXT2,
+                );
                 let clicked = resp.clicked();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
@@ -579,7 +657,13 @@ impl GuardApp {
                             (None, false) => "还没检查",
                         })
                         .size(12.0)
-                        .color(if last.as_ref().map(|o| o.passed).unwrap_or(false) { GREEN_DEEP } else { TXT2 }),
+                        .color(
+                            if last.as_ref().map(|o| o.passed).unwrap_or(false) {
+                                GREEN_DEEP
+                            } else {
+                                TXT2
+                            },
+                        ),
                     );
                 });
                 if clicked {
@@ -595,7 +679,11 @@ impl GuardApp {
                     step_row(ui, "代理能连通", &o.port);
                     step_row(ui, "出口 IP 正确", &o.egress);
                 } else {
-                    ui.label(egui::RichText::new("还没有结果，稍等片刻…").size(12.5).color(TXT2));
+                    ui.label(
+                        egui::RichText::new("还没有结果，稍等片刻…")
+                            .size(12.5)
+                            .color(TXT2),
+                    );
                 }
             }
         });
@@ -606,10 +694,26 @@ impl GuardApp {
         card_p(ui, if compact { 12 } else { 20 }, |ui| {
             ui.horizontal(|ui| {
                 let label = "运行日志";
-                let tw = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(13.0), TXT2).size().x;
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(tw + 18.0, 20.0), egui::Sense::click());
-                ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.0), TXT2);
-                chevron(ui, egui::pos2(rect.left() + tw + 9.0, rect.center().y), self.show_log, TXT2);
+                let tw = ui
+                    .painter()
+                    .layout_no_wrap(label.to_string(), egui::FontId::proportional(13.0), TXT2)
+                    .size()
+                    .x;
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(tw + 18.0, 20.0), egui::Sense::click());
+                ui.painter().text(
+                    rect.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(13.0),
+                    TXT2,
+                );
+                chevron(
+                    ui,
+                    egui::pos2(rect.left() + tw + 9.0, rect.center().y),
+                    self.show_log,
+                    TXT2,
+                );
                 if resp.clicked() {
                     self.show_log = !self.show_log;
                 }
@@ -620,11 +724,13 @@ impl GuardApp {
                 ui.add_space(6.0);
                 let lines = self.sh.loglines.lock().unwrap().clone();
                 let start = lines.len().saturating_sub(30);
-                egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                    for l in &lines[start..] {
-                        ui.label(egui::RichText::new(l).size(11.0).color(TXT2).monospace());
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        for l in &lines[start..] {
+                            ui.label(egui::RichText::new(l).size(11.0).color(TXT2).monospace());
+                        }
+                    });
             }
         });
 
@@ -632,7 +738,11 @@ impl GuardApp {
         ui.add_space(if compact { 4.0 } else { 8.0 });
         ui.vertical_centered(|ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(concat!("ClaudeGuard v", env!("CARGO_PKG_VERSION"))).size(12.0).color(TXT2));
+                ui.label(
+                    egui::RichText::new(concat!("ClaudeGuard v", env!("CARGO_PKG_VERSION")))
+                        .size(12.0)
+                        .color(TXT2),
+                );
                 ui.label(egui::RichText::new("·").size(12.0).color(TXT2));
                 if text_link(ui, "ft_data", "打开数据文件夹", 12.0, LINK) {
                     let explorer = std::env::var("SystemRoot")
@@ -656,10 +766,26 @@ impl GuardApp {
         card_p(ui, if compact { 12 } else { 20 }, |ui| {
             ui.horizontal(|ui| {
                 let label = "设置";
-                let tw = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(13.0), TXT2).size().x;
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(tw + 18.0, 20.0), egui::Sense::click());
-                ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.0), TXT2);
-                chevron(ui, egui::pos2(rect.left() + tw + 9.0, rect.center().y), self.show_settings, TXT2);
+                let tw = ui
+                    .painter()
+                    .layout_no_wrap(label.to_string(), egui::FontId::proportional(13.0), TXT2)
+                    .size()
+                    .x;
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(tw + 18.0, 20.0), egui::Sense::click());
+                ui.painter().text(
+                    rect.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(13.0),
+                    TXT2,
+                );
+                chevron(
+                    ui,
+                    egui::pos2(rect.left() + tw + 9.0, rect.center().y),
+                    self.show_settings,
+                    TXT2,
+                );
                 if resp.clicked() {
                     self.show_settings = !self.show_settings;
                 }
@@ -670,56 +796,91 @@ impl GuardApp {
             ui.add_space(4.0);
             hairline(ui);
             ui.add_space(6.0);
-            let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
-            btext(ui, egui::pos2(r.left(), r.center().y), egui::Align2::LEFT_CENTER, "检测", 15.0, TXT);
+            let (r, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
+            btext(
+                ui,
+                egui::pos2(r.left(), r.center().y),
+                egui::Align2::LEFT_CENTER,
+                "检测",
+                15.0,
+                TXT,
+            );
             ui.add_space(4.0);
             let mut saved = false;
-            setting_row(ui, "代理端口", "代理软件的端口，常见是 7890", |ui| {
-                let r = ui.add(egui::TextEdit::singleline(&mut self.ed_port).desired_width(140.0).font(egui::TextStyle::Monospace));
-                if r.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    if let Ok(p) = self.ed_port.trim().parse::<u16>() {
-                        self.sh.cfg.lock().unwrap().proxy_port = p;
-                        self.err_port = None;
-                        saved = true;
-                    } else {
-                        self.err_port = Some("端口要填 1-65535".into());
+            setting_row(
+                ui,
+                "代理端口",
+                "代理软件的端口，常见是 7890",
+                |ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.ed_port)
+                            .desired_width(140.0)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if r.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if let Ok(p) = self.ed_port.trim().parse::<u16>() {
+                            self.sh.cfg.lock().unwrap().proxy_port = p;
+                            self.err_port = None;
+                            saved = true;
+                        } else {
+                            self.err_port = Some("端口要填 1-65535".into());
+                        }
                     }
-                }
-            });
+                },
+            );
             if let Some(e) = &self.err_port {
                 ui.label(egui::RichText::new(e).size(12.0).color(RED));
             }
-            setting_row(ui, "约定的出口 IP", "只认这个出口，别的都会拦", |ui| {
-                let r = ui.add(egui::TextEdit::singleline(&mut self.ed_ip).desired_width(140.0).font(egui::TextStyle::Monospace));
-                if r.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    if std::net::Ipv4Addr::from_str(self.ed_ip.trim()).is_ok() {
-                        self.sh.cfg.lock().unwrap().required_ip = self.ed_ip.trim().to_string();
-                        self.err_ip = None;
-                        saved = true;
-                    } else {
-                        self.err_ip = Some("要写成 4 段数字，如 203.0.113.10".into());
+            setting_row(
+                ui,
+                "约定的出口 IP",
+                "只认这个出口，别的都会拦",
+                |ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.ed_ip)
+                            .desired_width(140.0)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if r.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if std::net::Ipv4Addr::from_str(self.ed_ip.trim()).is_ok() {
+                            self.sh.cfg.lock().unwrap().required_ip = self.ed_ip.trim().to_string();
+                            self.err_ip = None;
+                            saved = true;
+                        } else {
+                            self.err_ip = Some("要写成 4 段数字，如 203.0.113.10".into());
+                        }
                     }
-                }
-            });
+                },
+            );
             if let Some(e) = &self.err_ip {
                 ui.label(egui::RichText::new(e).size(12.0).color(RED));
             }
-            setting_row(ui, "检查间隔", "每隔几秒复查一次（秒）", |ui| {
-                let r = ui.add(egui::TextEdit::singleline(&mut self.ed_interval).desired_width(140.0).font(egui::TextStyle::Monospace));
-                if r.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    if let Ok(iv) = self.ed_interval.trim().parse::<u64>() {
-                        if (5..=3600).contains(&iv) {
-                            self.sh.cfg.lock().unwrap().check_interval_secs = iv;
-                            self.err_interval = None;
-                            saved = true;
+            setting_row(
+                ui,
+                "检查间隔",
+                "每隔几秒复查一次（秒）",
+                |ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.ed_interval)
+                            .desired_width(140.0)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if r.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if let Ok(iv) = self.ed_interval.trim().parse::<u64>() {
+                            if (5..=3600).contains(&iv) {
+                                self.sh.cfg.lock().unwrap().check_interval_secs = iv;
+                                self.err_interval = None;
+                                saved = true;
+                            } else {
+                                self.err_interval = Some("范围 5-3600 秒".into());
+                            }
                         } else {
-                            self.err_interval = Some("范围 5-3600 秒".into());
+                            self.err_interval = Some("填数字".into());
                         }
-                    } else {
-                        self.err_interval = Some("填数字".into());
                     }
-                }
-            });
+                },
+            );
             if let Some(e) = &self.err_interval {
                 ui.label(egui::RichText::new(e).size(12.0).color(RED));
             }
@@ -727,24 +888,42 @@ impl GuardApp {
             ui.add_space(6.0);
 
             // 异常时组
-            let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
-            btext(ui, egui::pos2(r.left(), r.center().y), egui::Align2::LEFT_CENTER, "发现出口不对时", 15.0, TXT);
+            let (r, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
+            btext(
+                ui,
+                egui::pos2(r.left(), r.center().y),
+                egui::Align2::LEFT_CENTER,
+                "发现出口不对时",
+                15.0,
+                TXT,
+            );
             ui.add_space(4.0);
             let mut chg = false;
             {
                 let mut cfg = self.sh.cfg.lock().unwrap();
                 let mut v = cfg.kill_on_fail;
-                setting_row(ui, "停掉 Claude", "立刻结束 Claude 的所有进程", |ui| {
-                    if ios_toggle(ui, "tg_kill", &mut v) {
-                        chg = true;
-                    }
-                });
+                setting_row(
+                    ui,
+                    "停掉 Claude",
+                    "立刻结束 Claude 的所有进程",
+                    |ui| {
+                        if ios_toggle(ui, "tg_kill", &mut v) {
+                            chg = true;
+                        }
+                    },
+                );
                 let mut v2 = cfg.quarantine_on_fail;
-                setting_row(ui, "断开它的网络", "用防火墙拦住 Claude 联网，恢复后自动解除", |ui| {
-                    if ios_toggle(ui, "tg_quar", &mut v2) {
-                        chg = true;
-                    }
-                });
+                setting_row(
+                    ui,
+                    "断开它的网络",
+                    "用防火墙拦住 Claude 联网，恢复后自动解除",
+                    |ui| {
+                        if ios_toggle(ui, "tg_quar", &mut v2) {
+                            chg = true;
+                        }
+                    },
+                );
                 if chg {
                     cfg.kill_on_fail = v;
                     cfg.quarantine_on_fail = v2;
@@ -758,26 +937,44 @@ impl GuardApp {
             ui.add_space(6.0);
 
             // 通用组
-            let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
-            btext(ui, egui::pos2(r.left(), r.center().y), egui::Align2::LEFT_CENTER, "通用", 15.0, TXT);
+            let (r, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
+            btext(
+                ui,
+                egui::pos2(r.left(), r.center().y),
+                egui::Align2::LEFT_CENTER,
+                "通用",
+                15.0,
+                TXT,
+            );
             ui.add_space(4.0);
             let mut chg2 = false;
             {
                 let mut cfg = self.sh.cfg.lock().unwrap();
                 let mut v = cfg.close_to_tray;
-                setting_row(ui, "关窗后驻留托盘", "守护继续在后台运行", |ui| {
-                    if ios_toggle(ui, "tg_tray", &mut v) {
-                        chg2 = true;
-                    }
-                });
+                setting_row(
+                    ui,
+                    "关窗后驻留托盘",
+                    "守护继续在后台运行",
+                    |ui| {
+                        if ios_toggle(ui, "tg_tray", &mut v) {
+                            chg2 = true;
+                        }
+                    },
+                );
                 let installed = self.installed;
                 let mut v2 = cfg.auto_start_with_system;
                 if installed {
-                    setting_row(ui, "开机自启", "开机后自动在托盘里默默守护", |ui| {
-                        if ios_toggle(ui, "tg_autostart", &mut v2) {
-                            chg2 = true;
-                        }
-                    });
+                    setting_row(
+                        ui,
+                        "开机自启",
+                        "开机后自动在托盘里默默守护",
+                        |ui| {
+                            if ios_toggle(ui, "tg_autostart", &mut v2) {
+                                chg2 = true;
+                            }
+                        },
+                    );
                 } else {
                     setting_row(ui, "开机自启", "安装之后才能开启", |ui| {
                         let _ = ios_toggle_disabled(ui, "tg_autostart_d");
@@ -802,8 +999,16 @@ impl GuardApp {
             // ---- 软件更新 ----
             hairline(ui);
             ui.add_space(6.0);
-            let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
-            btext(ui, egui::pos2(r.left(), r.center().y), egui::Align2::LEFT_CENTER, "软件更新", 15.0, TXT);
+            let (r, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
+            btext(
+                ui,
+                egui::pos2(r.left(), r.center().y),
+                egui::Align2::LEFT_CENTER,
+                "软件更新",
+                15.0,
+                TXT,
+            );
             ui.add_space(4.0);
             let upd = self.upd.lock().unwrap().clone();
             let mut act_check = false;
@@ -827,21 +1032,53 @@ impl GuardApp {
                     });
                 }
                 UpdState::Available { ver, url, size } => {
-                    setting_row(ui, "检查更新", "有新版本，下载完会自动重启", |ui| {
-                        if text_link(ui, "upd_dl", &format!("下载 v{ver} 并更新"), 13.0, LINK) {
-                            act_download = Some((url.clone(), *size));
-                        }
-                    });
+                    setting_row(
+                        ui,
+                        "检查更新",
+                        "有新版本，下载完会自动重启",
+                        |ui| {
+                            if text_link(ui, "upd_dl", &format!("下载 v{ver} 并更新"), 13.0, LINK)
+                            {
+                                act_download = Some((url.clone(), *size));
+                            }
+                        },
+                    );
                 }
                 UpdState::Downloading { done, total } => {
-                    setting_row(ui, "正在下载新版本", "下载完会自动重启", |ui| {
-                        let pct = if *total > 0 { (*done as f32 / *total as f32 * 100.0) as u64 } else { 0 };
-                        ui.label(egui::RichText::new(format!("{pct}%")).size(13.0).color(TXT));
-                    });
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
-                    let frac = if *total > 0 { *done as f32 / *total as f32 } else { 0.0 }.clamp(0.0, 1.0);
-                    ui.painter().rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(r.width() * frac, 6.0)), egui::CornerRadius::same(3), BLUE);
-                    ui.painter().rect_stroke(r, egui::CornerRadius::same(3), egui::Stroke::new(1.0, SEP), egui::StrokeKind::Middle);
+                    setting_row(
+                        ui,
+                        "正在下载新版本",
+                        "下载完会自动重启",
+                        |ui| {
+                            let pct = if *total > 0 {
+                                (*done as f32 / *total as f32 * 100.0) as u64
+                            } else {
+                                0
+                            };
+                            ui.label(egui::RichText::new(format!("{pct}%")).size(13.0).color(TXT));
+                        },
+                    );
+                    let (r, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 6.0),
+                        egui::Sense::hover(),
+                    );
+                    let frac = if *total > 0 {
+                        *done as f32 / *total as f32
+                    } else {
+                        0.0
+                    }
+                    .clamp(0.0, 1.0);
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(r.min, egui::vec2(r.width() * frac, 6.0)),
+                        egui::CornerRadius::same(3),
+                        BLUE,
+                    );
+                    ui.painter().rect_stroke(
+                        r,
+                        egui::CornerRadius::same(3),
+                        egui::Stroke::new(1.0, SEP),
+                        egui::StrokeKind::Middle,
+                    );
                 }
                 UpdState::Restarting => {
                     setting_row(ui, "检查更新", "下载完成，马上重启", |ui| {
@@ -862,7 +1099,10 @@ impl GuardApp {
                 self.spawn_update_check();
             }
             if let Some((url, size)) = act_download {
-                *self.upd.lock().unwrap() = UpdState::Downloading { done: 0, total: size };
+                *self.upd.lock().unwrap() = UpdState::Downloading {
+                    done: 0,
+                    total: size,
+                };
                 self.spawn_update_download(url, size);
             }
 
@@ -947,7 +1187,11 @@ impl eframe::App for GuardApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(14)))
+            .frame(
+                egui::Frame::new()
+                    .fill(BG)
+                    .inner_margin(egui::Margin::same(14)),
+            )
             .show(ui, |ui| {
                 if let Some(act) = title_bar(ui, self.maximized) {
                     match act {
@@ -956,8 +1200,10 @@ impl eframe::App for GuardApp {
                             let to_tray = self.sh.cfg.lock().unwrap().close_to_tray;
                             if to_tray {
                                 self.sh.log("窗口已收进托盘，守护仍在运行");
-                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                                ui.ctx()
+                                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                                ui.ctx()
+                                    .send_viewport_cmd(egui::ViewportCommand::Visible(false));
                             } else {
                                 self.quitting = true;
                                 self.sh.stop.store(true, Ordering::SeqCst);
@@ -966,11 +1212,14 @@ impl eframe::App for GuardApp {
                             }
                         }
                         TitleAction::Minimize => {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
                         TitleAction::MaximizeToggle => {
                             self.maximized = !self.maximized;
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(self.maximized));
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(
+                                self.maximized,
+                            ));
                         }
                     }
                 }

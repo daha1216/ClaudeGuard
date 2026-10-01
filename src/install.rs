@@ -2,7 +2,7 @@
 //! 写入注册表卸载项与开机自启项。
 
 use crate::guard::log_line;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const APP_NAME: &str = "ClaudeGuard";
@@ -31,7 +31,11 @@ pub fn install() -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let dst = installed_exe();
     std::fs::copy(&src, &dst).map_err(|e| e.to_string())?;
-    log_line(&format!("installed: {} -> {}", src.display(), dst.display()));
+    log_line(&format!(
+        "installed: {} -> {}",
+        src.display(),
+        dst.display()
+    ));
 
     // 快捷方式（桌面 + 开始菜单），目标直接指向 exe
     create_shortcuts(&dst);
@@ -43,16 +47,28 @@ pub fn install() -> Result<PathBuf, String> {
 }
 
 fn run_ps(script: &str) -> bool {
-    Command::new(crate::guard::sys32(r"WindowsPowerShell\v1.0\powershell.exe"))
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    Command::new(crate::guard::sys32(
+        r"WindowsPowerShell\v1.0\powershell.exe",
+    ))
+    .args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ])
+    .output()
+    .map(|o| o.status.success())
+    .unwrap_or(false)
 }
 
-fn create_shortcuts(exe: &PathBuf) {
+fn create_shortcuts(exe: &Path) {
     let exe_s = exe.to_string_lossy().to_string().replace('\'', "''");
-    let work = exe.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default().replace('\'', "''");
+    let work = exe
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default()
+        .replace('\'', "''");
     let mk = |dir_var: &str| {
         format!(
             "$d=[Environment]::GetFolderPath('{dir_var}'); $w=New-Object -ComObject WScript.Shell; \
@@ -66,7 +82,7 @@ fn create_shortcuts(exe: &PathBuf) {
     log_line(&format!("shortcuts: desktop={a} startmenu={b}"));
 }
 
-fn write_uninstall_key(exe: &PathBuf) {
+fn write_uninstall_key(exe: &Path) {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -75,7 +91,12 @@ fn write_uninstall_key(exe: &PathBuf) {
         let _ = key.set_value("DisplayName", &"Claude 守护器 (ClaudeGuard)");
         let _ = key.set_value("DisplayVersion", &env!("CARGO_PKG_VERSION"));
         let _ = key.set_value("Publisher", &"ClaudeGuard");
-        let _ = key.set_value("InstallLocation", &exe.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default());
+        let _ = key.set_value(
+            "InstallLocation",
+            &exe.parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        );
         let _ = key.set_value("DisplayIcon", &exe_s);
         let _ = key.set_value("UninstallString", &format!("\"{exe_s}\" --uninstall"));
         let _ = key.set_value("NoModify", &1u32);
@@ -94,7 +115,8 @@ pub fn set_autostart(enabled: bool) -> bool {
     };
     if enabled {
         let exe = installed_exe().to_string_lossy().to_string();
-        key.set_value(APP_NAME, &format!("\"{exe}\" --tray")).is_ok()
+        key.set_value(APP_NAME, &format!("\"{exe}\" --tray"))
+            .is_ok()
     } else {
         let _ = key.delete_value(APP_NAME);
         true
@@ -127,6 +149,9 @@ pub fn uninstall() {
     // 延迟自删安装目录（ping 做延迟：timeout 在无控制台环境会立即退出不等）
     let dir = install_dir().to_string_lossy().to_string();
     let _ = Command::new(crate::guard::sys32("cmd.exe"))
-        .args(["/C", &format!("ping -n 4 127.0.0.1 >nul & rmdir /s /q \"{dir}\"")])
+        .args([
+            "/C",
+            &format!("ping -n 4 127.0.0.1 >nul & rmdir /s /q \"{dir}\""),
+        ])
         .spawn();
 }
