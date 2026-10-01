@@ -12,10 +12,10 @@ Windows 桌面守护器：校验本地代理出口 IP → 通过才放行 Claude
 
 | 模块 | 职责 | 允许 | 禁止 |
 |---|---|---|---|
-| `src/app.rs` | 唯一有状态类型 `GuardApp`、主视图、设置卡、监测编排 | 改状态字段/视图逻辑 | 再膨胀；新视图请建新文件 |
-| `src/widgets.rs` | 全部无状态 UI 部件（按钮/开关/卡片/标题栏…） | 新部件=纯函数 `fn(ui, …) -> Response` | 持有任何状态、引用 GuardApp |
-| `src/theme.rs` | 设计令牌（颜色/字体/样式）+ `init(ctx)` | 加常量 | 在别处内联魔法色值/字号 |
-| `src/wizard.rs` | 首次运行向导（`impl GuardApp` 三页流程） | 改向导 | 塞入与向导无关的内容 |
+| `src/main.rs` | CLI 入口 + tauri 建窗/托盘/标题回调/单实例 | 改窗口与托盘装配 | 塞业务逻辑 |
+| `src/monitor.rs` | 后台检测循环/熔断/解除/更新线程, `guard://status\|log\|update` 事件 | 改监测编排与事件载荷 | 在 webview 线程做耗时操作 |
+| `src/ipc.rs` | 全部 `#[tauri::command]`（13 条 + `js_log` 诊断桥） | 加命令 | 绕过 `Shared` 直接摸全局 |
+| `ui/` | 纯静态前端（index.html/app.css/icons.js/ipc.js/main.js，无构建步骤） | 改前端 | 引入 node/打包器；顶层 `const`（见坑 1） |
 | `src/checks.rs` | 三步校验（注册表代理/CONNECT 握手/出口 IP） | 改校验逻辑+单测 | panic（任何输入都必须返回失败步骤） |
 | `src/guard.rs` | 熔断：杀进程/防火墙/日志/启动 Claude | 改熔断 | 相对路径调子进程 |
 | `src/install.rs` | 安装/卸载/自启/快捷方式 | 改安装逻辑 | 写死用户路径 |
@@ -71,14 +71,31 @@ cargo fmt
 
 ## 已知坑（别再踩）
 
-- **中文 .ps1 必须 UTF-8 带 BOM**：很多工具写文件会剥 BOM，PowerShell 5.1 按 ANSI 读，
-  中文字面量会吞掉后续代码。写完用 `[IO.File]::WriteAllText($p, $t, [Text.UTF8Encoding]::new($true))` 补。
-- pwsh 内嵌 C#（DllImport）时 `$`/引号转义会被外层吃掉：一律写 .ps1 文件再 `-File` 执行。
-- 测试钩子（仅 debug/截图用，别在生产路径依赖）：env `CG_WIN_H`=覆盖窗口高；
-  env `CG_SMOKE_SETTINGS`=只渲染设置卡视图。冒烟脚本 `smoke-ui3.ps1`（不入库）。
-- `egui` 无字重字段：600 字重靠 `widgets::btext` 双重绘制模拟；无字距 API。
-- 屏幕是 1080p@200% 缩放：窗口高度公式按工作区算（`main.rs` SPI_GETWORKAREA），改 UI 后
-  用截图+视觉模型复核，不要凭想象改布局。
+1. **classic script 共享全局词法作用域**：`ui/*.js` 顶层 `const/let` 跨文件撞名会让后加载的
+   脚本**整个编译失败**（`SyntaxError: Identifier 'x' has already been declared`），一行都不
+   执行，且页面里没有任何 error 监听能捕到（监听器本身在那个脚本里）。v2 P0 实测踩过：
+   `node --check` 逐文件独立解析查不出来。**铁律：ui/*.js 一律 IIFE 包裹**，跨文件只走
+   `window.ICONS` / `window.CG_IPC`。
+2. **tauri 资源嵌入是编译期的**：改 `ui/` 后必须重新 `cargo build`（必要时 touch ui 文件强制
+   重嵌），磁盘改完不重编=运行的还是旧前端。
+3. **`document.title` → 原生窗口标题不自动**：wry 只回调不代设，需
+   `.on_document_title_changed(|w, t| w.set_title(&t))`（main.rs 已接）。
+4. **webview 前端诊断三板斧**（按序）：`js_log` 命令把 `[js] …` 写进 guard.log；
+   CDP（`$env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS='--remote-debugging-port=9222'` 启动
+   + node 连 `/json/list` 的 webSocketDebuggerUrl，`Runtime.evaluate`/`Page.reload`+console 域
+   收真实报错）；像素扫描截图（绿环/橙横幅色值计数）。
+5. **中文 .ps1 必须 UTF-8 带 BOM**：很多工具写文件会剥 BOM，PowerShell 5.1 按 ANSI 读，
+   中文字面量会吞掉后续代码。写完用 `[IO.File]::WriteAllText($p, $t, [Text.UTF8Encoding]::new($true))` 补。
+6. pwsh 内嵌 C#（DllImport）时 `$`/引号转义会被外层吃掉：一律写 .ps1 文件再 `-File` 执行。
+7. 测试钩子（仅 debug/截图用，别在生产路径依赖）：env `CG_WIN_H`=覆盖窗口高；
+   env `CG_SMOKE_SETTINGS`=自动展开设置卡。冒烟脚本 `smoke-v2.ps1`（不入库；向导阶段有
+   安全阀：claude.exe 在跑就跳过，空 required_ip 会触发真实熔断）。
+8. 屏幕是 1080p@200% 缩放：窗口高度公式按工作区算（`main.rs` SPI_GETWORKAREA），改 UI 后
+   用截图+像素扫描复核，不要凭想象改布局。窗口尺寸 API 传的是逻辑像素。
+9. tauri 权限：`core:default` 不含窗口操作，`capabilities/default.json` 需显式放行
+   minimize/toggle-maximize/close/start-dragging/start-resize-dragging。
+10. v1 egui 时代条目已随模块删除失效（无字重字段等）；v1 行为基准全部迁入
+    `docs/PARITY-v2.md`，文案/状态机以它为准。
 
 ## 改 UI 的验收标准
 
