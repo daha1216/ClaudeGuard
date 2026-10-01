@@ -14,3 +14,5 @@ smoke-*.ps1
 probe-*.ps1
 deploy-*.ps1
 make-zip.ps1
+
+make-release.ps1
