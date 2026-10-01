@@ -355,7 +355,7 @@ impl GuardApp {
             match r {
                 Ok(path) => {
                     *st.lock().unwrap() = UpdState::Restarting;
-                    match update::apply_update(&path) {
+                    match update::apply_update(&path, true) {
                         Ok(()) => std::process::exit(0),
                         Err(e) => *st.lock().unwrap() = UpdState::Failed(e),
                     }

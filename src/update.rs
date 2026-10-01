@@ -183,9 +183,10 @@ pub fn download(
 
 /// 用新 exe 替换当前进程的 exe 并重启。
 ///
-/// 流程: 当前 exe 改名为 .old → 新文件复制到原路径(失败则回滚) → 启动新实例 → 本进程退出。
+/// 流程: 当前 exe 改名为 .old → 新文件复制到原路径(失败则回滚) → 启动新实例。
 /// 安装版以管理员运行, 重命名/复制/启动均无权限问题; 便携版在可写目录同样适用。
-pub fn apply_update(new_exe: &Path) -> Result<(), String> {
+/// `spawn_new=false` 供自测使用: 只做替换不启动。
+pub fn apply_update(new_exe: &Path, spawn_new: bool) -> Result<(), String> {
     let cur = std::env::current_exe().map_err(|e| format!("定位自身: {e}"))?;
     let old = cur.with_extension("exe.old");
 
@@ -200,10 +201,22 @@ pub fn apply_update(new_exe: &Path) -> Result<(), String> {
         return Err(format!("复制新版本: {e}"));
     }
 
-    // 启动新实例(分离, 不继承句柄)
-    std::process::Command::new(&cur)
-        .spawn()
-        .map_err(|e| format!("启动新版本: {e}"))?;
+    if !spawn_new {
+        return Ok(());
+    }
+
+    // 启动新实例(分离)。提权进程下直接 CreateProcess 即可;
+    // 未提权进程遇到带管理员清单的 exe 会得到 ERROR_ELEVATION_REQUIRED,
+    // 此时经 explorer(ShellExecute 语义)触发 UAC 弹窗启动。
+    if std::process::Command::new(&cur).spawn().is_err() {
+        let expl = std::env::var("SystemRoot")
+            .map(|r| format!(r"{r}\explorer.exe"))
+            .unwrap_or_else(|_| "explorer.exe".to_string());
+        std::process::Command::new(expl)
+            .arg(&cur)
+            .spawn()
+            .map_err(|e| format!("启动新版本: {e}"))?;
+    }
 
     Ok(())
 }

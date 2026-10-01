@@ -35,8 +35,59 @@ fn main() {
     } else if has("--uninstall") {
         install::uninstall();
         println!("uninstalled");
+    } else if has("--update-selftest") {
+        update_selftest();
     } else {
         run_gui(has("--tray"));
+    }
+}
+
+/// 隐藏入口: 更新链路自测。真实走一遍 GitHub API → 资产解析 → 下载 → 自替换(不重启)。
+/// 在 %TEMP% 的副本上运行, 不影响已安装实例。
+fn update_selftest() {
+    let cfg = Config::load();
+    println!("current : {}", update::current_version());
+    match update::check_latest(&cfg) {
+        Ok(rel) => {
+            println!("latest  : {} (tag {})", rel.version(), rel.tag_name);
+            println!(
+                "is_newer: {}",
+                update::is_newer(rel.version(), update::current_version())
+            );
+            match rel.exe_asset() {
+                Some(a) => {
+                    println!("asset   : {} ({} bytes)", a.name, a.size);
+                    match update::download(&cfg, &a.browser_download_url, a.size, |d, t| {
+                        if d == t {
+                            println!("download: {d}/{t} bytes");
+                        }
+                    }) {
+                        Ok(p) => match update::apply_update(&p, false) {
+                            Ok(()) => {
+                                let cur = std::env::current_exe().unwrap();
+                                println!("SWAP OK : {} (旧版本在 .old)", cur.display());
+                            }
+                            Err(e) => {
+                                eprintln!("swap failed: {e}");
+                                std::process::exit(2);
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("download failed: {e}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                None => {
+                    eprintln!("release 里没有匹配的 exe 资产");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("check failed: {e}");
+            std::process::exit(2);
+        }
     }
 }
 
