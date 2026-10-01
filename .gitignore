@@ -12,6 +12,7 @@ shot*.png
 *.zip
 smoke-*.ps1
 probe-*.ps1
+test-*.ps1
 deploy-*.ps1
 make-zip.ps1
 

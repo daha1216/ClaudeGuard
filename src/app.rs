@@ -14,7 +14,7 @@ use crate::theme::{BG, BLUE, BLUE_H, GREEN, GREEN_DEEP, LINK, MIST, ORANGE, RED,
 use crate::update;
 use crate::widgets::{
     arc, banner, btext, capsule, card_p, chevron, hairline, ios_toggle, ios_toggle_disabled,
-    setting_row, text_link, title_bar, TitleAction,
+    resize_edges, setting_row, text_link, title_bar, TitleAction,
 };
 
 const TRAY_SHOW: &str = "cg_show";
@@ -1247,6 +1247,8 @@ impl eframe::App for GuardApp {
                         }
                     });
             });
+        // 无边框窗口边缘拖拽缩放：必须在整个内容之后调用(边缘带优先于标题栏拖拽)
+        resize_edges(ui.ctx(), self.maximized);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

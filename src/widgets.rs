@@ -127,6 +127,109 @@ pub(crate) enum TitleAction {
     Minimize,
     MaximizeToggle,
 }
+
+/// 边缘缩放带厚度(逻辑px)。200% DPI 下=12 物理px，与系统无边框窗口手感一致。
+pub(crate) const EDGE_W: f32 = 6.0;
+/// 三个标题栏按钮(最小化/最大化/关闭)总宽。顶边缩放带要让出这块(按钮顶边优先响应点击)。
+pub(crate) const CAP_BTNS_W: f32 = 46.0 * 3.0;
+
+/// 无边框窗口四边/四角拖拽缩放：悬停切换方向箭头光标，按下交给系统缩放循环
+/// (egui `BeginResize` → winit → WM_NCLBUTTONDOWN + HT*)。
+/// 每帧在 ui() 末尾调用；最大化时禁用。
+pub(crate) fn resize_edges(ctx: &egui::Context, maximized: bool) {
+    use egui::viewport::ResizeDirection;
+    if maximized {
+        return;
+    }
+    let Some(p) = ctx.pointer_latest_pos() else {
+        return;
+    };
+    let r = ctx.viewport_rect();
+    if !r.contains(p) {
+        return;
+    }
+    let west = p.x - r.left() < EDGE_W;
+    let east = r.right() - p.x < EDGE_W;
+    // 顶边在标题栏按钮区上方不响应，保持按钮完整可点(与系统行为一致)
+    let north = p.y - r.top() < EDGE_W && p.x < r.right() - CAP_BTNS_W;
+    let south = r.bottom() - p.y < EDGE_W;
+    let dir = match (west || east, north || south) {
+        (true, true) => Some(if west == north {
+            if west {
+                ResizeDirection::NorthWest
+            } else {
+                ResizeDirection::SouthEast
+            }
+        } else if west {
+            ResizeDirection::SouthWest
+        } else {
+            ResizeDirection::NorthEast
+        }),
+        (true, false) => Some(if west {
+            ResizeDirection::West
+        } else {
+            ResizeDirection::East
+        }),
+        (false, true) => Some(if north {
+            ResizeDirection::North
+        } else {
+            ResizeDirection::South
+        }),
+        (false, false) => None,
+    };
+    let Some(dir) = dir else { return };
+    // 边缘带矩形(角为正方形, 边为整条带)
+    let (l, rt, t, b) = (r.left(), r.right(), r.top(), r.bottom());
+    let band = match dir {
+        ResizeDirection::North => {
+            egui::Rect::from_min_max(egui::pos2(l, t), egui::pos2(rt, t + EDGE_W))
+        }
+        ResizeDirection::South => {
+            egui::Rect::from_min_max(egui::pos2(l, b - EDGE_W), egui::pos2(rt, b))
+        }
+        ResizeDirection::West => {
+            egui::Rect::from_min_max(egui::pos2(l, t), egui::pos2(l + EDGE_W, b))
+        }
+        ResizeDirection::East => {
+            egui::Rect::from_min_max(egui::pos2(rt - EDGE_W, t), egui::pos2(rt, b))
+        }
+        ResizeDirection::NorthWest => {
+            egui::Rect::from_min_max(egui::pos2(l, t), egui::pos2(l + EDGE_W, t + EDGE_W))
+        }
+        ResizeDirection::NorthEast => {
+            egui::Rect::from_min_max(egui::pos2(rt - EDGE_W, t), egui::pos2(rt, t + EDGE_W))
+        }
+        ResizeDirection::SouthWest => {
+            egui::Rect::from_min_max(egui::pos2(l, b - EDGE_W), egui::pos2(l + EDGE_W, b))
+        }
+        ResizeDirection::SouthEast => {
+            egui::Rect::from_min_max(egui::pos2(rt - EDGE_W, b - EDGE_W), egui::pos2(rt, b))
+        }
+    };
+    // 必须注册真实交互控件: 纯数学判断不参与 egui 命中测试, egui-winit 会把按下事件当
+    // "无控件要输入"丢弃, BeginResize 永远发不出去。用 Foreground 层的隐形 Area 承接。
+    egui::Area::new(egui::Id::new("resize-band"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(band.min)
+        .interactable(true)
+        .show(ctx, |ui| {
+            let resp = ui.allocate_rect(band, egui::Sense::drag());
+            if resp.is_pointer_button_down_on() || resp.drag_started() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+            }
+        });
+    ctx.set_cursor_icon(match dir {
+        ResizeDirection::North => egui::CursorIcon::ResizeNorth,
+        ResizeDirection::South => egui::CursorIcon::ResizeSouth,
+        ResizeDirection::East => egui::CursorIcon::ResizeEast,
+        ResizeDirection::West => egui::CursorIcon::ResizeWest,
+        ResizeDirection::NorthEast => egui::CursorIcon::ResizeNorthEast,
+        ResizeDirection::NorthWest => egui::CursorIcon::ResizeNorthWest,
+        ResizeDirection::SouthEast => egui::CursorIcon::ResizeSouthEast,
+        ResizeDirection::SouthWest => egui::CursorIcon::ResizeSouthWest,
+    });
+}
+
 pub(crate) fn title_bar(ui: &mut egui::Ui, maximized: bool) -> Option<TitleAction> {
     let h = 44.0;
     let (bar, _) =
@@ -181,9 +284,11 @@ pub(crate) fn title_bar(ui: &mut egui::Ui, maximized: bool) -> Option<TitleActio
     ) {
         act = Some(TitleAction::Close);
     }
-    // 拖拽区（按钮左侧全部）+ 双击最大化
-    let drag_rect =
-        egui::Rect::from_min_max(bar.left_top(), egui::pos2(x1 - bw * 3.0, bar.bottom()));
+    // 拖拽区（按钮左侧全部）+ 双击最大化；顶边让出 EDGE_W 给缩放带，避免按下同时发 StartDrag+BeginResize
+    let drag_rect = egui::Rect::from_min_max(
+        egui::pos2(bar.left(), bar.top() + if maximized { 0.0 } else { EDGE_W }),
+        egui::pos2(x1 - bw * 3.0, bar.bottom()),
+    );
     let resp = ui.interact(
         drag_rect,
         egui::Id::new("titlebar_drag"),
