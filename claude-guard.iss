@@ -6,9 +6,13 @@
 ; Note: uninstall intentionally KEEPS user data in %APPDATA%\ClaudeGuard.
 
 #define MyAppName "ClaudeGuard"
-; Single source of truth: read version straight from the built exe (set by
-; build.rs from Cargo.toml). Keep the exe built BEFORE compiling the installer.
-#define MyAppVersion GetVersionNumbersString('target\release\claude-guard.exe')
+; Version: prefer the /DMyAppVersionStr=X.Y.Z passed by make-release.ps1 (the
+; exe's win32 version resource is padded to 4 parts, e.g. 2.0.0.0). When
+; compiled manually without the define we fall back to reading the exe.
+#ifndef MyAppVersionStr
+#define MyAppVersionStr GetVersionNumbersString('target\release\claude-guard.exe')
+#endif
+#define MyAppVersion MyAppVersionStr
 #define MyAppPublisher "daha1216"
 #define MyAppURL "https://github.com/daha1216/ClaudeGuard"
 #define MyAppExeName "ClaudeGuard.exe"
@@ -57,6 +61,33 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 [Code]
 var
   TaskkillResultCode: Integer;
+
+// v2 UI runs on WebView2 (Edge Evergreen runtime). Most Windows 10/11 boxes
+// have it via Edge updates; we do NOT bundle or auto-download it -- just fail
+// with a pointer if it is missing (keeps installer small and dependency-free).
+function WebView2Present(): Boolean;
+var
+  V: String;
+begin
+  if RegQueryStringValue(HKLM, 'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}', 'pv', V) and (V <> '') then begin
+    Result := True;
+    exit;
+  end;
+  Result := RegQueryStringValue(HKCU, 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}', 'pv', V) and (V <> '');
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  Result := True;
+  if not WebView2Present() then begin
+    MsgBox('ClaudeGuard v2 needs the Microsoft Edge WebView2 Runtime, which is not installed on this PC.' + #13#10 + #13#10 +
+           'Please install it from:' + #13#10 +
+           'https://developer.microsoft.com/microsoft-edge/webview2/' + #13#10 + #13#10 +
+           '(Chinese page: search "WebView2 运行时" or visit the same link.)',
+           mbError, MB_OK);
+    Result := False;
+  end;
+end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
