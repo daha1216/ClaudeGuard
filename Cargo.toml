@@ -1,0 +1,31 @@
+[package]
+name = "claude-guard"
+version = "1.2.1"
+edition = "2021"
+description = "Claude 守护器：代理出口校验、托盘常驻监测、异常熔断隔离"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "2"
+sysinfo = "0.30"
+winreg = "0.52"
+windows = { version = "0.58", features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+] }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow"] }
+tray-icon = "0.24"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+winres = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

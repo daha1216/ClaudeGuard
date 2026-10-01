@@ -1,0 +1,11 @@
+# 构建产物
+/target/
+
+# 本地过程产物
+*.log
+shot*.png
+
+# 本地专属（不入公共仓库）
+/backup/
+/迭代手册.md
+/config.json
