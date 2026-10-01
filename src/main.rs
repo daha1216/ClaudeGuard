@@ -8,6 +8,7 @@ mod config;
 mod guard;
 mod install;
 mod tcp_table;
+mod update;
 
 use config::Config;
 

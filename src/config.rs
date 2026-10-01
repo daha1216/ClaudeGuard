@@ -26,7 +26,9 @@ impl Default for Config {
         Self {
             proxy_host: "127.0.0.1".into(),
             proxy_port: 7890,
-            required_ip: "204.1.100.98".into(),
+            // 默认留空：出口 IP 属于用户隐私，由首次运行向导引导填写。
+            // 留空时校验必定失败（宁可错杀），直到用户设置了自己的期望 IP。
+            required_ip: String::new(),
             connect_target: "api.anthropic.com:443".into(),
             app_id: "Claude_pzs8sxrjxfjjc!Claude".into(),
             check_interval_secs: 15,
