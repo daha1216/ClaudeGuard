@@ -78,8 +78,7 @@ async function init() {
   listen(EV.status, (e) => {
     Object.assign(S, e.payload);
     render();
-  });
-  listen(EV.log, (e) => {
+  });  listen(EV.log, (e) => {
     S.logs.push(e.payload);
     if (S.logs.length > 200) S.logs.splice(0, S.logs.length - 200);
     renderLog();
@@ -92,10 +91,11 @@ async function init() {
   wireStatic();
   render();
   if (S.smokeSettings) {
-    requestAnimationFrame(() => {
+    // 手风琴展开(280ms)完成后再滚到底，否则内容长高后停在中途
+    setTimeout(() => {
       const c = $("content");
       c.scrollTop = c.scrollHeight;
-    });
+    }, 450);
   }
 }
 
@@ -160,6 +160,12 @@ function wireStatic() {
 
   updateCompact();
   new ResizeObserver(updateCompact).observe($("content"));
+
+  // 标题栏发丝线：内容滚到标题栏底下才浮现（macOS 风）
+  const contentEl = $("content");
+  contentEl.addEventListener("scroll", () => {
+    $("titlebar").classList.toggle("scrolled", contentEl.scrollTop > 0);
+  }, { passive: true });
 }
 
 function updateCompact() {
@@ -172,6 +178,9 @@ function render() {
   const wizardMode = !!S.cfg && S.cfg.first_run;
   $("home").classList.toggle("hidden", wizardMode);
   $("wizard").classList.toggle("hidden", !wizardMode);
+  // 折叠状态应用（默认全收起；点击头部或冒烟钩子展开）
+  const CARD_IDS = { details: "card-details", settings: "card-settings", log: "card-log" };
+  for (const k in CARD_IDS) $(CARD_IDS[k]).classList.toggle("open", !!S.openCards[k]);
   if (wizardMode) {
     renderWizard();
     return;
@@ -201,29 +210,41 @@ function heroState() {
   return { ring: "idle", title: "准备中", sub: "马上开始第一次检查" };
 }
 
+let prevRing = ""; // 状态没变就不重画环（自旋动画不重置、对勾不重播）
+
 function renderHero() {
   const h = heroState();
   $("hero-title").textContent = h.title;
   $("hero-sub").textContent = h.sub;
   const g = $("ring-dynamic");
-  g.classList.toggle("spin", h.ring === "spin");
+  const changed = prevRing !== h.ring;
+  if (h.ring === "spin") {
+    if (changed) {
+      let arcs = "";
+      for (let i = 0; i < 3; i++) {
+        const a0 = (i * 2 * Math.PI) / 3;
+        const a1 = a0 + 1.4;
+        const x0 = 60 + 52 * Math.cos(a0), y0 = 60 + 52 * Math.sin(a0);
+        const x1 = 60 + 52 * Math.cos(a1), y1 = 60 + 52 * Math.sin(a1);
+        arcs += `<path class="spin-arc" d="M${x0.toFixed(1)} ${y0.toFixed(1)} A52 52 0 0 1 ${x1.toFixed(1)} ${y1.toFixed(1)}"/>`;
+      }
+      g.innerHTML = arcs;
+    }
+    prevRing = h.ring;
+    g.classList.add("spin");
+    return;
+  }
+  g.classList.remove("spin");
+  if (!changed) return;
+  prevRing = h.ring;
+  const draw = ' pathLength="1" class="ring-mark draw-in"'; // 仅状态切换时描画
   if (h.ring === "pass") {
     g.innerHTML = `<circle class="ring-full" cx="60" cy="60" r="52" stroke="var(--green)"/>
-      <path class="ring-mark" d="M43 61 L54 73 L78 47"/>`;
+      <path${draw} d="M43 61 L54 73 L78 47"/>`;
   } else if (h.ring === "fail") {
     g.innerHTML = `<circle class="ring-full" cx="60" cy="60" r="52" stroke="var(--red)"/>
-      <path class="ring-mark" d="M60 43 L60 65"/>
+      <path${draw} d="M60 43 L60 65"/>
       <circle cx="60" cy="79" r="4" fill="#FFFFFF" stroke="none"/>`;
-  } else if (h.ring === "spin") {
-    let arcs = "";
-    for (let i = 0; i < 3; i++) {
-      const a0 = (i * 2 * Math.PI) / 3;
-      const a1 = a0 + 1.4;
-      const x0 = 60 + 52 * Math.cos(a0), y0 = 60 + 52 * Math.sin(a0);
-      const x1 = 60 + 52 * Math.cos(a1), y1 = 60 + 52 * Math.sin(a1);
-      arcs += `<path class="spin-arc" d="M${x0.toFixed(1)} ${y0.toFixed(1)} A52 52 0 0 1 ${x1.toFixed(1)} ${y1.toFixed(1)}"/>`;
-    }
-    g.innerHTML = arcs;
   } else {
     g.innerHTML = `<circle class="ring-dot" cx="46" cy="60" r="4.5"/>
       <circle class="ring-dot" cx="60" cy="60" r="4.5"/>
@@ -254,16 +275,32 @@ function renderBanners() {
       <div class="banner-title">暂时没法确认网络</div>
       <div class="banner-desc">刚才的检查没有成功，可能是网络没通。确认代理软件开着，再点重新检查。</div></div></div>`;
   }
-  z.innerHTML = html;
+  // 内容签名去重：状态事件每几秒重渲一次，内容没变就别重建 DOM（否则横幅入场动画会被重播）
+  if (z.dataset.sig !== html) {
+    z.dataset.sig = html;
+    z.innerHTML = html;
+  }
 }
-
 function showNotice(title, desc) {
+  if (S.noticeTimer) clearTimeout(S.noticeTimer);
   S.notice = { title, desc };
   renderBanners();
-  setTimeout(() => {
+  S.noticeTimer = setTimeout(dismissNotice, 4000);
+}
+function dismissNotice() {
+  S.noticeTimer = null;
+  const b = document.querySelector("#banner-zone .banner");
+  if (b) {
+    // 退场淡出后再清（进出同曲线，退场更快）
+    b.classList.add("leaving");
+    setTimeout(() => {
+      S.notice = null;
+      renderBanners();
+    }, 170);
+  } else {
     S.notice = null;
     renderBanners();
-  }, 4000);
+  }
 }
 
 /* ===== CTA ===== */
@@ -380,7 +417,6 @@ function renderSettings() {
   wireSettingToggle("set-tray", "close_to_tray");
   wireAutostart();
   renderUpdateGroup();
-  body.querySelectorAll(".card.collapsible");
 }
 
 function settingInput(id, title, desc, value) {
@@ -496,7 +532,17 @@ function settingRow(title, control) {
 function renderLog() {
   const el = $("log-body");
   if (!el) return;
-  el.innerHTML = `<div id="log-scroll">${S.logs.slice(-30).map((l) => `<div>${esc(l)}</div>`).join("")}</div>`;
+  const html = `<div id="log-scroll">${S.logs.slice(-30).map((l) => `<div>${esc(l)}</div>`).join("")}</div>`;
+  if (el.dataset.sig === html) return;
+  el.dataset.sig = html;
+  // 用户没往上翻时像 tail -f 一样钉在底部；翻了就别拽
+  const prev = $("log-scroll");
+  const stick = !prev || prev.scrollHeight - prev.scrollTop - prev.clientHeight < 30;
+  el.innerHTML = html;
+  if (stick) {
+    const s = $("log-scroll");
+    s.scrollTop = s.scrollHeight;
+  }
 }
 
 /* ===== 底栏 ===== */
@@ -518,8 +564,18 @@ async function doInstall() {
 
 /* ===== 向导 ===== */
 function gotoWizard(page) {
+  const dir = page > S.wizPage ? "next" : "prev";
+  const from = S.wizPage;
   S.wizPage = page;
   renderWizard();
+  if (from !== page) {
+    const el = $(`wiz-${page}`);
+    if (el) {
+      el.classList.remove("enter-next", "enter-prev");
+      void el.offsetWidth; // 强制 reflow 让入场动画可重播
+      el.classList.add(`enter-${dir}`);
+    }
+  }
 }
 
 function renderWizard() {
