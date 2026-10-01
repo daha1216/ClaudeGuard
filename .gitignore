@@ -19,3 +19,8 @@ make-zip.ps1
 make-release.ps1
 installer/*.exe
 installer/*.zip
+
+gen/
+smoke-v2.ps1
+shot-v2-*.png
+diag-cdp.mjs

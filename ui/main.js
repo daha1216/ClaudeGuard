@@ -1,0 +1,581 @@
+/* ClaudeGuard v2 前端主逻辑 — 对等依据 docs/PARITY-v2.md（文案/状态机以它为准）
+ * IIFE 隔离词法作用域（见 ipc.js 头注：顶层 const 撞名会让整个脚本编译失败）。 */
+(() => {
+"use strict";
+
+const { invoke, EV, CMD, listen, win } = window.CG_IPC;
+
+/* ===== JS 诊断桥（P0 调试期）：错误与里程碑写入 guard.log ===== */
+const jsLog = (m) => {
+  try { invoke("js_log", { msg: m }); } catch (_) { /* 诊断自身不许抛 */ }
+};
+window.addEventListener("error", (e) => {
+  jsLog(`error: ${e.message} @${(e.filename || "").split("/").pop()}:${e.lineno}:${e.colno}`);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  jsLog(`rejection: ${e.reason}`);
+});
+
+/* ===== 全局状态 ===== */
+const S = {
+  checking: false,
+  last: null,          // CheckOutcome | null
+  tripped: null,       // {killed,firewall_rules,quarantined} | null
+  admin: true,
+  installed: false,
+  version: "",
+  smokeSettings: false,
+  cfg: null,           // Config
+  upd: { state: "idle" },
+  logs: [],
+  notice: null,        // {title, desc} 4 秒自动清
+  wizPage: 0,
+  wizPort: "",
+  wizIp: "",
+  openCards: { details: false, settings: false, log: false },
+};
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) =>
+  String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+/* ===== 校验（与 v1 Rust 端规则一致） ===== */
+const portOk = (s) => /^\d{1,5}$/.test(s.trim()) && +s.trim() >= 1 && +s.trim() <= 65535;
+function ipOk(s) {
+  const t = s.trim();
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(t);
+  if (!m) return false;
+  return m.slice(1).every((p) => (/^0\d/.test(p) ? false : +p <= 255));
+}
+const intOk = (s) => /^\d+$/.test(s.trim());
+
+/* ===== plain_reason（PARITY §7） ===== */
+function plainReason(reason) {
+  const r = reason || "";
+  if (r.includes("系统代理")) return "电脑还没开系统代理：打开代理软件里的「系统代理」开关";
+  if (r.includes("端口") || r.includes("握手") || r.includes("CONNECT")) return "连不上代理端口：看看代理软件是不是开着";
+  if (r.includes("出口") || r.includes("IP")) return "出口 IP 和约定不一致";
+  if (!r) return "没有通过检查";
+  return r;
+}
+
+/* ===== 启动 ===== */
+async function init() {
+  const [st, cfg, upd, logs] = await Promise.all([
+    invoke(CMD.getState),
+    invoke(CMD.getConfig),
+    invoke(CMD.updState),
+    invoke(CMD.recentLogs),
+  ]);
+  Object.assign(S, st);
+  S.cfg = cfg;
+  S.upd = upd;
+  S.logs = logs;
+  S.wizPort = String(cfg.proxy_port ?? "");
+  S.wizIp = cfg.required_ip ?? "";
+  if (S.smokeSettings) S.openCards.settings = true;
+
+  listen(EV.status, (e) => {
+    Object.assign(S, e.payload);
+    render();
+  });
+  listen(EV.log, (e) => {
+    S.logs.push(e.payload);
+    if (S.logs.length > 200) S.logs.splice(0, S.logs.length - 200);
+    renderLog();
+  });
+  listen(EV.update, (e) => {
+    S.upd = e.payload;
+    renderSettings();
+  });
+
+  wireStatic();
+  render();
+  if (S.smokeSettings) {
+    requestAnimationFrame(() => {
+      const c = $("content");
+      c.scrollTop = c.scrollHeight;
+    });
+  }
+}
+
+/* ===== 静态事件接线 ===== */
+function wireStatic() {
+  $("btn-min").onclick = () => win.minimize();
+  $("btn-max").onclick = () => win.toggleMaximize();
+  $("btn-close").onclick = () => win.close();
+  win.onResized(() => {
+    win.isMaximized().then((m) => {
+      $("btn-max").innerHTML = m ? ICONS.restore : ICONS.maximize;
+    });
+    updateCompact();
+  });
+
+  // 边缘缩放热区（ResizeDirection 枚举是 PascalCase 变体名）
+  const EDGE_DIR = { n: "North", s: "South", e: "East", w: "West", ne: "NorthEast", nw: "NorthWest", se: "SouthEast", sw: "SouthWest" };
+  document.querySelectorAll(".edge").forEach((el) => {
+    el.addEventListener("pointerdown", (ev) => {
+      win.startResizeDragging(EDGE_DIR[el.dataset.edge] || "East");
+      ev.preventDefault();
+    });
+  });
+
+  // 折叠卡头
+  document.querySelectorAll(".card-head[data-toggle]").forEach((head) => {
+    head.onclick = () => {
+      const key = head.dataset.toggle;
+      S.openCards[key] = !S.openCards[key];
+      render();
+    };
+  });
+
+  // 底栏
+  $("link-data-folder").onclick = (e) => {
+    e.preventDefault();
+    invoke(CMD.openDataFolder);
+  };
+  $("link-install").onclick = (e) => {
+    e.preventDefault();
+    doInstall();
+  };
+
+  // 向导
+  $("wiz0-next").onclick = () => gotoWizard(1);
+  $("wiz1-prev").onclick = (e) => {
+    e.preventDefault();
+    gotoWizard(0);
+  };
+  $("wiz1-next").onclick = wiz1Continue;
+  $("wiz2-prev").onclick = (e) => {
+    e.preventDefault();
+    gotoWizard(1);
+  };
+  $("wiz2-install").onclick = async () => {
+    await doInstall();
+    finishWizard();
+  };
+  $("wiz2-portable").onclick = () => finishWizard();
+
+  $("cta").onclick = ctaClick;
+
+  updateCompact();
+  new ResizeObserver(updateCompact).observe($("content"));
+}
+
+function updateCompact() {
+  const h = $("content").clientHeight;
+  document.body.classList.toggle("compact", h > 0 && h < 400);
+}
+
+/* ===== 渲染总控 ===== */
+function render() {
+  const wizardMode = !!S.cfg && S.cfg.first_run;
+  $("home").classList.toggle("hidden", wizardMode);
+  $("wizard").classList.toggle("hidden", !wizardMode);
+  if (wizardMode) {
+    renderWizard();
+    return;
+  }
+  renderHero();
+  renderBanners();
+  renderCta();
+  renderDetails();
+  renderSettings();
+  renderLog();
+  renderFooter();
+}
+
+/* ===== hero ===== */
+function heroState() {
+  if (S.checking) return { ring: "spin", title: "正在检查…", sub: "正在核对代理和出口 IP" };
+  if (S.tripped) {
+    const reason = S.last && S.last.reason ? S.last.reason : "出口 IP 与约定不一致";
+    return { ring: "fail", title: "已暂停 Claude", sub: `${reason} · 切回节点后自动恢复` };
+  }
+  if (S.last && S.last.passed) {
+    const ip = S.last.egress_ip || "-";
+    const desc = (S.last.egress_desc || "").slice(0, 18);
+    return { ring: "pass", title: "一切正常", sub: `出口 ${ip} ${desc}`.trim() };
+  }
+  if (S.last) return { ring: "fail", title: "没有通过检查", sub: plainReason(S.last.reason) };
+  return { ring: "idle", title: "准备中", sub: "马上开始第一次检查" };
+}
+
+function renderHero() {
+  const h = heroState();
+  $("hero-title").textContent = h.title;
+  $("hero-sub").textContent = h.sub;
+  const g = $("ring-dynamic");
+  g.classList.toggle("spin", h.ring === "spin");
+  if (h.ring === "pass") {
+    g.innerHTML = `<circle class="ring-full" cx="60" cy="60" r="52" stroke="var(--green)"/>
+      <path class="ring-mark" d="M43 61 L54 73 L78 47"/>`;
+  } else if (h.ring === "fail") {
+    g.innerHTML = `<circle class="ring-full" cx="60" cy="60" r="52" stroke="var(--red)"/>
+      <path class="ring-mark" d="M60 43 L60 65"/>
+      <circle cx="60" cy="79" r="4" fill="#FFFFFF" stroke="none"/>`;
+  } else if (h.ring === "spin") {
+    let arcs = "";
+    for (let i = 0; i < 3; i++) {
+      const a0 = (i * 2 * Math.PI) / 3;
+      const a1 = a0 + 1.4;
+      const x0 = 60 + 52 * Math.cos(a0), y0 = 60 + 52 * Math.sin(a0);
+      const x1 = 60 + 52 * Math.cos(a1), y1 = 60 + 52 * Math.sin(a1);
+      arcs += `<path class="spin-arc" d="M${x0.toFixed(1)} ${y0.toFixed(1)} A52 52 0 0 1 ${x1.toFixed(1)} ${y1.toFixed(1)}"/>`;
+    }
+    g.innerHTML = arcs;
+  } else {
+    g.innerHTML = `<circle class="ring-dot" cx="46" cy="60" r="4.5"/>
+      <circle class="ring-dot" cx="60" cy="60" r="4.5"/>
+      <circle class="ring-dot" cx="74" cy="60" r="4.5"/>`;
+  }
+}
+
+/* ===== 横幅（优先级：notice > 非管理员 > tripped > 网络不明） ===== */
+function renderBanners() {
+  const z = $("banner-zone");
+  let html = "";
+  if (S.notice) {
+    html += `<div class="banner green"><span class="banner-dot"></span><div>
+      <div class="banner-title">${esc(S.notice.title)}</div>
+      ${S.notice.desc ? `<div class="banner-desc">${esc(S.notice.desc)}</div>` : ""}</div></div>`;
+  } else if (!S.admin) {
+    const desc = document.body.classList.contains("compact")
+      ? "请关掉本窗口，用桌面的 ClaudeGuard 快捷方式重新打开。"
+      : "自动断网要用管理员权限。请关掉这个窗口，用桌面的 ClaudeGuard 快捷方式重新打开。";
+    html += `<div class="banner orange"><span class="banner-dot"></span><div>
+      <div class="banner-title">需要管理员权限</div><div class="banner-desc">${esc(desc)}</div></div></div>`;
+  } else if (S.tripped) {
+    html += `<div class="banner red"><span class="banner-dot"></span><div>
+      <div class="banner-title">Claude 已被暂停</div>
+      <div class="banner-desc">出口 IP 和约定不一致：已结束 Claude 的进程，并断开了它的网络。切回正确节点后会自动恢复。</div></div></div>`;
+  } else if (S.last && !S.last.passed && !S.checking && S.last.egress_ip == null) {
+    html += `<div class="banner orange"><span class="banner-dot"></span><div>
+      <div class="banner-title">暂时没法确认网络</div>
+      <div class="banner-desc">刚才的检查没有成功，可能是网络没通。确认代理软件开着，再点重新检查。</div></div></div>`;
+  }
+  z.innerHTML = html;
+}
+
+function showNotice(title, desc) {
+  S.notice = { title, desc };
+  renderBanners();
+  setTimeout(() => {
+    S.notice = null;
+    renderBanners();
+  }, 4000);
+}
+
+/* ===== CTA ===== */
+function ctaClick() {
+  if (S.tripped || !S.last || !S.last.passed || S.checking) {
+    invoke(CMD.recheck);
+  } else {
+    invoke(CMD.launch);
+  }
+}
+
+function renderCta() {
+  const btn = $("cta");
+  const sec = $("cta-secondary");
+  if (S.tripped) {
+    btn.disabled = S.checking;
+    btn.textContent = "我已切回节点，重新检查";
+  } else if (S.checking || !S.last) {
+    btn.disabled = true;
+    btn.textContent = "正在检查，稍候…";
+  } else if (S.last.passed) {
+    btn.disabled = false;
+    btn.textContent = "启动 Claude";
+  } else {
+    btn.disabled = false;
+    btn.textContent = "重新检查";
+  }
+  const lastOk = S.last && S.last.passed && !S.tripped;
+  sec.innerHTML = lastOk ? `<a href="#" id="cta-recheck" class="inline-link">重新检查</a>` : "";
+  if (lastOk) {
+    $("cta-recheck").onclick = (e) => {
+      e.preventDefault();
+      invoke(CMD.recheck);
+    };
+  }
+}
+
+/* ===== 检查详情卡 ===== */
+function renderDetails() {
+  const side = $("details-state");
+  const body = $("details-body");
+  if (!S.last) {
+    side.textContent = S.checking ? "检查中" : "还没检查";
+    side.className = "card-head-side";
+    body.innerHTML = `<div class="details-empty">还没有结果，稍等片刻…</div>`;
+    return;
+  }
+  if (S.last.passed) {
+    side.textContent = "全部通过";
+    side.className = "card-head-side ok";
+  } else {
+    side.textContent = "有问题";
+    side.className = "card-head-side bad";
+  }
+  // Rust StepState 枚举序列化为 "Pass"/"Fail"/"Skip"（v1 --check JSON 格式，保持不动），
+  // 前端归一成小写再当 CSS class / 比较用。
+  const rows = [
+    ["代理已开启", S.last.proxy],
+    ["代理能连通", S.last.port],
+    ["出口 IP 正确", S.last.egress],
+  ]
+    .map(([name, step]) => {
+      const st = String(step.state ?? "").toLowerCase();
+      return `<div class="step-row">
+        <span class="step-dot ${st}"></span>
+        <span class="step-name">${esc(name)}</span>
+        <span class="step-text">${esc(st === "skip" ? "未检测" : step.text)}</span>
+      </div>`;
+    })
+    .join("");
+  body.innerHTML = rows;
+}
+
+/* ===== 设置卡 ===== */
+function renderSettings() {
+  const cfg = S.cfg;
+  if (!cfg) return;
+  const body = $("settings-body");
+  const err = (id, msg) => `<div class="field-error" id="${id}">${esc(msg || "")}</div>`;
+
+  body.innerHTML = `
+    <div class="group-title">检测</div>
+    ${settingInput("set-port", "代理端口", "代理软件的端口，常见是 7890", String(cfg.proxy_port), "text")}
+    <div class="hairline"></div>
+    ${settingInput("set-ip", "约定的出口 IP", "只认这个出口，别的都会拦", cfg.required_ip, "text")}
+    <div class="hairline"></div>
+    ${settingInput("set-interval", "检查间隔", "每隔几秒复查一次（秒）", String(cfg.check_interval_secs), "text")}
+    <div class="group-title">发现出口不对时</div>
+    ${settingToggle("set-kill", "停掉 Claude", "立刻结束 Claude 的所有进程", cfg.kill_on_fail)}
+    ${settingToggle("set-quarantine", "断开它的网络", "用防火墙拦住 Claude 联网，恢复后自动解除", cfg.quarantine_on_fail)}
+    <div class="group-title">通用</div>
+    ${settingToggle("set-tray", "关窗后驻留托盘", "守护继续在后台运行", cfg.close_to_tray)}
+    ${settingToggle("set-autostart", "开机自启", S.installed ? "开机后自动在托盘里默默守护" : "安装之后才能开启", cfg.auto_start_with_system, !S.installed)}
+    <div class="group-title">软件更新</div>
+    <div id="upd-group"></div>
+  `;
+
+  wireSettingInput("set-port", (v) => {
+    if (!portOk(v)) return { ok: false, msg: "端口要填 1-65535" };
+    return { ok: true, apply: (c) => (c.proxy_port = +v.trim()) };
+  });
+  wireSettingInput("set-ip", (v) => {
+    if (!ipOk(v)) return { ok: false, msg: "要写成 4 段数字，如 203.0.113.10" };
+    return { ok: true, apply: (c) => (c.required_ip = v.trim()) };
+  });
+  wireSettingInput("set-interval", (v) => {
+    if (!intOk(v)) return { ok: false, msg: "填数字" };
+    const n = +v.trim();
+    if (n < 5 || n > 3600) return { ok: false, msg: "范围 5-3600 秒" };
+    return { ok: true, apply: (c) => (c.check_interval_secs = n) };
+  });
+  wireSettingToggle("set-kill", "kill_on_fail");
+  wireSettingToggle("set-quarantine", "quarantine_on_fail");
+  wireSettingToggle("set-tray", "close_to_tray");
+  wireAutostart();
+  renderUpdateGroup();
+  body.querySelectorAll(".card.collapsible");
+}
+
+function settingInput(id, title, desc, value) {
+  return `<div class="setting-row">
+    <div class="setting-label"><div class="st-title">${esc(title)}</div><div class="st-desc">${esc(desc)}</div></div>
+    <div class="setting-control">
+      <input id="${id}" class="text-input" type="text" value="${esc(value)}">
+      <div class="field-error" id="${id}-err"></div>
+    </div>
+  </div>`;
+}
+
+function settingToggle(id, title, desc, on, disabled = false) {
+  return `<div class="setting-row">
+    <div class="setting-label"><div class="st-title">${esc(title)}</div><div class="st-desc">${esc(desc)}</div></div>
+    <div class="setting-control">
+      <button id="${id}" class="toggle ${on ? "on" : ""}" ${disabled ? "disabled" : ""}><span class="knob"></span></button>
+    </div>
+  </div>`;
+}
+
+/* 失焦/回车校验写回（v1 同款） */
+function wireSettingInput(id, validate) {
+  const input = $(id);
+  const errEl = $(id + "-err");
+  const commit = async () => {
+    const v = input.value;
+    const r = validate(v);
+    if (!r.ok) {
+      input.classList.add("invalid");
+      errEl.textContent = r.msg;
+      return;
+    }
+    input.classList.remove("invalid");
+    errEl.textContent = "";
+    const old = JSON.stringify(S.cfg);
+    r.apply(S.cfg);
+    if (JSON.stringify(S.cfg) !== old) {
+      await invoke(CMD.setConfig, { cfg: S.cfg });
+      showNotice("完成", "已保存");
+    }
+  };
+  input.addEventListener("blur", commit);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      input.blur();
+    }
+  });
+}
+
+function wireSettingToggle(id, field) {
+  $(id).onclick = async () => {
+    S.cfg[field] = !S.cfg[field];
+    $(id).classList.toggle("on", S.cfg[field]);
+    await invoke(CMD.setConfig, { cfg: S.cfg });
+    showNotice("完成", "已保存");
+  };
+}
+
+function wireAutostart() {
+  const btn = $("set-autostart");
+  btn.onclick = async () => {
+    const enabled = !S.cfg.auto_start_with_system;
+    const ok = await invoke(CMD.setAutostart, { enabled });
+    S.cfg.auto_start_with_system = enabled;
+    btn.classList.toggle("on", enabled);
+    showNotice("完成", "已保存");
+  };
+}
+
+/* 软件更新组（UpdState 状态机文案 = PARITY §2） */
+function renderUpdateGroup() {
+  const el = $("upd-group");
+  if (!el) return;
+  const u = S.upd;
+  let row = "";
+  if (u.state === "idle") {
+    row = settingRow("从 GitHub 看看有没有新版本", `<a href="#" id="upd-check" class="inline-link">检查更新</a>`);
+  } else if (u.state === "up_to_date") {
+    row = settingRow("已经是最新版本了", `<a href="#" id="upd-check" class="inline-link">检查更新</a>`);
+  } else if (u.state === "checking") {
+    row = settingRow("正在向 GitHub 查询", `<span style="font-size:13px;color:var(--txt2)">正在检查…</span>`);
+  } else if (u.state === "available") {
+    row = settingRow("有新版本，下载完会自动重启", `<a href="#" id="upd-download" class="inline-link">下载 v${esc(u.ver)} 并更新</a>`);
+  } else if (u.state === "downloading") {
+    const pct = u.total > 0 ? Math.floor((u.done / u.total) * 100) : 0;
+    row = settingRow("正在下载新版本", `<div class="upd-row"><span class="upd-pct">${pct}%</span>
+      <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div></div>`);
+  } else if (u.state === "restarting") {
+    row = settingRow("下载完成，马上重启", `<span style="font-size:13px;color:var(--txt2)">即将重启…</span>`);
+  } else if (u.state === "failed") {
+    row = settingRow("上次没成功，可以再试", `<a href="#" id="upd-check" class="inline-link">重试</a>`);
+    row += `<div class="field-error" style="text-align:left">${esc(u.msg)}</div>`;
+  }
+  el.innerHTML = row;
+  const c = $("upd-check");
+  if (c) c.onclick = (e) => { e.preventDefault(); invoke(CMD.updCheck); };
+  const d = $("upd-download");
+  if (d) d.onclick = (e) => {
+    e.preventDefault();
+    invoke(CMD.updDownload, { url: u.url, size: u.size });
+  };
+}
+
+function settingRow(title, control) {
+  return `<div class="setting-row">
+    <div class="setting-label"><div class="st-title" style="font-size:13px;color:var(--txt2)">${esc(title)}</div></div>
+    <div class="setting-control">${control}</div>
+  </div>`;
+}
+
+/* ===== 运行日志卡 ===== */
+function renderLog() {
+  const el = $("log-body");
+  if (!el) return;
+  el.innerHTML = `<div id="log-scroll">${S.logs.slice(-30).map((l) => `<div>${esc(l)}</div>`).join("")}</div>`;
+}
+
+/* ===== 底栏 ===== */
+function renderFooter() {
+  $("footer-version").textContent = `ClaudeGuard v${S.version}`;
+  $("link-install").classList.toggle("hidden", S.installed);
+}
+
+async function doInstall() {
+  try {
+    await invoke(CMD.installApp);
+    S.installed = true;
+    showNotice("完成", "安装完成，桌面已建快捷方式");
+  } catch (e) {
+    showNotice("完成", `安装失败：${e}`);
+  }
+  renderFooter();
+}
+
+/* ===== 向导 ===== */
+function gotoWizard(page) {
+  S.wizPage = page;
+  renderWizard();
+}
+
+function renderWizard() {
+  for (let i = 0; i < 3; i++) {
+    const el = $(`wiz-${i}`);
+    if (el) el.classList.toggle("hidden", S.wizPage !== i);
+  }
+  const dots = $("wiz-dots");
+  dots.innerHTML = [0, 1, 2].map((i) => `<span class="${i === S.wizPage ? "cur" : ""}"></span>`).join("");
+  if (S.wizPage === 1) {
+    const port = $("wiz-port"), ip = $("wiz-ip");
+    if (!port.value) port.value = S.wizPort;
+    if (!ip.value) ip.value = S.wizIp;
+    port.oninput = ip.oninput = wiz1Validate;
+    port.onkeydown = ip.onkeydown = (e) => { if (e.key === "Enter") wiz1Continue(); };
+  }
+}
+
+function wiz1Validate() {
+  const port = $("wiz-port").value, ip = $("wiz-ip").value;
+  const okP = portOk(port), okI = ipOk(ip);
+  const errEl = $("wiz1-error");
+  if (!okP) errEl.textContent = "端口需为 1-65535 的数字";
+  else if (!okI) errEl.textContent = "要写成 4 段数字，如 203.0.113.10";
+  else errEl.textContent = "";
+  $("wiz-port").classList.toggle("invalid", !okP);
+  $("wiz-ip").classList.toggle("invalid", !okI);
+  $("wiz1-next").disabled = !(okP && okI);
+  return okP && okI;
+}
+
+async function wiz1Continue() {
+  if (!wiz1Validate()) return;
+  S.wizPort = $("wiz-port").value.trim();
+  S.wizIp = $("wiz-ip").value.trim();
+  // v2 修复（PARITY §0-1）：向导页 1 的端口/IP 即时落盘，不再等到主屏设置卡。
+  S.cfg.proxy_port = +S.wizPort;
+  S.cfg.required_ip = S.wizIp;
+  await invoke(CMD.setConfig, { cfg: S.cfg });
+  gotoWizard(2);
+}
+
+async function finishWizard() {
+  S.cfg.first_run = false;
+  await invoke(CMD.setConfig, { cfg: S.cfg });
+  render();
+}
+
+/* ===== 入口 ===== */
+window.addEventListener("DOMContentLoaded", () => {
+  $("btn-min").innerHTML = ICONS.minimize;
+  $("btn-max").innerHTML = ICONS.maximize;
+  $("btn-close").innerHTML = ICONS.close;
+  document.querySelectorAll(".chevron").forEach((c) => (c.innerHTML = ICONS.chevron));
+  init().catch((e) => {
+    document.body.innerHTML = `<div style="padding:24px;color:#E4002B;font-size:13px">加载失败：${esc(String(e))}</div>`;
+  });
+});
+})();

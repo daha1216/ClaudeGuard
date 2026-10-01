@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude 守护器</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <!-- 自绘标题栏（拖拽区 + 三钮；顶边缩放热区让出右侧 138px） -->
+  <div id="titlebar" data-tauri-drag-region>
+    <span id="titlebar-text" data-tauri-drag-region>Claude 守护器</span>
+    <div id="caption-btns">
+      <button id="btn-min" class="cap-btn" title="最小化"></button>
+      <button id="btn-max" class="cap-btn" title="最大化"></button>
+      <button id="btn-close" class="cap-btn cap-close" title="关闭"></button>
+    </div>
+  </div>
+
+  <div id="content">
+    <!-- ===== 主屏 ===== -->
+    <div id="home" class="screen">
+      <div id="hero">
+        <div id="ring">
+          <svg id="ring-svg" viewBox="0 0 120 120" width="150" height="150">
+            <circle class="ring-track" cx="60" cy="60" r="52"/>
+            <g id="ring-dynamic"></g>
+          </svg>
+        </div>
+        <div id="hero-title">准备中</div>
+        <div id="hero-sub">马上开始第一次检查</div>
+      </div>
+
+      <div id="banner-zone"></div>
+
+      <button id="cta" class="capsule"></button>
+      <div id="cta-secondary"></div>
+
+      <div class="card collapsible" id="card-details">
+        <div class="card-head" data-toggle="details">
+          <span class="card-head-title">检查详情</span>
+          <span id="details-state" class="card-head-side"></span>
+          <span class="chevron" data-for="details"></span>
+        </div>
+        <div class="card-body" id="details-body"></div>
+      </div>
+
+      <div class="card collapsible" id="card-settings">
+        <div class="card-head" data-toggle="settings">
+          <span class="card-head-title">设置</span>
+          <span class="chevron" data-for="settings"></span>
+        </div>
+        <div class="card-body" id="settings-body"></div>
+      </div>
+
+      <div class="card collapsible" id="card-log">
+        <div class="card-head" data-toggle="log">
+          <span class="card-head-title">运行日志</span>
+          <span class="chevron" data-for="log"></span>
+        </div>
+        <div class="card-body" id="log-body"></div>
+      </div>
+
+      <div id="footer">
+        <span id="footer-version">ClaudeGuard</span>
+        <a href="#" id="link-data-folder" class="inline-link">打开数据文件夹</a>
+        <a href="#" id="link-install" class="inline-link hidden">安装到电脑</a>
+      </div>
+    </div>
+
+    <!-- ===== 首次运行向导 ===== -->
+    <div id="wizard" class="screen hidden">
+      <!-- 页 0：欢迎 -->
+      <div id="wiz-0" class="wiz-page">
+        <div class="wiz-title-lg">欢迎使用</div>
+        <div class="wiz-title-lg">Claude 守护器</div>
+        <div class="card wiz-card">
+          <div class="wiz-card-label">它做三件事</div>
+          <div class="wiz-feature">
+            <span class="wiz-dot"></span>
+            <div><div class="wiz-ft-title">替你把关</div><div class="wiz-ft-desc">打开 Claude 前，先确认网络走的是约定的出口</div></div>
+          </div>
+          <div class="wiz-feature">
+            <span class="wiz-dot"></span>
+            <div><div class="wiz-ft-title">一直在守护</div><div class="wiz-ft-desc">常驻后台，每隔几秒复查一次，不用你操心</div></div>
+          </div>
+          <div class="wiz-feature">
+            <span class="wiz-dot"></span>
+            <div><div class="wiz-ft-title">不对就刹车</div><div class="wiz-ft-desc">一旦出口不对，立刻停掉 Claude 并断开它的联网</div></div>
+          </div>
+        </div>
+        <button id="wiz0-next" class="capsule">继续</button>
+      </div>
+
+      <!-- 页 1：两个关键数字 -->
+      <div id="wiz-1" class="wiz-page hidden">
+        <div class="wiz-title">两个关键数字</div>
+        <div class="wiz-subtitle">不知道的话，保持默认就好</div>
+        <div class="card wiz-card">
+          <div class="wiz-field">
+            <div class="wiz-field-title">代理端口</div>
+            <div class="wiz-field-desc">代理软件的端口，常见是 7890</div>
+            <input id="wiz-port" class="text-input" type="text" inputmode="numeric">
+          </div>
+          <div class="hairline"></div>
+          <div class="wiz-field">
+            <div class="wiz-field-title">约定的出口 IP</div>
+            <div class="wiz-field-desc">只有从这个出口走，才允许用 Claude</div>
+            <input id="wiz-ip" class="text-input" type="text" placeholder="203.0.113.10">
+          </div>
+        </div>
+        <div id="wiz1-error" class="field-error"></div>
+        <button id="wiz1-next" class="capsule">继续</button>
+        <div><a href="#" id="wiz1-prev" class="inline-link">上一步</a></div>
+      </div>
+
+      <!-- 页 2：最后一步 -->
+      <div id="wiz-2" class="wiz-page hidden">
+        <div class="wiz-title">最后一步</div>
+        <div class="wiz-subtitle">要把它装进这台电脑吗？</div>
+        <button id="wiz2-install" class="wiz-option">
+          <span class="wiz-radio"></span>
+          <span><span class="wiz-opt-title">安装到这台电脑（推荐）</span><span class="wiz-opt-desc">放进程序列表，桌面建快捷方式，随时可卸载</span></span>
+        </button>
+        <button id="wiz2-portable" class="wiz-option">
+          <span class="wiz-radio"></span>
+          <span><span class="wiz-opt-title">直接用，不安装</span><span class="wiz-opt-desc">这次打开就当便携版用，不影响功能</span></span>
+        </button>
+        <div><a href="#" id="wiz2-prev" class="inline-link">上一步</a></div>
+        <div id="wiz-dots"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 八向边缘缩放热区 -->
+  <div class="edge" data-edge="n" id="edge-n"></div>
+  <div class="edge" data-edge="s" id="edge-s"></div>
+  <div class="edge" data-edge="w" id="edge-w"></div>
+  <div class="edge" data-edge="e" id="edge-e"></div>
+  <div class="edge corner" data-edge="nw" id="edge-nw"></div>
+  <div class="edge corner" data-edge="ne" id="edge-ne"></div>
+  <div class="edge corner" data-edge="sw" id="edge-sw"></div>
+  <div class="edge corner" data-edge="se" id="edge-se"></div>
+
+  <script src="icons.js"></script>
+  <script src="ipc.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>

@@ -1,34 +1,13 @@
 fn main() {
-    // 仅 release 嵌入 requireAdministrator 清单与图标：
-    // debug 版免清单，方便不经 UAC 快速迭代测试。
-    let profile = std::env::var("PROFILE").unwrap_or_default();
-    if profile != "release" {
-        println!("cargo:rerun-if-changed=build.rs");
-        return;
+    // release 嵌 requireAdministrator 清单走 tauri-build 官方通道（WindowsAttributes::app_manifest）。
+    // 教训（调研 #11）：tauri-build 在 Windows 已用 tauri-winres 统一编资源，再自跑 winresource
+    // 会二次编 RC → CVTRES CVT1100 duplicate resource。debug 不嵌清单，免 UAC 便于迭代（v1 传统）。
+    if std::env::var("PROFILE").as_deref() == Ok("release") {
+        tauri_build::try_build(tauri_build::Attributes::new().windows_attributes(
+            tauri_build::WindowsAttributes::new().app_manifest(include_str!("app.manifest")),
+        ))
+        .expect("tauri build failed (release, admin manifest)");
+    } else {
+        tauri_build::build();
     }
-    #[cfg(target_os = "windows")]
-    {
-        let mut res = winresource::WindowsResource::new();
-        res.set_manifest(
-            r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
-    <security>
-      <requestedPrivileges>
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
-      </requestedPrivileges>
-    </security>
-  </trustInfo>
-  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
-    <application>
-      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
-    </application>
-  </compatibility>
-</assembly>"#,
-        );
-        res.set_icon("assets/claude.ico");
-        if let Err(e) = res.compile() {
-            println!("cargo:warning=winresource failed: {e}");
-        }
-    }
-    println!("cargo:rerun-if-changed=assets/claude.ico");
 }
