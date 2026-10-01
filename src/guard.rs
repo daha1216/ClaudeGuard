@@ -26,24 +26,33 @@ fn chrono_like_now() -> String {
     format!("[{secs}]")
 }
 
-/// 定位 Claude 安装目录（WindowsApps 下 Claude_ 开头，取字典序最大的版本）
+/// 目录名版本段转数字序列：Claude_2.16120.0.0_x64__hash -> [2,16120,0,0]
+/// 数字逐段比较，避免字典序 "2.9" > "2.10" 的错误。
+fn version_key(name: &str) -> Vec<u64> {
+    let seg = name.split('_').nth(1).unwrap_or("");
+    seg.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect()
+}
+
+/// 定位 Claude 安装目录（WindowsApps 下 Claude_ 开头，版本数值最大者）
 pub fn find_claude_dir() -> Option<PathBuf> {
     let root = Path::new(r"C:\Program Files\WindowsApps");
-    let mut best: Option<std::ffi::OsString> = None;
+    let mut best: Option<(Vec<u64>, std::ffi::OsString)> = None;
     if let Ok(rd) = std::fs::read_dir(root) {
         for entry in rd.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("Claude_") && name.contains("__") {
-                let prev = best.take();
-                best = match prev {
-                    Some(p) if p.to_string_lossy() >= name => Some(p),
-                    _ => Some(entry.file_name()),
+            let s = entry.file_name().to_string_lossy().to_string();
+            if s.starts_with("Claude_") && s.contains("__") {
+                let key = version_key(&s);
+                let better = match &best {
+                    Some((k, _)) => key > *k,
+                    None => true,
                 };
+                if better {
+                    best = Some((key, entry.file_name()));
+                }
             }
         }
     }
-    best.map(|n| root.join(n))
+    best.map(|(_, n)| root.join(n))
 }
 
 /// Claude_2.16120.0.0_x64__pzs8sxrjxfjjc -> Claude_pzs8sxrjxfjjc
@@ -83,7 +92,7 @@ fn collect_exes(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
 
 /// 杀掉所有 Claude 进程（按安装目录路径匹配 + 进程名兜底），返回杀掉的进程数
 pub fn kill_claude() -> usize {
-    use sysinfo::{Pid, System};
+    use sysinfo::System;
     let dir = find_claude_dir();
     let dir_s = dir.as_ref().map(|d| d.to_string_lossy().to_lowercase());
     let mut sys = System::new();
@@ -106,7 +115,6 @@ pub fn kill_claude() -> usize {
                 log_line(&format!("killed claude process pid={pidv}"));
             }
         }
-        let _ = Pid::from_u32(0); // 保持 import
     }
     if killed > 0 {
         log_line(&format!("kill_claude: {killed} processes terminated"));
@@ -114,8 +122,15 @@ pub fn kill_claude() -> usize {
     killed
 }
 
+/// System32 下系统工具的绝对路径（本进程以管理员运行，避免 PATH/应用目录搜索提权面）。
+/// name 可含子路径，如 r"WindowsPowerShell\v1.0\powershell.exe"。
+pub(crate) fn sys32(name: &str) -> PathBuf {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    PathBuf::from(root).join("System32").join(name)
+}
+
 fn netsh(args: &[&str]) -> bool {
-    Command::new("netsh")
+    Command::new(sys32("netsh.exe"))
         .args(args)
         .output()
         .map(|o| o.status.success())
@@ -162,7 +177,7 @@ pub fn firewall_release() -> bool {
 /// 是否存在 ClaudeGuard 规则
 pub fn firewall_active() -> bool {
     let check = |name: &str| {
-        Command::new("netsh")
+        Command::new(sys32("netsh.exe"))
             .args(["advfirewall", "firewall", "show", "rule", &format!("name={name}")])
             .output()
             .map(|o| {
@@ -176,7 +191,7 @@ pub fn firewall_active() -> bool {
 
 /// 当前是否管理员（清单已 requireAdministrator，这里用于兜底显示）
 pub fn is_admin() -> bool {
-    Command::new("net")
+    Command::new(sys32("net.exe"))
         .args(["session"])
         .output()
         .map(|o| o.status.success())
@@ -186,7 +201,10 @@ pub fn is_admin() -> bool {
 /// 启动 Claude（UWP）
 pub fn launch_claude(app_id: &str) -> bool {
     let arg = format!("shell:AppsFolder\\{app_id}");
-    let ok = Command::new("explorer.exe")
+    let explorer = std::env::var("SystemRoot")
+        .map(|r| PathBuf::from(r).join("explorer.exe"))
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\explorer.exe"));
+    let ok = Command::new(explorer)
         .arg(&arg)
         .spawn()
         .map(|_| true)

@@ -1,6 +1,6 @@
 [package]
 name = "claude-guard"
-version = "1.2.1"
+version = "1.3.0"
 edition = "2021"
 description = "Claude 守护器：代理出口校验、托盘常驻监测、异常熔断隔离"
 
@@ -21,7 +21,7 @@ tray-icon = "0.24"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [build-dependencies]
-winres = "0.1"
+winresource = "0.1"
 
 [profile.release]
 opt-level = "z"

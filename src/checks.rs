@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 pub enum StepState {
     Pass,
     Fail,
-    Running,
     Skip,
 }
 
@@ -69,11 +68,13 @@ pub fn check_system_proxy(host: &str, port: u16) -> StepResult {
 /// 成功时返回保持打开的隧道连接，供步骤 3 的 TCP 观察回退使用。
 pub fn check_port_connect(host: &str, port: u16, target: &str) -> (StepResult, Option<TcpStream>) {
     let t0 = Instant::now();
+    use std::net::ToSocketAddrs;
     let addr = format!("{host}:{port}");
-    let mut stream = match TcpStream::connect_timeout(
-        &addr.parse().unwrap_or_else(|_| format!("{host}:{port}").parse().unwrap()),
-        Duration::from_secs(4),
-    ) {
+    let sockaddr = match (host, port).to_socket_addrs().map(|mut it| it.next()) {
+        Ok(Some(a)) => a,
+        _ => return (StepResult::fail(format!("代理地址无效: {addr}")), None),
+    };
+    let mut stream = match TcpStream::connect_timeout(&sockaddr, Duration::from_secs(4)) {
         Ok(s) => s,
         Err(e) => {
             return (StepResult::fail(format!("无法连接 {addr}，端口没有监听（{e}）")), None)
@@ -81,6 +82,7 @@ pub fn check_port_connect(host: &str, port: u16, target: &str) -> (StepResult, O
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(8)));
+    let target = target.trim().replace(['\r', '\n'], "");
     let req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
     if let Err(e) = stream.write_all(req.as_bytes()) {
         return (StepResult::fail(format!("发送握手失败: {e}")), None);
@@ -108,14 +110,18 @@ pub fn check_port_connect(host: &str, port: u16, target: &str) -> (StepResult, O
     }
 }
 
-/// 步骤 3 主判据：走代理查询出口公网 IP
-fn fetch_ipinfo(cfg: &Config) -> Result<(String, String), String> {
+/// 步骤 3 共用的代理 Agent（连接池复用，避免每周期重新握手）
+fn proxy_agent(cfg: &Config) -> Result<ureq::Agent, String> {
     let proxy = ureq::Proxy::new(format!("http://{}:{}", cfg.proxy_host, cfg.proxy_port))
         .map_err(|e| e.to_string())?;
-    let agent = ureq::AgentBuilder::new()
+    Ok(ureq::AgentBuilder::new()
         .proxy(proxy)
         .timeout(Duration::from_secs(12))
-        .build();
+        .build())
+}
+
+/// 步骤 3 主判据：走代理查询出口公网 IP
+fn fetch_ipinfo(agent: &ureq::Agent) -> Result<(String, String), String> {
     let resp = agent
         .get("https://ipinfo.io/json")
         .call()
@@ -133,13 +139,7 @@ fn fetch_ipinfo(cfg: &Config) -> Result<(String, String), String> {
     Ok((ip, desc))
 }
 
-fn fetch_ipify(cfg: &Config) -> Result<(String, String), String> {
-    let proxy = ureq::Proxy::new(format!("http://{}:{}", cfg.proxy_host, cfg.proxy_port))
-        .map_err(|e| e.to_string())?;
-    let agent = ureq::AgentBuilder::new()
-        .proxy(proxy)
-        .timeout(Duration::from_secs(12))
-        .build();
+fn fetch_ipify(agent: &ureq::Agent) -> Result<(String, String), String> {
     let resp = agent
         .get("https://api.ipify.org?format=json")
         .call()
@@ -182,8 +182,10 @@ pub fn run_checks(cfg: &Config, mut log: impl FnMut(String)) -> CheckOutcome {
         return out;
     }
 
-    // 3a. 网页出口
-    let web = fetch_ipinfo(cfg).or_else(|e1| fetch_ipify(cfg).map_err(|e2| format!("{e1} | {e2}")));
+    // 3a. 网页出口（共享一个代理 Agent，失败再换 ipify）
+    let web = proxy_agent(cfg).map_err(|e| format!("agent: {e}")).and_then(|agent| {
+        fetch_ipinfo(&agent).or_else(|e1| fetch_ipify(&agent).map_err(|e2| format!("{e1} | {e2}")))
+    });
     match web {
         Ok((ip, desc)) => {
             log(format!("egress(web): {ip} {desc}"));

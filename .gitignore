@@ -9,3 +9,8 @@ shot*.png
 /backup/
 /迭代手册.md
 /config.json
+*.zip
+smoke-*.ps1
+probe-*.ps1
+deploy-*.ps1
+make-zip.ps1

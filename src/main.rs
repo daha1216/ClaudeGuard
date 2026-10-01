@@ -8,7 +8,10 @@ mod config;
 mod guard;
 mod install;
 mod tcp_table;
+mod theme;
 mod update;
+mod widgets;
+mod wizard;
 
 use config::Config;
 

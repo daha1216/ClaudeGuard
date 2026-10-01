@@ -2,10 +2,8 @@
 //! 用手动字节解析，避免结构体布局问题。
 
 pub struct TcpConn {
-    pub local_addr: String,
     pub local_port: u16,
     pub remote_addr: String,
-    pub remote_port: u16,
     pub state: u32,
     pub pid: u32,
 }
@@ -76,18 +74,14 @@ fn table_rows() -> Vec<TcpConn> {
                 u32::from_le_bytes([buf[off + k], buf[off + k + 1], buf[off + k + 2], buf[off + k + 3]])
             };
             let state = u32_at(0);
-            let local_addr = format!("{}.{}.{}.{}", buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]);
+            // 本地端口在偏移 8（网络序低 16 位）；对端地址在偏移 12；PID 在偏移 20
             let lp = u32_at(8) & 0xffff;
             let remote_addr = format!("{}.{}.{}.{}", buf[off + 12], buf[off + 13], buf[off + 14], buf[off + 15]);
-            let rp = u32_at(16) & 0xffff;
             let pid = u32_at(20);
-            // 端口字段为网络字节序（低 16 位）
-            let net_port = |v: u32| -> u16 { (((v & 0xff) << 8) | ((v >> 8) & 0xff)) as u16 };
+            let local_port = (((lp & 0xff) << 8) | ((lp >> 8) & 0xff)) as u16;
             out.push(TcpConn {
-                local_addr,
-                local_port: net_port(lp),
+                local_port,
                 remote_addr,
-                remote_port: net_port(rp),
                 state,
                 pid,
             });

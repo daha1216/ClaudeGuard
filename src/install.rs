@@ -43,7 +43,7 @@ pub fn install() -> Result<PathBuf, String> {
 }
 
 fn run_ps(script: &str) -> bool {
-    Command::new("powershell.exe")
+    Command::new(crate::guard::sys32(r"WindowsPowerShell\v1.0\powershell.exe"))
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
         .output()
         .map(|o| o.status.success())
@@ -51,8 +51,8 @@ fn run_ps(script: &str) -> bool {
 }
 
 fn create_shortcuts(exe: &PathBuf) {
-    let exe_s = exe.to_string_lossy().to_string();
-    let work = exe.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    let exe_s = exe.to_string_lossy().to_string().replace('\'', "''");
+    let work = exe.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default().replace('\'', "''");
     let mk = |dir_var: &str| {
         format!(
             "$d=[Environment]::GetFolderPath('{dir_var}'); $w=New-Object -ComObject WScript.Shell; \
@@ -93,22 +93,12 @@ pub fn set_autostart(enabled: bool) -> bool {
         return false;
     };
     if enabled {
-        let exe = std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        let exe = installed_exe().to_string_lossy().to_string();
         key.set_value(APP_NAME, &format!("\"{exe}\" --tray")).is_ok()
     } else {
         let _ = key.delete_value(APP_NAME);
         true
     }
-}
-
-pub fn autostart_enabled() -> bool {
-    use winreg::enums::HKEY_CURRENT_USER;
-    use winreg::RegKey;
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    hkcu.open_subkey(RUN_KEY)
-        .ok()
-        .and_then(|k| k.get_value::<String, _>(APP_NAME).ok())
-        .is_some()
 }
 
 /// 卸载：解除防火墙隔离 -> 删除快捷方式/注册表 -> 延迟自删
@@ -136,7 +126,7 @@ pub fn uninstall() {
     log_line("uninstalled registry/shortcuts/config removed");
     // 延迟自删安装目录（ping 做延迟：timeout 在无控制台环境会立即退出不等）
     let dir = install_dir().to_string_lossy().to_string();
-    let _ = Command::new("cmd")
+    let _ = Command::new(crate::guard::sys32("cmd.exe"))
         .args(["/C", &format!("ping -n 4 127.0.0.1 >nul & rmdir /s /q \"{dir}\"")])
         .spawn();
 }

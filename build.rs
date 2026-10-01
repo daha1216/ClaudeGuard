@@ -8,7 +8,7 @@ fn main() {
     }
     #[cfg(target_os = "windows")]
     {
-        let mut res = winres::WindowsResource::new();
+        let mut res = winresource::WindowsResource::new();
         res.set_manifest(
             r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
@@ -27,7 +27,7 @@ fn main() {
         );
         res.set_icon("assets/claude.ico");
         if let Err(e) = res.compile() {
-            println!("cargo:warning=winres failed: {e}");
+            println!("cargo:warning=winresource failed: {e}");
         }
     }
     println!("cargo:rerun-if-changed=assets/claude.ico");

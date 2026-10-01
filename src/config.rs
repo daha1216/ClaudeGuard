@@ -55,8 +55,14 @@ impl Config {
     pub fn load() -> Self {
         let p = config_path();
         if let Ok(text) = fs::read_to_string(&p) {
-            if let Ok(cfg) = serde_json::from_str::<Config>(&text) {
-                return cfg;
+            match serde_json::from_str::<Config>(&text) {
+                Ok(cfg) => return cfg,
+                // 解析失败不再静默：记日志后回退默认，便于排查被覆盖的配置
+                Err(e) => {
+                    crate::guard::log_line(&format!(
+                        "config parse failed ({}), falling back to defaults", e
+                    ));
+                }
             }
         }
         Self::default()

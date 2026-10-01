@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const GITHUB_REPO: &str = "daha1216/ClaudeGuard";
-const API_LATEST: &str = "https://api.github.com/repos/daha1216/ClaudeGuard/releases/latest";
 const USER_AGENT: &str = "ClaudeGuard-Updater";
 
 /// 检查超时
@@ -23,8 +22,11 @@ const T_DOWNLOAD: Duration = Duration::from_secs(300);
 #[derive(Debug, Clone, Deserialize)]
 pub struct Release {
     pub tag_name: String,
+    /// 更新说明用（暂未在 UI 展示，保留给后续版本）
+    #[allow(dead_code)]
     pub name: Option<String>,
     /// 更新说明(markdown 源码)
+    #[allow(dead_code)]
     pub body: Option<String>,
     pub assets: Vec<Asset>,
 }
@@ -101,9 +103,10 @@ fn agent_direct() -> ureq::Agent {
 
 /// 查询最新 release。代理优先, 失败回退直连。
 pub fn check_latest(cfg: &Config) -> Result<Release, String> {
+    let api = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
     let fetch = |agent: &ureq::Agent| -> Result<Release, String> {
         let resp = agent
-            .get(API_LATEST)
+            .get(&api)
             .set("User-Agent", USER_AGENT)
             .set("Accept", "application/vnd.github+json")
             .timeout(T_CHECK)
@@ -163,10 +166,10 @@ pub fn download(
         Ok(())
     };
 
-    let mut prog = &mut progress;
+    let prog = &mut progress;
     if let Some(agent) = agent_with_proxy(cfg) {
         if let Err(e1) = do_download(&agent, prog) {
-            let mut p2 = &mut progress;
+            let p2 = &mut progress;
             do_download(&agent_direct(), p2).map_err(|e2| format!("代理失败: {e1}; 直连失败: {e2}"))?;
             return Ok(tmp);
         }
