@@ -49,6 +49,7 @@ html, body {
   color: var(--txt);
   font-family: system-ui, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
   font-optical-sizing: auto;
+  font-variant-numeric: tabular-nums; /* 状态行/相对时间的数字原地递进不推挤 */
   -webkit-font-smoothing: antialiased;
   user-select: none;
   cursor: default;
@@ -150,22 +151,23 @@ a:focus-visible {
 #ring-dynamic.spin { animation: ring-spin 2.4s linear infinite; }
 @keyframes ring-spin { to { transform: rotate(360deg); } }
 
-/* 状态切换时对勾/叉的描画入场（pathLength=1 技法；仅状态变化触发，JS 控制） */
+/* 状态切换时对勾/感叹号的描画入场（pathLength=1 技法；仅状态变化触发，JS 控制） */
 #ring-svg .draw-in {
   stroke-dasharray: 1;
   stroke-dashoffset: 1;
-  animation: draw-mark 340ms var(--ease-out) forwards;
+  animation: draw-mark 260ms var(--ease-out) forwards;
 }
 @keyframes draw-mark { to { stroke-dashoffset: 0; } }
 
 /* 签名转场：晕盘随满环收拢浮现（弧线收拢由 WAAPI 驱动 dasharray，见 main.js settleRing） */
-#ring-svg .disc { animation: disc-in 380ms var(--ease-out) both; }
+#ring-svg .disc { animation: disc-in 260ms var(--ease-out) both; }
 @keyframes disc-in { from { fill-opacity: 0; } }
 
 /* 首屏进场编排（#home.boot 由 JS 每次进入主屏时重挂）：环先落位 → 标题 → 副标题 */
 #home.boot #ring { animation: ring-in 150ms var(--ease-out) both; }
 #home.boot #hero-title { animation: rise-in 200ms var(--ease-out) 40ms both; }
 #home.boot #hero-sub { animation: rise-in 200ms var(--ease-out) 80ms both; }
+#home.boot #status-line { animation: rise-in 200ms var(--ease-out) 120ms both; }
 @keyframes ring-in { from { opacity: 0; transform: scale(0.96); } }
 @keyframes rise-in { from { opacity: 0; transform: translateY(6px); } }
 
@@ -243,7 +245,11 @@ body.compact #ring-svg .ring-mark { stroke-width: 5.8; }
 .banner {
   transition: opacity var(--t-float) var(--ease-out), transform var(--t-float) var(--ease-out);
 }
-.banner.leaving { opacity: 0; transition: opacity 160ms var(--ease-out); }
+.banner.leaving {
+  opacity: 0;
+  transform: translateY(-6px); /* 与入场同路径收回（@starting-style -6px 沉落的镜像） */
+  transition: opacity 160ms var(--ease-out), transform 160ms var(--ease-out);
+}
 .banner .banner-dot { width: 11px; height: 11px; border-radius: 50%; margin-top: 4px; flex: none; }
 .banner-title { font-size: 14px; font-weight: 500; }
 .banner-desc { font-size: 12px; line-height: 1.45; color: var(--txt2); margin-top: 2px; }
@@ -290,9 +296,10 @@ body.compact #ring-svg .ring-mark { stroke-width: 5.8; }
   transition: border-color var(--t-press) var(--ease-out), transform var(--t-press) var(--ease-out);
 }
 @media (hover: hover) and (pointer: fine) {
-  .btn-outline:hover { border-color: var(--input-hover); }
+  .btn-outline:hover:not(:disabled) { border-color: var(--input-hover); }
 }
-.btn-outline:active { transform: scale(0.97); }
+.btn-outline:active:not(:disabled) { transform: scale(0.97); }
+.btn-outline:disabled { border-color: var(--sep); color: var(--txt2); opacity: 0.55; }
 
 /* 页脚分隔点 */
 .foot-sep { color: #C7C7CC; }
@@ -331,7 +338,7 @@ body.compact .card { border-radius: 20px; padding: 12px; }
 .card-head-side .rel { opacity: 0.65; }
 .chevron { display: inline-flex; color: var(--txt2); }
 .chevron svg { width: 12px; height: 12px; transition: transform var(--t-drop) var(--ease-out); }
-.card.collapsible.open .chevron svg { transform: rotate(180deg); }
+.card.collapsible.open .chevron svg { transform: rotate(90deg); } /* 右向箭头转 90°=朝下=内容向下展开 */
 
 /* 折叠面板：grid-rows 0fr→1fr + 淡入（抽屉曲线；可打断） */
 .card-body {
@@ -407,13 +414,14 @@ body.compact .card { border-radius: 20px; padding: 12px; }
   border: 1px solid var(--sep);
   border-radius: 7px;
   outline: none;
-  transition: border-color var(--t-press) var(--ease-out);
+  transition: border-color var(--t-press) var(--ease-out), box-shadow var(--t-press) var(--ease-out);
 }
 @media (hover: hover) and (pointer: fine) {
   .text-input:hover { border-color: var(--input-hover); }
 }
-.text-input:focus { border-color: var(--blue); }
+.text-input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.16); }
 .text-input.invalid { border-color: var(--red); }
+.text-input.invalid:focus { border-color: var(--red); box-shadow: 0 0 0 3px rgba(228, 0, 43, 0.16); }
 
 /* 下拉（出口地区）：系统原生控件，宽度自适应选项 */
 .select-input { width: auto; min-width: 96px; font-family: inherit; padding-right: 4px; cursor: pointer; }

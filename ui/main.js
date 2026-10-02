@@ -364,7 +364,7 @@ function trippedNames() {
   return a.length ? a.join("、") : "守护对象";
 }
 
-// 签名转场：自旋减速收拢成满环——弧长 30%→100% + 旋转对齐到整圈，对勾延迟 240ms 描画
+// 签名转场：自旋减速收拢成满环——弧长 30%→100% + 旋转对齐到整圈，对勾延迟 160ms 描画
 function settleRing(g, wasSpin) {
   if (!wasSpin || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
   const t = getComputedStyle(g).transform;
@@ -372,10 +372,10 @@ function settleRing(g, wasSpin) {
   if (t && t !== "none") th = (Math.atan2(new DOMMatrixReadOnly(t).b, new DOMMatrixReadOnly(t).a) * 180) / Math.PI;
   const target = Math.ceil((th + 140) / 360) * 360; // 收在整圈上，动画结束后回落 0° 无跳变
   const ease = "cubic-bezier(0.23,1,0.32,1)";
-  g.animate([{ transform: `rotate(${th}deg)` }, { transform: `rotate(${target}deg)` }], { duration: 400, easing: ease });
-  g.querySelector(".ring-full").animate([{ strokeDasharray: "30 100" }, { strokeDasharray: "100 0" }], { duration: 400, easing: ease });
+  g.animate([{ transform: `rotate(${th}deg)` }, { transform: `rotate(${target}deg)` }], { duration: 280, easing: ease });
+  g.querySelector(".ring-full").animate([{ strokeDasharray: "30 100" }, { strokeDasharray: "100 0" }], { duration: 280, easing: ease });
   const mark = g.querySelector(".ring-mark");
-  if (mark) mark.style.animationDelay = "240ms";
+  if (mark) mark.style.animationDelay = "160ms";
 }
 
 function renderHero() {
@@ -420,7 +420,7 @@ function renderHero() {
   } else if (h.ring === "fail") {
     g.innerHTML = `<circle class="ring-full" pathLength="100" cx="60" cy="60" r="52" stroke="var(--red)"/>
       <circle class="disc" cx="60" cy="60" r="40" fill="var(--red)" fill-opacity="0.09" stroke="none"/>
-      <path${draw} d="M60 45 L60 67 M49 56 L71 56" stroke="var(--red)"/>`;
+      <path${draw} d="M60 44 L60 60 M60 70 L60 70.02" stroke="var(--red)"/>`;
     settleRing(g, wasSpin);
   } else {
     g.innerHTML = `<circle class="ring-dot" cx="46" cy="60" r="4.5"/>
