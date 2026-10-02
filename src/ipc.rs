@@ -64,6 +64,16 @@ pub fn open_data_folder() {
     let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
 }
 
+/// 底栏"用户指南"：用系统默认浏览器打开仓库里的使用文档。
+/// 写死 URL（不收前端参数），避免任意 URL 打开面。
+#[tauri::command]
+pub fn open_guide() {
+    const GUIDE_URL: &str = "https://github.com/daha1216/ClaudeGuard/blob/master/docs/GUIDE.md";
+    let _ = std::process::Command::new("explorer.exe")
+        .arg(GUIDE_URL)
+        .spawn();
+}
+
 /// 向导页 2 选项 A / 底栏"安装到电脑"（install::install 原样调用）。
 #[tauri::command]
 pub fn install_app(sh: Sh) -> Result<String, String> {

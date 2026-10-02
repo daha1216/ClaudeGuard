@@ -178,6 +178,7 @@ fn run_gui(start_hidden: bool) {
             ipc::release,
             ipc::recent_logs,
             ipc::open_data_folder,
+            ipc::open_guide,
             ipc::install_app,
             ipc::set_autostart,
             ipc::upd_state,

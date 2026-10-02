@@ -185,7 +185,8 @@ a:focus-visible {
 }
 #hero-sub { font-size: 14px; line-height: 1.5; color: var(--txt2); text-align: center; margin-top: 2px; }
 
-/* 状态行：守护运行状态一览（点 + 一行小字，静态无动画） */
+/* 状态行：守护运行状态一览（点 + 一行小字，静态无动画）。
+ * 文本按段排布：段内不许断行，过宽时整段落到第二行（断在 · 处，不劈词）。 */
 #status-line {
   margin-top: 10px;
   display: flex;
@@ -196,6 +197,16 @@ a:focus-visible {
   line-height: 1.4;
   color: var(--txt2);
 }
+#status-text {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  column-gap: 6px;
+  row-gap: 2px;
+  max-width: 100%;
+}
+#status-text .seg { white-space: nowrap; }
+#status-text .dot-sep { color: #C7C7CC; }
 .status-dot {
   width: 6px;
   height: 6px;
@@ -259,7 +270,10 @@ body.compact #ring-svg .ring-mark { stroke-width: 5.8; }
 }
 #cta:active, .capsule:active:not(:disabled) { transform: scale(0.97); }
 #cta:disabled, .capsule:disabled { background: var(--mist); color: var(--txt2); }
-#cta-secondary { display: flex; justify-content: center; align-items: center; margin-top: 8px; min-height: 36px; }
+/* 主/次动作同一行（次级不再独占一行，省 44px 纵向） */
+#cta-row { display: flex; justify-content: center; align-items: center; gap: 10px; margin: 2px 0; }
+#cta { width: auto; min-width: 168px; padding: 0 30px; }
+#cta-secondary { display: flex; align-items: center; }
 
 /* 次级动作：描边胶囊（与主 CTA 同族但让位，不用文字链抢视觉） */
 .btn-outline {

@@ -28,14 +28,14 @@
 ## 2. 主屏（自上而下）
 
 - **hero**：环+主副标题。busy→(Spin,"正在检查…","正在核对代理和出口 IP")；tripped→(Fail,"已暂停 {tripped.agents 名单，如 Claude、ChatGPT}","{reason}·切回节点后自动恢复"，reason 空则"出口 IP 与约定不一致")；passed→(Pass,"一切正常","出口 {ip} {desc 前18字}")；未过→(Fail,"没有通过检查",plain_reason(reason))；无结果→(Idle,"准备中","马上开始第一次检查")。环 150px r52 stroke9；Pass 绿满环+矢量勾；Fail 红满环+矢量感叹号；Spin 3 段蓝弧转速 2.6rad/s；Idle 3 灰点。**v2.5：仅手动检查（manual）或首查转圈，后台检查环保持原状态**。`[P0 状态/文案 | P1 动效]`
-- **状态行**（v2.5，hero 下方 12px+色点）：手动检查中蓝"正在检查…"；tripped 红"已熔断 · 切回节点后自动恢复"；暂停橙"已暂停 · HH:MM 自动恢复"；默认绿"自动守护中 · 每 {interval} 秒检查"。每分支后缀守护对象段（v2.7："{agents_running join、} 运行中"，空则"守护对象未运行"；agents_running 只列 guarded 内的，同一应用多进程显示 ×N），CLI 在跑再追加" · CLI {cli_running join、} 运行中"。5s 心跳只改文本。
+- **状态行**（v2.5，hero 下方 12px+色点；v2.8 按段渲染）：手动检查中蓝"正在检查…"；tripped 红"已熔断"+"切回节点后自动恢复"；暂停橙"已暂停 · HH:MM 自动恢复"；默认绿"自动守护中"+"每 {interval} 秒检查"。每分支后缀守护对象段（v2.7："{agents_running join、} 运行中"，空则"守护对象未运行"；agents_running 只列 guarded 内的，同一应用多进程显示 ×N），CLI 在跑追加"CLI {cli_running join、}"段。段以 · 分隔，`.seg` 不许内部断行——过宽时整段换行不劈词；无"上次 X"尾段（相对时间在详情卡头）。5s 心跳只改文本（sig 去重）。
 - **横幅**（白卡+状态色发丝线+色点）：①notice 绿"完成"（"已保存"/"安装完成，桌面已建快捷方式"/"安装失败：{e}"，4 秒消失）②非管理员 橙"需要管理员权限"/"自动断网要用管理员权限。请关掉这个窗口，用桌面的 ClaudeGuard 快捷方式重新打开。"③tripped 红"{tripped.agents join、} 已被暂停"/"出口和约定不一致：已结束 {names} 的进程，并断开了它的网络。切回正确节点后会自动恢复。"（v2.7：CLI 在跑时追加一行"CLI（{names}）不会自动结束，请自行关闭。"）④暂停橙"守护已暂停 · HH:MM 自动恢复"/"检查照常进行，但暂停期间不会结束守护对象的进程或断网。可在托盘菜单提前恢复。"（v2.4）⑤last 未过且 egress_ip 无 橙"暂时没法确认网络"/"刚才的检查没有成功，可能是网络没通。确认代理软件开着，再点重新检查。"（优先级即此序）`[P0]`
-- **CTA 胶囊**（44 高满圆，宽 min(avail-28,320)）：tripped→"我已切回节点，重新检查"；busy/无结果→"正在检查，稍候…"禁用灰；passed 未 tripped→"启动 Claude"；否则→"重新检查"（未过不给启动入口）。次级"重新检查"链接仅 last_ok 时显示。`[P0]`
+- **CTA 行**（v2.8 主/次同一行，行高 44）：主胶囊 auto 宽（min-width 168）：tripped→"我已切回节点，重新检查"；busy/无结果→"正在检查，稍候…"禁用灰；passed 未 tripped→"启动 Claude"；否则→"重新检查"（未过不给启动入口）。次级描边胶囊"重新检查"仅 last_ok 时显示在主胶囊右侧。`[P0]`
 - **检查详情卡**（默认收起）：header"检查详情"+右侧状态字（"全部通过"绿/"有问题"/"检查中"/"还没检查"）；展开三行："代理已开启"/"代理能连通"/"出口 IP 正确" + 右侧 StepResult.text（Skip 固定"未检测"），圆点绿/红/灰；无结果"还没有结果，稍等片刻…"。`[P0]`
 - **设置卡**（默认收起）：组"检测"：代理端口｜"代理软件的端口，常见是 7890"｜1-65535，err"端口要填 1-65535"；约定的出口 IP｜"只认这些出口，别的都会拦"｜**v2.6 列表编辑器**（每行一个 IPv4，×删除，底部"添加 IP"追加，err"要写成 4 段数字，如 203.0.113.10"；清空且无地区时拒绝保存："至少留一个 IP，或先选一个出口地区"）；出口地区｜"没有固定 IP 时按国家放行"｜下拉 12 项（不限/美国/日本/新加坡/香港/台湾/韩国/英国/德国/法国/加拿大/澳大利亚）；检查间隔｜"每隔几秒复查一次（秒）"｜5-3600，err"范围 5-3600 秒"/"填数字"。组"发现出口不对时"（v2.7 文案泛化）：停掉守护对象｜"立刻结束勾选应用的所有进程"；断开它的网络｜"用防火墙拦住这些应用联网，恢复后自动解除"。组"守护对象"（v2.7）：Claude 桌面版｜"Anthropic Claude 桌面端"；ChatGPT 桌面版｜"OpenAI ChatGPT 桌面端"；反重力桌面版｜"Antigravity / 反重力桌面端"；CLI 只提醒不处理｜"检测到 Claude Code / Codex / Gemini CLI 时在日志和横幅里提醒"——前三项读写 guarded_agents，全关时允许但 notice"已全部关闭/没有守护对象时，检查仍在，但不会结束任何进程。"组"通用"：关窗后驻留托盘｜"守护继续在后台运行"；开机自启｜"开机后自动在托盘里默默守护"（未安装时禁用+"安装之后才能开启"；变化即 set_autostart）。字段失焦/回车写回；写回成功 notice"已保存"。`[P0]`
 - **软件更新组**（UpdState）：Idle"从 GitHub 看看有没有新版本"+链接"检查更新"；UpToDate"已经是最新版本了"；Checking"正在向 GitHub 查询"+"正在检查…"；Available"有新版本，下载完会自动重启"+"下载 v{ver} 并更新"；Downloading"正在下载新版本"+"{pct}%"+进度条(6 高蓝填充)；Restarting"下载完成，马上重启"+"即将重启…"；Failed"上次没成功，可以再试"+链接"重试"+错误行。`[P0]`
 - **运行日志卡**（默认收起）：末尾 30 条，11px monospace。`[P0]`
-- **底栏**：`ClaudeGuard v{版本}` · "打开数据文件夹"（explorer 打开 %APPDATA%\ClaudeGuard）·（未安装）"安装到电脑"。`[P0]`
+- **底栏**：`ClaudeGuard v{版本}` · "打开数据文件夹"（explorer 打开 %APPDATA%\ClaudeGuard）· "用户指南"（v2.8，explorer 打开仓库 docs/GUIDE.md）·（未安装）"安装到电脑"。`[P0]`
 
 ## 3. 向导（3 页，圆点指示）
 
@@ -79,6 +79,7 @@ reason 含"系统代理"→"电脑还没开系统代理：打开代理软件里�
 - update::{current_version, is_newer, check_latest(&Config)->Result<Release>, Release{tag_name,assets}, Asset{name,size,browser_download_url}, Release::exe_asset, download(&Config,url,size,progress), apply_update(&Path,bool), cleanup_old}
 - install::{install_dir, installed_exe, is_installed, install()->Result<PathBuf,String>, set_autostart(bool)->bool, uninstall}
 - tcp_table::{established_connections, listener_pid}
+- ipc::（#[tauri::command] 15 条，main.rs generate_handler 同步注册）：get_state/get_config/set_config/recheck/launch/release/recent_logs/open_data_folder/open_guide(v2.8, 写死 URL 开浏览器)/install_app/set_autostart/upd_state/upd_check/upd_download/js_log
 
 ## 9. P1 参考
 

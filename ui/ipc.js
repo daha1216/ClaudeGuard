@@ -29,6 +29,7 @@
     release: "release",
     recentLogs: "recent_logs",
     openDataFolder: "open_data_folder",
+    openGuide: "open_guide",
     installApp: "install_app",
     setAutostart: "set_autostart",
     updState: "upd_state",

@@ -223,6 +223,10 @@ function wireStatic() {
     e.preventDefault();
     invoke(CMD.openDataFolder);
   };
+  $("link-guide").onclick = (e) => {
+    e.preventDefault();
+    invoke(CMD.openGuide);
+  };
   $("link-install").onclick = (e) => {
     e.preventDefault();
     doInstall();
@@ -295,29 +299,38 @@ function renderStatusLine() {
   const txt = $("status-text");
   if (!dot || !txt) return;
   let cls = "green";
-  let s = "";
+  const segs = [];
   const paused = S.pauseUntil && S.pauseUntil > Date.now() / 1000;
-  // 守护对象进程段：每个分支都带上；CLI 在跑时单独追加提醒段
+  // 守护对象进程段：每个分支都带上；CLI 在跑时单独追加提醒段。
+  // 文本按段渲染（.seg 不许内部断行），过宽时整段换行，不会把"运行中"这类词劈成两半。
   const agents = S.agentsRunning.length
     ? `${S.agentsRunning.join("、")} 运行中`
     : "守护对象未运行";
-  const cli = S.cliRunning.length ? ` · CLI ${S.cliRunning.join("、")} 运行中` : "";
   if (S.checking && S.manual) {
     cls = "blue";
-    s = `正在检查… · ${agents}${cli}`;
+    segs.push("正在检查…", agents);
   } else if (S.tripped) {
     cls = "red";
-    s = `已熔断 · 切回节点后自动恢复 · ${agents}${cli}`;
+    segs.push("已熔断", "切回节点后自动恢复", agents);
   } else if (paused) {
     cls = "orange";
     const t = new Date(S.pauseUntil * 1000);
-    s = `已暂停 · ${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")} 自动恢复 · ${agents}${cli}`;
+    segs.push(
+      `已暂停 · ${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")} 自动恢复`,
+      agents
+    );
   } else {
     const iv = S.cfg && S.cfg.check_interval_secs ? S.cfg.check_interval_secs : 30;
-    s = `自动守护中 · 每 ${iv} 秒检查 · ${agents}${cli}` + (S.lastAt ? ` · 上次 ${relTime(S.lastAt)}` : "");
+    // "上次 X"不放在这里：详情卡头已有相对时间，状态行保持一行内。
+    segs.push("自动守护中", `每 ${iv} 秒检查`, agents);
   }
+  if (S.cliRunning.length) segs.push(`CLI ${S.cliRunning.join("、")}`);
   dot.className = `status-dot ${cls}`;
-  if (txt.textContent !== s) txt.textContent = s;
+  const sig = cls + "|" + segs.join("·");
+  if (txt.dataset.sig !== sig) {
+    txt.dataset.sig = sig;
+    txt.innerHTML = segs.map((s) => `<span class="seg">${s}</span>`).join('<span class="dot-sep">·</span>');
+  }
 }
 
 /* ===== hero ===== */
@@ -333,7 +346,9 @@ function heroState() {
   }
   if (S.last && S.last.passed) {
     const ip = S.last.egress_ip || "-";
-    const desc = (S.last.egress_desc || "").slice(0, 18);
+    // 副标题是给用户看的摘要：剥掉"(via ipify)"这类回退来源标注（详情/日志里保留），超长按词边界截断。
+    let desc = (S.last.egress_desc || "").replace(/\s*\(via ipify\)/, "");
+    if (desc.length > 26) desc = desc.slice(0, 25).replace(/\s+\S*$/, "") + "…";
     return { ring: "pass", title: "一切正常", sub: `出口 ${ip} ${desc}`.trim() };
   }
   if (S.last) return { ring: "fail", title: "没有通过检查", sub: plainReason(S.last.reason) };
