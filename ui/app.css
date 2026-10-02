@@ -136,7 +136,7 @@ a:focus-visible {
 #ring-svg circle.ring-track { fill: none; stroke: var(--sep); stroke-width: 9; }
 #ring-svg .spin-arc { fill: none; stroke: var(--blue); stroke-width: 9; stroke-linecap: butt; }
 #ring-svg .ring-full { fill: none; stroke-width: 9; }
-#ring-svg .ring-mark { fill: none; stroke: #FFFFFF; stroke-width: 6; stroke-linecap: round; stroke-linejoin: round; }
+#ring-svg .ring-mark { fill: none; stroke-width: 8; stroke-linecap: round; stroke-linejoin: round; } /* 描边色随状态内联（--green/--red） */
 #ring-svg .ring-dot { fill: var(--txt2); }
 #ring-dynamic.spin { animation: ring-spin 2.4s linear infinite; transform-origin: 60px 60px; }
 @keyframes ring-spin { to { transform: rotate(360deg); } }
@@ -163,6 +163,7 @@ body.compact #hero-title { font-size: 20px; }
 body.compact #hero-sub { font-size: 13px; line-height: 1.45; }
 body.compact #ring-svg { width: 104px; height: 104px; }
 body.compact #ring-svg circle, body.compact #ring-svg .spin-arc { stroke-width: 6.5; }
+body.compact #ring-svg .ring-mark { stroke-width: 5.8; }
 
 /* ===== 横幅 ===== */
 #banner-zone { display: flex; flex-direction: column; gap: 8px; margin: 2px 0; }

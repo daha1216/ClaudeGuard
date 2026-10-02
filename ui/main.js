@@ -251,11 +251,12 @@ function renderHero() {
   const draw = ' pathLength="1" class="ring-mark draw-in"'; // 仅状态切换时描画
   if (h.ring === "pass") {
     g.innerHTML = `<circle class="ring-full" cx="60" cy="60" r="52" stroke="var(--green)"/>
-      <path${draw} d="M43 61 L54 73 L78 47"/>`;
+      <circle cx="60" cy="60" r="40" fill="var(--green)" fill-opacity="0.09" stroke="none"/>
+      <path${draw} d="M44 61 L54 72 L77 48" stroke="var(--green)"/>`;
   } else if (h.ring === "fail") {
     g.innerHTML = `<circle class="ring-full" cx="60" cy="60" r="52" stroke="var(--red)"/>
-      <path${draw} d="M60 43 L60 65"/>
-      <circle cx="60" cy="79" r="4" fill="#FFFFFF" stroke="none"/>`;
+      <circle cx="60" cy="60" r="40" fill="var(--red)" fill-opacity="0.09" stroke="none"/>
+      <path${draw} d="M60 45 L60 67 M49 56 L71 56" stroke="var(--red)"/>`;
   } else {
     g.innerHTML = `<circle class="ring-dot" cx="46" cy="60" r="4.5"/>
       <circle class="ring-dot" cx="60" cy="60" r="4.5"/>
