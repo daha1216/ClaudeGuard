@@ -90,6 +90,7 @@ async function init() {
 
   wireStatic();
   render();
+  playBoot();
   if (S.smokeSettings) {
     // 手风琴展开(280ms)完成后再滚到底，否则内容长高后停在中途
     setTimeout(() => {
@@ -126,6 +127,7 @@ function wireStatic() {
       const key = head.dataset.toggle;
       S.openCards[key] = !S.openCards[key];
       render();
+      if (S.openCards[key]) staggerIn(key);
     };
     head.onkeydown = (e) => {
       if (e.key === "Enter" || e.key === " ") {
@@ -222,11 +224,33 @@ function heroState() {
 }
 
 let prevRing = ""; // 状态没变就不重画环（自旋动画不重置、对勾不重播）
+let firstHero = true; // 首帧交给进场编排，副标题不做淡换
+
+// 签名转场：自旋减速收拢成满环——弧长 30%→100% + 旋转对齐到整圈，对勾延迟 240ms 描画
+function settleRing(g, wasSpin) {
+  if (!wasSpin || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const t = getComputedStyle(g).transform;
+  let th = 0;
+  if (t && t !== "none") th = (Math.atan2(new DOMMatrixReadOnly(t).b, new DOMMatrixReadOnly(t).a) * 180) / Math.PI;
+  const target = Math.ceil((th + 140) / 360) * 360; // 收在整圈上，动画结束后回落 0° 无跳变
+  const ease = "cubic-bezier(0.23,1,0.32,1)";
+  g.animate([{ transform: `rotate(${th}deg)` }, { transform: `rotate(${target}deg)` }], { duration: 400, easing: ease });
+  g.querySelector(".ring-full").animate([{ strokeDasharray: "30 100" }, { strokeDasharray: "100 0" }], { duration: 400, easing: ease });
+  const mark = g.querySelector(".ring-mark");
+  if (mark) mark.style.animationDelay = "240ms";
+}
 
 function renderHero() {
   const h = heroState();
+  const sub = $("hero-sub");
+  if (!firstHero && sub.textContent !== h.sub) {
+    sub.classList.remove("swap");
+    void sub.offsetWidth;
+    sub.classList.add("swap");
+  }
+  firstHero = false;
   $("hero-title").textContent = h.title;
-  $("hero-sub").textContent = h.sub;
+  sub.textContent = h.sub;
   const g = $("ring-dynamic");
   const changed = prevRing !== h.ring;
   if (h.ring === "spin") {
@@ -247,21 +271,44 @@ function renderHero() {
   }
   g.classList.remove("spin");
   if (!changed) return;
+  const wasSpin = prevRing === "spin";
   prevRing = h.ring;
   const draw = ' pathLength="1" class="ring-mark draw-in"'; // 仅状态切换时描画
   if (h.ring === "pass") {
-    g.innerHTML = `<circle class="ring-full" cx="60" cy="60" r="52" stroke="var(--green)"/>
-      <circle cx="60" cy="60" r="40" fill="var(--green)" fill-opacity="0.09" stroke="none"/>
+    g.innerHTML = `<circle class="ring-full" pathLength="100" cx="60" cy="60" r="52" stroke="var(--green)"/>
+      <circle class="disc" cx="60" cy="60" r="40" fill="var(--green)" fill-opacity="0.09" stroke="none"/>
       <path${draw} d="M44 61 L54 72 L77 48" stroke="var(--green)"/>`;
+    settleRing(g, wasSpin);
   } else if (h.ring === "fail") {
-    g.innerHTML = `<circle class="ring-full" cx="60" cy="60" r="52" stroke="var(--red)"/>
-      <circle cx="60" cy="60" r="40" fill="var(--red)" fill-opacity="0.09" stroke="none"/>
+    g.innerHTML = `<circle class="ring-full" pathLength="100" cx="60" cy="60" r="52" stroke="var(--red)"/>
+      <circle class="disc" cx="60" cy="60" r="40" fill="var(--red)" fill-opacity="0.09" stroke="none"/>
       <path${draw} d="M60 45 L60 67 M49 56 L71 56" stroke="var(--red)"/>`;
+    settleRing(g, wasSpin);
   } else {
     g.innerHTML = `<circle class="ring-dot" cx="46" cy="60" r="4.5"/>
       <circle class="ring-dot" cx="60" cy="60" r="4.5"/>
       <circle class="ring-dot" cx="74" cy="60" r="4.5"/>`;
   }
+}
+
+// 首屏进场编排：环先落位 → 标题 → 副标题（40ms 步进）；向导完成后回主屏重播
+function playBoot() {
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const home = $("home");
+  home.classList.remove("boot");
+  void home.offsetWidth;
+  home.classList.add("boot");
+}
+
+// 展开内容错峰：仅展开瞬间挂 .dealing（前 8 行 30ms 步进），状态重渲染不重播
+function staggerIn(key) {
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const inner = document.querySelector(`#card-${key} .card-inner`);
+  if (!inner) return;
+  inner.classList.remove("dealing");
+  [...inner.children].slice(0, 8).forEach((el, i) => el.style.setProperty("--row", i));
+  void inner.offsetWidth;
+  inner.classList.add("dealing");
 }
 
 /* ===== 横幅（优先级：notice > 非管理员 > tripped > 网络不明） ===== */
@@ -657,6 +704,7 @@ async function finishWizard() {
   S.cfg.first_run = false;
   await invoke(CMD.setConfig, { cfg: S.cfg });
   render();
+  playBoot();
 }
 
 /* ===== 入口 ===== */

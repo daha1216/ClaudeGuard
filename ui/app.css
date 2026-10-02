@@ -146,7 +146,8 @@ a:focus-visible {
 #ring-svg .ring-full { fill: none; stroke-width: 9; }
 #ring-svg .ring-mark { fill: none; stroke-width: 8; stroke-linecap: round; stroke-linejoin: round; } /* 描边色随状态内联（--green/--red） */
 #ring-svg .ring-dot { fill: var(--txt2); }
-#ring-dynamic.spin { animation: ring-spin 2.4s linear infinite; transform-origin: 60px 60px; }
+#ring-dynamic { transform-origin: 60px 60px; }
+#ring-dynamic.spin { animation: ring-spin 2.4s linear infinite; }
 @keyframes ring-spin { to { transform: rotate(360deg); } }
 
 /* 状态切换时对勾/叉的描画入场（pathLength=1 技法；仅状态变化触发，JS 控制） */
@@ -156,6 +157,24 @@ a:focus-visible {
   animation: draw-mark 340ms var(--ease-out) forwards;
 }
 @keyframes draw-mark { to { stroke-dashoffset: 0; } }
+
+/* 签名转场：晕盘随满环收拢浮现（弧线收拢由 WAAPI 驱动 dasharray，见 main.js settleRing） */
+#ring-svg .disc { animation: disc-in 380ms var(--ease-out) both; }
+@keyframes disc-in { from { fill-opacity: 0; } }
+
+/* 首屏进场编排（#home.boot 由 JS 每次进入主屏时重挂）：环先落位 → 标题 → 副标题 */
+#home.boot #ring { animation: ring-in 150ms var(--ease-out) both; }
+#home.boot #hero-title { animation: rise-in 200ms var(--ease-out) 40ms both; }
+#home.boot #hero-sub { animation: rise-in 200ms var(--ease-out) 80ms both; }
+@keyframes ring-in { from { opacity: 0; transform: scale(0.96); } }
+@keyframes rise-in { from { opacity: 0; transform: translateY(6px); } }
+
+/* 展开内容错峰（.dealing 由 JS 展开瞬间挂上，状态重渲染不重播；前 8 行 30ms 步进） */
+.card-inner.dealing > * { animation: rise-in 200ms var(--ease-out) both; animation-delay: calc(var(--row, 0) * 30ms); }
+
+/* 副标题数据变化淡换（换节点/换状态时 IP 行 240ms 淡入新版；特异度需盖过 boot 编排） */
+#home #hero-sub.swap { animation: sub-in 240ms var(--ease-out); }
+@keyframes sub-in { from { opacity: 0; transform: translateY(2px); } }
 
 #hero-title {
   font-size: 24px;
@@ -378,6 +397,9 @@ body.compact .card { border-radius: 20px; padding: 12px; }
 .toggle.on { background: var(--green); }
 .toggle.on .knob { transform: translateX(20px); }
 .toggle:disabled { opacity: 0.5; }
+/* 按压弹性：按住旋钮缩到 0.9，松手 130ms 回弹（与 CTA scale(0.97) 同语言） */
+.toggle:active .knob { transform: translateX(0) scale(0.9); transition-duration: var(--t-press); }
+.toggle.on:active .knob { transform: translateX(20px) scale(0.9); transition-duration: var(--t-press); }
 
 /* 更新进度条 */
 .upd-row { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
@@ -404,8 +426,11 @@ body.compact .card { border-radius: 20px; padding: 12px; }
   user-select: text;
   cursor: text;
 }
-#log-scroll div { padding: 1px 4px; border-radius: 4px; }
+#log-scroll div { padding: 1px 4px; border-radius: 4px; transition: background-color 100ms var(--ease-out); }
 #log-scroll div:nth-child(even) { background: rgba(0, 0, 0, 0.025); }
+@media (hover: hover) and (pointer: fine) {
+  #log-scroll div:hover { background: #FAFAFC; }
+}
 .log-ts { color: #A1A1A6; }
 .log-ok { color: var(--green-deep); }
 .log-err { color: var(--red); }
@@ -501,6 +526,7 @@ body.compact .card { border-radius: 20px; padding: 12px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     transition-delay: 0ms !important;
