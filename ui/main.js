@@ -594,11 +594,8 @@ function renderSettings() {
   body.innerHTML = `
     <div class="group-title">检测</div>
     ${settingInput("set-port", "代理端口", "代理软件的端口，常见是 7890", String(cfg.proxy_port), "text")}
-    <div class="hairline"></div>
     ${ipListRow(cfg)}
-    <div class="hairline"></div>
     ${settingSelect("set-region", "出口地区", "出口 IP 不固定时，按国家/地区放行", cfg.egress_region || "")}
-    <div class="hairline"></div>
     ${settingInput("set-interval", "检查间隔", "每隔几秒复查一次（秒）", String(cfg.check_interval_secs), "text")}
     <div class="group-title">发现出口不对时</div>
     ${settingToggle("set-kill", "停掉守护对象", "立刻结束勾选应用的所有进程", cfg.kill_on_fail)}
@@ -652,7 +649,7 @@ function settingToggle(id, title, desc, on, disabled = false) {
   return `<div class="setting-row">
     <div class="setting-label"><div class="st-title">${esc(title)}</div><div class="st-desc">${esc(desc)}</div></div>
     <div class="setting-control">
-      <button id="${id}" class="toggle ${on ? "on" : ""}" ${disabled ? "disabled" : ""}><span class="knob"></span></button>
+      <button id="${id}" class="toggle ${on ? "on" : ""}" role="switch" aria-checked="${on ? "true" : "false"}" ${disabled ? "disabled" : ""}><span class="knob"></span></button>
     </div>
   </div>`;
 }
@@ -696,7 +693,7 @@ function ipListRow(cfg) {
     .map(
       (ip, i) => `<div class="ip-row">
         <input id="set-ip-${i}" class="text-input" type="text" value="${esc(ip)}">
-        <button class="ip-del" data-i="${i}" title="删除这个 IP" aria-label="删除">×</button>
+        <button class="ip-del" data-i="${i}" title="删除这个 IP" aria-label="删除"><svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true"><path d="M1.5 1.5 L8.5 8.5 M8.5 1.5 L1.5 8.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>
       </div>`,
     )
     .join("");
