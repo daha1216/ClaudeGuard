@@ -185,9 +185,32 @@ a:focus-visible {
 }
 #hero-sub { font-size: 14px; line-height: 1.5; color: var(--txt2); text-align: center; margin-top: 2px; }
 
+/* 状态行：守护运行状态一览（点 + 一行小字，静态无动画） */
+#status-line {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--txt2);
+}
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--green);
+}
+.status-dot.blue { background: var(--blue); }
+.status-dot.orange { background: var(--orange); }
+.status-dot.red { background: var(--red); }
+
 /* compact 模式（内容高 < 400 触发，JS 切换） */
 body.compact #hero-title { font-size: 20px; }
 body.compact #hero-sub { font-size: 13px; line-height: 1.45; }
+body.compact #status-line { font-size: 11px; margin-top: 8px; }
 body.compact #ring-svg { width: 104px; height: 104px; }
 body.compact #ring-svg circle, body.compact #ring-svg .spin-arc { stroke-width: 6.5; }
 body.compact #ring-svg .ring-mark { stroke-width: 5.8; }

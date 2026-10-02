@@ -54,6 +54,8 @@ pub struct StatusSnapshot {
     pub smoke_settings: bool,
     /// 守护暂停截止（unix 秒）：暂停期间检查照常但跳过熔断。托盘"暂停守护 30 分钟"设置。
     pub pause_until: Option<i64>,
+    /// 正在进行的检查是否用户触发（前端只在手动检查时转圈/禁按钮）。
+    pub manual: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -79,6 +81,8 @@ pub struct Shared {
     pub last: Arc<Mutex<Option<CheckOutcome>>>,
     pub tripped: Arc<Mutex<Option<TripResult>>>,
     pub pause_until: Arc<Mutex<Option<i64>>>,
+    /// 当前正在跑的检查是否用户触发（手动/启动按钮）。后台周期检查不转圈、不打断界面。
+    pub manual: AtomicBool,
     pub busy: Arc<AtomicBool>,
     pub stop: Arc<AtomicBool>,
     pub loglines: Arc<Mutex<Vec<String>>>,
@@ -93,6 +97,7 @@ impl Shared {
             last: Arc::new(Mutex::new(None)),
             tripped: Arc::new(Mutex::new(None)),
             pause_until: Arc::new(Mutex::new(None)),
+            manual: AtomicBool::new(false),
             busy: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),
             loglines: Arc::new(Mutex::new(Vec::new())),
@@ -141,6 +146,7 @@ impl Shared {
             version: update::current_version(),
             smoke_settings,
             pause_until: *self.pause_until.lock().unwrap(),
+            manual: self.manual.load(Ordering::SeqCst),
         }
     }
 }
@@ -177,6 +183,11 @@ pub fn run_check(sh: &Arc<Shared>, purpose: Purpose) {
     if sh.busy.swap(true, Ordering::SeqCst) {
         return; // 已有检查在跑（v1 同款防重入）
     }
+    // 手动/启动触发的检查才算"用户在等"——UI 转圈只给这类；后台周期检查静默跑。
+    sh.manual.store(
+        matches!(purpose, Purpose::Manual | Purpose::Launch),
+        Ordering::SeqCst,
+    );
     sh.emit(EV_STATUS, sh_full_snapshot(sh));
 
     let cfg = sh.cfg.lock().unwrap().clone();
@@ -238,6 +249,7 @@ pub fn run_check(sh: &Arc<Shared>, purpose: Purpose) {
     }
 
     sh.busy.store(false, Ordering::SeqCst);
+    sh.manual.store(false, Ordering::SeqCst);
     sh.emit(EV_STATUS, sh_full_snapshot(sh));
 }
 

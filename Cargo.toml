@@ -1,6 +1,6 @@
 [package]
 name = "claude-guard"
-version = "2.4.0"
+version = "2.5.0"
 edition = "2021"
 description = "Claude 守护器：代理出口校验、托盘常驻监测、异常熔断隔离"
 

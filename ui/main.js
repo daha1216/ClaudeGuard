@@ -129,6 +129,7 @@ async function init() {
     if (!S.lastAt) return;
     const el = document.querySelector("#details-state .rel");
     if (el) el.textContent = `· ${relTime(S.lastAt)}`;
+    renderStatusLine();
   }, 5000);
   // 通知权限只在用户首次交互时问一次（避免一上来就弹权限条）。
   document.addEventListener(
@@ -254,11 +255,41 @@ function render() {
   renderSettings();
   renderLog();
   renderFooter();
+  renderStatusLine();
+}
+
+/* ===== 状态行（hero 下方：守护运行状态一览） ===== */
+function renderStatusLine() {
+  const dot = document.querySelector("#status-line .status-dot");
+  const txt = $("status-text");
+  if (!dot || !txt) return;
+  let cls = "green";
+  let s = "";
+  const paused = S.pauseUntil && S.pauseUntil > Date.now() / 1000;
+  if (S.checking && S.manual) {
+    cls = "blue";
+    s = "正在检查…";
+  } else if (S.tripped) {
+    cls = "red";
+    s = "已熔断 · 切回节点后自动恢复";
+  } else if (paused) {
+    cls = "orange";
+    const t = new Date(S.pauseUntil * 1000);
+    s = `已暂停 · ${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")} 自动恢复`;
+  } else {
+    const iv = S.cfg && S.cfg.check_interval_secs ? S.cfg.check_interval_secs : 30;
+    s = `自动守护中 · 每 ${iv} 秒检查` + (S.lastAt ? ` · 上次 ${relTime(S.lastAt)}` : "");
+  }
+  dot.className = `status-dot ${cls}`;
+  if (txt.textContent !== s) txt.textContent = s;
 }
 
 /* ===== hero ===== */
 function heroState() {
-  if (S.checking) return { ring: "spin", title: "正在检查…", sub: "正在核对代理和出口 IP" };
+  // 只有"用户在等"的检查才转圈：手动点按钮，或还没有任何结果的首查。
+  // 后台周期检查静默进行（环保持原状态，副标题仅在数据变化时淡换）。
+  if (S.checking && (S.manual || !S.last))
+    return { ring: "spin", title: "正在检查…", sub: "正在核对代理和出口 IP" };
   if (S.tripped) {
     const reason = S.last && S.last.reason ? S.last.reason : "出口 IP 与约定不一致";
     return { ring: "fail", title: "已暂停 Claude", sub: `${reason} · 切回节点后自动恢复` };
@@ -430,9 +461,9 @@ function renderCta() {
   const btn = $("cta");
   const sec = $("cta-secondary");
   if (S.tripped) {
-    btn.disabled = S.checking;
+    btn.disabled = S.checking && S.manual;
     btn.textContent = "我已切回节点，重新检查";
-  } else if (S.checking || !S.last) {
+  } else if ((S.checking && S.manual) || !S.last) {
     btn.disabled = true;
     btn.textContent = "正在检查，稍候…";
   } else if (S.last.passed) {
