@@ -30,9 +30,11 @@ const S = {
   logs: [],
   notice: null,        // {title, desc} 4 秒自动清
   lastAt: 0,           // 最近一次检查完成的本地时刻（相对时间用）
+  claudeRunning: false, // Claude 桌面端进程状态（快照字段）
   wizPage: 0,
   wizPort: "",
   wizIp: "",
+  wizRegion: "",
   openCards: { details: false, settings: false, log: false },
 };
 
@@ -49,6 +51,32 @@ function ipOk(s) {
   return m.slice(1).every((p) => (/^0\d/.test(p) ? false : +p <= 255));
 }
 const intOk = (s) => /^\d+$/.test(s.trim());
+
+/* ===== 出口地区选项（ISO 3166-1 alpha-2，与 ipinfo 的 country 字段对齐） ===== */
+const REGIONS = [
+  ["", "不限"],
+  ["US", "美国"],
+  ["JP", "日本"],
+  ["SG", "新加坡"],
+  ["HK", "香港"],
+  ["TW", "台湾"],
+  ["KR", "韩国"],
+  ["GB", "英国"],
+  ["DE", "德国"],
+  ["FR", "法国"],
+  ["CA", "加拿大"],
+  ["AU", "澳大利亚"],
+];
+const regionName = (code) => {
+  const hit = REGIONS.find((r) => r[0] === code);
+  return hit ? hit[1] : code;
+};
+/* 向导/设置共用：把逗号/空格/分号分隔的输入拆成 IP 数组 */
+const splitIps = (s) =>
+  String(s || "")
+    .split(/[,\s;，；]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
 
 /* ===== plain_reason（PARITY §7） ===== */
 function plainReason(reason) {
@@ -94,7 +122,8 @@ async function init() {
   S.upd = upd;
   S.logs = logs;
   S.wizPort = String(cfg.proxy_port ?? "");
-  S.wizIp = cfg.required_ip ?? "";
+  S.wizIp = (cfg.allowed_ips || []).join(", ");
+  S.wizRegion = cfg.egress_region ?? "";
   if (!S.checking && S.last) S.lastAt = Date.now();
   if (S.smokeSettings) S.openCards.settings = true;
 
@@ -266,19 +295,21 @@ function renderStatusLine() {
   let cls = "green";
   let s = "";
   const paused = S.pauseUntil && S.pauseUntil > Date.now() / 1000;
+  // Claude 桌面端状态段：每分支都带上（运行中/未运行），随检查周期刷新
+  const claude = `Claude ${S.claudeRunning ? "运行中" : "未运行"}`;
   if (S.checking && S.manual) {
     cls = "blue";
-    s = "正在检查…";
+    s = `正在检查… · ${claude}`;
   } else if (S.tripped) {
     cls = "red";
-    s = "已熔断 · 切回节点后自动恢复";
+    s = `已熔断 · 切回节点后自动恢复 · ${claude}`;
   } else if (paused) {
     cls = "orange";
     const t = new Date(S.pauseUntil * 1000);
-    s = `已暂停 · ${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")} 自动恢复`;
+    s = `已暂停 · ${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")} 自动恢复 · ${claude}`;
   } else {
     const iv = S.cfg && S.cfg.check_interval_secs ? S.cfg.check_interval_secs : 30;
-    s = `自动守护中 · 每 ${iv} 秒检查` + (S.lastAt ? ` · 上次 ${relTime(S.lastAt)}` : "");
+    s = `自动守护中 · 每 ${iv} 秒检查 · ${claude}` + (S.lastAt ? ` · 上次 ${relTime(S.lastAt)}` : "");
   }
   dot.className = `status-dot ${cls}`;
   if (txt.textContent !== s) txt.textContent = s;
@@ -533,7 +564,9 @@ function renderSettings() {
     <div class="group-title">检测</div>
     ${settingInput("set-port", "代理端口", "代理软件的端口，常见是 7890", String(cfg.proxy_port), "text")}
     <div class="hairline"></div>
-    ${settingInput("set-ip", "约定的出口 IP", "只认这个出口，别的都会拦", cfg.required_ip, "text")}
+    ${ipListRow(cfg)}
+    <div class="hairline"></div>
+    ${settingSelect("set-region", "出口地区", "出口 IP 不固定时，按国家/地区放行", cfg.egress_region || "")}
     <div class="hairline"></div>
     ${settingInput("set-interval", "检查间隔", "每隔几秒复查一次（秒）", String(cfg.check_interval_secs), "text")}
     <div class="group-title">发现出口不对时</div>
@@ -550,10 +583,8 @@ function renderSettings() {
     if (!portOk(v)) return { ok: false, msg: "端口要填 1-65535" };
     return { ok: true, apply: (c) => (c.proxy_port = +v.trim()) };
   });
-  wireSettingInput("set-ip", (v) => {
-    if (!ipOk(v)) return { ok: false, msg: "要写成 4 段数字，如 203.0.113.10" };
-    return { ok: true, apply: (c) => (c.required_ip = v.trim()) };
-  });
+  wireIpList();
+  wireRegionSelect();
   wireSettingInput("set-interval", (v) => {
     if (!intOk(v)) return { ok: false, msg: "填数字" };
     const n = +v.trim();
@@ -584,6 +615,137 @@ function settingToggle(id, title, desc, on, disabled = false) {
       <button id="${id}" class="toggle ${on ? "on" : ""}" ${disabled ? "disabled" : ""}><span class="knob"></span></button>
     </div>
   </div>`;
+}
+
+/* 约定出口 IP 列表：每行一个可编辑 IP（× 删除），底部一格"添加 IP" */
+function ipListRow(cfg) {
+  const rows = (cfg.allowed_ips || [])
+    .map(
+      (ip, i) => `<div class="ip-row">
+        <input id="set-ip-${i}" class="text-input" type="text" value="${esc(ip)}">
+        <button class="ip-del" data-i="${i}" title="删除这个 IP" aria-label="删除">×</button>
+      </div>`,
+    )
+    .join("");
+  return `<div class="setting-row ip-list-row">
+    <div class="setting-label"><div class="st-title">约定的出口 IP</div><div class="st-desc">可填多个，命中任意一个就放行</div></div>
+    <div class="setting-control ip-list-ctl">
+      ${rows}
+      <div class="ip-row">
+        <input id="set-ip-new" class="text-input" type="text" placeholder="添加 IP">
+      </div>
+      <div class="field-error" id="set-ip-err"></div>
+    </div>
+  </div>`;
+}
+
+function settingSelect(id, title, desc, value) {
+  const opts = REGIONS.map(
+    ([code, name]) => `<option value="${esc(code)}"${code === value ? " selected" : ""}>${esc(name)}</option>`,
+  ).join("");
+  return `<div class="setting-row">
+    <div class="setting-label"><div class="st-title">${esc(title)}</div><div class="st-desc">${esc(desc)}</div></div>
+    <div class="setting-control">
+      <select id="${id}" class="text-input select-input">${opts}</select>
+    </div>
+  </div>`;
+}
+
+/* IP 列表编辑：逐行失焦改写、× 删除、"添加 IP" 行失焦/回车追加 */
+async function saveIps(next, errEl) {
+  const region = (S.cfg.egress_region || "").trim();
+  if (!next.length && !region) {
+    if (errEl) errEl.textContent = "至少留一个 IP，或先选一个出口地区";
+    return false;
+  }
+  if (errEl) errEl.textContent = "";
+  const old = JSON.stringify(S.cfg);
+  S.cfg.allowed_ips = next;
+  if (JSON.stringify(S.cfg) !== old) {
+    await invoke(CMD.setConfig, { cfg: S.cfg });
+    showNotice("完成", "已保存");
+  }
+  return true;
+}
+
+function wireIpList() {
+  const ctl = document.querySelector(".ip-list-ctl");
+  if (!ctl) return;
+  const errEl = $("set-ip-err");
+  const ips = () => (S.cfg && S.cfg.allowed_ips) || [];
+  // 逐行编辑：失焦/回车校验并写回
+  ips().forEach((_, i) => {
+    const input = $(`set-ip-${i}`);
+    if (!input) return;
+    const commit = async () => {
+      const v = input.value.trim();
+      if (v === ips()[i]) return;
+      if (!ipOk(v)) {
+        input.classList.add("invalid");
+        errEl.textContent = "要写成 4 段数字，如 203.0.113.10";
+        return;
+      }
+      input.classList.remove("invalid");
+      errEl.textContent = "";
+      const next = ips().slice();
+      next[i] = v;
+      await saveIps(next, errEl);
+    };
+    input.addEventListener("blur", commit);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") input.blur();
+    });
+  });
+  // 删除行
+  ctl.querySelectorAll(".ip-del").forEach((btn) => {
+    btn.onclick = () => {
+      const i = +btn.dataset.i;
+      const next = ips().slice();
+      next.splice(i, 1);
+      saveIps(next, errEl).then((ok) => {
+        if (ok) renderSettings();
+      });
+    };
+  });
+  // 添加行：空值忽略；合法则追加
+  const add = $("set-ip-new");
+  if (add) {
+    const commit = async () => {
+      const v = add.value.trim();
+      add.classList.remove("invalid");
+      if (!v) return;
+      if (!ipOk(v)) {
+        add.classList.add("invalid");
+        errEl.textContent = "要写成 4 段数字，如 203.0.113.10";
+        return;
+      }
+      errEl.textContent = "";
+      const next = ips().slice();
+      if (!next.includes(v)) next.push(v);
+      const ok = await saveIps(next, errEl);
+      if (ok) renderSettings();
+    };
+    add.addEventListener("blur", commit);
+    add.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") add.blur();
+    });
+  }
+}
+
+function wireRegionSelect() {
+  const sel = $("set-region");
+  if (!sel) return;
+  sel.addEventListener("change", async () => {
+    const v = sel.value;
+    if (!v && !(S.cfg.allowed_ips || []).length) {
+      showNotice("提示", "至少留一个 IP，或选一个出口地区");
+      sel.value = S.cfg.egress_region || "";
+      return;
+    }
+    S.cfg.egress_region = v;
+    await invoke(CMD.setConfig, { cfg: S.cfg });
+    showNotice("完成", v ? `按${regionName(v)}出口放行` : "已改为不限地区");
+  });
 }
 
 /* 失焦/回车校验写回（v1 同款） */
@@ -758,34 +920,43 @@ function renderWizard() {
   const dots = $("wiz-dots");
   dots.innerHTML = [0, 1, 2].map((i) => `<span class="${i === S.wizPage ? "cur" : ""}"></span>`).join("");
   if (S.wizPage === 1) {
-    const port = $("wiz-port"), ip = $("wiz-ip");
+    const port = $("wiz-port"), ip = $("wiz-ip"), region = $("wiz-region");
     if (!port.value) port.value = S.wizPort;
     if (!ip.value) ip.value = S.wizIp;
+    if (region && !region.value) region.value = S.wizRegion;
     port.oninput = ip.oninput = wiz1Validate;
+    if (region) region.onchange = wiz1Validate;
     port.onkeydown = ip.onkeydown = (e) => { if (e.key === "Enter") wiz1Continue(); };
   }
 }
 
 function wiz1Validate() {
   const port = $("wiz-port").value, ip = $("wiz-ip").value;
-  const okP = portOk(port), okI = ipOk(ip);
+  const region = $("wiz-region") ? $("wiz-region").value : "";
+  const ips = splitIps(ip);
+  const okP = portOk(port);
+  const okI = ips.every(ipOk);
+  const okEgress = okI && (ips.length > 0 || region !== "");
   const errEl = $("wiz1-error");
   if (!okP) errEl.textContent = "端口需为 1-65535 的数字";
-  else if (!okI) errEl.textContent = "要写成 4 段数字，如 203.0.113.10";
+  else if (!okI) errEl.textContent = "IP 要写成 4 段数字，如 203.0.113.10";
+  else if (!okEgress) errEl.textContent = "至少填一个约定 IP，或选一个出口地区";
   else errEl.textContent = "";
   $("wiz-port").classList.toggle("invalid", !okP);
-  $("wiz-ip").classList.toggle("invalid", !okI);
-  $("wiz1-next").disabled = !(okP && okI);
-  return okP && okI;
+  $("wiz-ip").classList.toggle("invalid", ips.length > 0 && !okI);
+  $("wiz1-next").disabled = !(okP && okEgress);
+  return okP && okEgress;
 }
 
 async function wiz1Continue() {
   if (!wiz1Validate()) return;
   S.wizPort = $("wiz-port").value.trim();
   S.wizIp = $("wiz-ip").value.trim();
+  S.wizRegion = $("wiz-region") ? $("wiz-region").value : "";
   // v2 修复（PARITY §0-1）：向导页 1 的端口/IP 即时落盘，不再等到主屏设置卡。
   S.cfg.proxy_port = +S.wizPort;
-  S.cfg.required_ip = S.wizIp;
+  S.cfg.allowed_ips = splitIps(S.wizIp);
+  S.cfg.egress_region = S.wizRegion;
   await invoke(CMD.setConfig, { cfg: S.cfg });
   gotoWizard(2);
 }

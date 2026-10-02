@@ -49,6 +49,28 @@ pub struct CheckOutcome {
     /// egress ip observed (if any) for display
     pub egress_ip: Option<String>,
     pub egress_desc: Option<String>,
+    /// egress country code from ipinfo (e.g. "US"), when geo is known
+    pub egress_country: Option<String>,
+}
+
+/// 出口判定（v2.6 多 IP + 地区规则，run_checks 与 monitor 熔断共用）。
+/// 返回 (pass, mismatch)：
+/// - pass:    命中任一约定 IP，或命中约定地区
+/// - mismatch: 拿到了出口信息且两条规则都不满足——只有这种情况才允许熔断
+///   （网络失败/地区模式下拿不到地区 → mismatch=false，沿用 v1 的防误杀语义）
+pub fn match_egress(cfg: &Config, ip: Option<&str>, country: Option<&str>) -> (bool, bool) {
+    let ip_hit = ip
+        .map(|ip| cfg.allowed_ips.iter().any(|a| a == ip))
+        .unwrap_or(false);
+    let region = cfg.egress_region.trim();
+    let region_hit = !region.is_empty() && country == Some(region);
+    let pass = ip_hit || region_hit;
+    // 防误杀：完全拿不到出口信息（网络失败），或地区模式下本次没拿到地区（ipinfo 挂了只有 ipify）
+    // ——两种情况都不算 mismatch，宁可放过不可错杀
+    let no_info = ip.is_none() && country.is_none();
+    let region_blind = !region.is_empty() && country.is_none();
+    let mismatch = !pass && !no_info && !region_blind;
+    (pass, mismatch)
 }
 
 /// 步骤 1：系统代理必须启用并指向 host:port
@@ -139,8 +161,8 @@ fn proxy_agent(cfg: &Config) -> Result<ureq::Agent, String> {
         .build())
 }
 
-/// 步骤 3 主判据：走代理查询出口公网 IP
-fn fetch_ipinfo(agent: &ureq::Agent) -> Result<(String, String), String> {
+/// 步骤 3 主判据：走代理查询出口公网 IP（附带国家代码，供地区匹配）
+fn fetch_ipinfo(agent: &ureq::Agent) -> Result<(String, String, String), String> {
     let resp = agent
         .get("https://ipinfo.io/json")
         .call()
@@ -162,10 +184,10 @@ fn fetch_ipinfo(agent: &ureq::Agent) -> Result<(String, String), String> {
     if ip.is_empty() {
         return Err("ipinfo: no ip field".into());
     }
-    Ok((ip, desc))
+    Ok((ip, desc, country.to_string()))
 }
 
-fn fetch_ipify(agent: &ureq::Agent) -> Result<(String, String), String> {
+fn fetch_ipify(agent: &ureq::Agent) -> Result<(String, String, String), String> {
     let resp = agent
         .get("https://api.ipify.org?format=json")
         .call()
@@ -181,7 +203,7 @@ fn fetch_ipify(agent: &ureq::Agent) -> Result<(String, String), String> {
     if ip.is_empty() {
         return Err("ipify: no ip field".into());
     }
-    Ok((ip, "(via ipify)".into()))
+    Ok((ip, "(via ipify)".into(), String::new()))
 }
 
 /// 完整三步校验。log 回调用于写日志。
@@ -194,6 +216,7 @@ pub fn run_checks(cfg: &Config, mut log: impl FnMut(String)) -> CheckOutcome {
         reason: String::new(),
         egress_ip: None,
         egress_desc: None,
+        egress_country: None,
     };
 
     // 1. 系统代理
@@ -222,17 +245,41 @@ pub fn run_checks(cfg: &Config, mut log: impl FnMut(String)) -> CheckOutcome {
                 .or_else(|e1| fetch_ipify(&agent).map_err(|e2| format!("{e1} | {e2}")))
         });
     match web {
-        Ok((ip, desc)) => {
+        Ok((ip, desc, country)) => {
             log(format!("egress(web): {ip} {desc}"));
             out.egress_ip = Some(ip.clone());
             out.egress_desc = Some(desc.clone());
-            if ip == cfg.required_ip {
-                out.egress = StepResult::pass(format!("{ip}  {desc}"));
+            out.egress_country = if country.is_empty() {
+                None
+            } else {
+                Some(country.clone())
+            };
+            let (hit, _) = match_egress(cfg, Some(&ip), out.egress_country.as_deref());
+            let region = cfg.egress_region.trim();
+            if hit {
+                let how = if cfg.allowed_ips.iter().any(|a| a == &ip) {
+                    "命中约定 IP".to_string()
+                } else {
+                    format!("命中约定地区 {country}")
+                };
+                let region_note = if !region.is_empty() && cfg.allowed_ips.is_empty() {
+                    // 纯地区模式：把约定地区带上，用户看得见为什么放行
+                    format!("（约定地区 {region}）")
+                } else {
+                    String::new()
+                };
+                out.egress = StepResult::pass(format!("{ip}  {desc} · {how}{region_note}"));
                 out.passed = true;
                 return out;
             }
             out.egress = StepResult::fail(format!("当前出口 {ip}（{desc}）"));
-            out.reason = format!("出口 IP 是 {ip}，应为 {}", cfg.required_ip);
+            out.reason = if !region.is_empty() && !cfg.allowed_ips.is_empty() {
+                format!("出口 {ip}（{country}）既不在约定 IP 列表，也不是约定地区 {region}")
+            } else if !region.is_empty() {
+                format!("出口地区 {country} 不是约定的 {region}")
+            } else {
+                format!("出口 IP 是 {ip}，不在约定列表")
+            };
             log(format!("BLOCKED: {}", out.reason));
             out
         }
@@ -240,18 +287,21 @@ pub fn run_checks(cfg: &Config, mut log: impl FnMut(String)) -> CheckOutcome {
             // 3b. 网页查询失败 -> TCP 观察回退（tunnel 仍打开，迫使代理保持节点连接）
             log(format!("web check failed, tcp fallback: {err}"));
             let deadline = Instant::now() + Duration::from_secs(4);
-            let mut hit = false;
+            let mut hit_ip = String::new();
             while Instant::now() < deadline {
                 let conns = crate::tcp_table::established_connections();
-                if conns.iter().any(|c| c.remote_addr == cfg.required_ip) {
-                    hit = true;
+                if let Some(c) = conns
+                    .iter()
+                    .find(|c| cfg.allowed_ips.iter().any(|w| w == &c.remote_addr))
+                {
+                    hit_ip = c.remote_addr.clone();
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(150));
             }
             drop(tunnel);
-            if hit {
-                out.egress = StepResult::pass(format!("TCP 观察: 已连接 {}", cfg.required_ip));
+            if !hit_ip.is_empty() {
+                out.egress = StepResult::pass(format!("TCP 观察: 已连接 {hit_ip}"));
                 out.passed = true;
                 return out;
             }
@@ -264,11 +314,12 @@ pub fn run_checks(cfg: &Config, mut log: impl FnMut(String)) -> CheckOutcome {
                     .collect::<Vec<_>>()
             };
             let shown: Vec<String> = egress.iter().take(5).cloned().collect();
-            out.egress = StepResult::fail(format!(
-                "未连接 {}，当前出口: {}",
-                cfg.required_ip,
-                shown.join(", ")
-            ));
+            let want = if cfg.allowed_ips.is_empty() {
+                "约定地区".to_string()
+            } else {
+                cfg.allowed_ips.join("/")
+            };
+            out.egress = StepResult::fail(format!("未连接 {want}，当前出口: {}", shown.join(", ")));
             out.reason = "代理未连接指定节点".into();
             log(format!(
                 "BLOCKED: {} (egress: {})",
@@ -305,4 +356,56 @@ fn is_private_ip(ip: &str) -> bool {
                 false
             }
         }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(ips: &[&str], region: &str) -> Config {
+        let mut c = Config::default();
+        c.allowed_ips = ips.iter().map(|s| s.to_string()).collect();
+        c.egress_region = region.to_string();
+        c
+    }
+
+    /// 行为锁: 多 IP 列表命中任一即通过。
+    #[test]
+    fn multi_ip_list_matches() {
+        let c = cfg(&["1.1.1.1", "2.2.2.2"], "");
+        assert_eq!(match_egress(&c, Some("2.2.2.2"), Some("AU")), (true, false));
+        let (pass, mis) = match_egress(&c, Some("3.3.3.3"), Some("AU"));
+        assert!(!pass && mis);
+    }
+
+    /// 行为锁: 地区模式——国家命中即通过；拿不到国家时防误杀（不熔断）。
+    #[test]
+    fn region_mode() {
+        let c = cfg(&[], "US");
+        assert_eq!(match_egress(&c, Some("9.9.9.9"), Some("US")), (true, false));
+        let (pass, mis) = match_egress(&c, Some("9.9.9.9"), Some("JP"));
+        assert!(!pass && mis);
+        // ipify 兜底只拿到 IP、没拿到地区：不通过，但绝不熔断
+        let (pass, mis) = match_egress(&c, Some("9.9.9.9"), None);
+        assert!(!pass && !mis);
+    }
+
+    /// 行为锁: 双规则并存时任一命中即通过；全部落空才熔断。
+    #[test]
+    fn ip_or_region_union() {
+        let c = cfg(&["1.1.1.1"], "US");
+        assert_eq!(match_egress(&c, Some("9.9.9.9"), Some("US")), (true, false));
+        assert_eq!(match_egress(&c, Some("1.1.1.1"), Some("JP")), (true, false));
+        let (pass, mis) = match_egress(&c, Some("9.9.9.9"), Some("JP"));
+        assert!(!pass && mis);
+    }
+
+    /// 行为锁: 完全拿不到出口信息 → 不通过也不熔断（v1 防误杀语义）。
+    #[test]
+    fn no_info_no_trip() {
+        let c = cfg(&["1.1.1.1"], "");
+        assert_eq!(match_egress(&c, None, None), (false, false));
+        let c2 = cfg(&["1.1.1.1"], "US");
+        assert_eq!(match_egress(&c2, None, None), (false, false));
+    }
 }

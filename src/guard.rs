@@ -122,6 +122,34 @@ fn collect_exes(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// 与 kill_claude 同一口径的 Claude 进程判定（安装目录前缀 + WindowsApps 兜底 + 进程名）
+fn is_claude_proc(proc: &sysinfo::Process, dir_s: &Option<String>) -> bool {
+    let exe_match = proc
+        .exe()
+        .map(|p| {
+            let s = p.to_string_lossy().to_lowercase();
+            dir_s
+                .as_ref()
+                .map(|d| s.starts_with(d.as_str()))
+                .unwrap_or(false)
+                || (s.contains(r"\windowsapps\claude_") && s.ends_with("claude.exe"))
+        })
+        .unwrap_or(false);
+    exe_match || proc.name().eq_ignore_ascii_case("claude.exe")
+}
+
+/// Claude 桌面端是否在运行（状态行展示用；不含杀进程副作用）
+pub fn claude_running() -> bool {
+    use sysinfo::System;
+    let dir = find_claude_dir();
+    let dir_s = dir.as_ref().map(|d| d.to_string_lossy().to_lowercase());
+    let mut sys = System::new();
+    sys.refresh_processes();
+    sys.processes()
+        .iter()
+        .any(|(_, p)| is_claude_proc(p, &dir_s))
+}
+
 /// 杀掉所有 Claude 进程（按安装目录路径匹配 + 进程名兜底），返回杀掉的进程数
 pub fn kill_claude() -> usize {
     use sysinfo::System;
@@ -131,19 +159,7 @@ pub fn kill_claude() -> usize {
     sys.refresh_processes();
     let mut killed = 0usize;
     for (pid, proc) in sys.processes() {
-        let exe_match = proc
-            .exe()
-            .map(|p| {
-                let s = p.to_string_lossy().to_lowercase();
-                dir_s
-                    .as_ref()
-                    .map(|d| s.starts_with(d.as_str()))
-                    .unwrap_or(false)
-                    || (s.contains(r"\windowsapps\claude_") && s.ends_with("claude.exe"))
-            })
-            .unwrap_or(false);
-        let name_match = proc.name().eq_ignore_ascii_case("claude.exe");
-        if exe_match || name_match {
+        if is_claude_proc(proc, &dir_s) {
             let pidv: u32 = pid.as_u32();
             if proc.kill() {
                 killed += 1;

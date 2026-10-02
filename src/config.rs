@@ -7,7 +7,16 @@ use std::path::PathBuf;
 pub struct Config {
     pub proxy_host: String,
     pub proxy_port: u16,
-    pub required_ip: String,
+    /// 约定出口 IP 列表（v2.6 起）：命中任意一个即视为出口正确。
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
+    /// 约定出口地区（ISO 3166-1 alpha-2，如 "US"）。空串 = 不启用地区匹配。
+    /// 给没有固定 IP 的用户：按出口所在国家/地区放行。
+    #[serde(default)]
+    pub egress_region: String,
+    /// 兼容字段：v1~v2.5 的单值 required_ip。仅用于读取迁移，不再写出。
+    #[serde(default, skip_serializing)]
+    pub required_ip: Option<String>,
     pub connect_target: String,
     /// AppUserModelId of the Claude UWP app
     pub app_id: String,
@@ -27,8 +36,10 @@ impl Default for Config {
             proxy_host: "127.0.0.1".into(),
             proxy_port: 7890,
             // 默认留空：出口 IP 属于用户隐私，由首次运行向导引导填写。
-            // 留空时校验必定失败（宁可错杀），直到用户设置了自己的期望 IP。
-            required_ip: String::new(),
+            // 列表与地区都为空时校验必定失败（宁可错杀），直到用户设置其一。
+            allowed_ips: Vec::new(),
+            egress_region: String::new(),
+            required_ip: None,
             connect_target: "api.anthropic.com:443".into(),
             app_id: "Claude_pzs8sxrjxfjjc!Claude".into(),
             check_interval_secs: 15,
@@ -56,7 +67,14 @@ impl Config {
         let p = config_path();
         if let Ok(text) = fs::read_to_string(&p) {
             match serde_json::from_str::<Config>(&text) {
-                Ok(cfg) => return cfg,
+                Ok(mut cfg) => {
+                    let migrated = cfg.migrate();
+                    if migrated {
+                        // 老配置迁移成列表后立即落盘，之后 required_ip 不再出现在文件里
+                        let _ = cfg.save();
+                    }
+                    return cfg;
+                }
                 // 解析失败不再静默：记日志后回退默认，便于排查被覆盖的配置
                 Err(e) => {
                     crate::guard::log_line(&format!(
@@ -67,6 +85,38 @@ impl Config {
             }
         }
         Self::default()
+    }
+
+    /// v2.6 迁移：旧单值 required_ip → allowed_ips 列表（去空白/去重）。
+    /// 返回是否有改动（调用方决定是否落盘）。
+    pub fn migrate(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(ip) = self.required_ip.take() {
+            let ip = ip.trim().to_string();
+            if !ip.is_empty() && !self.allowed_ips.iter().any(|a| a == &ip) {
+                self.allowed_ips.push(ip);
+                changed = true;
+            }
+        }
+        let clean: Vec<String> = self
+            .allowed_ips
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let dedup: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            clean
+                .into_iter()
+                .filter(|s| seen.insert(s.clone()))
+                .collect()
+        };
+        if dedup != self.allowed_ips {
+            self.allowed_ips = dedup;
+            changed = true;
+        }
+        self.egress_region = self.egress_region.trim().to_string();
+        changed
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -90,7 +140,9 @@ mod tests {
         let cfg = Config {
             proxy_host: "127.0.0.1".into(),
             proxy_port: 7890,
-            required_ip: "203.0.113.10".into(),
+            allowed_ips: vec!["203.0.113.10".into(), "198.51.100.7".into()],
+            egress_region: "US".into(),
+            required_ip: None,
             connect_target: "api.anthropic.com:443".into(),
             app_id: "Claude_pzs8sxrjxfjjc!Claude".into(),
             check_interval_secs: 15,
@@ -102,8 +154,11 @@ mod tests {
             first_run: false,
         };
         let json = serde_json::to_string(&cfg).unwrap();
+        // 兼容字段不落盘：旧 required_ip 不得再出现在文件里
+        assert!(!json.contains("required_ip"));
         let back: Config = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.required_ip, "203.0.113.10");
+        assert_eq!(back.allowed_ips, vec!["203.0.113.10", "198.51.100.7"]);
+        assert_eq!(back.egress_region, "US");
         assert_eq!(back.proxy_port, 7890);
         assert_eq!(back.check_interval_secs, 15);
     }
@@ -112,7 +167,7 @@ mod tests {
     /// 加新字段时不许破坏已装用户的配置。
     #[test]
     fn old_config_still_loads() {
-        // v1.2 时代的最小配置(部分字段缺失)
+        // v1.2 时代的最小配置(部分字段缺失，required_ip 还是单值)
         let legacy = r#"{
             "proxy_host": "127.0.0.1",
             "proxy_port": 7890,
@@ -121,9 +176,28 @@ mod tests {
             "app_id": "Claude_pzs8sxrjxfjjc!Claude",
             "first_run": false
         }"#;
-        let cfg: Config = serde_json::from_str(legacy).expect("旧配置必须可解析");
-        assert_eq!(cfg.required_ip, "203.0.113.10");
+        let mut cfg: Config = serde_json::from_str(legacy).expect("旧配置必须可解析");
         assert_eq!(cfg.check_interval_secs, 15); // 缺省值兜底
         assert!(cfg.kill_on_fail); //              缺省值兜底
+                                   // 迁移：单值进列表，兼容字段清空
+        assert!(cfg.migrate());
+        assert_eq!(cfg.allowed_ips, vec!["203.0.113.10"]);
+        assert!(cfg.required_ip.is_none());
+        // 再跑一次迁移必须幂等
+        assert!(!cfg.migrate());
+    }
+
+    /// 行为锁: 列表清理——空白条目剔除、重复去重。
+    #[test]
+    fn migrate_cleans_ip_list() {
+        let mut cfg = Config::default();
+        cfg.allowed_ips = vec![
+            " 1.2.3.4 ".into(),
+            "".into(),
+            "1.2.3.4".into(),
+            "5.6.7.8".into(),
+        ];
+        assert!(cfg.migrate());
+        assert_eq!(cfg.allowed_ips, vec!["1.2.3.4", "5.6.7.8"]);
     }
 }

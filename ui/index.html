@@ -108,8 +108,27 @@
           <div class="hairline"></div>
           <div class="wiz-field">
             <div class="wiz-field-title">约定的出口 IP</div>
-            <div class="wiz-field-desc">只有从这个出口走，才允许用 Claude</div>
-            <input id="wiz-ip" class="text-input" type="text" placeholder="203.0.113.10">
+            <div class="wiz-field-desc">可填多个，用逗号分隔；从这些出口走才允许用 Claude</div>
+            <input id="wiz-ip" class="text-input" type="text" placeholder="203.0.113.10, 198.51.100.7">
+          </div>
+          <div class="hairline"></div>
+          <div class="wiz-field">
+            <div class="wiz-field-title">出口地区</div>
+            <div class="wiz-field-desc">出口 IP 不固定时，按国家/地区放行</div>
+            <select id="wiz-region" class="text-input select-input">
+              <option value="">不限</option>
+              <option value="US">美国</option>
+              <option value="JP">日本</option>
+              <option value="SG">新加坡</option>
+              <option value="HK">香港</option>
+              <option value="TW">台湾</option>
+              <option value="KR">韩国</option>
+              <option value="GB">英国</option>
+              <option value="DE">德国</option>
+              <option value="FR">法国</option>
+              <option value="CA">加拿大</option>
+              <option value="AU">澳大利亚</option>
+            </select>
           </div>
         </div>
         <div id="wiz1-error" class="field-error"></div>

@@ -56,6 +56,8 @@ pub struct StatusSnapshot {
     pub pause_until: Option<i64>,
     /// 正在进行的检查是否用户触发（前端只在手动检查时转圈/禁按钮）。
     pub manual: bool,
+    /// Claude 桌面端当前是否在运行（状态行展示；与 kill_claude 同一匹配口径）
+    pub claude_running: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -147,6 +149,7 @@ impl Shared {
             smoke_settings,
             pause_until: *self.pause_until.lock().unwrap(),
             manual: self.manual.load(Ordering::SeqCst),
+            claude_running: guard::claude_running(),
         }
     }
 }
@@ -205,9 +208,14 @@ pub fn run_check(sh: &Arc<Shared>, purpose: Purpose) {
         out.passed, reason_disp
     ));
 
-    // 熔断条件（精确复刻）：拿到了出口 IP 且与约定不符才熔断；网络失败（None）不熔断，防误杀。
+    // 熔断条件（v2.6）：拿到了出口信息且 IP 列表与地区规则都不满足才熔断；
+    // 网络失败/地区模式下拿不到地区（None）不熔断，沿用 v1 防误杀语义。
     // 暂停窗口内跳过熔断（检查与日志照常，恢复通过时隔离照常解除）。
-    let mismatch = matches!(&out.egress_ip, Some(ip) if *ip != cfg.required_ip);
+    let (_, mismatch) = checks::match_egress(
+        &cfg,
+        out.egress_ip.as_deref(),
+        out.egress_country.as_deref(),
+    );
     let already = sh.tripped.lock().unwrap().is_some();
     if !out.passed && mismatch {
         if pause_active(sh) {

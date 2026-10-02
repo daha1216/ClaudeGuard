@@ -401,6 +401,24 @@ body.compact .card { border-radius: 20px; padding: 12px; }
 .text-input:focus { border-color: var(--blue); }
 .text-input.invalid { border-color: var(--red); }
 
+/* 下拉（出口地区）：系统原生控件，宽度自适应选项 */
+.select-input { width: auto; min-width: 96px; font-family: inherit; padding-right: 4px; cursor: pointer; }
+
+/* 约定 IP 列表编辑器（settings）：每行一个 IP + 删除钮，底部"添加 IP"行 */
+.ip-list-ctl { gap: 6px; }
+.ip-row { display: flex; gap: 6px; align-items: center; }
+.ip-del {
+  width: 24px; height: 24px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  border: none; background: transparent; border-radius: 6px;
+  color: var(--txt2); font-size: 16px; line-height: 1; cursor: pointer;
+  transition: background-color var(--t-press) var(--ease-out), color var(--t-press) var(--ease-out);
+}
+@media (hover: hover) and (pointer: fine) {
+  .ip-del:hover { background: var(--cap-hover); color: var(--txt); }
+}
+.ip-del:active { transform: scale(0.94); }
+
 /* 开关（v1 ios_toggle 50x30；knob 用 transform 不做 layout） */
 .toggle {
   width: 50px; height: 30px; border-radius: 15px;
