@@ -341,10 +341,9 @@ function renderCta() {
     btn.textContent = "重新检查";
   }
   const lastOk = S.last && S.last.passed && !S.tripped;
-  sec.innerHTML = lastOk ? `<a href="#" id="cta-recheck" class="inline-link">重新检查</a>` : "";
+  sec.innerHTML = lastOk ? `<button id="cta-recheck" class="btn-outline">重新检查</button>` : "";
   if (lastOk) {
-    $("cta-recheck").onclick = (e) => {
-      e.preventDefault();
+    $("cta-recheck").onclick = () => {
       invoke(CMD.recheck);
     };
   }
@@ -383,7 +382,7 @@ function renderDetails() {
       </div>`;
     })
     .join("");
-  body.innerHTML = rows;
+  body.innerHTML = `<div class="steps">${rows}</div>`;
 }
 
 /* ===== 设置卡 ===== */
@@ -544,7 +543,15 @@ function settingRow(title, control) {
 function renderLog() {
   const el = $("log-body");
   if (!el) return;
-  const html = `<div id="log-scroll">${S.logs.slice(-30).map((l) => `<div>${esc(l)}</div>`).join("")}</div>`;
+  // 空状态：引导语而不是空白
+  if (!S.logs.length) {
+    if (el.dataset.sig !== "empty") {
+      el.dataset.sig = "empty";
+      el.innerHTML = `<div class="log-empty">还没有日志，检查开始后这里会显示记录</div>`;
+    }
+    return;
+  }
+  const html = `<div id="log-scroll">${S.logs.slice(-30).map(renderLogLine).join("")}</div>`;
   if (el.dataset.sig === html) return;
   el.dataset.sig = html;
   // 用户没往上翻时像 tail -f 一样钉在底部；翻了就别拽
@@ -557,10 +564,26 @@ function renderLog() {
   }
 }
 
+/* 时间戳弱化 + 结果关键词着色（都在 esc 之后做，不引入注入面） */
+function renderLogLine(l) {
+  let s = esc(l);
+  const m = /^(\d{1,2}:\d{2}:\d{2})\s/.exec(s);
+  let ts = "";
+  if (m) {
+    ts = `<span class="log-ts">${m[1]}</span>`;
+    s = s.slice(m[0].length);
+  }
+  s = s
+    .replace(/(passed=true|全部通过|已恢复|恢复守护|解除)/g, '<span class="log-ok">$1</span>')
+    .replace(/(passed=false|失败|错误|暂停|拦截|隔离|不一致)/g, '<span class="log-err">$1</span>');
+  return `<div>${ts}${s}</div>`;
+}
+
 /* ===== 底栏 ===== */
 function renderFooter() {
   $("footer-version").textContent = `ClaudeGuard v${S.version}`;
   $("link-install").classList.toggle("hidden", S.installed);
+  $("foot-sep-install").classList.toggle("hidden", S.installed);
 }
 
 async function doInstall() {
@@ -642,6 +665,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("btn-max").innerHTML = ICONS.maximize;
   $("btn-close").innerHTML = ICONS.close;
   document.querySelectorAll(".chevron").forEach((c) => (c.innerHTML = ICONS.chevron));
+  document.querySelectorAll(".wiz-icon").forEach((el) => (el.innerHTML = ICONS[el.dataset.icon] || ""));
   init().catch((e) => {
     document.body.innerHTML = `<div style="padding:24px;color:#E4002B;font-size:13px">加载失败：${esc(String(e))}</div>`;
   });

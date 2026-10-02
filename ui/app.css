@@ -123,8 +123,16 @@ a:focus-visible {
   padding-left: 14px;
   padding-right: 14px;
   padding-bottom: 14px;
-  scrollbar-width: thin;
-  scrollbar-color: var(--sep) transparent;
+}
+
+/* 滚动条：默认隐形，容器悬停时浮现细条（比常驻 thin 安静） */
+#content::-webkit-scrollbar, #log-scroll::-webkit-scrollbar { width: 8px; }
+#content::-webkit-scrollbar-thumb, #log-scroll::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 4px;
+}
+@media (hover: hover) and (pointer: fine) {
+  #content:hover::-webkit-scrollbar-thumb, #log-scroll:hover::-webkit-scrollbar-thumb { background: var(--sep); }
 }
 .screen { display: flex; flex-direction: column; min-height: 100%; min-width: 0; }
 
@@ -209,7 +217,29 @@ body.compact #ring-svg .ring-mark { stroke-width: 5.8; }
 }
 #cta:active, .capsule:active:not(:disabled) { transform: scale(0.97); }
 #cta:disabled, .capsule:disabled { background: var(--mist); color: var(--txt2); }
-#cta-secondary { text-align: center; margin-top: 8px; min-height: 18px; }
+#cta-secondary { display: flex; justify-content: center; align-items: center; margin-top: 8px; min-height: 36px; }
+
+/* 次级动作：描边胶囊（与主 CTA 同族但让位，不用文字链抢视觉） */
+.btn-outline {
+  height: 36px;
+  padding: 0 24px;
+  border: 1px solid var(--sep);
+  border-radius: 18px;
+  background: var(--card);
+  color: var(--txt);
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: default;
+  transition: border-color var(--t-press) var(--ease-out), transform var(--t-press) var(--ease-out);
+}
+@media (hover: hover) and (pointer: fine) {
+  .btn-outline:hover { border-color: var(--input-hover); }
+}
+.btn-outline:active { transform: scale(0.97); }
+
+/* 页脚分隔点 */
+.foot-sep { color: #C7C7CC; }
 
 .inline-link {
   color: var(--link);
@@ -237,7 +267,7 @@ body.compact .card { border-radius: 20px; padding: 12px; }
   min-height: 24px;
   cursor: default;
 }
-.card-head-title { font-size: 13px; font-weight: 500; color: var(--txt2); flex: 1; }
+.card-head-title { font-size: 14px; font-weight: 600; color: var(--txt); flex: 1; }
 .card-head-side { font-size: 12px; }
 .card-head-side.ok { color: var(--green-deep); }
 .card-head-side.bad { color: var(--txt2); }
@@ -263,13 +293,26 @@ body.compact .card { border-radius: 20px; padding: 12px; }
 
 .hairline { height: 1px; background: var(--sep); margin: 12px 0; }
 
-/* 检查详情 */
+/* 检查详情：步骤时间线（圆点间细连线表达 1→2→3 的先后） */
+.steps { position: relative; }
+.steps::before {
+  content: "";
+  position: absolute;
+  left: 9px; top: 12px; bottom: 12px;
+  width: 1px;
+  background: var(--mist);
+}
 .step-row {
   display: flex; align-items: center; gap: 10px;
-  padding: 4px 0 7px;
+  padding: 5px 6px 7px;
+  border-radius: 8px;
+}
+@media (hover: hover) and (pointer: fine) {
+  .step-row:hover { background: #FAFAFC; }
 }
 .step-dot {
   width: 7px; height: 7px; border-radius: 50%; flex: none;
+  box-shadow: 0 0 0 3px var(--card); /* 遮住背后的连线 */
   transition: background var(--t-drop) var(--ease-out); /* 数据刷新只动指示灯 */
 }
 .step-dot.pass { background: var(--green); }
@@ -279,8 +322,8 @@ body.compact .card { border-radius: 20px; padding: 12px; }
 .step-text { font-size: 12px; color: var(--txt2); text-align: right; max-width: 55%; word-break: break-all; }
 .details-empty { font-size: 12px; color: var(--txt2); }
 
-/* 设置卡 */
-.group-title { font-size: 15px; font-weight: 600; margin: 14px 0 2px; }
+/* 设置卡（组标题=小节标签，刻意小于卡头，避免层级倒挂） */
+.group-title { font-size: 12px; font-weight: 500; color: var(--txt2); letter-spacing: 0.01em; margin: 16px 0 2px; }
 .group-title:first-child { margin-top: 0; }
 .setting-row {
   display: grid;
@@ -348,7 +391,7 @@ body.compact .card { border-radius: 20px; padding: 12px; }
 }
 .progress-fill { height: 100%; background: var(--blue); transition: width 200ms linear; }
 
-/* 运行日志 */
+/* 运行日志：斑马纹 + 时间戳弱化 + 结果着色（排障时的扫描效率） */
 #log-scroll {
   max-height: 150px;
   overflow-y: auto;
@@ -361,7 +404,12 @@ body.compact .card { border-radius: 20px; padding: 12px; }
   user-select: text;
   cursor: text;
 }
-#log-scroll div { padding: 1px 0; }
+#log-scroll div { padding: 1px 4px; border-radius: 4px; }
+#log-scroll div:nth-child(even) { background: rgba(0, 0, 0, 0.025); }
+.log-ts { color: #A1A1A6; }
+.log-ok { color: var(--green-deep); }
+.log-err { color: var(--red); }
+.log-empty { font-family: inherit; font-size: 12px; color: var(--txt2); text-align: center; padding: 18px 0; }
 
 /* 底栏 */
 #footer {
@@ -377,7 +425,7 @@ body.compact .card { border-radius: 20px; padding: 12px; }
 .wiz-title { font-size: 21px; line-height: 1.3; font-weight: 600; letter-spacing: -0.02em; }
 .wiz-subtitle { font-size: 12px; color: var(--txt2); margin: 4px 0 12px; }
 .wiz-card { margin-top: 14px; margin-bottom: 6px; }
-.wiz-card-label { font-size: 13px; font-weight: 500; color: var(--txt2); margin-bottom: 10px; }
+.wiz-card-label { font-size: 12px; font-weight: 500; color: var(--txt2); margin-bottom: 10px; }
 .wiz-feature { display: flex; gap: 12px; align-items: flex-start; padding: 7px 0; }
 .wiz-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--blue); margin-top: 7px; flex: none; }
 .wiz-ft-title { font-size: 14px; font-weight: 500; }
@@ -408,7 +456,12 @@ body.compact .card { border-radius: 20px; padding: 12px; }
   .wiz-option:hover { border-color: var(--blue); box-shadow: 0 0 0 0.5px var(--blue); }
 }
 .wiz-option:active { transform: scale(0.98); }
-.wiz-radio { width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid var(--txt2); flex: none; }
+/* 向导选项：语义图标（点击即动作，不是选择态，故用图标而非 radio） */
+.wiz-icon { width: 20px; height: 20px; flex: none; color: var(--blue); }
+.wiz-icon.dim { color: var(--txt2); }
+@media (hover: hover) and (pointer: fine) {
+  .wiz-option:hover .wiz-icon.dim { color: var(--blue); }
+}
 .wiz-opt-title { display: block; font-size: 14px; color: var(--txt); }
 .wiz-opt-desc { display: block; font-size: 12px; color: var(--txt2); margin-top: 2px; }
 

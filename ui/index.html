@@ -63,7 +63,9 @@
 
       <div id="footer">
         <span id="footer-version">ClaudeGuard</span>
+        <span class="foot-sep" aria-hidden="true">·</span>
         <a href="#" id="link-data-folder" class="inline-link">打开数据文件夹</a>
+        <span class="foot-sep" id="foot-sep-install" aria-hidden="true">·</span>
         <a href="#" id="link-install" class="inline-link hidden">安装到电脑</a>
       </div>
     </div>
@@ -119,11 +121,11 @@
         <div class="wiz-title">最后一步</div>
         <div class="wiz-subtitle">要把它装进这台电脑吗？</div>
         <button id="wiz2-install" class="wiz-option">
-          <span class="wiz-radio"></span>
+          <span class="wiz-icon" data-icon="install"></span>
           <span><span class="wiz-opt-title">安装到这台电脑（推荐）</span><span class="wiz-opt-desc">放进程序列表，桌面建快捷方式，随时可卸载</span></span>
         </button>
         <button id="wiz2-portable" class="wiz-option">
-          <span class="wiz-radio"></span>
+          <span class="wiz-icon dim" data-icon="portable"></span>
           <span><span class="wiz-opt-title">直接用，不安装</span><span class="wiz-opt-desc">这次打开就当便携版用，不影响功能</span></span>
         </button>
         <div><a href="#" id="wiz2-prev" class="inline-link">上一步</a></div>
