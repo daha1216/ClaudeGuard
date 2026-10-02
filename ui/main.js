@@ -30,7 +30,8 @@ const S = {
   logs: [],
   notice: null,        // {title, desc} 4 秒自动清
   lastAt: 0,           // 最近一次检查完成的本地时刻（相对时间用）
-  claudeRunning: false, // Claude 桌面端进程状态（快照字段）
+  agentsRunning: [],    // 守护范围内在跑的 GUI agent 显示名（快照字段）
+  cliRunning: [],       // 在跑的 CLI agent 显示名（快照字段，只提醒）
   wizPage: 0,
   wizPort: "",
   wizIp: "",
@@ -132,12 +133,13 @@ async function init() {
     Object.assign(S, e.payload);
     if (!S.checking && S.last) S.lastAt = Date.now();
     if (!wasTripped && S.tripped) {
+      const names = trippedNames();
       notify(
-        "Claude 守护器：已暂停 Claude",
-        `${(S.last && S.last.reason) || "出口 IP 与约定不一致"}。切回节点后自动恢复。`,
+        `Claude 守护器：已暂停 ${names}`,
+        `${(S.last && S.last.reason) || "出口与约定不一致"}。切回节点后自动恢复。`,
       );
     } else if (wasTripped && !S.tripped && S.last && S.last.passed) {
-      notify("Claude 守护器：已恢复守护", "出口校验通过，可以正常使用 Claude 了。");
+      notify("Claude 守护器：已恢复守护", "出口校验通过，可以正常使用了。");
     }
     render();
   });  listen(EV.log, (e) => {
@@ -295,21 +297,24 @@ function renderStatusLine() {
   let cls = "green";
   let s = "";
   const paused = S.pauseUntil && S.pauseUntil > Date.now() / 1000;
-  // Claude 桌面端状态段：每分支都带上（运行中/未运行），随检查周期刷新
-  const claude = `Claude ${S.claudeRunning ? "运行中" : "未运行"}`;
+  // 守护对象进程段：每个分支都带上；CLI 在跑时单独追加提醒段
+  const agents = S.agentsRunning.length
+    ? `${S.agentsRunning.join("、")} 运行中`
+    : "守护对象未运行";
+  const cli = S.cliRunning.length ? ` · CLI ${S.cliRunning.join("、")} 运行中` : "";
   if (S.checking && S.manual) {
     cls = "blue";
-    s = `正在检查… · ${claude}`;
+    s = `正在检查… · ${agents}${cli}`;
   } else if (S.tripped) {
     cls = "red";
-    s = `已熔断 · 切回节点后自动恢复 · ${claude}`;
+    s = `已熔断 · 切回节点后自动恢复 · ${agents}${cli}`;
   } else if (paused) {
     cls = "orange";
     const t = new Date(S.pauseUntil * 1000);
-    s = `已暂停 · ${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")} 自动恢复 · ${claude}`;
+    s = `已暂停 · ${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")} 自动恢复 · ${agents}${cli}`;
   } else {
     const iv = S.cfg && S.cfg.check_interval_secs ? S.cfg.check_interval_secs : 30;
-    s = `自动守护中 · 每 ${iv} 秒检查 · ${claude}` + (S.lastAt ? ` · 上次 ${relTime(S.lastAt)}` : "");
+    s = `自动守护中 · 每 ${iv} 秒检查 · ${agents}${cli}` + (S.lastAt ? ` · 上次 ${relTime(S.lastAt)}` : "");
   }
   dot.className = `status-dot ${cls}`;
   if (txt.textContent !== s) txt.textContent = s;
@@ -323,7 +328,8 @@ function heroState() {
     return { ring: "spin", title: "正在检查…", sub: "正在核对代理和出口 IP" };
   if (S.tripped) {
     const reason = S.last && S.last.reason ? S.last.reason : "出口 IP 与约定不一致";
-    return { ring: "fail", title: "已暂停 Claude", sub: `${reason} · 切回节点后自动恢复` };
+    const names = trippedNames();
+    return { ring: "fail", title: `已暂停 ${names}`, sub: `${reason} · 切回节点后自动恢复` };
   }
   if (S.last && S.last.passed) {
     const ip = S.last.egress_ip || "-";
@@ -336,6 +342,12 @@ function heroState() {
 
 let prevRing = ""; // 状态没变就不重画环（自旋动画不重置、对勾不重播）
 let firstHero = true; // 首帧交给进场编排，副标题不做淡换
+
+// 熔断时涉及的 agent 显示名：优先用后端给的名单，兜底"守护对象"
+function trippedNames() {
+  const a = (S.tripped && S.tripped.agents) || [];
+  return a.length ? a.join("、") : "守护对象";
+}
 
 // 签名转场：自旋减速收拢成满环——弧长 30%→100% + 旋转对齐到整圈，对勾延迟 240ms 描画
 function settleRing(g, wasSpin) {
@@ -437,15 +449,17 @@ function renderBanners() {
     html += `<div class="banner orange"><span class="banner-dot"></span><div>
       <div class="banner-title">需要管理员权限</div><div class="banner-desc">${esc(desc)}</div></div></div>`;
   } else if (S.tripped) {
+    const names = trippedNames();
     html += `<div class="banner red"><span class="banner-dot"></span><div>
-      <div class="banner-title">Claude 已被暂停</div>
-      <div class="banner-desc">出口 IP 和约定不一致：已结束 Claude 的进程，并断开了它的网络。切回正确节点后会自动恢复。</div></div></div>`;
+      <div class="banner-title">${esc(names)} 已被暂停</div>
+      <div class="banner-desc">出口和约定不一致：已结束 ${esc(names)} 的进程，并断开了它的网络。切回正确节点后会自动恢复。</div>
+      ${S.cliRunning.length ? `<div class="banner-desc">CLI（${esc(S.cliRunning.join("、"))}）不会自动结束，请自行关闭。</div>` : ""}</div></div>`;
   } else if (S.pauseUntil && S.pauseUntil > Date.now() / 1000) {
     const t = new Date(S.pauseUntil * 1000);
     const hm = `${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")}`;
     html += `<div class="banner orange"><span class="banner-dot"></span><div>
       <div class="banner-title">守护已暂停 · ${hm} 自动恢复</div>
-      <div class="banner-desc">检查照常进行，但暂停期间不会结束 Claude 进程或断网。可在托盘菜单提前恢复。</div></div></div>`;
+      <div class="banner-desc">检查照常进行，但暂停期间不会结束守护对象的进程或断网。可在托盘菜单提前恢复。</div></div></div>`;
   } else if (S.last && !S.last.passed && !S.checking && S.last.egress_ip == null) {
     html += `<div class="banner orange"><span class="banner-dot"></span><div>
       <div class="banner-title">暂时没法确认网络</div>
@@ -570,8 +584,13 @@ function renderSettings() {
     <div class="hairline"></div>
     ${settingInput("set-interval", "检查间隔", "每隔几秒复查一次（秒）", String(cfg.check_interval_secs), "text")}
     <div class="group-title">发现出口不对时</div>
-    ${settingToggle("set-kill", "停掉 Claude", "立刻结束 Claude 的所有进程", cfg.kill_on_fail)}
-    ${settingToggle("set-quarantine", "断开它的网络", "用防火墙拦住 Claude 联网，恢复后自动解除", cfg.quarantine_on_fail)}
+    ${settingToggle("set-kill", "停掉守护对象", "立刻结束勾选应用的所有进程", cfg.kill_on_fail)}
+    ${settingToggle("set-quarantine", "断开它的网络", "用防火墙拦住这些应用联网，恢复后自动解除", cfg.quarantine_on_fail)}
+    <div class="group-title">守护对象</div>
+    ${agentToggle("set-guard-claude", "Claude 桌面版", "claude")}
+    ${agentToggle("set-guard-chatgpt", "ChatGPT 桌面版", "chatgpt")}
+    ${agentToggle("set-guard-antigravity", "反重力桌面版", "antigravity")}
+    ${settingToggle("set-cliwarn", "CLI 只提醒不处理", "检测到 Claude Code / Codex / Gemini CLI 时在日志和横幅里提醒", cfg.cli_warn)}
     <div class="group-title">通用</div>
     ${settingToggle("set-tray", "关窗后驻留托盘", "守护继续在后台运行", cfg.close_to_tray)}
     ${settingToggle("set-autostart", "开机自启", S.installed ? "开机后自动在托盘里默默守护" : "安装之后才能开启", cfg.auto_start_with_system, !S.installed)}
@@ -593,6 +612,10 @@ function renderSettings() {
   });
   wireSettingToggle("set-kill", "kill_on_fail");
   wireSettingToggle("set-quarantine", "quarantine_on_fail");
+  wireSettingToggle("set-cliwarn", "cli_warn");
+  wireAgentToggle("set-guard-claude", "claude");
+  wireAgentToggle("set-guard-chatgpt", "chatgpt");
+  wireAgentToggle("set-guard-antigravity", "antigravity");
   wireSettingToggle("set-tray", "close_to_tray");
   wireAutostart();
   renderUpdateGroup();
@@ -615,6 +638,39 @@ function settingToggle(id, title, desc, on, disabled = false) {
       <button id="${id}" class="toggle ${on ? "on" : ""}" ${disabled ? "disabled" : ""}><span class="knob"></span></button>
     </div>
   </div>`;
+}
+
+/* 守护对象勾选：开关写进 guarded_agents 列表 */
+function agentToggle(id, title, agentId) {
+  const on = (S.cfg.guarded_agents || []).includes(agentId);
+  const desc = {
+    claude: "Anthropic Claude 桌面端",
+    chatgpt: "OpenAI ChatGPT 桌面端",
+    antigravity: "Antigravity / 反重力桌面端",
+  }[agentId];
+  return settingToggle(id, title, desc, on);
+}
+
+function wireAgentToggle(id, agentId) {
+  const el = $(id);
+  if (!el) return;
+  el.onclick = async () => {
+    const cfg = S.cfg;
+    if (!cfg) return;
+    const list = new Set(cfg.guarded_agents || []);
+    if (list.has(agentId)) list.delete(agentId);
+    else list.add(agentId);
+    const next = [...list];
+    cfg.guarded_agents = next;
+    await invoke(CMD.setConfig, { cfg });
+    el.classList.toggle("on", list.has(agentId));
+    if (!next.length && !(cfg.egress_region || "").trim()) {
+      // 全关且没配地区 = 没有守护对象。用户显式行为，允许，但提醒一句后果。
+      showNotice("已全部关闭", "没有守护对象时，检查仍在，但不会结束任何进程。");
+    } else {
+      showNotice("完成", "已保存");
+    }
+  };
 }
 
 /* 约定出口 IP 列表：每行一个可编辑 IP（× 删除），底部一格"添加 IP" */

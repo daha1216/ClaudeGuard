@@ -56,8 +56,10 @@ pub struct StatusSnapshot {
     pub pause_until: Option<i64>,
     /// 正在进行的检查是否用户触发（前端只在手动检查时转圈/禁按钮）。
     pub manual: bool,
-    /// Claude 桌面端当前是否在运行（状态行展示；与 kill_claude 同一匹配口径）
-    pub claude_running: bool,
+    /// 守护范围内正在运行的 GUI agent 显示名（状态行用；与 kill 同一匹配口径）
+    pub agents_running: Vec<String>,
+    /// 正在运行的 CLI agent 显示名（Claude Code/Codex/Gemini CLI——只提醒不杀）
+    pub cli_running: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -65,6 +67,8 @@ pub struct TripSnap {
     pub killed: usize,
     pub firewall_rules: usize,
     pub quarantined: bool,
+    /// 本次熔断涉及的 agent 显示名
+    pub agents: Vec<String>,
 }
 
 impl From<&TripResult> for TripSnap {
@@ -73,6 +77,7 @@ impl From<&TripResult> for TripSnap {
             killed: t.killed,
             firewall_rules: t.firewall_rules,
             quarantined: t.quarantined,
+            agents: t.agents.clone(),
         }
     }
 }
@@ -139,6 +144,8 @@ impl Shared {
         installed: bool,
         smoke_settings: bool,
     ) -> StatusSnapshot {
+        let cfg = self.cfg.lock().unwrap();
+        let scan = guard::scan_agents();
         StatusSnapshot {
             checking: self.busy.load(Ordering::SeqCst),
             last: self.last.lock().unwrap().clone(),
@@ -149,7 +156,30 @@ impl Shared {
             smoke_settings,
             pause_until: *self.pause_until.lock().unwrap(),
             manual: self.manual.load(Ordering::SeqCst),
-            claude_running: guard::claude_running(),
+            agents_running: scan
+                .gui
+                .iter()
+                .filter(|(a, _)| cfg.guarded_agents.iter().any(|id| id == a.id))
+                .map(|(a, n)| {
+                    if *n > 1 {
+                        format!("{}×{}", a.name, n)
+                    } else {
+                        a.name.to_string()
+                    }
+                })
+                .collect(),
+            cli_running: scan
+                .cli
+                .iter()
+                .map(|(id, n)| {
+                    let name = guard::cli_agent_name(id);
+                    if *n > 1 {
+                        format!("{name}×{n}")
+                    } else {
+                        name.to_string()
+                    }
+                })
+                .collect(),
         }
     }
 }
@@ -174,7 +204,7 @@ pub fn pause_active(sh: &Shared) -> bool {
 pub fn set_pause(sh: &Arc<Shared>, until: Option<i64>) {
     *sh.pause_until.lock().unwrap() = until;
     match until {
-        Some(_) => sh.log("守护已暂停 30 分钟：检查照常，但不会结束 Claude 进程或断网"),
+        Some(_) => sh.log("守护已暂停 30 分钟：检查照常，但不会结束守护对象的进程或断网"),
         None => sh.log("已恢复守护（暂停结束或手动恢复）"),
     }
     sh.emit(EV_STATUS, sh_full_snapshot(sh));
@@ -221,9 +251,9 @@ pub fn run_check(sh: &Arc<Shared>, purpose: Purpose) {
         if pause_active(sh) {
             sh.log("守护已暂停：本次跳过熔断");
         } else if already {
-            let killed = guard::kill_claude();
+            let killed = guard::kill_agents(&cfg);
             if killed > 0 {
-                sh.log(format!("持续异常：再次结束 {killed} 个 Claude 进程"));
+                sh.log(format!("持续异常：再次结束 {killed} 个守护对象进程"));
             }
         } else {
             let res = guard::trip(&cfg, &out.reason);
@@ -232,6 +262,21 @@ pub fn run_check(sh: &Arc<Shared>, purpose: Purpose) {
                 res.killed, res.firewall_rules
             ));
             *sh.tripped.lock().unwrap() = Some(res);
+        }
+        // CLI 提醒（只在新熔断时提醒一次，避免每个检查周期刷屏）：
+        // CLI 跑在终端/node 宿主里，绝不自动结束——出口不对时只能用户自己关。
+        if !already && cfg.cli_warn {
+            let cli = guard::scan_agents().cli;
+            if !cli.is_empty() {
+                let names = cli
+                    .iter()
+                    .map(|(id, _)| guard::cli_agent_name(id))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                sh.log(format!(
+                    "CLI 提醒：{names} 正在运行但出口不一致；CLI 不会自动结束，请自行关闭"
+                ));
+            }
         }
     }
 

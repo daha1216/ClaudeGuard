@@ -17,6 +17,15 @@ pub struct Config {
     /// 兼容字段：v1~v2.5 的单值 required_ip。仅用于读取迁移，不再写出。
     #[serde(default, skip_serializing)]
     pub required_ip: Option<String>,
+    /// 守护对象（v2.7 起）：GUI agent id 列表，命中熔断条件时查杀 + 断网隔离。
+    /// 可选值见 guard::GUI_AGENTS（claude / chatgpt / antigravity）。
+    /// 默认只守 Claude（老用户行为不变）；空列表 = 什么都不杀（用户显式选择）。
+    #[serde(default = "default_guarded_agents")]
+    pub guarded_agents: Vec<String>,
+    /// CLI agent 告警（Claude Code / Codex / Gemini CLI）：只检测 + 提醒，绝不杀进程。
+    /// CLI 跑在 node/终端宿主里，按 exe 查杀会误伤终端和前端项目，防火墙也无 exe 粒度可拦。
+    #[serde(default = "default_true")]
+    pub cli_warn: bool,
     pub connect_target: String,
     /// AppUserModelId of the Claude UWP app
     pub app_id: String,
@@ -40,6 +49,8 @@ impl Default for Config {
             allowed_ips: Vec::new(),
             egress_region: String::new(),
             required_ip: None,
+            guarded_agents: default_guarded_agents(),
+            cli_warn: true,
             connect_target: "api.anthropic.com:443".into(),
             app_id: "Claude_pzs8sxrjxfjjc!Claude".into(),
             check_interval_secs: 15,
@@ -56,6 +67,14 @@ impl Default for Config {
 pub fn config_dir() -> PathBuf {
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
     PathBuf::from(base).join("ClaudeGuard")
+}
+
+fn default_guarded_agents() -> Vec<String> {
+    vec!["claude".into()]
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 pub fn config_path() -> PathBuf {
@@ -116,6 +135,30 @@ impl Config {
             changed = true;
         }
         self.egress_region = self.egress_region.trim().to_string();
+        // v2.7：守护对象列表清洗——去空白/去重/剔除未知 id（registry 变更后老配置不残留死 id）。
+        let known = crate::guard::gui_agent_ids();
+        let raw = self.guarded_agents.clone();
+        let mut cleaned: Vec<String> = Vec::new();
+        for id in &raw {
+            let id = id.trim().to_lowercase();
+            if known.contains(&id.as_str()) && !cleaned.iter().any(|x| x == &id) {
+                cleaned.push(id);
+            }
+        }
+        // raw 全是未知 id 被清光 → 回填 claude（保守护，不静默裸奔）；
+        // raw 本来就是空（用户显式清空）→ 尊重用户选择，什么都不杀。
+        if cleaned.is_empty() && !raw.is_empty() {
+            cleaned = default_guarded_agents();
+        }
+        let same = cleaned.len() == raw.len()
+            && cleaned
+                .iter()
+                .zip(raw.iter())
+                .all(|(a, b)| *a == b.trim().to_lowercase());
+        if !same {
+            self.guarded_agents = cleaned;
+            changed = true;
+        }
         changed
     }
 
@@ -143,6 +186,8 @@ mod tests {
             allowed_ips: vec!["203.0.113.10".into(), "198.51.100.7".into()],
             egress_region: "US".into(),
             required_ip: None,
+            guarded_agents: vec!["claude".into(), "chatgpt".into()],
+            cli_warn: false,
             connect_target: "api.anthropic.com:443".into(),
             app_id: "Claude_pzs8sxrjxfjjc!Claude".into(),
             check_interval_secs: 15,
@@ -159,6 +204,8 @@ mod tests {
         let back: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(back.allowed_ips, vec!["203.0.113.10", "198.51.100.7"]);
         assert_eq!(back.egress_region, "US");
+        assert_eq!(back.guarded_agents, vec!["claude", "chatgpt"]);
+        assert!(!back.cli_warn);
         assert_eq!(back.proxy_port, 7890);
         assert_eq!(back.check_interval_secs, 15);
     }
@@ -199,5 +246,26 @@ mod tests {
         ];
         assert!(cfg.migrate());
         assert_eq!(cfg.allowed_ips, vec!["1.2.3.4", "5.6.7.8"]);
+    }
+
+    /// 行为锁: v2.7 守护对象——默认只守 Claude；未知 id 清理但全垃圾时回填 claude；
+    /// 用户显式清空（合法状态）不被回填。
+    #[test]
+    fn migrate_guarded_agents() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.guarded_agents, vec!["claude"]);
+        assert!(cfg.cli_warn);
+        // 未知 id + 大小写/空白 → 清洗成合法集
+        cfg.guarded_agents = vec![" Claude ".into(), "bogus".into(), "ChatGPT".into()];
+        assert!(cfg.migrate());
+        assert_eq!(cfg.guarded_agents, vec!["claude", "chatgpt"]);
+        // 全垃圾 → 回填 claude（不静默裸奔）
+        cfg.guarded_agents = vec!["nope".into()];
+        assert!(cfg.migrate());
+        assert_eq!(cfg.guarded_agents, vec!["claude"]);
+        // 显式清空 → 尊重用户
+        cfg.guarded_agents = Vec::new();
+        assert!(!cfg.migrate(), "清空是合法状态，不回填");
+        assert!(cfg.guarded_agents.is_empty());
     }
 }
