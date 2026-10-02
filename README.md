@@ -25,6 +25,22 @@ ClaudeGuard 是专为 Windows 10/11 设计的 AI 应用网络出口门禁：只�
 
 ---
 
+## 界面预览
+
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshot-main.png" alt="主界面：一切正常态" width="400" /><br><sub>主界面 · 检查通过，出口已锁定</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshot-settings.png" alt="设置卡展开态" width="400" /><br><sub>设置 · 端口、多 IP 与出口地区</sub></td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="assets/screenshot-guide.png" alt="内置用户指南" width="400" /><br>
+  <sub>内置用户指南 · 随开随查</sub>
+</p>
+
+---
+
 ## 功能亮点
 
 - **启动闸门校验**：启动时执行三步串行校验（系统代理配置 → 代理握手 → 出口 IP），全部通过才放行目标应用启动。
