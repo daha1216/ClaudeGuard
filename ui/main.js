@@ -29,6 +29,7 @@ const S = {
   upd: { state: "idle" },
   logs: [],
   notice: null,        // {title, desc} 4 秒自动清
+  lastAt: 0,           // 最近一次检查完成的本地时刻（相对时间用）
   wizPage: 0,
   wizPort: "",
   wizIp: "",
@@ -59,6 +60,27 @@ function plainReason(reason) {
   return r;
 }
 
+/* ===== 相对时间（详情卡"X 秒前"） ===== */
+function relTime(t) {
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 5) return "刚刚";
+  if (s < 60) return `${s} 秒前`;
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
+  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
+  return `${Math.floor(s / 86400)} 天前`;
+}
+
+/* ===== 系统通知（熔断/恢复气泡；权限已授予才发） ===== */
+function notify(title, body) {
+  try {
+    if ("Notification" in window && Notification.permission === "granted") {
+      new Notification(title, { body, tag: "claudeguard" });
+    }
+  } catch (_) {
+    /* WebView2 环境异常时静默降级 */
+  }
+}
+
 /* ===== 启动 ===== */
 async function init() {
   const [st, cfg, upd, logs] = await Promise.all([
@@ -73,10 +95,21 @@ async function init() {
   S.logs = logs;
   S.wizPort = String(cfg.proxy_port ?? "");
   S.wizIp = cfg.required_ip ?? "";
+  if (!S.checking && S.last) S.lastAt = Date.now();
   if (S.smokeSettings) S.openCards.settings = true;
 
   listen(EV.status, (e) => {
+    const wasTripped = !!S.tripped;
     Object.assign(S, e.payload);
+    if (!S.checking && S.last) S.lastAt = Date.now();
+    if (!wasTripped && S.tripped) {
+      notify(
+        "Claude 守护器：已暂停 Claude",
+        `${(S.last && S.last.reason) || "出口 IP 与约定不一致"}。切回节点后自动恢复。`,
+      );
+    } else if (wasTripped && !S.tripped && S.last && S.last.passed) {
+      notify("Claude 守护器：已恢复守护", "出口校验通过，可以正常使用 Claude 了。");
+    }
     render();
   });  listen(EV.log, (e) => {
     S.logs.push(e.payload);
@@ -91,6 +124,22 @@ async function init() {
   wireStatic();
   render();
   playBoot();
+  // 相对时间心跳：只改文本节点，不触发整卡重渲（避免打断日志 tail-f 等局部状态）。
+  setInterval(() => {
+    if (!S.lastAt) return;
+    const el = document.querySelector("#details-state .rel");
+    if (el) el.textContent = `· ${relTime(S.lastAt)}`;
+  }, 5000);
+  // 通知权限只在用户首次交互时问一次（避免一上来就弹权限条）。
+  document.addEventListener(
+    "click",
+    () => {
+      if ("Notification" in window && Notification.permission === "default") {
+        Notification.requestPermission().catch(() => {});
+      }
+    },
+    { once: true },
+  );
   if (S.smokeSettings) {
     // 手风琴展开(280ms)完成后再滚到底，否则内容长高后停在中途
     setTimeout(() => {
@@ -311,7 +360,7 @@ function staggerIn(key) {
   inner.classList.add("dealing");
 }
 
-/* ===== 横幅（优先级：notice > 非管理员 > tripped > 网络不明） ===== */
+/* ===== 横幅（优先级：notice > 非管理员 > tripped > 暂停中 > 网络不明） ===== */
 function renderBanners() {
   const z = $("banner-zone");
   let html = "";
@@ -329,6 +378,12 @@ function renderBanners() {
     html += `<div class="banner red"><span class="banner-dot"></span><div>
       <div class="banner-title">Claude 已被暂停</div>
       <div class="banner-desc">出口 IP 和约定不一致：已结束 Claude 的进程，并断开了它的网络。切回正确节点后会自动恢复。</div></div></div>`;
+  } else if (S.pauseUntil && S.pauseUntil > Date.now() / 1000) {
+    const t = new Date(S.pauseUntil * 1000);
+    const hm = `${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")}`;
+    html += `<div class="banner orange"><span class="banner-dot"></span><div>
+      <div class="banner-title">守护已暂停 · ${hm} 自动恢复</div>
+      <div class="banner-desc">检查照常进行，但暂停期间不会结束 Claude 进程或断网。可在托盘菜单提前恢复。</div></div></div>`;
   } else if (S.last && !S.last.passed && !S.checking && S.last.egress_ip == null) {
     html += `<div class="banner orange"><span class="banner-dot"></span><div>
       <div class="banner-title">暂时没法确认网络</div>
@@ -388,9 +443,12 @@ function renderCta() {
     btn.textContent = "重新检查";
   }
   const lastOk = S.last && S.last.passed && !S.tripped;
-  sec.innerHTML = lastOk ? `<button id="cta-recheck" class="btn-outline">重新检查</button>` : "";
+  sec.innerHTML = lastOk
+    ? `<button id="cta-recheck" class="btn-outline"${S.checking ? " disabled" : ""}>${S.checking ? "正在检查…" : "重新检查"}</button>`
+    : "";
   if (lastOk) {
     $("cta-recheck").onclick = () => {
+      if (S.checking) return;
       invoke(CMD.recheck);
     };
   }
@@ -406,11 +464,12 @@ function renderDetails() {
     body.innerHTML = `<div class="details-empty">还没有结果，稍等片刻…</div>`;
     return;
   }
+  const rel = S.lastAt ? ` <span class="rel">· ${relTime(S.lastAt)}</span>` : "";
   if (S.last.passed) {
-    side.textContent = "全部通过";
+    side.innerHTML = `全部通过${rel}`;
     side.className = "card-head-side ok";
   } else {
-    side.textContent = "有问题";
+    side.innerHTML = `有问题${rel}`;
     side.className = "card-head-side bad";
   }
   // Rust StepState 枚举序列化为 "Pass"/"Fail"/"Skip"（v1 --check JSON 格式，保持不动），

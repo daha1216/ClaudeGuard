@@ -219,14 +219,21 @@ fn run_gui(start_hidden: bool) {
                 }
             });
 
-            // 托盘（v1 菜单四项同 id 同文案；左键显示+聚焦）。
+            // 托盘（v1 菜单同 id 同文案 + 暂停守护/数据目录；左键显示+聚焦）。
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
             let m_show = MenuItem::with_id(app, "cg_show", "显示主窗口", true, None::<&str>)?;
             let m_recheck = MenuItem::with_id(app, "cg_recheck", "立即检测", true, None::<&str>)?;
+            let m_pause =
+                MenuItem::with_id(app, "cg_pause", "暂停守护 30 分钟", true, None::<&str>)?;
             let m_release = MenuItem::with_id(app, "cg_release", "解除隔离", true, None::<&str>)?;
+            let m_data = MenuItem::with_id(app, "cg_data", "打开数据文件夹", true, None::<&str>)?;
             let m_quit = MenuItem::with_id(app, "cg_quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&m_show, &m_recheck, &m_release, &m_quit])?;
+            let menu = Menu::with_items(
+                app,
+                &[&m_show, &m_recheck, &m_pause, &m_release, &m_data, &m_quit],
+            )?;
+            let m_pause_for_menu = m_pause.clone();
             TrayIconBuilder::with_id("main")
                 .icon(icon)
                 .tooltip("Claude 守护器")
@@ -240,7 +247,26 @@ fn run_gui(start_hidden: bool) {
                         }
                     }
                     "cg_recheck" => monitor::spawn_check(&sh_for_tray, monitor::Purpose::Manual),
+                    "cg_pause" => {
+                        // 30 分钟暂停 ⇄ 恢复：菜单文案同步翻转（临时关代理改配置的场景）。
+                        if monitor::pause_active(&sh_for_tray) {
+                            let _ = m_pause_for_menu.set_text("暂停守护 30 分钟");
+                            monitor::set_pause(&sh_for_tray, None);
+                        } else {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            let _ = m_pause_for_menu.set_text("恢复守护");
+                            monitor::set_pause(&sh_for_tray, Some(now + 1800));
+                        }
+                    }
                     "cg_release" => monitor::release_now(&sh_for_tray),
+                    "cg_data" => {
+                        let _ = std::process::Command::new("explorer.exe")
+                            .arg(config::config_dir())
+                            .spawn();
+                    }
                     "cg_quit" => {
                         sh_for_tray.stop.store(true, Ordering::SeqCst);
                         handle.exit(0);

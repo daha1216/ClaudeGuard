@@ -52,6 +52,8 @@ pub struct StatusSnapshot {
     pub installed: bool,
     pub version: &'static str,
     pub smoke_settings: bool,
+    /// 守护暂停截止（unix 秒）：暂停期间检查照常但跳过熔断。托盘"暂停守护 30 分钟"设置。
+    pub pause_until: Option<i64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -76,6 +78,7 @@ pub struct Shared {
     pub cfg: Arc<Mutex<Config>>,
     pub last: Arc<Mutex<Option<CheckOutcome>>>,
     pub tripped: Arc<Mutex<Option<TripResult>>>,
+    pub pause_until: Arc<Mutex<Option<i64>>>,
     pub busy: Arc<AtomicBool>,
     pub stop: Arc<AtomicBool>,
     pub loglines: Arc<Mutex<Vec<String>>>,
@@ -89,6 +92,7 @@ impl Shared {
             cfg: Arc::new(Mutex::new(cfg)),
             last: Arc::new(Mutex::new(None)),
             tripped: Arc::new(Mutex::new(None)),
+            pause_until: Arc::new(Mutex::new(None)),
             busy: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),
             loglines: Arc::new(Mutex::new(Vec::new())),
@@ -136,8 +140,35 @@ impl Shared {
             installed,
             version: update::current_version(),
             smoke_settings,
+            pause_until: *self.pause_until.lock().unwrap(),
         }
     }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 守护是否处于暂停窗口内（托盘"暂停守护 30 分钟"）。
+pub fn pause_active(sh: &Shared) -> bool {
+    sh.pause_until
+        .lock()
+        .unwrap()
+        .map(|t| t > now_secs())
+        .unwrap_or(false)
+}
+
+/// 设置/清除暂停。None = 立即恢复守护。UI 侧自行把 pause_until 格式化成本地时间。
+pub fn set_pause(sh: &Arc<Shared>, until: Option<i64>) {
+    *sh.pause_until.lock().unwrap() = until;
+    match until {
+        Some(_) => sh.log("守护已暂停 30 分钟：检查照常，但不会结束 Claude 进程或断网"),
+        None => sh.log("已恢复守护（暂停结束或手动恢复）"),
+    }
+    sh.emit(EV_STATUS, sh_full_snapshot(sh));
 }
 
 /// v1 run_check（app.rs:112-174）逐条对等：busy 防重入、熔断条件、重复熔断只杀不加规则、
@@ -164,10 +195,13 @@ pub fn run_check(sh: &Arc<Shared>, purpose: Purpose) {
     ));
 
     // 熔断条件（精确复刻）：拿到了出口 IP 且与约定不符才熔断；网络失败（None）不熔断，防误杀。
+    // 暂停窗口内跳过熔断（检查与日志照常，恢复通过时隔离照常解除）。
     let mismatch = matches!(&out.egress_ip, Some(ip) if *ip != cfg.required_ip);
     let already = sh.tripped.lock().unwrap().is_some();
     if !out.passed && mismatch {
-        if already {
+        if pause_active(sh) {
+            sh.log("守护已暂停：本次跳过熔断");
+        } else if already {
             let killed = guard::kill_claude();
             if killed > 0 {
                 sh.log(format!("持续异常：再次结束 {killed} 个 Claude 进程"));
@@ -345,4 +379,28 @@ pub fn sh_full_snapshot(sh: &Shared) -> StatusSnapshot {
         INSTALLED_FLAG.load(Ordering::SeqCst),
         smoke_settings(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sh() -> Arc<Shared> {
+        Arc::new(Shared::new(crate::config::Config::default()))
+    }
+
+    #[test]
+    fn pause_window_toggles() {
+        let s = sh();
+        assert!(!pause_active(&s), "默认未暂停");
+        let until = now_secs() + 1800;
+        set_pause(&s, Some(until));
+        assert!(pause_active(&s), "设置 30 分钟窗口后生效");
+        assert_eq!(*s.pause_until.lock().unwrap(), Some(until));
+        set_pause(&s, None);
+        assert!(!pause_active(&s), "手动清除立即恢复");
+        // 过期窗口视为已恢复
+        set_pause(&s, Some(now_secs() - 1));
+        assert!(!pause_active(&s), "过期暂停不算数");
+    }
 }

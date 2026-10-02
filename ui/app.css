@@ -290,6 +290,8 @@ body.compact .card { border-radius: 20px; padding: 12px; }
 .card-head-side { font-size: 12px; }
 .card-head-side.ok { color: var(--green-deep); }
 .card-head-side.bad { color: var(--txt2); }
+/* 相对时间（"· 3 分钟前"）：跟着状态色但弱一档 */
+.card-head-side .rel { opacity: 0.65; }
 .chevron { display: inline-flex; color: var(--txt2); }
 .chevron svg { width: 12px; height: 12px; transition: transform var(--t-drop) var(--ease-out); }
 .card.collapsible.open .chevron svg { transform: rotate(180deg); }
