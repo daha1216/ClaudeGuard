@@ -24,3 +24,4 @@ gen/
 smoke-v2.ps1
 shot-v2-*.png
 diag-cdp.mjs
+diag-v29*.mjs

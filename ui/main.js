@@ -1,5 +1,7 @@
 /* ClaudeGuard v2 前端主逻辑 — 对等依据 docs/PARITY-v2.md（文案/状态机以它为准）
- * IIFE 隔离词法作用域（见 ipc.js 头注：顶层 const 撞名会让整个脚本编译失败）。 */
+ * IIFE 隔离词法作用域（见 ipc.js 头注：顶层 const 撞名会让整个脚本编译失败）。
+ * v2.9：用户指南改为前端内置模态（guideOpen/guideClose，不再调 openGuide）；
+ *       日志新增行落位动画（.log-enter 配 app.css log-drop）。 */
 (() => {
 "use strict";
 
@@ -225,7 +227,7 @@ function wireStatic() {
   };
   $("link-guide").onclick = (e) => {
     e.preventDefault();
-    invoke(CMD.openGuide);
+    guideOpen();
   };
   $("link-install").onclick = (e) => {
     e.preventDefault();
@@ -921,7 +923,15 @@ function renderLog() {
     }
     return;
   }
-  const html = `<div id="log-scroll">${S.logs.slice(-30).map(renderLogLine).join("")}</div>`;
+  const shown = S.logs.slice(-30);
+  // 与上次相比真正新出现的尾部行才播落位动画（环形缓冲翻转时 count 变小，全部按新行处理）
+  let prevShown = 0;
+  if (typeof renderLog.prevShown === "number") prevShown = renderLog.prevShown;
+  renderLog.prevShown = shown.length;
+  const fresh = prevShown < shown.length ? shown.length - prevShown : shown.length;
+  const html = `<div id="log-scroll">${shown
+    .map((l, i) => renderLogLine(l, i >= shown.length - fresh))
+    .join("")}</div>`;
   if (el.dataset.sig === html) return;
   el.dataset.sig = html;
   // 用户没往上翻时像 tail -f 一样钉在底部；翻了就别拽
@@ -934,8 +944,8 @@ function renderLog() {
   }
 }
 
-/* 时间戳弱化 + 结果关键词着色（都在 esc 之后做，不引入注入面） */
-function renderLogLine(l) {
+/* 时间戳弱化 + 结果关键词着色（都在 esc 之后做，不引入注入面）；fresh=本次新增行，播落位 */
+function renderLogLine(l, fresh) {
   let s = esc(l);
   const m = /^(\d{1,2}:\d{2}:\d{2})\s/.exec(s);
   let ts = "";
@@ -946,7 +956,7 @@ function renderLogLine(l) {
   s = s
     .replace(/(passed=true|全部通过|已恢复|恢复守护|解除)/g, '<span class="log-ok">$1</span>')
     .replace(/(passed=false|失败|错误|暂停|拦截|隔离|不一致)/g, '<span class="log-err">$1</span>');
-  return `<div>${ts}${s}</div>`;
+  return `<div${fresh ? ' class="log-enter"' : ""}>${ts}${s}</div>`;
 }
 
 /* ===== 底栏 ===== */
@@ -965,6 +975,23 @@ async function doInstall() {
     showNotice("完成", `安装失败：${e}`);
   }
   renderFooter();
+}
+
+/* ===== 用户指南模态（纯前端；打开者焦点在关闭时归还） ===== */
+let guideOpener = null;
+function guideOpen() {
+  const g = $("guide");
+  if (!g || !g.classList.contains("hidden")) return;
+  guideOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  g.classList.remove("hidden");
+  $("guide-close").focus();
+}
+function guideClose() {
+  const g = $("guide");
+  if (!g || g.classList.contains("hidden")) return;
+  g.classList.add("hidden");
+  if (guideOpener && document.contains(guideOpener)) guideOpener.focus();
+  guideOpener = null;
 }
 
 /* ===== 向导 ===== */
@@ -1046,6 +1073,12 @@ window.addEventListener("DOMContentLoaded", () => {
   $("btn-close").innerHTML = ICONS.close;
   document.querySelectorAll(".chevron").forEach((c) => (c.innerHTML = ICONS.chevron));
   document.querySelectorAll(".wiz-icon").forEach((el) => (el.innerHTML = ICONS[el.dataset.icon] || ""));
+  document.querySelectorAll("#guide [data-icon]").forEach((el) => (el.innerHTML = ICONS[el.dataset.icon] || ""));
+  $("guide-close").onclick = guideClose;
+  $("guide-scrim").onclick = guideClose;
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") guideClose();
+  });
   init().catch((e) => {
     document.body.innerHTML = `<div style="padding:24px;color:#E4002B;font-size:13px">加载失败：${esc(String(e))}</div>`;
   });
