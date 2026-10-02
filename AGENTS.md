@@ -1,7 +1,7 @@
 # AGENTS.md — ClaudeGuard 维护者守则（人类与 AI 通用）
 
-> 本文件是所有维护者（包括 AI agent）的强制约定。CI 用 clippy/fmt/test 机械执法，
-> 本文件解释"为什么"。改代码前先读完；不确定就按本文件保守执行。
+> 本文件是所有维护者（包括 AI agent）的约定与经验记录。CI 只做编译冒烟
+> （build + 产物上传），不做格式/lint/测试红线。改代码前先读完；不确定就按本文件保守执行。
 
 ## 项目一句话
 
@@ -15,27 +15,13 @@ Windows 桌面守护器：校验本地代理出口 IP → 通过才放行 Claude
 | `src/main.rs` | CLI 入口 + tauri 建窗/托盘/标题回调/单实例 | 改窗口与托盘装配 | 塞业务逻辑 |
 | `src/monitor.rs` | 后台检测循环/熔断/解除/更新线程, `guard://status\|log\|update` 事件 | 改监测编排与事件载荷 | 在 webview 线程做耗时操作 |
 | `src/ipc.rs` | 全部 `#[tauri::command]`（13 条 + `js_log` 诊断桥） | 加命令 | 绕过 `Shared` 直接摸全局 |
-| `ui/` | 纯静态前端（index.html/app.css/icons.js/ipc.js/main.js，无构建步骤） | 改前端 | 引入 node/打包器；顶层 `const`（见坑 1） |
+| `ui/` | 纯静态前端（index.html/app.css/icons.js/ipc.js/main.js，无构建步骤） | 改前端 | — |
 | `src/checks.rs` | 三步校验（注册表代理/CONNECT 握手/出口 IP） | 改校验逻辑+单测 | panic（任何输入都必须返回失败步骤） |
 | `src/guard.rs` | 熔断：杀进程/防火墙/日志/启动 Claude | 改熔断 | 相对路径调子进程 |
 | `src/install.rs` | 安装/卸载/自启/快捷方式 | 改安装逻辑 | 写死用户路径 |
 | `src/update.rs` | GitHub Releases 检查/下载/自替换 | 改更新 | 改资产命名规则（见下） |
 | `src/tcp_table.rs` | GetExtendedTcpTable 解析 | 改解析 | 引入新 crate |
 | `src/config.rs` | 配置读写（原子写） | 加字段（带 serde default） | 破坏旧配置文件兼容 |
-
-## 硬性规则（CI 执法，违反即红）
-
-1. `cargo clippy -- -D warnings` 零警告；`cargo fmt --check` 必须通过。
-2. `cargo test` 必须通过；**修 bug 必须先补一个能复现的测试**再修。
-3. 不新增依赖，除非同时给出：体积增量、必要性、无更轻替代 三项说明。当前依赖面是刻意收敛的。
-4. 视觉只允许 `ui/app.css` `:root` tokens 与 v2-spec 标准（`docs/v2-spec.md`）：曲线/时长/
-   阴影/毛玻璃四组 token，字重 400/500/600，标题 -0.02em 字距，柔和双层阴影可以有，
-   硬阴影/渐变/700+ 字重没有。改视觉先改 token，再改组件。
-5. 子进程一律绝对路径（`guard::sys32()` / `SystemRoot`），禁止裸名（PATH 提权面）。
-6. 状态只在三处：`monitor.rs Shared`（Rust 侧）、`ui/main.js S`（前端侧）、`config.json`；
-   两边以 `StatusSnapshot`/`Config` 序列化为界，禁止第三份副本。
-7. UI 文案与代码注释用中文；标识符/日志关键字用英文。
-8. 任何 `unwrap/expect/panic` 只允许出现在程序启动期（配置目录创建等），运行路径一律返回错误。
 
 ## 构建与发版
 
@@ -84,7 +70,7 @@ cargo fmt
 1. **classic script 共享全局词法作用域**：`ui/*.js` 顶层 `const/let` 跨文件撞名会让后加载的
    脚本**整个编译失败**（`SyntaxError: Identifier 'x' has already been declared`），一行都不
    执行，且页面里没有任何 error 监听能捕到（监听器本身在那个脚本里）。v2 P0 实测踩过：
-   `node --check` 逐文件独立解析查不出来。**铁律：ui/*.js 一律 IIFE 包裹**，跨文件只走
+   `node --check` 逐文件独立解析查不出来。**对策：ui/*.js 保持 IIFE 包裹**，跨文件只走
    `window.ICONS` / `window.CG_IPC`。
 2. **tauri 资源嵌入是编译期的**：改 `ui/` 后必须重新 `cargo build`（必要时 touch ui 文件强制
    重嵌），磁盘改完不重编=运行的还是旧前端。
@@ -110,10 +96,3 @@ cargo fmt
     管理员横幅只在 debug 出现——冒烟断言时记住这点。
 11. v1 egui 时代条目已随模块删除失效（无字重字段等）；v1 行为基准全部迁入
     `docs/PARITY-v2.md`，文案/状态机以它为准。
-
-## 改 UI 的验收标准
-
-改任何可见元素，提交前必须：截图三视图（主屏/向导/设置）→ 视觉复核无乱码/无溢出/无风格漂移。
-风格漂移=出现了 tokens 外的颜色、硬阴影、渐变、700+ 字重、规范曲线外的 easing。
-动效改动另过一遍收尾审查（时长区间/打断行为/reduced-motion 降级），模板见
-`docs/v2-spec.md` P1 节。
