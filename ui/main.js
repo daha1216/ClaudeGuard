@@ -120,12 +120,18 @@ function wireStatic() {
     });
   });
 
-  // 折叠卡头
+  // 折叠卡头（div+role=button：键盘 Enter/Space 等价点击）
   document.querySelectorAll(".card-head[data-toggle]").forEach((head) => {
     head.onclick = () => {
       const key = head.dataset.toggle;
       S.openCards[key] = !S.openCards[key];
       render();
+    };
+    head.onkeydown = (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        head.click();
+      }
     };
   });
 
@@ -180,7 +186,12 @@ function render() {
   $("wizard").classList.toggle("hidden", !wizardMode);
   // 折叠状态应用（默认全收起；点击头部或冒烟钩子展开）
   const CARD_IDS = { details: "card-details", settings: "card-settings", log: "card-log" };
-  for (const k in CARD_IDS) $(CARD_IDS[k]).classList.toggle("open", !!S.openCards[k]);
+  for (const k in CARD_IDS) {
+    const open = !!S.openCards[k];
+    const card = $(CARD_IDS[k]);
+    card.classList.toggle("open", open);
+    card.querySelector(".card-head").setAttribute("aria-expanded", String(open));
+  }
   if (wizardMode) {
     renderWizard();
     return;

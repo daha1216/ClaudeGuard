@@ -56,6 +56,14 @@ html, body {
 
 .hidden { display: none !important; }
 
+/* 键盘焦点指示（静态，无动画；文字输入框有自己的 :focus 边框反馈） */
+button:focus-visible,
+[role="button"]:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
 /* ===== 标题栏（毛玻璃：内容从其下滚过） ===== */
 #titlebar {
   height: 44px;
@@ -68,10 +76,19 @@ html, body {
   position: absolute;
   top: 0; left: 0; right: 0;
   z-index: 5;
-  transition: box-shadow var(--t-float) var(--ease-out);
 }
-/* macOS 风格：仅当内容滚过时浮现发丝线 */
-#titlebar.scrolled { box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.08); }
+/* macOS 风格：仅当内容滚过时浮现发丝线（独立 1px 假线 + opacity，只动合成器属性） */
+#titlebar::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 1px;
+  background: rgba(0, 0, 0, 0.08);
+  opacity: 0;
+  transition: opacity var(--t-float) var(--ease-out);
+  pointer-events: none;
+}
+#titlebar.scrolled::after { opacity: 1; }
 #titlebar-text {
   align-self: center;
   padding-left: 16px;
@@ -91,9 +108,9 @@ html, body {
 @media (hover: hover) and (pointer: fine) {
   .cap-btn { transition: background var(--t-press) var(--ease-out); }
   .cap-btn:hover { background: var(--cap-hover); }
+  .cap-close:hover { background: var(--close-red); color: #FFFFFF; }
 }
 .cap-btn:active { background: #DCDCE0; }
-.cap-close:hover { background: var(--close-red); color: #FFFFFF; }
 .cap-close:active { background: #B22618; color: #FFFFFF; }
 
 /* ===== 内容滚动区（顶部伸到标题栏下，衬出毛玻璃） ===== */
@@ -259,7 +276,7 @@ body.compact .card { border-radius: 20px; padding: 12px; }
 .step-dot.skip { background: var(--txt2); }
 .step-name { font-size: 14px; flex: 1; }
 .step-text { font-size: 12px; color: var(--txt2); text-align: right; max-width: 55%; word-break: break-all; }
-.details-empty { font-size: 12.5px; color: var(--txt2); }
+.details-empty { font-size: 12px; color: var(--txt2); }
 
 /* 设置卡 */
 .group-title { font-size: 15px; font-weight: 600; margin: 14px 0 2px; }
@@ -310,7 +327,7 @@ body.compact .card { border-radius: 20px; padding: 12px; }
   position: absolute; top: 3px; left: 3px;
   width: 24px; height: 24px; border-radius: 50%;
   background: #FFFFFF;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.20);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12), 0 0 0 1px rgba(0, 0, 0, 0.10);
   transform: translateX(0);
   transition: transform var(--t-drop) var(--ease-drawer);
 }
@@ -323,10 +340,10 @@ body.compact .card { border-radius: 20px; padding: 12px; }
 .upd-pct { font-size: 13px; }
 .progress-track {
   width: 140px; height: 6px;
-  border: 1px solid var(--sep);
+  border: none;
   border-radius: 3px;
   overflow: hidden;
-  background: #FFFFFF;
+  background: var(--mist);
 }
 .progress-fill { height: 100%; background: var(--blue); transition: width 200ms linear; }
 
@@ -383,10 +400,11 @@ body.compact .card { border-radius: 20px; padding: 12px; }
   cursor: default;
   text-align: left;
   font-family: inherit;
-  transition: border-color var(--t-press) var(--ease-out), transform var(--t-press) var(--ease-out);
+  transition: border-color var(--t-press) var(--ease-out), box-shadow var(--t-press) var(--ease-out), transform var(--t-press) var(--ease-out);
 }
 @media (hover: hover) and (pointer: fine) {
-  .wiz-option:hover { border-color: var(--blue); border-width: 1.5px; }
+  /* 边框恒 1px，hover 用 0.5px 光环强调——不引发任何几何/layout 跳动 */
+  .wiz-option:hover { border-color: var(--blue); box-shadow: 0 0 0 0.5px var(--blue); }
 }
 .wiz-option:active { transform: scale(0.98); }
 .wiz-radio { width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid var(--txt2); flex: none; }
