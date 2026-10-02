@@ -3,8 +3,8 @@
 > 本文件是所有维护者（包括 AI agent）的约定与经验记录。CI 只做编译冒烟
 > （build + 产物上传），不做格式/lint/测试红线。改代码前先读完；不确定就按本文件保守执行。
 >
-> **CI 状态：快速迭代期已 `gh workflow disable CI`（2026-10-02），push 不再触发。**
-> 迭代结束发版前：`gh workflow enable CI` → push 确认全绿 → 再发版。
+> **CI 状态：已停用（2026-10-02，`gh workflow disable CI`），push 不触发任何 run。**
+> **只有用户明确要求跑 CI 时才 `gh workflow enable` + push 验证；发版流程也不依赖 CI。**
 > 期间质量由本地门禁兜底：`cargo fmt && cargo clippy --locked -- -D warnings && cargo test --locked`。
 
 ## 项目一句话
