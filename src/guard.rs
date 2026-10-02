@@ -186,11 +186,42 @@ pub fn log_line(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&path)
     {
         use std::io::Write;
         let _ = writeln!(f, "{} {}", chrono_like_now(), msg);
     }
+    // 日志上限：超过 1MB 就地裁剪到最近约 400KB（按行边界切，临时文件+rename 原子替换）。
+    // 默认 15s 一检约 290KB/天，长期常驻机器几个月才会触发一次。
+    let _ = trim_log_if_huge(&path, 1_000_000, 400_000);
+}
+
+/// 文件超过 `max_bytes` 时重写为最近 `keep_bytes` 的尾部（从完整行边界开始，
+/// 最多回退到整文件）。小文件或读失败时原样保留。
+fn trim_log_if_huge(
+    path: &std::path::Path,
+    max_bytes: u64,
+    keep_bytes: usize,
+) -> std::io::Result<()> {
+    let len = std::fs::metadata(path)?.len();
+    if len <= max_bytes {
+        return Ok(());
+    }
+    let data = std::fs::read(path)?;
+    // 找到保留起点：先跳到 (len - keep)，再前进到下一个换行，保证不切半行。
+    let skip = data.len().saturating_sub(keep_bytes);
+    let mut start = skip;
+    if start > 0 {
+        if let Some(nl) = data[start..].iter().position(|&b| b == b'\n') {
+            start += nl + 1;
+        } else {
+            start = data.len(); // 尾部一行超长：宁可清空也不切半行
+        }
+    }
+    let tmp = path.with_extension("log.tmp");
+    std::fs::write(&tmp, &data[start..])?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn chrono_like_now() -> String {
@@ -215,6 +246,40 @@ fn version_key(name: &str) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 行为锁: 日志裁剪只在上限触发, 保留尾部完整行, 原子替换。
+    #[test]
+    fn trim_log_respects_cap_and_line_boundary() {
+        let dir = std::env::temp_dir().join(format!("cg-trim-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.log");
+        // 每行 10 字节, 写 300 行 = 3000B; cap=1000, keep=400 → 触发
+        let mut body = String::new();
+        for i in 0..300 {
+            body.push_str(&format!("{:09}\n", i)); // 9 位数字+换行 = 10B
+        }
+        std::fs::write(&p, &body).unwrap();
+        trim_log_if_huge(&p, 1000, 400).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(out.len() <= 400, "裁剪后不超过 keep: {}", out.len());
+        assert!(out.ends_with("299\n"), "尾部完整保留");
+        assert!(
+            out.starts_with(|c: char| c.is_ascii_digit()) && !out.starts_with('\n'),
+            "从行首开始"
+        );
+        assert!(!out.contains("\n\n"), "没有切出半行(不会出现空行缝合)");
+        let first: u64 = out.lines().next().unwrap().parse().unwrap();
+        assert_eq!(
+            first,
+            300 - (out.len() / 10) as u64,
+            "起点正好落在行边界(整行保留)"
+        );
+        // 小文件不动
+        std::fs::write(&p, "short\n").unwrap();
+        trim_log_if_huge(&p, 1000, 400).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "short\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// 行为锁: 版本比较必须按数字段, 不许退回字典序。
     #[test]
