@@ -5,7 +5,14 @@
   "use strict";
 
   if (!window.__TAURI__) {
-    throw new Error("__TAURI__ missing (withGlobalTauri?)");
+    document.title = "ClaudeGuard · 请打开桌面程序";
+    document.body.innerHTML = `<main style="max-width:520px;margin:12vh auto;padding:32px;font-family:'Microsoft YaHei UI',sans-serif;line-height:1.8">
+      <h1 style="font-size:24px">请从桌面打开 ClaudeGuard</h1>
+      <p>这里是桌面应用的界面文件预览，单独打开网页无法连接守护器。</p>
+      <p>请关闭此页，双击 ClaudeGuard 快捷方式，或从系统托盘打开守护器。</p>
+      <p style="color:#707070">飞书通知设置位于内置版的「设置 → 飞书通知」。</p>
+    </main>`;
+    return;
   }
 
   const core = window.__TAURI__.core;

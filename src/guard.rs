@@ -673,19 +673,19 @@ pub fn is_admin() -> bool {
         .unwrap_or(false)
 }
 
-/// 启动 Claude（UWP）
-pub fn launch_claude(app_id: &str) -> bool {
+/// 检查当前账户的包状态并提交 Claude 启动请求；成功不代表应用已激活。
+pub fn launch_claude(app_id: &str) -> Result<(), String> {
+    crate::claude_update::check_claude_launch_ready()?;
     let arg = format!("shell:AppsFolder\\{app_id}");
     let explorer = std::env::var("SystemRoot")
         .map(|r| PathBuf::from(r).join("explorer.exe"))
         .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\explorer.exe"));
-    let ok = Command::new(explorer)
+    Command::new(explorer)
         .arg(&arg)
         .spawn()
-        .map(|_| true)
-        .unwrap_or(false);
-    log_line(&format!("launch claude ({app_id}): {ok}"));
-    ok
+        .map_err(|e| format!("无法向 Windows 发送 Claude 启动请求：{e}"))?;
+    log_line(&format!("launch claude ({app_id}): request submitted"));
+    Ok(())
 }
 
 /// 熔断：按配置的守护对象逐个杀进程 + 防火墙隔离（按配置开关）。

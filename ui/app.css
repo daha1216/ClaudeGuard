@@ -921,3 +921,14 @@ body.compact .card { border-radius: 20px; padding: 12px; }
     backdrop-filter: none;
   }
 }
+/* Native Feishu settings: stacked fields fit the existing narrow settings card. */
+.feishu-settings { padding: 4px 0 14px; }
+.feishu-settings .text-input { width: 100%; box-sizing: border-box; }
+.feishu-settings .st-desc { font-size: 12px; line-height: 1.65; color: var(--txt2); margin: 6px 0; }
+.fs-label { display: block; margin: 14px 0 6px; font-size: 13px; color: var(--txt2); }
+.fs-check { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.fs-small { margin: 10px 0; font-size: 12px; color: var(--txt2); }
+.fs-actions { display: flex; gap: 10px; margin: 14px 0 8px; }
+.fs-actions .btn { flex: 1; min-width: 0; }
+.fs-message { font-size: 12px; line-height: 1.6; color: var(--txt2); overflow-wrap: anywhere; }
+.fs-status { white-space: pre-line; margin-top: 8px; }

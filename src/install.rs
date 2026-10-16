@@ -20,7 +20,12 @@ pub fn installed_exe() -> PathBuf {
 
 pub fn is_installed() -> bool {
     std::env::current_exe()
-        .map(|p| p == installed_exe())
+        .map(|p| {
+            p == installed_exe()
+                || p.parent()
+                    .map(|d| d.join("unins000.exe").is_file())
+                    .unwrap_or(false)
+        })
         .unwrap_or(false)
 }
 
@@ -114,7 +119,10 @@ pub fn set_autostart(enabled: bool) -> bool {
         return false;
     };
     if enabled {
-        let exe = installed_exe().to_string_lossy().to_string();
+        let Ok(current) = std::env::current_exe() else {
+            return false;
+        };
+        let exe = current.to_string_lossy().to_string();
         key.set_value(APP_NAME, &format!("\"{exe}\" --tray"))
             .is_ok()
     } else {
