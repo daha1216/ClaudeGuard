@@ -4,6 +4,7 @@
  *       日志新增行落位动画（.log-enter 配 app.css log-drop）。 */
 (() => {
 "use strict";
+if (!window.CG_IPC) return;
 
 const { invoke, EV, CMD, listen, win } = window.CG_IPC;
 
@@ -31,6 +32,7 @@ const S = {
   upd: { state: "idle" },
   logs: [],
   notice: null,        // {title, desc} 4 秒自动清
+  launchError: null,   // 独立于出口检查，保留到下一次尝试启动
   lastAt: 0,           // 最近一次检查完成的本地时刻（相对时间用）
   agentsRunning: [],    // 守护范围内在跑的 GUI agent 显示名（快照字段）
   cliRunning: [],       // 在跑的 CLI agent 显示名（快照字段，只提醒）
@@ -141,7 +143,7 @@ async function init() {
         `${(S.last && S.last.reason) || "出口与约定不一致"}。切回节点后自动恢复。`,
       );
     } else if (wasTripped && !S.tripped && S.last && S.last.passed) {
-      notify("Claude 守护器：已恢复守护", "出口校验通过，可以正常使用了。");
+      notify("Claude 守护器：已恢复守护", "出口校验通过，守护已恢复。");
     }
     render();
   });  listen(EV.log, (e) => {
@@ -155,6 +157,11 @@ async function init() {
   });
 
   wireStatic();
+  window.addEventListener("cg-open-settings", () => {
+    S.openCards.settings = true;
+    render();
+    document.getElementById("feishu-group")?.scrollIntoView({ block: "center", behavior: "smooth" });
+  });
   render();
   playBoot();
   // 相对时间心跳：只改文本节点，不触发整卡重渲（避免打断日志 tail-f 等局部状态）。
@@ -177,8 +184,7 @@ async function init() {
   if (S.smokeSettings) {
     // 手风琴展开(280ms)完成后再滚到底，否则内容长高后停在中途
     setTimeout(() => {
-      const c = $("content");
-      c.scrollTop = c.scrollHeight;
+      $("feishu-group")?.scrollIntoView({ block: "center" });
     }, 450);
   }
 }
@@ -351,7 +357,7 @@ function heroState() {
     // 副标题是给用户看的摘要：剥掉"(via ipify)"这类回退来源标注（详情/日志里保留），超长按词边界截断。
     let desc = (S.last.egress_desc || "").replace(/\s*\(via ipify\)/, "");
     if (desc.length > 26) desc = desc.slice(0, 25).replace(/\s+\S*$/, "") + "…";
-    return { ring: "pass", title: "一切正常", sub: `出口 ${ip} ${desc}`.trim() };
+    return { ring: "pass", title: S.launchError ? "网络检查通过" : "一切正常", sub: `出口 ${ip} ${desc}`.trim() };
   }
   if (S.last) return { ring: "fail", title: "没有通过检查", sub: plainReason(S.last.reason) };
   return { ring: "idle", title: "准备中", sub: "马上开始第一次检查" };
@@ -482,6 +488,10 @@ function renderBanners() {
       <div class="banner-title">暂时没法确认网络</div>
       <div class="banner-desc">刚才的检查没有成功，可能是网络没通。确认代理软件开着，再点重新检查。</div></div></div>`;
   }
+  if (S.launchError) {
+    html += `<div id="launch-error" class="banner orange" role="alert"><span class="banner-dot"></span><div>
+      <div class="banner-title">Claude 未能启动</div><div class="banner-desc">${esc(S.launchError)}</div></div></div>`;
+  }
   // 内容签名去重：状态事件每几秒重渲一次，内容没变就别重建 DOM（否则横幅入场动画会被重播）
   if (z.dataset.sig !== html) {
     z.dataset.sig = html;
@@ -589,6 +599,9 @@ function renderSettings() {
   const cfg = S.cfg;
   if (!cfg) return;
   const body = $("settings-body");
+  const settingsKey = JSON.stringify([cfg, S.installed]);
+  if (body.dataset.settingsKey === settingsKey) { renderUpdateGroup(); return; }
+  body.dataset.settingsKey = settingsKey;
   const err = (id, msg) => `<div class="field-error" id="${id}">${esc(msg || "")}</div>`;
 
   body.innerHTML = `
@@ -605,10 +618,16 @@ function renderSettings() {
     ${agentToggle("set-guard-chatgpt", "ChatGPT 桌面版", "chatgpt")}
     ${agentToggle("set-guard-antigravity", "反重力桌面版", "antigravity")}
     ${settingToggle("set-cliwarn", "CLI 只提醒不处理", "检测到 Claude Code / Codex / Gemini CLI 时在日志和横幅里提醒", cfg.cli_warn)}
+    <div class="group-title">飞书通知</div>
+    <div id="feishu-group"></div>
+    <div class="group-title">Claude 客户端更新</div>
+    <div id="claude-update-group"></div>
+    <div class="group-title">Codex 客户端更新</div>
+    <div id="codex-update-group"></div>
     <div class="group-title">通用</div>
     ${settingToggle("set-tray", "关窗后驻留托盘", "守护继续在后台运行", cfg.close_to_tray)}
     ${settingToggle("set-autostart", "开机自启", S.installed ? "开机后自动在托盘里默默守护" : "安装之后才能开启", cfg.auto_start_with_system, !S.installed)}
-    <div class="group-title">软件更新</div>
+    <div class="group-title">守护器软件更新</div>
     <div id="upd-group"></div>
   `;
 
@@ -632,6 +651,9 @@ function renderSettings() {
   wireAgentToggle("set-guard-antigravity", "antigravity");
   wireSettingToggle("set-tray", "close_to_tray");
   wireAutostart();
+  window.CG_FEISHU.mount($("feishu-group"));
+  window.CG_CLAUDE_UPDATES.mount($("claude-update-group"));
+  window.CG_CODEX_UPDATES.mount($("codex-update-group"));
   renderUpdateGroup();
 }
 

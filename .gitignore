@@ -1,5 +1,6 @@
 # 构建产物
 /target/
+/tests/output/
 
 # 本地过程产物
 *.log

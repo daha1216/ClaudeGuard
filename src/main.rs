@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod checks;
+mod claude_update;
 mod config;
+mod feishu;
 mod guard;
 mod install;
 mod ipc;
@@ -21,8 +23,25 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let has = |flag: &str| args.iter().any(|a| a == flag);
 
-    if has("--check") {
+    if has("--claude-update-status") || has("--codex-update-status") {
+        let product = if has("--codex-update-status") {
+            claude_update::Product::Codex
+        } else {
+            claude_update::Product::Claude
+        };
+        let updater = claude_update::Updater::load(product);
+        println!(
+            "{}",
+            serde_json::to_string(&updater.status()).unwrap_or_default()
+        );
+    } else if has("--check") {
         cmd_check();
+    } else if has("--feishu-status") {
+        let notifier = feishu::Notifier::load();
+        println!(
+            "{}",
+            serde_json::to_string(&notifier.status()).unwrap_or_default()
+        );
     } else if has("--install") {
         match install::install() {
             Ok(p) => {
@@ -40,6 +59,7 @@ fn main() {
     } else if has("--update-selftest") {
         update_selftest();
     } else {
+        monitor::OPEN_SETTINGS.store(has("--settings"), Ordering::SeqCst);
         run_gui(has("--tray"));
     }
 }
@@ -161,11 +181,14 @@ fn run_gui(start_hidden: bool) {
     let sh_for_monitor = Arc::clone(&sh);
 
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // 二次启动：唤起已有主窗口（v1 无此保护，v2 顺带修掉多实例）。
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
                 let _ = w.set_focus();
+                if args.iter().any(|a| a == "--settings") {
+                    let _ = w.eval("window.dispatchEvent(new Event('cg-open-settings'));");
+                }
             }
         }))
         .manage(Arc::clone(&sh))
@@ -185,6 +208,16 @@ fn run_gui(start_hidden: bool) {
             ipc::upd_check,
             ipc::upd_download,
             ipc::js_log,
+            ipc::feishu_status,
+            ipc::feishu_retry_failed,
+            ipc::feishu_save,
+            ipc::feishu_test,
+            ipc::codex_update_status,
+            ipc::codex_update_configure,
+            ipc::codex_update_check,
+            ipc::claude_update_status,
+            ipc::claude_update_configure,
+            ipc::claude_update_check,
         ])
         .setup(move |app| {
             sh.attach(app.handle().clone());
@@ -194,18 +227,25 @@ fn run_gui(start_hidden: bool) {
             let icon = tauri::image::Image::from_bytes(include_bytes!("../assets/icon.png"))?;
 
             // 手动建窗：--tray 启动全程不闪窗（visible=false），正常启动 setup 内 show。
-            let win = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
-                .title("Claude 守护器")
-                .inner_size(420.0, win_h as f64)
-                .min_inner_size(400.0, 420.0)
-                .decorations(false)
-                .visible(!start_hidden)
-                .on_document_title_changed(|w, title| {
-                    // document.title → 原生窗口标题（wry 只回调不代设）。P0 期兼作前端存活信标通道。
-                    let _ = w.set_title(&title);
-                })
-                .icon(icon.clone())?
-                .build()?;
+            let win_builder =
+                tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
+                    .title("Claude 守护器")
+                    .inner_size(420.0, win_h as f64)
+                    .min_inner_size(400.0, 420.0)
+                    .decorations(false)
+                    .visible(!start_hidden)
+                    .on_document_title_changed(|w, title| {
+                        // document.title → 原生窗口标题（wry 只回调不代设）。P0 期兼作前端存活信标通道。
+                        let _ = w.set_title(&title);
+                    })
+                    .icon(icon.clone())?;
+            #[cfg(debug_assertions)]
+            let win_builder = if std::env::var("CG_WEBVIEW_DEBUG").as_deref() == Ok("1") {
+                win_builder.additional_browser_args("--remote-debugging-port=9223")
+            } else {
+                win_builder
+            };
+            let win = win_builder.build()?;
 
             // 关窗驻留托盘（v1 语义：close_to_tray=true → 阻止关闭+隐藏并记日志；false → 真退出）。
             let w2 = win.clone();
@@ -289,6 +329,11 @@ fn run_gui(start_hidden: bool) {
                 })
                 .build(app)?;
 
+            sh_for_monitor
+                .feishu
+                .start(Arc::clone(&sh_for_monitor.stop));
+            claude_update::Updater::start(&sh_for_monitor, claude_update::Product::Claude);
+            claude_update::Updater::start(&sh_for_monitor, claude_update::Product::Codex);
             monitor::spawn_monitor(sh_for_monitor);
             Ok(())
         })

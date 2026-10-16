@@ -12,6 +12,76 @@ use crate::monitor::{self, Shared, UpdState};
 
 type Sh<'a> = State<'a, Arc<Shared>>;
 
+#[tauri::command]
+pub fn claude_update_status(sh: Sh) -> crate::claude_update::Status {
+    sh.claude_update.status()
+}
+
+#[tauri::command]
+pub fn claude_update_configure(
+    sh: Sh,
+    enabled: bool,
+) -> Result<crate::claude_update::Status, String> {
+    sh.claude_update.configure(enabled)
+}
+
+#[tauri::command]
+pub fn claude_update_check(sh: Sh, finish: Option<bool>) -> Result<(), String> {
+    crate::claude_update::Updater::request(
+        &sh,
+        crate::claude_update::Product::Claude,
+        finish.unwrap_or(false),
+    )
+}
+
+#[tauri::command]
+pub fn codex_update_status(sh: Sh) -> crate::claude_update::Status {
+    sh.codex_update.status()
+}
+
+#[tauri::command]
+pub fn codex_update_configure(
+    sh: Sh,
+    enabled: bool,
+) -> Result<crate::claude_update::Status, String> {
+    sh.codex_update.configure(enabled)
+}
+
+#[tauri::command]
+pub fn codex_update_check(sh: Sh, finish: Option<bool>) -> Result<(), String> {
+    crate::claude_update::Updater::request(
+        &sh,
+        crate::claude_update::Product::Codex,
+        finish.unwrap_or(false),
+    )
+}
+
+#[tauri::command]
+pub fn feishu_status(sh: Sh) -> crate::feishu::Status {
+    sh.feishu.status()
+}
+
+#[tauri::command]
+pub fn feishu_retry_failed(sh: Sh) -> Result<crate::feishu::Status, String> {
+    sh.feishu.retry_failed()
+}
+
+#[tauri::command]
+pub fn feishu_save(
+    sh: Sh,
+    settings: crate::feishu::Settings,
+) -> Result<crate::feishu::Status, String> {
+    sh.feishu.configure(settings)
+}
+
+#[tauri::command]
+pub async fn feishu_test(sh: Sh<'_>) -> Result<crate::feishu::Status, String> {
+    let notifier = Arc::clone(&sh.feishu);
+    tauri::async_runtime::spawn_blocking(move || notifier.test())
+        .await
+        .map_err(|_| "测试通知任务失败".to_string())?
+}
+
 /// 守卫快照（前端进入时拉一次，之后靠 guard://status 事件）。
 #[tauri::command]
 pub fn get_state(sh: Sh) -> monitor::StatusSnapshot {

@@ -60,6 +60,8 @@ pub struct StatusSnapshot {
     pub agents_running: Vec<String>,
     /// 正在运行的 CLI agent 显示名（Claude Code/Codex/Gemini CLI——只提醒不杀）
     pub cli_running: Vec<String>,
+    /// 最近一次启动失败；周期网络检查不能把应用错误覆盖成正常。
+    pub launch_error: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -84,6 +86,9 @@ impl From<&TripResult> for TripSnap {
 
 /// v1 Shared 的等价物。loglines 环形 200 条照旧。
 pub struct Shared {
+    pub codex_update: Arc<crate::claude_update::Updater>,
+    pub claude_update: Arc<crate::claude_update::Updater>,
+    pub feishu: Arc<crate::feishu::Notifier>,
     pub cfg: Arc<Mutex<Config>>,
     pub last: Arc<Mutex<Option<CheckOutcome>>>,
     pub tripped: Arc<Mutex<Option<TripResult>>>,
@@ -94,12 +99,20 @@ pub struct Shared {
     pub stop: Arc<AtomicBool>,
     pub loglines: Arc<Mutex<Vec<String>>>,
     pub upd: Arc<Mutex<UpdState>>,
+    launch_error: Mutex<Option<String>>,
     app: Mutex<Option<AppHandle>>,
 }
 
 impl Shared {
     pub fn new(cfg: Config) -> Self {
         Self {
+            codex_update: Arc::new(crate::claude_update::Updater::load(
+                crate::claude_update::Product::Codex,
+            )),
+            claude_update: Arc::new(crate::claude_update::Updater::load(
+                crate::claude_update::Product::Claude,
+            )),
+            feishu: Arc::new(crate::feishu::Notifier::load()),
             cfg: Arc::new(Mutex::new(cfg)),
             last: Arc::new(Mutex::new(None)),
             tripped: Arc::new(Mutex::new(None)),
@@ -109,6 +122,7 @@ impl Shared {
             stop: Arc::new(AtomicBool::new(false)),
             loglines: Arc::new(Mutex::new(Vec::new())),
             upd: Arc::new(Mutex::new(UpdState::Idle)),
+            launch_error: Mutex::new(None),
             app: Mutex::new(None),
         }
     }
@@ -154,6 +168,7 @@ impl Shared {
             installed,
             version: update::current_version(),
             smoke_settings,
+            launch_error: self.launch_error.lock().unwrap().clone(),
             pause_until: *self.pause_until.lock().unwrap(),
             manual: self.manual.load(Ordering::SeqCst),
             agents_running: scan
@@ -221,6 +236,9 @@ pub fn run_check(sh: &Arc<Shared>, purpose: Purpose) {
         matches!(purpose, Purpose::Manual | Purpose::Launch),
         Ordering::SeqCst,
     );
+    if purpose == Purpose::Launch {
+        *sh.launch_error.lock().unwrap() = None;
+    }
     sh.emit(EV_STATUS, sh_full_snapshot(sh));
 
     let cfg = sh.cfg.lock().unwrap().clone();
@@ -247,8 +265,14 @@ pub fn run_check(sh: &Arc<Shared>, purpose: Purpose) {
         out.egress_country.as_deref(),
     );
     let already = sh.tripped.lock().unwrap().is_some();
+    let mut notification_detail = if already {
+        "仍处于此前的熔断状态".to_string()
+    } else {
+        "未执行熔断；检查失败不代表已断网".to_string()
+    };
     if !out.passed && mismatch {
         if pause_active(sh) {
+            notification_detail = "守护已暂停，本次跳过熔断".into();
             sh.log("守护已暂停：本次跳过熔断");
         } else if already {
             let killed = guard::kill_agents(&cfg);
@@ -257,6 +281,16 @@ pub fn run_check(sh: &Arc<Shared>, purpose: Purpose) {
             }
         } else {
             let res = guard::trip(&cfg, &out.reason);
+            notification_detail = format!(
+                "已执行熔断：结束 {} 个进程，新增出站规则 {} 条；隔离状态：{}",
+                res.killed,
+                res.firewall_rules,
+                if res.quarantined {
+                    "检测到阻止规则"
+                } else {
+                    "未确认隔离成功"
+                }
+            );
             sh.log(format!(
                 "已熔断：结束 {} 个进程，新增防火墙规则 {} 条",
                 res.killed, res.firewall_rules
@@ -286,18 +320,38 @@ pub fn run_check(sh: &Arc<Shared>, purpose: Purpose) {
             sh.log("检测通过：已解除防火墙隔离");
         }
         *sh.tripped.lock().unwrap() = None;
+        notification_detail = if guard::firewall_active() {
+            "出口已恢复，但仍检测到隔离规则，请检查".into()
+        } else {
+            "出口已恢复，已确认无 ClaudeGuard 隔离规则".into()
+        };
+    } else if out.passed {
+        notification_detail = "出口检查通过；本次没有需要解除的隔离状态".into();
     }
 
+    sh.feishu.observe(
+        out.passed,
+        &out.reason,
+        out.egress_ip.as_deref(),
+        sh.tripped.lock().unwrap().is_some(),
+        &notification_detail,
+    );
+
     if purpose == Purpose::Launch {
-        if out.passed {
+        let result = if sh.claude_update.installing.load(Ordering::SeqCst) {
+            Err("Claude 正在原位升级，请等待更新完成后再打开。".to_string())
+        } else if out.passed {
             let app_id = guard::resolve_app_id(&cfg.app_id);
-            if guard::launch_claude(&app_id) {
-                sh.log("校验通过，已启动 Claude");
-            } else {
-                sh.log("启动 Claude 失败（shell:AppsFolder）");
-            }
+            guard::launch_claude(&app_id)
         } else {
-            sh.log("校验未通过，已阻止启动");
+            Err("网络校验未通过，已阻止启动。请先恢复代理与出口。".to_string())
+        };
+        match result {
+            Ok(()) => sh.log("校验通过，已向 Windows 发送 Claude 启动请求"),
+            Err(error) => {
+                sh.log(format!("Claude 未能启动：{error}"));
+                *sh.launch_error.lock().unwrap() = Some(error);
+            }
         }
     }
 
@@ -432,9 +486,10 @@ pub fn spawn_update_download(sh: &Arc<Shared>, url: String, size: u64) {
 /// admin/installed 缓存：v1 存在 GuardApp 字段里（net session / current_exe 判定，代价高不逐帧算）。
 pub static ADMIN_FLAG: AtomicBool = AtomicBool::new(false);
 pub static INSTALLED_FLAG: AtomicBool = AtomicBool::new(false);
+pub static OPEN_SETTINGS: AtomicBool = AtomicBool::new(false);
 
 pub fn smoke_settings() -> bool {
-    std::env::var("CG_SMOKE_SETTINGS").is_ok()
+    OPEN_SETTINGS.load(Ordering::SeqCst) || std::env::var("CG_SMOKE_SETTINGS").is_ok()
 }
 
 /// 拿到完整快照（admin/installed 用缓存标志，smoke 读环境变量）。
