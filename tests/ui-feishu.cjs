@@ -23,7 +23,7 @@ const assert = require('assert');
       auto_start_with_system:true,first_run:false};
     const invoke=async (cmd,args)=>{
       window.testCalls.push({cmd,args});
-      if(cmd==='get_state')return {admin:true,installed:true,version:'2.13.1',smokeSettings:true,agentsRunning:[],cliRunning:[],launchError:null};
+      if(cmd==='get_state')return {admin:true,installed:true,version:'2.11.0',smokeSettings:true,agentsRunning:[],cliRunning:[],launchError:null};
       if(cmd==='get_config')return config;
       if(cmd==='upd_state')return {state:'idle'};
       if(cmd==='recent_logs')return [];

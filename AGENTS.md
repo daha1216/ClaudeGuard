@@ -18,12 +18,14 @@ Windows 桌面守护器：校验本地代理出口 IP → 通过才放行 Claude
 |---|---|---|---|
 | `src/main.rs` | CLI 入口 + tauri 建窗/托盘/标题回调/单实例 | 改窗口与托盘装配 | 塞业务逻辑 |
 | `src/monitor.rs` | 后台检测循环/熔断/解除/更新线程, `guard://status\|log\|update` 事件 | 改监测编排与事件载荷 | 在 webview 线程做耗时操作 |
-| `src/ipc.rs` | 全部 `#[tauri::command]`（13 条 + `js_log` 诊断桥） | 加命令 | 绕过 `Shared` 直接摸全局 |
-| `ui/` | 纯静态前端（index.html/app.css/icons.js/ipc.js/main.js，无构建步骤） | 改前端 | — |
+| `src/ipc.rs` | 全部 `#[tauri::command]`（26 条，含 `js_log` 诊断桥） | 加命令 | 绕过 `Shared` 直接摸全局 |
+| `ui/` | 纯静态前端（index.html/app.css/icons.js/ipc.js/main.js + feishu/claude-update/codex-update，无构建步骤） | 改前端 | — |
 | `src/checks.rs` | 三步校验（注册表代理/CONNECT 握手/出口 IP） | 改校验逻辑+单测 | panic（任何输入都必须返回失败步骤） |
 | `src/guard.rs` | 熔断：杀进程/防火墙/日志/启动 Claude | 改熔断 | 相对路径调子进程 |
 | `src/install.rs` | 安装/卸载/自启/快捷方式 | 改安装逻辑 | 写死用户路径 |
 | `src/update.rs` | GitHub Releases 检查/下载/自替换 | 改更新 | 改资产命名规则（见下） |
+| `src/claude_update.rs` | Claude/Codex 桌面客户端 MSIX 检查、下载校验、原位升级状态机（内嵌 `src/claude_package.ps1`） | 改更新流程 | 绕过签名/包身份校验，或加卸载/重置等破坏性回退 |
+| `src/feishu.rs` | 飞书群通知：Webhook/签名、DPAPI 凭据、持久队列、去重与重试 | 改通知 | 在日志或状态里回显凭据 |
 | `src/tcp_table.rs` | GetExtendedTcpTable 解析 | 改解析 | 引入新 crate |
 | `src/config.rs` | 配置读写（原子写） | 加字段（带 serde default） | 破坏旧配置文件兼容 |
 
@@ -35,6 +37,8 @@ cargo test                     # debug 跑测试；cargo test --release 会因�
 cargo clippy -- -D warnings
 cargo fmt
 ```
+
+扩展测试（改动通知/更新相关代码后必跑，详见 `tests/README.md`）：`tests/package-deployment.ps1` 用 Windows PowerShell 5.1 跑 40 组包部署模拟；`tests/ui-feishu.cjs` 用 Node + Playwright（本机 Edge 无头）跑前端模拟 IPC。产物写 `tests/output/`（已忽略）。
 
 发版流程（顺序固定）：
 1. `Cargo.toml` 升版本 → build/test/clippy 全绿。
@@ -100,3 +104,15 @@ cargo fmt
     管理员横幅只在 debug 出现——冒烟断言时记住这点。
 11. v1 egui 时代条目已随模块删除失效（无字重字段等）；v1 行为基准全部迁入
     `docs/PARITY-v2.md`，文案/状态机以它为准。
+12. **客户端更新只走官方 MSIX 源**：Claude 走 claude.ai 重定向后的 downloads.claude.ai，
+    Codex 走 persistent.oaistatic.com。部署脚本固定用 **Windows PowerShell 5.1**（Appx
+    模块只在 5.1 可用），参数全走环境变量、绝不拼接命令；`Add-AppxPackage` 只用原位升级
+    参数，不做卸载/重置/强制关闭。改动 `src/claude_package.ps1` 后必须重跑
+    `tests/package-deployment.ps1` 的 40 组模拟。
+13. 新增设置存**独立 json**（`feishu.json` / `claude-update.json` / `codex-update.json`），
+    不进 `config.json`；飞书凭据用 DPAPI 加密，但通知队列正文是明文且含出口 IP——文档已披露，
+    别把凭据写进日志或状态。
+14. 前端模拟 IPC 测试 `tests/ui-feishu.cjs` 需要 Playwright（找不到时用 `CG_PLAYWRIGHT`
+    指定模块路径），用本机 Edge 无头跑、不装浏览器；截图/模拟包/结果写 `tests/output/`（已忽略）。
+15. CLI 快照：`--settings` 唤起设置页；`--feishu-status` / `--claude-update-status` /
+    `--codex-update-status` 只读本地状态文件，不联网、不发通知、不触发安装。
