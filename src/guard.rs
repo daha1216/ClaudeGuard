@@ -42,7 +42,8 @@ pub const CLI_AGENTS: &[(&str, &str)] = &[
     ("gemini", "Gemini CLI"),
 ];
 
-pub fn gui_agent_ids() -> Vec<&'static str> {
+/// GUI 守护对象的 id 列表（config 的 guarded_agents 校验/清洗依赖它）。
+pub fn agent_ids() -> Vec<&'static str> {
     GUI_AGENTS.iter().map(|a| a.id).collect()
 }
 
@@ -432,6 +433,64 @@ mod tests {
             )
         );
     }
+
+    /// 行为锁: GUI 守护对象注册表 = 契约要求的三个 id（config.clean_guarded 依赖）。
+    #[test]
+    fn agent_ids_match_contract() {
+        assert_eq!(agent_ids(), vec!["claude", "chatgpt", "antigravity"]);
+        assert_eq!(agent_ids().len(), GUI_AGENTS.len());
+        // 显示名与兜底：未知 id 原样返回（UI 仍能展示）
+        assert_eq!(gui_agent_name("antigravity"), "反重力");
+        assert_eq!(gui_agent_name("unknown"), "unknown");
+    }
+
+    /// 行为锁: 同名同程序的重复隔离规则只保留第一条实例，其余按实例 Name 返回。
+    #[test]
+    fn dedupes_duplicate_firewall_rule_instances() {
+        let json = r#"[
+            {"name":"{a}","display":"ClaudeGuard Block Out","program":"C:\\Apps\\A.exe"},
+            {"name":"{b}","display":"ClaudeGuard Block Out","program":"c:\\apps\\a.EXE"},
+            {"name":"{c}","display":"ClaudeGuard Block Out","program":"C:\\Apps\\B.exe"},
+            {"name":"{d}","display":"ClaudeGuard Block In","program":"C:\\Apps\\A.exe"}
+        ]"#;
+        let rules = parse_rule_instances(json);
+        assert_eq!(rules.len(), 4);
+        assert_eq!(duplicate_rule_instances(&rules), vec!["{b}"]);
+
+        // 单条输出是对象、多条是数组；空/null/非法都不 panic
+        let single =
+            r#"{"name":"{x}","display":"ClaudeGuard Block Out","program":"C:\\Apps\\A.exe"}"#;
+        let one = parse_rule_instances(single);
+        assert_eq!(one.len(), 1);
+        assert!(duplicate_rule_instances(&one).is_empty());
+        assert!(parse_rule_instances("").is_empty());
+        assert!(parse_rule_instances("null").is_empty());
+        assert!(parse_rule_instances("not json").is_empty());
+        // 没有 Name 的实例没法定点删除，跳过而不是整组误删
+        let missing = r#"[
+            {"display":"ClaudeGuard Block Out","program":"C:\\A.exe"},
+            {"display":"ClaudeGuard Block Out","program":"C:\\A.exe"}
+        ]"#;
+        assert!(duplicate_rule_instances(&parse_rule_instances(missing)).is_empty());
+    }
+
+    /// 行为锁: PowerShell 的 base64/UTF-8 回传按 UTF-8 解码（中文网卡名/路径不坏）。
+    #[test]
+    fn decodes_base64_powershell_output() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        let json = r#"["WLAN","以太网"]"#;
+        let encoded = STANDARD.encode(json.as_bytes());
+        assert_eq!(decode_b64_text(&encoded).as_deref(), Some(json));
+        // 允许空白/末尾换行（PowerShell 输出风格）
+        assert_eq!(
+            decode_b64_text(&format!(" {encoded}\n")),
+            Some(json.to_string())
+        );
+        assert!(decode_b64_text("").is_none());
+        assert!(decode_b64_text("   \n").is_none());
+        assert!(decode_b64_text("不是 base64").is_none());
+    }
 }
 
 /// 定位 WindowsApps 下指定前缀的安装目录（版本数值最大者）。
@@ -510,6 +569,37 @@ fn collect_exes(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
 pub(crate) fn sys32(name: &str) -> PathBuf {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
     PathBuf::from(root).join("System32").join(name)
+}
+
+/// CREATE_NO_WINDOW：GUI 进程（无控制台）拉起控制台子进程时不弹黑框。
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 相对 System32 的 Windows PowerShell 5.1 路径（cmdlet 只在 5.1 上有保证）。
+pub(crate) const POWERSHELL: &str = r"WindowsPowerShell\v1.0\powershell.exe";
+
+/// 起隐藏窗口的子进程并收集输出（绝对路径调用，不走相对路径搜索）。
+pub(crate) fn run_hidden(exe: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    Command::new(exe)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+}
+
+/// 纯函数：解码 PowerShell 回传的 base64/UTF-8 文本。
+///
+/// Windows PowerShell 5.1 把中文写到被重定向的 stdout 时按控制台代码页编码，
+/// 直接按 UTF-8 读会乱码（中文网卡名、用户名路径都会中招），所以 PowerShell 侧
+/// 统一先 `[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(...))` 再输出。
+pub(crate) fn decode_b64_text(text: &str) -> Option<String> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.is_empty() {
+        return None;
+    }
+    let bytes = STANDARD.decode(compact.as_bytes()).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 fn netsh(args: &[&str]) -> bool {
@@ -662,6 +752,117 @@ pub fn firewall_active() -> bool {
         let (o, i) = fw_names(a.id);
         check(&o) || check(&i)
     })
+}
+
+/// 一条防火墙规则实例。`Get-NetFirewallRule` 的 Name 是实例 ID（GUID），
+/// DisplayName 才是规则显示名；按实例 Name 删才不会把同名规则整组误删。
+#[derive(Debug, serde::Deserialize)]
+struct FwRuleInstance {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    display: String,
+    #[serde(default)]
+    program: String,
+}
+
+/// `Get-NetFirewallRule ... | ConvertTo-Json`：单条输出对象，多条输出数组。
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RuleList {
+    One(FwRuleInstance),
+    Many(Vec<FwRuleInstance>),
+}
+
+/// 纯函数：解析规则实例 JSON（空/null/非法输入返回空）。
+fn parse_rule_instances(text: &str) -> Vec<FwRuleInstance> {
+    let text = text.trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("null") {
+        return Vec::new();
+    }
+    match serde_json::from_str::<RuleList>(text) {
+        Ok(RuleList::One(rule)) => vec![rule],
+        Ok(RuleList::Many(rules)) => rules,
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 纯函数：同一 (显示名, 程序) 的重复规则实例只保留第一条，返回其余实例的 Name。
+/// v2 每次熔断都 `netsh add rule`，持续失败会让同名规则越积越多。
+fn duplicate_rule_instances(rules: &[FwRuleInstance]) -> Vec<String> {
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut duplicates: Vec<String> = Vec::new();
+    for rule in rules {
+        let name = rule.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let key = (
+            rule.display.trim().to_ascii_lowercase(),
+            rule.program.trim().to_ascii_lowercase(),
+        );
+        if seen.contains(&key) {
+            duplicates.push(name.to_string());
+        } else {
+            seen.push(key);
+        }
+    }
+    duplicates
+}
+
+/// 枚举 ClaudeGuard 隔离规则并删掉同名重复实例，返回删除的实例数。
+///
+/// netsh 按名字删会整组删掉，没法只删多余实例，所以走 PowerShell 拿实例 GUID（Name）
+/// 后用 `Remove-NetFirewallRule -Name` 精确删；失败（非管理员等）时返回 0，不影响熔断。
+pub fn firewall_dedupe() -> usize {
+    let script = r"$rules = @(Get-NetFirewallRule -DisplayName 'ClaudeGuard*' | ForEach-Object { $app = $_ | Get-NetFirewallApplicationFilter; [pscustomobject]@{ name = $_.Name; display = $_.DisplayName; program = [string]$app.Program } }); $json = $rules | ConvertTo-Json -Compress; [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$json))";
+    let out = match run_hidden(
+        &sys32(POWERSHELL),
+        &["-NoProfile", "-NonInteractive", "-Command", script],
+    ) {
+        Ok(out) => out,
+        Err(err) => {
+            log_line(&format!("firewall_dedupe: 无法启动 PowerShell（{err}）"));
+            return 0;
+        }
+    };
+    if !out.status.success() {
+        log_line(&format!(
+            "firewall_dedupe: 枚举规则失败（exit={:?}）",
+            out.status.code()
+        ));
+        return 0;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).to_string();
+    let text = decode_b64_text(&raw).unwrap_or(raw);
+    let duplicates = duplicate_rule_instances(&parse_rule_instances(&text));
+    if duplicates.is_empty() {
+        return 0;
+    }
+    let quoted: Vec<String> = duplicates
+        .iter()
+        .map(|name| format!("'{}'", name.replace('\'', "''")))
+        .collect();
+    let script = format!(
+        "Remove-NetFirewallRule -Name {} -ErrorAction Stop",
+        quoted.join(",")
+    );
+    let removed = run_hidden(
+        &sys32(POWERSHELL),
+        &["-NoProfile", "-NonInteractive", "-Command", &script],
+    )
+    .map(|out| out.status.success())
+    .unwrap_or(false);
+    if removed {
+        log_line(&format!(
+            "firewall_dedupe: 删除重复隔离规则 {} 条",
+            duplicates.len()
+        ));
+        duplicates.len()
+    } else {
+        log_line("firewall_dedupe: 删除重复规则失败");
+        0
+    }
 }
 
 /// 当前是否管理员（清单已 requireAdministrator，这里用于兜底显示）

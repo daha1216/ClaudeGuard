@@ -1,526 +1,472 @@
-//! v2 监测核心：把 v1 app.rs 的后台语义（监测线程 / run_check / 熔断 / 解除 / 更新状态机）
-//! 原样搬到 Tauri 事件模型上。守卫判定逻辑一行未改，只把"每帧轮询锁"换成事件推送。
+//! 监控调度：一轮探测 → 每目标判定 → 防抖 → 熔断/恢复/启动门禁。
 //!
-//! 对等依据：docs/PARITY-v2.md §5。
+//! 只有这个模块会"下决定"；`anchors`/`policy` 是纯逻辑，`guard`/`netcut` 只执行动作。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use serde::Serialize;
-use tauri::{AppHandle, Emitter};
-
-use crate::checks::{self, CheckOutcome};
 use crate::config::Config;
-use crate::guard::{self, TripResult};
-use crate::update;
+use crate::model::{
+    now, CutMode, Evaluation, ProbeResult, Target, TargetState, TargetStatus, TripInfo, Verdict,
+};
+use crate::state::AppState;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+use tauri::Manager;
 
-pub const EV_STATUS: &str = "guard://status";
-pub const EV_LOG: &str = "guard://log";
-pub const EV_UPDATE: &str = "guard://update";
+/// 暂停守护的时长（分钟）。
+pub const PAUSE_MINUTES: u64 = 30;
 
-/// v1 Purpose {Monitor, Manual, Launch} 原样。
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Claude 的 AUMID 兜底值（包家族未找到时仍可尝试）。
+const CLAUDE_APP_ID_FALLBACK: &str = "Claude_pzs8sxrjxfjjc!Claude";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
     Monitor,
     Manual,
     Launch,
 }
 
-/// 软件更新状态机（v1 UpdState 原样，仅加 serde 以便事件推送）。
-#[derive(Clone, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum UpdState {
-    Idle,
-    Checking,
-    UpToDate,
-    Available { ver: String, url: String, size: u64 },
-    Downloading { done: u64, total: u64 },
-    Restarting,
-    Failed { msg: String },
+#[derive(Debug, Clone)]
+pub struct RoundSummary {
+    pub passed: bool,
+    pub block_reason: String,
+    #[allow(dead_code)]
+    pub failing: Vec<String>,
 }
 
-/// 推给前端的守卫快照（对应 v1 UI 每帧从 Shared 读到的全部字段）。
-/// camelCase：JS 侧惯例（smoke_settings → smokeSettings），Config 保持 snake 原样往返。
-#[derive(Clone, Serialize)]
+impl RoundSummary {
+    fn ok() -> Self {
+        Self {
+            passed: true,
+            block_reason: String::new(),
+            failing: Vec::new(),
+        }
+    }
+}
+
+/// --check 用的只读结果（不写状态、不熔断）。
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StatusSnapshot {
-    pub checking: bool,
-    pub last: Option<CheckOutcome>,
-    pub tripped: Option<TripSnap>,
-    pub admin: bool,
-    pub installed: bool,
-    pub version: &'static str,
-    pub smoke_settings: bool,
-    /// 守护暂停截止（unix 秒）：暂停期间检查照常但跳过熔断。托盘"暂停守护 30 分钟"设置。
-    pub pause_until: Option<i64>,
-    /// 正在进行的检查是否用户触发（前端只在手动检查时转圈/禁按钮）。
-    pub manual: bool,
-    /// 守护范围内正在运行的 GUI agent 显示名（状态行用；与 kill 同一匹配口径）
-    pub agents_running: Vec<String>,
-    /// 正在运行的 CLI agent 显示名（Claude Code/Codex/Gemini CLI——只提醒不杀）
-    pub cli_running: Vec<String>,
-    /// 最近一次启动失败；周期网络检查不能把应用错误覆盖成正常。
-    pub launch_error: Option<String>,
+pub struct DryResult {
+    pub id: String,
+    pub name: String,
+    pub pass: bool,
+    pub verdict: Verdict,
+    pub reason: String,
+    pub ip: Option<String>,
+    pub country: Option<String>,
+    pub latency_ms: u64,
 }
 
-#[derive(Clone, Serialize)]
-pub struct TripSnap {
-    pub killed: usize,
-    pub firewall_rules: usize,
-    pub quarantined: bool,
-    /// 本次熔断涉及的 agent 显示名
-    pub agents: Vec<String>,
+fn proxy_url(cfg: &Config) -> String {
+    cfg.proxy_url()
 }
 
-impl From<&TripResult> for TripSnap {
-    fn from(t: &TripResult) -> Self {
-        Self {
-            killed: t.killed,
-            firewall_rules: t.firewall_rules,
-            quarantined: t.quarantined,
-            agents: t.agents.clone(),
-        }
+/// 并行探测全部启用目标，返回与输入同序的结果。
+fn probe_all(cfg: &Config) -> Vec<(Target, ProbeResult)> {
+    let targets: Vec<Target> = cfg.enabled_targets().cloned().collect();
+    if targets.is_empty() {
+        return Vec::new();
     }
-}
-
-/// v1 Shared 的等价物。loglines 环形 200 条照旧。
-pub struct Shared {
-    pub codex_update: Arc<crate::claude_update::Updater>,
-    pub claude_update: Arc<crate::claude_update::Updater>,
-    pub feishu: Arc<crate::feishu::Notifier>,
-    pub cfg: Arc<Mutex<Config>>,
-    pub last: Arc<Mutex<Option<CheckOutcome>>>,
-    pub tripped: Arc<Mutex<Option<TripResult>>>,
-    pub pause_until: Arc<Mutex<Option<i64>>>,
-    /// 当前正在跑的检查是否用户触发（手动/启动按钮）。后台周期检查不转圈、不打断界面。
-    pub manual: AtomicBool,
-    pub busy: Arc<AtomicBool>,
-    pub stop: Arc<AtomicBool>,
-    pub loglines: Arc<Mutex<Vec<String>>>,
-    pub upd: Arc<Mutex<UpdState>>,
-    launch_error: Mutex<Option<String>>,
-    app: Mutex<Option<AppHandle>>,
-}
-
-impl Shared {
-    pub fn new(cfg: Config) -> Self {
-        Self {
-            codex_update: Arc::new(crate::claude_update::Updater::load(
-                crate::claude_update::Product::Codex,
-            )),
-            claude_update: Arc::new(crate::claude_update::Updater::load(
-                crate::claude_update::Product::Claude,
-            )),
-            feishu: Arc::new(crate::feishu::Notifier::load()),
-            cfg: Arc::new(Mutex::new(cfg)),
-            last: Arc::new(Mutex::new(None)),
-            tripped: Arc::new(Mutex::new(None)),
-            pause_until: Arc::new(Mutex::new(None)),
-            manual: AtomicBool::new(false),
-            busy: Arc::new(AtomicBool::new(false)),
-            stop: Arc::new(AtomicBool::new(false)),
-            loglines: Arc::new(Mutex::new(Vec::new())),
-            upd: Arc::new(Mutex::new(UpdState::Idle)),
-            launch_error: Mutex::new(None),
-            app: Mutex::new(None),
-        }
-    }
-
-    pub fn attach(&self, app: AppHandle) {
-        *self.app.lock().unwrap() = Some(app);
-    }
-
-    fn emit<S: Serialize + Clone>(&self, event: &str, payload: S) {
-        if let Some(app) = self.app.lock().unwrap().as_ref() {
-            let _ = app.emit(event, payload);
-        }
-    }
-
-    /// v1 Shared::log：guard.log 落盘 + 内存环形缓冲 + 事件推送。
-    pub fn log(&self, msg: impl Into<String>) {
-        let msg = msg.into();
-        guard::log_line(&msg);
-        {
-            let mut buf = self.loglines.lock().unwrap();
-            if buf.len() >= 200 {
-                let keep_from = buf.len() - 199;
-                buf.drain(..keep_from);
-            }
-            buf.push(msg.clone());
-        }
-        self.emit(EV_LOG, &msg);
-    }
-
-    pub fn snapshot_extras(
-        &self,
-        admin: bool,
-        installed: bool,
-        smoke_settings: bool,
-    ) -> StatusSnapshot {
-        let cfg = self.cfg.lock().unwrap();
-        let scan = guard::scan_agents();
-        StatusSnapshot {
-            checking: self.busy.load(Ordering::SeqCst),
-            last: self.last.lock().unwrap().clone(),
-            tripped: self.tripped.lock().unwrap().as_ref().map(TripSnap::from),
-            admin,
-            installed,
-            version: update::current_version(),
-            smoke_settings,
-            launch_error: self.launch_error.lock().unwrap().clone(),
-            pause_until: *self.pause_until.lock().unwrap(),
-            manual: self.manual.load(Ordering::SeqCst),
-            agents_running: scan
-                .gui
-                .iter()
-                .filter(|(a, _)| cfg.guarded_agents.iter().any(|id| id == a.id))
-                .map(|(a, n)| {
-                    if *n > 1 {
-                        format!("{}×{}", a.name, n)
-                    } else {
-                        a.name.to_string()
-                    }
+    let proxy = proxy_url(cfg);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|target| {
+                let proxy = proxy.clone();
+                let target = target.clone();
+                scope.spawn(move || {
+                    let probe = crate::anchors::probe(&proxy, &target);
+                    (target, probe)
                 })
-                .collect(),
-            cli_running: scan
-                .cli
-                .iter()
-                .map(|(id, n)| {
-                    let name = guard::cli_agent_name(id);
-                    if *n > 1 {
-                        format!("{name}×{n}")
-                    } else {
-                        name.to_string()
-                    }
-                })
-                .collect(),
-        }
-    }
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .collect()
+    })
 }
 
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// 守护是否处于暂停窗口内（托盘"暂停守护 30 分钟"）。
-pub fn pause_active(sh: &Shared) -> bool {
-    sh.pause_until
-        .lock()
-        .unwrap()
-        .map(|t| t > now_secs())
-        .unwrap_or(false)
-}
-
-/// 设置/清除暂停。None = 立即恢复守护。UI 侧自行把 pause_until 格式化成本地时间。
-pub fn set_pause(sh: &Arc<Shared>, until: Option<i64>) {
-    *sh.pause_until.lock().unwrap() = until;
-    match until {
-        Some(_) => sh.log("守护已暂停 30 分钟：检查照常，但不会结束守护对象的进程或断网"),
-        None => sh.log("已恢复守护（暂停结束或手动恢复）"),
-    }
-    sh.emit(EV_STATUS, sh_full_snapshot(sh));
-}
-
-/// v1 run_check（app.rs:112-174）逐条对等：busy 防重入、熔断条件、重复熔断只杀不加规则、
-/// 通过即解除、Launch 目的的启动/拦截语义。
-pub fn run_check(sh: &Arc<Shared>, purpose: Purpose) {
-    if sh.busy.swap(true, Ordering::SeqCst) {
-        return; // 已有检查在跑（v1 同款防重入）
-    }
-    // 手动/启动触发的检查才算"用户在等"——UI 转圈只给这类；后台周期检查静默跑。
-    sh.manual.store(
-        matches!(purpose, Purpose::Manual | Purpose::Launch),
-        Ordering::SeqCst,
-    );
-    if purpose == Purpose::Launch {
-        *sh.launch_error.lock().unwrap() = None;
-    }
-    sh.emit(EV_STATUS, sh_full_snapshot(sh));
-
-    let cfg = sh.cfg.lock().unwrap().clone();
-    let sh2 = Arc::clone(sh);
-    let out = checks::run_checks(&cfg, move |line| sh2.log(line));
-
-    *sh.last.lock().unwrap() = Some(out.clone());
-    let reason_disp = if out.reason.is_empty() {
-        "-"
-    } else {
-        &out.reason
-    };
-    sh.log(format!(
-        "result: passed={} reason={}",
-        out.passed, reason_disp
-    ));
-
-    // 熔断条件（v2.6）：拿到了出口信息且 IP 列表与地区规则都不满足才熔断；
-    // 网络失败/地区模式下拿不到地区（None）不熔断，沿用 v1 防误杀语义。
-    // 暂停窗口内跳过熔断（检查与日志照常，恢复通过时隔离照常解除）。
-    let (_, mismatch) = checks::match_egress(
-        &cfg,
-        out.egress_ip.as_deref(),
-        out.egress_country.as_deref(),
-    );
-    let already = sh.tripped.lock().unwrap().is_some();
-    let mut notification_detail = if already {
-        "仍处于此前的熔断状态".to_string()
-    } else {
-        "未执行熔断；检查失败不代表已断网".to_string()
-    };
-    if !out.passed && mismatch {
-        if pause_active(sh) {
-            notification_detail = "守护已暂停，本次跳过熔断".into();
-            sh.log("守护已暂停：本次跳过熔断");
-        } else if already {
-            let killed = guard::kill_agents(&cfg);
-            if killed > 0 {
-                sh.log(format!("持续异常：再次结束 {killed} 个守护对象进程"));
+/// 只读检查（--check 与设置页"测试目标"共用）。
+pub fn dry_round(cfg: &Config) -> Vec<DryResult> {
+    probe_all(cfg)
+        .into_iter()
+        .map(|(target, probe)| {
+            let eval = crate::policy::evaluate(&target, &probe);
+            DryResult {
+                id: target.id.clone(),
+                name: target.name.clone(),
+                pass: eval.verdict == Verdict::Pass,
+                verdict: eval.verdict,
+                reason: eval.reason,
+                ip: probe.ip,
+                country: probe.country,
+                latency_ms: probe.latency_ms,
             }
-        } else {
-            let res = guard::trip(&cfg, &out.reason);
-            notification_detail = format!(
-                "已执行熔断：结束 {} 个进程，新增出站规则 {} 条；隔离状态：{}",
-                res.killed,
-                res.firewall_rules,
-                if res.quarantined {
-                    "检测到阻止规则"
-                } else {
-                    "未确认隔离成功"
+        })
+        .collect()
+}
+
+/// 跑一轮完整检查（会更新状态、按需熔断/恢复）。
+pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
+    if state.is_checking() && purpose != Purpose::Launch {
+        return RoundSummary::ok();
+    }
+    state.set_checking(true);
+    state.emit_state();
+
+    let cfg = state.config();
+    let probes = probe_all(&cfg);
+    let mut statuses: Vec<TargetStatus> = cfg
+        .targets
+        .iter()
+        .map(|t| {
+            let state_kind = if t.enabled {
+                TargetState::Pending
+            } else {
+                TargetState::Disabled
+            };
+            TargetStatus::from_target(t, state_kind)
+        })
+        .collect();
+
+    let previous = state.statuses();
+    let prev_state = |id: &str| {
+        previous
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.state)
+            .unwrap_or(TargetState::Pending)
+    };
+
+    for (target, probe) in probes {
+        let Some(slot) = statuses.iter_mut().find(|s| s.id == target.id) else {
+            continue;
+        };
+        let eval: Evaluation = crate::policy::evaluate(&target, &probe);
+        let mut streak = previous
+            .iter()
+            .find(|s| s.id == target.id)
+            .map(|s| s.fail_streak)
+            .unwrap_or(0);
+        match eval.verdict {
+            Verdict::Fail => streak = streak.saturating_add(1),
+            _ => streak = 0,
+        }
+        slot.apply(&probe, &eval, streak);
+    }
+
+    // 状态变化日志 + 预警通知（只在跨越阈值-1 时提醒一次）。
+    for status in &statuses {
+        if status.state == TargetState::Disabled {
+            continue;
+        }
+        let was = prev_state(&status.id);
+        if was != status.state {
+            state.log(format!(
+                "{}：{}（{}）",
+                status.name,
+                status.reason,
+                match status.state {
+                    TargetState::Pass => "通过",
+                    TargetState::Fail => "未通过",
+                    TargetState::Unverified => "无法确认",
+                    _ => "等待",
                 }
-            );
-            sh.log(format!(
-                "已熔断：结束 {} 个进程，新增防火墙规则 {} 条",
-                res.killed, res.firewall_rules
             ));
-            *sh.tripped.lock().unwrap() = Some(res);
         }
-        // CLI 提醒（只在新熔断时提醒一次，避免每个检查周期刷屏）：
-        // CLI 跑在终端/node 宿主里，绝不自动结束——出口不对时只能用户自己关。
-        if !already && cfg.cli_warn {
-            let cli = guard::scan_agents().cli;
-            if !cli.is_empty() {
-                let names = cli
-                    .iter()
-                    .map(|(id, _)| guard::cli_agent_name(id))
-                    .collect::<Vec<_>>()
-                    .join("、");
-                sh.log(format!(
-                    "CLI 提醒：{names} 正在运行但出口不一致；CLI 不会自动结束，请自行关闭"
-                ));
-            }
-        }
-    }
-
-    // 每次通过都检查解除（v1 同款）。
-    if out.passed && already {
-        if guard::firewall_release() {
-            sh.log("检测通过：已解除防火墙隔离");
-        }
-        *sh.tripped.lock().unwrap() = None;
-        notification_detail = if guard::firewall_active() {
-            "出口已恢复，但仍检测到隔离规则，请检查".into()
-        } else {
-            "出口已恢复，已确认无 ClaudeGuard 隔离规则".into()
-        };
-    } else if out.passed {
-        notification_detail = "出口检查通过；本次没有需要解除的隔离状态".into();
-    }
-
-    sh.feishu.observe(
-        out.passed,
-        &out.reason,
-        out.egress_ip.as_deref(),
-        sh.tripped.lock().unwrap().is_some(),
-        &notification_detail,
-    );
-
-    if purpose == Purpose::Launch {
-        let result = if sh.claude_update.installing.load(Ordering::SeqCst) {
-            Err("Claude 正在原位升级，请等待更新完成后再打开。".to_string())
-        } else if out.passed {
-            let app_id = guard::resolve_app_id(&cfg.app_id);
-            guard::launch_claude(&app_id)
-        } else {
-            Err("网络校验未通过，已阻止启动。请先恢复代理与出口。".to_string())
-        };
-        match result {
-            Ok(()) => sh.log("校验通过，已向 Windows 发送 Claude 启动请求"),
-            Err(error) => {
-                sh.log(format!("Claude 未能启动：{error}"));
-                *sh.launch_error.lock().unwrap() = Some(error);
-            }
+        if status.state == TargetState::Fail
+            && cfg.trip_threshold > 1
+            && status.fail_streak == cfg.trip_threshold - 1
+            && !state.is_tripped()
+        {
+            state.log(format!(
+                "{} 出口连续 {} 次未通过，再失败一次将熔断",
+                status.name, status.fail_streak
+            ));
+            state.notify(
+                "warning",
+                "ClaudeGuard 检查未通过",
+                &format!(
+                    "{} 出口第 {} 次连续失败，再失败一次将熔断。",
+                    status.name, status.fail_streak
+                ),
+            );
         }
     }
 
-    sh.busy.store(false, Ordering::SeqCst);
-    sh.manual.store(false, Ordering::SeqCst);
-    sh.emit(EV_STATUS, sh_full_snapshot(sh));
-}
+    let failing: Vec<String> = statuses
+        .iter()
+        .filter(|s| s.state == TargetState::Fail)
+        .map(|s| s.name.clone())
+        .collect();
+    let failing_ids: Vec<String> = statuses
+        .iter()
+        .filter(|s| s.state == TargetState::Fail)
+        .map(|s| s.id.clone())
+        .collect();
+    let passed_count = statuses
+        .iter()
+        .filter(|s| s.state == TargetState::Pass)
+        .count();
+    let enabled_count = statuses
+        .iter()
+        .filter(|s| s.state != TargetState::Disabled)
+        .count();
+    let max_streak = statuses.iter().map(|s| s.fail_streak).max().unwrap_or(0);
 
-/// 手动/启动按钮触发：每次新线程（v1 spawn_check 同款）。
-pub fn spawn_check(sh: &Arc<Shared>, purpose: Purpose) {
-    let sh = Arc::clone(sh);
-    std::thread::spawn(move || run_check(&sh, purpose));
-}
+    state.set_statuses(statuses.clone());
+    state.set_last_check(now());
 
-/// v1 release_now（app.rs:371-378）：托盘"解除隔离"。
-pub fn release_now(sh: &Arc<Shared>) {
-    if guard::firewall_release() {
-        sh.log("已手动解除防火墙隔离");
+    let all_pass = enabled_count > 0 && passed_count == enabled_count;
+    let primary_ip = statuses.iter().find_map(|s| s.ip.clone());
+    let reason = if failing.is_empty() {
+        String::new()
     } else {
-        sh.log("没有可解除的隔离规则");
+        format!("{} 出口不在白名单", failing.join("、"))
+    };
+    let mut summary = RoundSummary {
+        passed: all_pass,
+        block_reason: if failing.is_empty() {
+            if all_pass {
+                String::new()
+            } else {
+                "部分目标无法确认，暂不允许启动".to_string()
+            }
+        } else {
+            reason.clone()
+        },
+        failing: failing.clone(),
+    };
+
+    let paused = state.is_paused();
+    let should_trip = !failing.is_empty()
+        && !state.is_tripped()
+        && !paused
+        && (purpose == Purpose::Launch || max_streak >= cfg.trip_threshold);
+
+    if should_trip {
+        do_trip(state, &cfg, &failing_ids, &reason);
+    } else if state.is_tripped() {
+        if !failing.is_empty() {
+            if cfg.kill_on_fail {
+                let killed = crate::guard::kill_agents(&cfg);
+                if killed > 0 {
+                    state.log(format!("持续异常：再次结束 {killed} 个进程"));
+                }
+            }
+        } else if passed_count > 0 && enabled_count > 0 && passed_count == enabled_count {
+            do_recover(state, &cfg, primary_ip.as_deref());
+        }
+    } else if all_pass && !failing.is_empty() {
+        state.set_launch_error(reason.clone());
     }
-    *sh.tripped.lock().unwrap() = None;
-    sh.emit(EV_STATUS, sh_full_snapshot(sh));
+
+    state.set_checking(false);
+    state.emit_state();
+
+    summary.passed = all_pass && !state.is_tripped();
+    summary
 }
 
-/// v1 监测线程（app.rs:266-284）：启动 1 秒后首轮；300ms tick；到点且空闲才跑；
-/// 间隔实时读 cfg、clamp(5,3600)。
-pub fn spawn_monitor(sh: Arc<Shared>) {
+fn do_trip(state: &Arc<AppState>, cfg: &Config, failing_ids: &[String], reason: &str) {
+    let mode = cfg.cut_mode();
+    state.log(format!("触发熔断：{reason}；断网档位 {}", mode.label()));
+    let trip = crate::guard::trip(cfg, reason);
+    let (cut_ok, cut_note) = crate::netcut::cut(mode);
+    if !cut_ok && mode != CutMode::Off {
+        state.log(format!("断网执行未完全成功：{cut_note}"));
+    }
+    let info = TripInfo {
+        since: now(),
+        reason: reason.to_string(),
+        failing_ids: failing_ids.to_vec(),
+        killed: trip.killed as u32,
+        firewall_rules: trip.firewall_rules as u32,
+        quarantined_agents: if trip.quarantined {
+            trip.agents.clone()
+        } else {
+            Vec::new()
+        },
+        agents: trip.agents.clone(),
+        network_cut: mode,
+        network_note: if cut_ok {
+            String::new()
+        } else {
+            cut_note.clone()
+        },
+    };
+    state.set_tripped(Some(info));
+    state.log(format!(
+        "熔断完成：结束 {} 个进程，防火墙隔离 {} 条，断网 {}",
+        trip.killed,
+        trip.firewall_rules,
+        if cut_ok { mode.label() } else { "执行失败" }
+    ));
+    let body = format!("{reason}，已结束相关应用并切断网络。修正后自动恢复。");
+    state.notify("trip", "ClaudeGuard 已熔断", &body);
+    state.feishu.observe(
+        false,
+        &format!("{reason}（{cut_note}）"),
+        None,
+        true,
+        "已熔断隔离",
+    );
+}
+
+fn do_recover(state: &Arc<AppState>, _cfg: &Config, ip: Option<&str>) {
+    let (ok, note) = crate::netcut::restore();
+    let released = crate::guard::firewall_release();
+    state.set_tripped(None);
+    state.clear_streaks();
+    state.log(format!(
+        "恢复：出口检查通过，解除隔离{}，网络{}",
+        if released {
+            "成功"
+        } else {
+            "无可解除规则"
+        },
+        if ok { "已恢复" } else { &note }
+    ));
+    state.notify(
+        "recover",
+        "ClaudeGuard 已恢复",
+        "出口检查通过，已解除隔离并恢复网络。",
+    );
+    state
+        .feishu
+        .observe(true, "出口检查通过", ip, false, "已解除隔离");
+}
+
+/// 手动"重新检查"（异步）。
+pub fn recheck(state: &Arc<AppState>) {
+    let state = Arc::clone(state);
     std::thread::spawn(move || {
-        let mut next = Instant::now() + Duration::from_secs(1);
+        run_round(&state, Purpose::Manual);
+    });
+}
+
+/// 启动门禁：必须所有启用目标通过才放行 Claude。
+pub fn launch(state: &Arc<AppState>) -> Result<(), String> {
+    let cfg = state.config();
+    let summary = run_round(state, Purpose::Launch);
+    if !summary.passed {
+        let reason = if summary.block_reason.is_empty() {
+            "出口检查未通过".to_string()
+        } else {
+            summary.block_reason.clone()
+        };
+        state.set_launch_error(reason.clone());
+        state.log(format!("阻止启动：{reason}"));
+        state.notify("launch_blocked", "ClaudeGuard 已阻止启动", &reason);
+        state.emit_state();
+        return Err(reason);
+    }
+    if !cfg.kill_on_fail && state.is_tripped() {
+        return Err("熔断状态尚未解除".into());
+    }
+    let app_id = crate::guard::resolve_app_id(CLAUDE_APP_ID_FALLBACK);
+    match crate::guard::launch_claude(&app_id) {
+        Ok(()) => {
+            state.set_launch_error("");
+            state.log("校验通过，已启动 Claude");
+            if cfg.close_to_tray {
+                if let Some(window) = state.app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
+            state.emit_state();
+            Ok(())
+        }
+        Err(err) => {
+            state.set_launch_error(err.clone());
+            state.log(format!("启动失败：{err}"));
+            state.emit_state();
+            Err(err)
+        }
+    }
+}
+
+/// 暂停守护；到点自动恢复。
+pub fn pause(state: &Arc<AppState>, minutes: u64) {
+    let until = now().saturating_add(minutes.saturating_mul(60));
+    state.set_paused_until(Some(until));
+    state.log(format!("暂停守护 {minutes} 分钟"));
+    state.emit_state();
+}
+
+pub fn resume(state: &Arc<AppState>) {
+    state.set_paused_until(None);
+    state.log("恢复守护");
+    state.emit_state();
+}
+
+pub fn toggle_pause(state: &Arc<AppState>) {
+    if state.is_paused() {
+        resume(state);
+    } else {
+        pause(state, PAUSE_MINUTES);
+    }
+}
+
+/// 手动解除隔离并恢复网络（不改变配置）。
+pub fn release(state: &Arc<AppState>) {
+    let (ok, note) = crate::netcut::restore();
+    let released = crate::guard::firewall_release();
+    state.set_tripped(None);
+    state.clear_streaks();
+    state.log(format!(
+        "手动解除隔离：网络{}，防火墙规则{}",
+        if ok { "已恢复" } else { &note },
+        if released { "已解除" } else { "无" }
+    ));
+    state.notify(
+        "recover",
+        "ClaudeGuard 已恢复",
+        "已手动解除隔离并恢复网络。",
+    );
+    state.emit_state();
+}
+
+/// 后台监控线程：启动 1 秒后首轮，之后按配置间隔轮询。
+pub fn spawn(state: Arc<AppState>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(1));
+        let mut last_run = 0u64;
         loop {
-            if sh.stop.load(Ordering::SeqCst) {
+            if state.stop.load(Ordering::SeqCst) {
                 break;
             }
-            let now = Instant::now();
-            if now >= next && !sh.busy.load(Ordering::SeqCst) {
-                run_check(&sh, Purpose::Monitor);
-                let iv = sh.cfg.lock().unwrap().check_interval_secs.clamp(5, 3600);
-                next = Instant::now() + Duration::from_secs(iv);
+            let interval = state.config().interval_secs();
+            let ts = now();
+            if ts.saturating_sub(last_run) >= interval && !state.is_checking() {
+                last_run = ts;
+                run_round(&state, Purpose::Monitor);
             }
             std::thread::sleep(Duration::from_millis(300));
         }
     });
 }
 
-/// v1 更新检查线程（spawn_update_check）。
-pub fn spawn_update_check(sh: &Arc<Shared>) {
-    let sh = Arc::clone(sh);
-    std::thread::spawn(move || {
-        *sh.upd.lock().unwrap() = UpdState::Checking;
-        sh.emit(EV_UPDATE, Clone::clone(&*sh.upd.lock().unwrap()));
-        let cfg = sh.cfg.lock().unwrap().clone();
-        match update::check_latest(&cfg) {
-            Ok(rel) => {
-                let remote = rel.version().to_string();
-                if update::is_newer(&remote, update::current_version()) {
-                    match rel.exe_asset() {
-                        Some(a) => {
-                            let st = UpdState::Available {
-                                ver: remote,
-                                url: a.browser_download_url.clone(),
-                                size: a.size,
-                            };
-                            *sh.upd.lock().unwrap() = st.clone();
-                            sh.emit(EV_UPDATE, st);
-                        }
-                        None => {
-                            let st = UpdState::Failed {
-                                msg: "新版本没有附带 exe 文件".into(),
-                            };
-                            *sh.upd.lock().unwrap() = st.clone();
-                            sh.emit(EV_UPDATE, st);
-                        }
-                    }
-                } else {
-                    *sh.upd.lock().unwrap() = UpdState::UpToDate;
-                    sh.emit(EV_UPDATE, UpdState::UpToDate);
-                }
-            }
-            Err(e) => {
-                let st = UpdState::Failed { msg: e };
-                *sh.upd.lock().unwrap() = st.clone();
-                sh.emit(EV_UPDATE, st);
-            }
-        }
-    });
-}
-
-/// v1 更新下载线程（app.rs:325-368）：进度事件 → Restarting → apply_update(true) → exit(0)。
-pub fn spawn_update_download(sh: &Arc<Shared>, url: String, size: u64) {
-    let sh = Arc::clone(sh);
-    std::thread::spawn(move || {
-        {
-            let mut st = sh.upd.lock().unwrap();
-            *st = UpdState::Downloading {
-                done: 0,
-                total: size,
-            };
-            sh.emit(EV_UPDATE, Clone::clone(&*st));
-        }
-        let cfg = sh.cfg.lock().unwrap().clone();
-        let sh2 = Arc::clone(&sh);
-        let res = update::download(&cfg, &url, size, move |done, total| {
-            let mut st = sh2.upd.lock().unwrap();
-            *st = UpdState::Downloading { done, total };
-            sh2.emit(EV_UPDATE, Clone::clone(&*st));
-        });
-        match res {
-            Ok(path) => {
-                *sh.upd.lock().unwrap() = UpdState::Restarting;
-                sh.emit(EV_UPDATE, UpdState::Restarting);
-                match update::apply_update(&path, true) {
-                    Ok(()) => std::process::exit(0),
-                    Err(e) => {
-                        let st = UpdState::Failed { msg: e };
-                        *sh.upd.lock().unwrap() = st.clone();
-                        sh.emit(EV_UPDATE, st);
-                    }
-                }
-            }
-            Err(e) => {
-                let st = UpdState::Failed { msg: e };
-                *sh.upd.lock().unwrap() = st.clone();
-                sh.emit(EV_UPDATE, st);
-            }
-        }
-    });
-}
-
-// —— 界面辅助状态（启动时填一次；install 后刷新） ——
-
-/// admin/installed 缓存：v1 存在 GuardApp 字段里（net session / current_exe 判定，代价高不逐帧算）。
-pub static ADMIN_FLAG: AtomicBool = AtomicBool::new(false);
-pub static INSTALLED_FLAG: AtomicBool = AtomicBool::new(false);
-pub static OPEN_SETTINGS: AtomicBool = AtomicBool::new(false);
-
-pub fn smoke_settings() -> bool {
-    OPEN_SETTINGS.load(Ordering::SeqCst) || std::env::var("CG_SMOKE_SETTINGS").is_ok()
-}
-
-/// 拿到完整快照（admin/installed 用缓存标志，smoke 读环境变量）。
-pub fn sh_full_snapshot(sh: &Shared) -> StatusSnapshot {
-    sh.snapshot_extras(
-        ADMIN_FLAG.load(Ordering::SeqCst),
-        INSTALLED_FLAG.load(Ordering::SeqCst),
-        smoke_settings(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sh() -> Arc<Shared> {
-        Arc::new(Shared::new(crate::config::Config::default()))
+    #[test]
+    fn summary_blocks_when_failing() {
+        let summary = RoundSummary {
+            passed: false,
+            block_reason: "Claude 出口不在白名单".into(),
+            failing: vec!["Claude 出口".into()],
+        };
+        assert!(!summary.passed);
+        assert!(summary.block_reason.contains("Claude"));
     }
 
     #[test]
-    fn pause_window_toggles() {
-        let s = sh();
-        assert!(!pause_active(&s), "默认未暂停");
-        let until = now_secs() + 1800;
-        set_pause(&s, Some(until));
-        assert!(pause_active(&s), "设置 30 分钟窗口后生效");
-        assert_eq!(*s.pause_until.lock().unwrap(), Some(until));
-        set_pause(&s, None);
-        assert!(!pause_active(&s), "手动清除立即恢复");
-        // 过期窗口视为已恢复
-        set_pause(&s, Some(now_secs() - 1));
-        assert!(!pause_active(&s), "过期暂停不算数");
+    fn ok_summary_is_pass() {
+        let summary = RoundSummary::ok();
+        assert!(summary.passed);
+        assert!(summary.block_reason.is_empty());
     }
 }

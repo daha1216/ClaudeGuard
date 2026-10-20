@@ -1,271 +1,437 @@
+//! v3 配置：读取、原子保存、v2 迁移与校验。
+//!
+//! `config.json` 只落 v3 字段；v2 的 `allowed_ips` / `egress_region` /
+//! `required_ip` 等旧字段仅用于反序列化后迁移，迁移完成即清空且不再序列化。
+
+use crate::guard;
+use crate::model::{default_true, normalize_ip, normalize_region, CutMode, Target};
+use crate::targets;
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, rename_all = "snake_case")]
-pub struct Config {
-    pub proxy_host: String,
-    pub proxy_port: u16,
-    /// 约定出口 IP 列表（v2.6 起）：命中任意一个即视为出口正确。
-    #[serde(default)]
-    pub allowed_ips: Vec<String>,
-    /// 约定出口地区（ISO 3166-1 alpha-2，如 "US"）。空串 = 不启用地区匹配。
-    /// 给没有固定 IP 的用户：按出口所在国家/地区放行。
-    #[serde(default)]
-    pub egress_region: String,
-    /// 兼容字段：v1~v2.5 的单值 required_ip。仅用于读取迁移，不再写出。
-    #[serde(default, skip_serializing)]
-    pub required_ip: Option<String>,
-    /// 守护对象（v2.7 起）：GUI agent id 列表，命中熔断条件时查杀 + 断网隔离。
-    /// 可选值见 guard::GUI_AGENTS（claude / chatgpt / antigravity）。
-    /// 默认只守 Claude（老用户行为不变）；空列表 = 什么都不杀（用户显式选择）。
-    #[serde(default = "default_guarded_agents")]
-    pub guarded_agents: Vec<String>,
-    /// CLI agent 告警（Claude Code / Codex / Gemini CLI）：只检测 + 提醒，绝不杀进程。
-    /// CLI 跑在 node/终端宿主里，按 exe 查杀会误伤终端和前端项目，防火墙也无 exe 粒度可拦。
-    #[serde(default = "default_true")]
-    pub cli_warn: bool,
-    pub connect_target: String,
-    /// AppUserModelId of the Claude UWP app
-    pub app_id: String,
-    pub check_interval_secs: u64,
-    pub kill_on_fail: bool,
-    pub quarantine_on_fail: bool,
-    /// auto-launch Claude once when checks first pass after app start
-    pub launch_on_pass: bool,
-    pub close_to_tray: bool,
-    pub auto_start_with_system: bool,
-    pub first_run: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            proxy_host: "127.0.0.1".into(),
-            proxy_port: 7890,
-            // 默认留空：出口 IP 属于用户隐私，由首次运行向导引导填写。
-            // 列表与地区都为空时校验必定失败（宁可错杀），直到用户设置其一。
-            allowed_ips: Vec::new(),
-            egress_region: String::new(),
-            required_ip: None,
-            guarded_agents: default_guarded_agents(),
-            cli_warn: true,
-            connect_target: "api.anthropic.com:443".into(),
-            app_id: "Claude_pzs8sxrjxfjjc!Claude".into(),
-            check_interval_secs: 15,
-            kill_on_fail: true,
-            quarantine_on_fail: true,
-            launch_on_pass: true,
-            close_to_tray: true,
-            auto_start_with_system: false,
-            first_run: true,
-        }
-    }
-}
-
 pub fn config_dir() -> PathBuf {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-    PathBuf::from(base).join("ClaudeGuard")
-}
-
-fn default_guarded_agents() -> Vec<String> {
-    vec!["claude".into()]
-}
-
-const fn default_true() -> bool {
-    true
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("ClaudeGuard")
 }
 
 pub fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
 
+fn default_proxy_host() -> String {
+    "127.0.0.1".into()
+}
+fn default_proxy_port() -> u16 {
+    7890
+}
+fn default_interval() -> u64 {
+    15
+}
+fn default_threshold() -> u32 {
+    2
+}
+fn default_agents() -> Vec<String> {
+    vec!["claude".into()]
+}
+
+/// 桌面通知分类开关（总开关 + 五类）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifyPrefs {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub trip: bool,
+    #[serde(default = "default_true")]
+    pub recover: bool,
+    #[serde(default = "default_true")]
+    pub launch_blocked: bool,
+    #[serde(default = "default_true")]
+    pub warning: bool,
+    #[serde(default = "default_true")]
+    pub client_update: bool,
+}
+
+impl Default for NotifyPrefs {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            trip: true,
+            recover: true,
+            launch_blocked: true,
+            warning: true,
+            client_update: true,
+        }
+    }
+}
+
+impl NotifyPrefs {
+    pub fn is_on(&self, class: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match class {
+            "trip" => self.trip,
+            "recover" => self.recover,
+            "launch_blocked" => self.launch_blocked,
+            "warning" => self.warning,
+            "client_update" => self.client_update,
+            _ => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default = "default_proxy_host")]
+    pub proxy_host: String,
+    #[serde(default = "default_proxy_port")]
+    pub proxy_port: u16,
+    #[serde(default)]
+    pub targets: Vec<Target>,
+    #[serde(default = "default_interval")]
+    pub check_interval_secs: u64,
+    #[serde(default = "default_threshold")]
+    pub trip_threshold: u32,
+    #[serde(default = "default_true")]
+    pub cut_network: bool,
+    #[serde(default)]
+    pub disable_network_adapters: bool,
+    #[serde(default = "default_true")]
+    pub kill_on_fail: bool,
+    #[serde(default = "default_true")]
+    pub quarantine_on_fail: bool,
+    #[serde(default = "default_agents")]
+    pub guarded_agents: Vec<String>,
+    #[serde(default = "default_true")]
+    pub cli_warn: bool,
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
+    #[serde(default)]
+    pub auto_start_with_system: bool,
+    #[serde(default)]
+    pub notify: NotifyPrefs,
+    #[serde(default = "default_true")]
+    pub first_run: bool,
+
+    // ---- v2 旧字段：只读迁移用，不落盘 ----
+    #[serde(default, skip_serializing)]
+    pub allowed_ips: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub egress_region: String,
+    #[serde(default, skip_serializing)]
+    pub required_ip: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub connect_target: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub app_id: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub launch_on_pass: Option<bool>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            version: 3,
+            proxy_host: default_proxy_host(),
+            proxy_port: default_proxy_port(),
+            targets: targets::default_targets(&[], &[]),
+            check_interval_secs: default_interval(),
+            trip_threshold: default_threshold(),
+            cut_network: true,
+            disable_network_adapters: false,
+            kill_on_fail: true,
+            quarantine_on_fail: true,
+            guarded_agents: default_agents(),
+            cli_warn: true,
+            close_to_tray: true,
+            auto_start_with_system: false,
+            notify: NotifyPrefs::default(),
+            first_run: true,
+            allowed_ips: Vec::new(),
+            egress_region: String::new(),
+            required_ip: None,
+            connect_target: None,
+            app_id: None,
+            launch_on_pass: None,
+        }
+    }
+}
+
 impl Config {
     pub fn load() -> Self {
-        let p = config_path();
-        if let Ok(text) = fs::read_to_string(&p) {
-            match serde_json::from_str::<Config>(&text) {
-                Ok(mut cfg) => {
-                    let migrated = cfg.migrate();
-                    if migrated {
-                        // 老配置迁移成列表后立即落盘，之后 required_ip 不再出现在文件里
-                        let _ = cfg.save();
-                    }
-                    return cfg;
-                }
-                // 解析失败不再静默：记日志后回退默认，便于排查被覆盖的配置
-                Err(e) => {
-                    crate::guard::log_line(&format!(
-                        "config parse failed ({}), falling back to defaults",
-                        e
+        let path = config_path();
+        let mut cfg = match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<Config>(&text) {
+                Ok(cfg) => cfg,
+                Err(err) => {
+                    backup_corrupt(&text);
+                    guard::log_line(&format!(
+                        "config: 配置无法解析（{err}），已备份并重置为默认"
                     ));
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(),
+        };
+        cfg.migrate();
+        cfg.save();
+        cfg
+    }
+
+    /// v2 → v3 迁移：旧白名单写进内置目标，旧字段清空，跨字段钳制。
+    pub fn migrate(&mut self) {
+        let mut legacy_ips = std::mem::take(&mut self.allowed_ips);
+        if legacy_ips.is_empty() {
+            if let Some(ip) = self.required_ip.take() {
+                legacy_ips.push(ip);
+            }
+        }
+        let legacy_ips: Vec<String> = legacy_ips
+            .iter()
+            .filter_map(|ip| normalize_ip(ip))
+            .collect();
+        let legacy_region = normalize_region(&self.egress_region).unwrap_or_default();
+
+        let legacy_regions: Vec<String> = if legacy_region.is_empty() {
+            Vec::new()
+        } else {
+            vec![legacy_region.clone()]
+        };
+
+        if self.targets.is_empty() {
+            self.targets = targets::default_targets(&legacy_ips, &legacy_regions);
+        }
+        self.targets = targets::ensure_builtins(self.targets.clone(), &legacy_ips, &legacy_regions);
+        self.guarded_agents = clean_guarded(&self.guarded_agents);
+
+        self.check_interval_secs = self.check_interval_secs.clamp(5, 3600);
+        self.trip_threshold = self.trip_threshold.clamp(1, 5);
+        self.proxy_host = self.proxy_host.trim().to_string();
+        if self.proxy_host.is_empty() {
+            self.proxy_host = default_proxy_host();
+        }
+        if self.proxy_port == 0 {
+            self.proxy_port = default_proxy_port();
+        }
+
+        self.allowed_ips.clear();
+        self.egress_region.clear();
+        self.required_ip = None;
+        self.connect_target = None;
+        self.app_id = None;
+        self.launch_on_pass = None;
+        self.version = 3;
+    }
+
+    pub fn save(&self) -> bool {
+        let dir = config_dir();
+        if std::fs::create_dir_all(&dir).is_err() {
+            return false;
+        }
+        let text = match serde_json::to_string_pretty(self) {
+            Ok(text) => text,
+            Err(err) => {
+                guard::log_line(&format!("config: 序列化失败：{err}"));
+                return false;
+            }
+        };
+        let tmp = dir.join("config.json.tmp");
+        if std::fs::write(&tmp, text.as_bytes()).is_err() {
+            return false;
+        }
+        let ok = std::fs::rename(&tmp, config_path()).is_ok();
+        if !ok {
+            let _ = std::fs::remove_file(&tmp);
+            guard::log_line("config: 保存失败（rename）");
+        }
+        ok
+    }
+
+    pub fn proxy_url(&self) -> String {
+        format!("http://{}:{}", self.proxy_host, self.proxy_port)
+    }
+
+    pub fn cut_mode(&self) -> CutMode {
+        if !self.cut_network {
+            CutMode::Off
+        } else if self.disable_network_adapters {
+            CutMode::Nics
+        } else {
+            CutMode::Firewall
+        }
+    }
+
+    pub fn enabled_targets(&self) -> impl Iterator<Item = &Target> {
+        self.targets.iter().filter(|t| t.enabled)
+    }
+
+    pub fn target(&self, id: &str) -> Option<&Target> {
+        self.targets.iter().find(|t| t.id == id)
+    }
+
+    pub fn interval_secs(&self) -> u64 {
+        self.check_interval_secs.clamp(5, 3600)
+    }
+
+    /// 把 UI 提交的部分字段深合并进现有配置并保存（未知字段忽略、数值重新钳制）。
+    pub fn apply_patch(&self, patch: &serde_json::Value) -> Result<Config, String> {
+        let base = serde_json::to_value(self).map_err(|err| err.to_string())?;
+        let merged = deep_merge(base, patch.clone());
+        let mut next: Config =
+            serde_json::from_value(merged).map_err(|err| format!("设置字段无效：{err}"))?;
+        next.migrate();
+        next.save();
+        Ok(next)
+    }
+}
+
+/// 递归合并两个 JSON 值：对象按键合并，其余以 patch 为准。
+fn deep_merge(base: serde_json::Value, patch: serde_json::Value) -> serde_json::Value {
+    match (base, patch) {
+        (serde_json::Value::Object(mut base_map), serde_json::Value::Object(patch_map)) => {
+            for (key, value) in patch_map {
+                match base_map.get_mut(&key) {
+                    Some(slot) => {
+                        let current = slot.take();
+                        *slot = deep_merge(current, value);
+                    }
+                    None => {
+                        base_map.insert(key, value);
+                    }
                 }
             }
+            serde_json::Value::Object(base_map)
         }
-        Self::default()
+        (_, patch) => patch,
     }
+}
 
-    /// v2.6 迁移：旧单值 required_ip → allowed_ips 列表（去空白/去重）。
-    /// 返回是否有改动（调用方决定是否落盘）。
-    pub fn migrate(&mut self) -> bool {
-        let mut changed = false;
-        if let Some(ip) = self.required_ip.take() {
-            let ip = ip.trim().to_string();
-            if !ip.is_empty() && !self.allowed_ips.iter().any(|a| a == &ip) {
-                self.allowed_ips.push(ip);
-                changed = true;
-            }
-        }
-        let clean: Vec<String> = self
-            .allowed_ips
-            .iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let dedup: Vec<String> = {
-            let mut seen = std::collections::HashSet::new();
-            clean
-                .into_iter()
-                .filter(|s| seen.insert(s.clone()))
-                .collect()
-        };
-        if dedup != self.allowed_ips {
-            self.allowed_ips = dedup;
-            changed = true;
-        }
-        self.egress_region = self.egress_region.trim().to_string();
-        // v2.7：守护对象列表清洗——去空白/去重/剔除未知 id（registry 变更后老配置不残留死 id）。
-        let known = crate::guard::gui_agent_ids();
-        let raw = self.guarded_agents.clone();
-        let mut cleaned: Vec<String> = Vec::new();
-        for id in &raw {
-            let id = id.trim().to_lowercase();
-            if known.contains(&id.as_str()) && !cleaned.iter().any(|x| x == &id) {
-                cleaned.push(id);
-            }
-        }
-        // raw 全是未知 id 被清光 → 回填 claude（保守护，不静默裸奔）；
-        // raw 本来就是空（用户显式清空）→ 尊重用户选择，什么都不杀。
-        if cleaned.is_empty() && !raw.is_empty() {
-            cleaned = default_guarded_agents();
-        }
-        let same = cleaned.len() == raw.len()
-            && cleaned
-                .iter()
-                .zip(raw.iter())
-                .all(|(a, b)| *a == b.trim().to_lowercase());
-        if !same {
-            self.guarded_agents = cleaned;
-            changed = true;
-        }
-        changed
+fn backup_corrupt(text: &str) {
+    let dir = config_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
     }
+    let stamp = crate::model::now();
+    let path = dir.join(format!("config.json.bak-{stamp}"));
+    let _ = std::fs::write(path, text.as_bytes());
+}
 
-    pub fn save(&self) -> std::io::Result<()> {
-        let dir = config_dir();
-        fs::create_dir_all(&dir)?;
-        let text = serde_json::to_string_pretty(self).unwrap_or_default();
-        // write via temp + rename for atomicity
-        let tmp = dir.join("config.json.tmp");
-        fs::write(&tmp, text)?;
-        fs::rename(&tmp, config_path())
+/// 清洗守护对象：去未知、去重、保留顺序；全垃圾时回填 claude；显式空列表尊重用户。
+pub fn clean_guarded(raw: &[String]) -> Vec<String> {
+    let known = guard::agent_ids();
+    let mut out: Vec<String> = Vec::new();
+    for id in raw {
+        let id = id.trim().to_ascii_lowercase();
+        if known.contains(&id.as_str()) && !out.contains(&id) {
+            out.push(id);
+        }
     }
+    if out.is_empty() && !raw.is_empty() {
+        out.push("claude".into());
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 行为锁: 配置 JSON 往返无损。
-    #[test]
-    fn json_round_trip() {
-        let cfg = Config {
-            proxy_host: "127.0.0.1".into(),
-            proxy_port: 7890,
-            allowed_ips: vec!["203.0.113.10".into(), "198.51.100.7".into()],
-            egress_region: "US".into(),
-            required_ip: None,
-            guarded_agents: vec!["claude".into(), "chatgpt".into()],
-            cli_warn: false,
-            connect_target: "api.anthropic.com:443".into(),
-            app_id: "Claude_pzs8sxrjxfjjc!Claude".into(),
-            check_interval_secs: 15,
-            kill_on_fail: true,
-            quarantine_on_fail: true,
-            launch_on_pass: true,
-            close_to_tray: true,
-            auto_start_with_system: false,
-            first_run: false,
-        };
-        let json = serde_json::to_string(&cfg).unwrap();
-        // 兼容字段不落盘：旧 required_ip 不得再出现在文件里
-        assert!(!json.contains("required_ip"));
-        let back: Config = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.allowed_ips, vec!["203.0.113.10", "198.51.100.7"]);
-        assert_eq!(back.egress_region, "US");
-        assert_eq!(back.guarded_agents, vec!["claude", "chatgpt"]);
-        assert!(!back.cli_warn);
-        assert_eq!(back.proxy_port, 7890);
-        assert_eq!(back.check_interval_secs, 15);
-    }
-
-    /// 行为锁: 旧版本/缺字段的配置文件必须能读——serde(default) 兜底,
-    /// 加新字段时不许破坏已装用户的配置。
-    #[test]
-    fn old_config_still_loads() {
-        // v1.2 时代的最小配置(部分字段缺失，required_ip 还是单值)
-        let legacy = r#"{
+    fn v2_json() -> &'static str {
+        r#"{
             "proxy_host": "127.0.0.1",
             "proxy_port": 7890,
-            "required_ip": "203.0.113.10",
+            "allowed_ips": ["204.1.100.98", " 198.51.100.7 "],
+            "egress_region": "us",
+            "guarded_agents": ["claude", "foo", "claude", "chatgpt"],
+            "cli_warn": false,
             "connect_target": "api.anthropic.com:443",
-            "app_id": "Claude_pzs8sxrjxfjjc!Claude",
+            "app_id": "",
+            "check_interval_secs": 15,
+            "kill_on_fail": true,
+            "quarantine_on_fail": true,
+            "launch_on_pass": false,
+            "close_to_tray": true,
+            "auto_start_with_system": false,
             "first_run": false
-        }"#;
-        let mut cfg: Config = serde_json::from_str(legacy).expect("旧配置必须可解析");
-        assert_eq!(cfg.check_interval_secs, 15); // 缺省值兜底
-        assert!(cfg.kill_on_fail); //              缺省值兜底
-                                   // 迁移：单值进列表，兼容字段清空
-        assert!(cfg.migrate());
-        assert_eq!(cfg.allowed_ips, vec!["203.0.113.10"]);
-        assert!(cfg.required_ip.is_none());
-        // 再跑一次迁移必须幂等
-        assert!(!cfg.migrate());
+        }"#
     }
 
-    /// 行为锁: 列表清理——空白条目剔除、重复去重。
     #[test]
-    fn migrate_cleans_ip_list() {
-        let mut cfg = Config::default();
-        cfg.allowed_ips = vec![
-            " 1.2.3.4 ".into(),
-            "".into(),
-            "1.2.3.4".into(),
-            "5.6.7.8".into(),
-        ];
-        assert!(cfg.migrate());
-        assert_eq!(cfg.allowed_ips, vec!["1.2.3.4", "5.6.7.8"]);
-    }
-
-    /// 行为锁: v2.7 守护对象——默认只守 Claude；未知 id 清理但全垃圾时回填 claude；
-    /// 用户显式清空（合法状态）不被回填。
-    #[test]
-    fn migrate_guarded_agents() {
-        let mut cfg = Config::default();
-        assert_eq!(cfg.guarded_agents, vec!["claude"]);
-        assert!(cfg.cli_warn);
-        // 未知 id + 大小写/空白 → 清洗成合法集
-        cfg.guarded_agents = vec![" Claude ".into(), "bogus".into(), "ChatGPT".into()];
-        assert!(cfg.migrate());
+    fn migrates_v2_whitelist_into_builtin_targets() {
+        let mut cfg: Config = serde_json::from_str(v2_json()).unwrap();
+        assert!(cfg.targets.is_empty());
+        cfg.migrate();
+        assert_eq!(cfg.version, 3);
+        assert!(cfg.targets.len() >= 4);
+        for id in ["local", "claude", "codex"] {
+            let t = cfg.target(id).expect(id);
+            assert_eq!(t.expect_ips, vec!["204.1.100.98", "198.51.100.7"]);
+            assert_eq!(t.expect_regions, vec!["US"]);
+        }
+        let anti = cfg.target("antigravity").unwrap();
+        assert!(anti.expect_ips.is_empty());
+        assert_eq!(anti.anchor_kind, crate::model::AnchorKind::Reachability);
+        assert!(cfg.allowed_ips.is_empty());
         assert_eq!(cfg.guarded_agents, vec!["claude", "chatgpt"]);
-        // 全垃圾 → 回填 claude（不静默裸奔）
-        cfg.guarded_agents = vec!["nope".into()];
-        assert!(cfg.migrate());
-        assert_eq!(cfg.guarded_agents, vec!["claude"]);
-        // 显式清空 → 尊重用户
-        cfg.guarded_agents = Vec::new();
-        assert!(!cfg.migrate(), "清空是合法状态，不回填");
-        assert!(cfg.guarded_agents.is_empty());
+        assert!(!cfg.first_run);
+    }
+
+    #[test]
+    fn migrates_legacy_required_ip() {
+        let text = r#"{"proxy_host":"127.0.0.1","proxy_port":7890,"required_ip":"204.1.100.98"}"#;
+        let mut cfg: Config = serde_json::from_str(text).unwrap();
+        cfg.migrate();
+        assert_eq!(
+            cfg.target("claude").unwrap().expect_ips,
+            vec!["204.1.100.98"]
+        );
+    }
+
+    #[test]
+    fn empty_v2_whitelist_stays_strict() {
+        let text = r#"{"proxy_host":"127.0.0.1","proxy_port":7890,"allowed_ips":[]}"#;
+        let mut cfg: Config = serde_json::from_str(text).unwrap();
+        cfg.migrate();
+        for id in ["local", "claude", "codex"] {
+            let t = cfg.target(id).unwrap();
+            assert!(t.expect_ips.is_empty() && t.expect_regions.is_empty());
+        }
+    }
+
+    #[test]
+    fn cleans_guarded_agents() {
+        assert_eq!(clean_guarded(&["claude".into()]), vec!["claude"]);
+        assert_eq!(
+            clean_guarded(&["ChatGPT".into(), "chatgpt".into(), "x".into()]),
+            vec!["chatgpt"]
+        );
+        assert_eq!(clean_guarded(&["nope".into()]), vec!["claude"]);
+        assert!(clean_guarded(&[]).is_empty());
+    }
+
+    #[test]
+    fn clamps_numbers_and_fills_proxy() {
+        let text =
+            r#"{"proxy_host":"  ","proxy_port":0,"check_interval_secs":1,"trip_threshold":9}"#;
+        let mut cfg: Config = serde_json::from_str(text).unwrap();
+        cfg.migrate();
+        assert_eq!(cfg.proxy_host, "127.0.0.1");
+        assert_eq!(cfg.proxy_port, 7890);
+        assert_eq!(cfg.check_interval_secs, 5);
+        assert_eq!(cfg.trip_threshold, 5);
+    }
+
+    #[test]
+    fn cut_mode_respects_flags() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.cut_mode(), CutMode::Firewall);
+        cfg.disable_network_adapters = true;
+        assert_eq!(cfg.cut_mode(), CutMode::Nics);
+        cfg.cut_network = false;
+        assert_eq!(cfg.cut_mode(), CutMode::Off);
     }
 }

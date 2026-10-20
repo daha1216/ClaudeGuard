@@ -1,1105 +1,909 @@
-/* ClaudeGuard v2 前端主逻辑 — 对等依据 docs/PARITY-v2.md（文案/状态机以它为准）
- * IIFE 隔离词法作用域（见 ipc.js 头注：顶层 const 撞名会让整个脚本编译失败）。
- * v2.9：用户指南改为前端内置模态（guideOpen/guideClose，不再调 openGuide）；
- *       日志新增行落位动画（.log-enter 配 app.css log-drop）。 */
+/* ClaudeGuard v3 — 页面编排：状态渲染、折叠卡、首启向导、事件订阅。
+   对外公开：window.CG_UI = { openSettings, openDetails, openLog, expand, toast, ... }（幂等）。
+   数据契约：guard://state → StateView（camelCase）；get_state / get_config 走 window.CG_IPC。 */
 (() => {
-"use strict";
-if (!window.CG_IPC) return;
+  "use strict";
 
-const { invoke, EV, CMD, listen, win } = window.CG_IPC;
+  const root = window;
+  const IPC = root.CG_IPC;
+  if (!IPC) return;
 
-/* ===== JS 诊断桥（P0 调试期）：错误与里程碑写入 guard.log ===== */
-const jsLog = (m) => {
-  try { invoke("js_log", { msg: m }); } catch (_) { /* 诊断自身不许抛 */ }
-};
-window.addEventListener("error", (e) => {
-  jsLog(`error: ${e.message} @${(e.filename || "").split("/").pop()}:${e.lineno}:${e.colno}`);
-});
-window.addEventListener("unhandledrejection", (e) => {
-  jsLog(`rejection: ${e.reason}`);
-});
+  const { invoke, EV, CMD } = IPC;
 
-/* ===== 全局状态 ===== */
-const S = {
-  checking: false,
-  last: null,          // CheckOutcome | null
-  tripped: null,       // {killed,firewall_rules,quarantined} | null
-  admin: true,
-  installed: false,
-  version: "",
-  smokeSettings: false,
-  cfg: null,           // Config
-  upd: { state: "idle" },
-  logs: [],
-  notice: null,        // {title, desc} 4 秒自动清
-  launchError: null,   // 独立于出口检查，保留到下一次尝试启动
-  lastAt: 0,           // 最近一次检查完成的本地时刻（相对时间用）
-  agentsRunning: [],    // 守护范围内在跑的 GUI agent 显示名（快照字段）
-  cliRunning: [],       // 在跑的 CLI agent 显示名（快照字段，只提醒）
-  wizPage: 0,
-  wizPort: "",
-  wizIp: "",
-  wizRegion: "",
-  openCards: { details: false, settings: false, log: false },
-};
+  // 未捕获异常写进 guard.log（后端环形日志），便于 CDP / 日志排查；限次防止刷屏。
+  let jsErrCount = 0;
+  function reportJsError(msg) {
+    if (jsErrCount >= 20) return;
+    jsErrCount++;
+    try {
+      invoke(CMD.js_log, { level: "error", msg: String(msg || "unknown error").slice(0, 500) }).catch(() => {});
+    } catch (e) { /* 桥不可用时忽略 */ }
+  }
+  window.addEventListener("error", (e) => {
+    reportJsError((e.message || "script error") + " @" + (e.filename || "") + ":" + (e.lineno || 0));
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    const r = e && e.reason;
+    reportJsError((r && r.message) || String(r || "unhandled rejection"));
+  });
 
-const $ = (id) => document.getElementById(id);
-const esc = (s) =>
-  String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const $ = (id) => document.getElementById(id);
+  const esc = (v) =>
+    String(v == null ? "" : v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[c]));
+  const icon = (name, size) => {
+    const set = root.ICONS || {};
+    const svg = set[name] || "";
+    return size ? svg.replace('width="20" height="20"', 'width="' + size + '" height="' + size + '"') : svg;
+  };
 
-/* ===== 校验（与 v1 Rust 端规则一致） ===== */
-const portOk = (s) => /^\d{1,5}$/.test(s.trim()) && +s.trim() >= 1 && +s.trim() <= 65535;
-function ipOk(s) {
-  const t = s.trim();
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(t);
-  if (!m) return false;
-  return m.slice(1).every((p) => (/^0\d/.test(p) ? false : +p <= 255));
-}
-const intOk = (s) => /^\d+$/.test(s.trim());
+  const REGION_NAMES = {
+    US: "美国", JP: "日本", SG: "新加坡", HK: "香港", TW: "台湾", KR: "韩国",
+    GB: "英国", UK: "英国", DE: "德国", FR: "法国", CA: "加拿大", AU: "澳大利亚",
+    NL: "荷兰", CH: "瑞士", SE: "瑞典", RU: "俄罗斯", IN: "印度", BR: "巴西",
+    AE: "阿联酋", TR: "土耳其", TH: "泰国", MY: "马来西亚", VN: "越南", PH: "菲律宾",
+    ID: "印尼", IT: "意大利", ES: "西班牙", PL: "波兰", FI: "芬兰", NO: "挪威",
+    DK: "丹麦", IE: "爱尔兰", AT: "奥地利", BE: "比利时", PT: "葡萄牙", CN: "中国",
+  };
+  const CITY_NAMES = {
+    tokyo: "东京", osaka: "大阪", "los angeles": "洛杉矶", "san francisco": "旧金山",
+    "san jose": "圣何塞", seattle: "西雅图", "new york": "纽约", chicago: "芝加哥",
+    dallas: "达拉斯", miami: "迈阿密", singapore: "新加坡", "hong kong": "香港",
+    taipei: "台北", seoul: "首尔", london: "伦敦", frankfurt: "法兰克福",
+    amsterdam: "阿姆斯特丹", paris: "巴黎", sydney: "悉尼", toronto: "多伦多",
+    vancouver: "温哥华", tokyo2: "东京", osaka2: "大阪",
+  };
+  const STATE_LABEL = { pass: "通过", fail: "不合规", unverified: "未确认", pending: "待检测", checking: "检测中", disabled: "未启用" };
+  const CUT_LABEL = { off: "不断网", firewall: "防火墙全局阻断", nics: "禁用物理网卡" };
+  const CUT_TEXT = { off: "未断网", firewall: "已断网隔离", nics: "已禁用网卡" };
+  const PHASE_LABEL = {
+    idle: "待检查", checking: "检查中", downloading: "正在下载", downloading_setup: "正在下载安装包",
+    waiting_exit: "等待退出", installing: "正在安装", pending_reboot: "等待重启", done: "已完成",
+    up_to_date: "已是最新", error: "出错", disabled: "已关闭", pending: "等待中",
+  };
 
-/* ===== 出口地区选项（ISO 3166-1 alpha-2，与 ipinfo 的 country 字段对齐） ===== */
-const REGIONS = [
-  ["", "不限"],
-  ["US", "美国"],
-  ["JP", "日本"],
-  ["SG", "新加坡"],
-  ["HK", "香港"],
-  ["TW", "台湾"],
-  ["KR", "韩国"],
-  ["GB", "英国"],
-  ["DE", "德国"],
-  ["FR", "法国"],
-  ["CA", "加拿大"],
-  ["AU", "澳大利亚"],
-];
-const regionName = (code) => {
-  const hit = REGIONS.find((r) => r[0] === code);
-  return hit ? hit[1] : code;
-};
-/* 向导/设置共用：把逗号/空格/分号分隔的输入拆成 IP 数组 */
-const splitIps = (s) =>
-  String(s || "")
-    .split(/[,\s;，；]+/)
-    .map((x) => x.trim())
-    .filter(Boolean);
+  const S = {
+    state: null,
+    stable: null,
+    cfg: null,
+    logs: [],
+    manualBusy: false,
+    launchBusy: false,
+    releaseBusy: false,
+    folds: { details: false, settings: false, logs: false },
+    settingsMounted: false,
+    smokeOpened: false,
+    launchErrShown: "",
+    wizard: { open: false, step: 0, busy: false },
+    detailsKey: "",
+  };
 
-/* ===== plain_reason（PARITY §7） ===== */
-function plainReason(reason) {
-  const r = reason || "";
-  if (r.includes("系统代理")) return "电脑还没开系统代理：打开代理软件里的「系统代理」开关";
-  if (r.includes("端口") || r.includes("握手") || r.includes("CONNECT")) return "连不上代理端口：看看代理软件是不是开着";
-  if (r.includes("出口") || r.includes("IP")) return "出口 IP 和约定不一致";
-  if (!r) return "没有通过检查";
-  return r;
-}
+  /* ---------- 小工具 ---------- */
 
-/* ===== 相对时间（详情卡"X 秒前"） ===== */
-function relTime(t) {
-  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
-  if (s < 5) return "刚刚";
-  if (s < 60) return `${s} 秒前`;
-  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
-  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
-  return `${Math.floor(s / 86400)} 天前`;
-}
-
-/* ===== 系统通知（熔断/恢复气泡；权限已授予才发） ===== */
-function notify(title, body) {
-  try {
-    if ("Notification" in window && Notification.permission === "granted") {
-      new Notification(title, { body, tag: "claudeguard" });
+  function pad2(n) { return String(n).padStart(2, "0"); }
+  function fmtClock(ts) {
+    if (!ts) return "";
+    const d = new Date(ts * 1000);
+    return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+  }
+  function minutesLeft(ts) {
+    if (!ts) return 0;
+    return Math.max(0, Math.ceil((ts * 1000 - Date.now()) / 60000));
+  }
+  function regionText(code) {
+    if (!code) return "";
+    const c = String(code).toUpperCase();
+    return REGION_NAMES[c] || String(code);
+  }
+  function cityText(city) {
+    if (!city) return "";
+    return CITY_NAMES[String(city).toLowerCase()] || String(city);
+  }
+  function listText(arr) {
+    return Array.isArray(arr) && arr.length ? arr.join(", ") : "";
+  }
+  function shortHost(url) {
+    if (!url) return "";
+    return String(url).replace(/^[a-z]+:\/\//i, "").split("/")[0];
+  }
+  function targetGeo(t) {
+    if (!t) return "";
+    if (t.state === "disabled") return "未启用";
+    if (t.anchorKind === "reachability") {
+      if (t.state === "pass") return "可达 · " + (t.latencyMs || 0) + "ms";
+      if (t.state === "fail") return "不可达";
+      return "待检测";
     }
-  } catch (_) {
-    /* WebView2 环境异常时静默降级 */
-  }
-}
-
-/* ===== 启动 ===== */
-async function init() {
-  const [st, cfg, upd, logs] = await Promise.all([
-    invoke(CMD.getState),
-    invoke(CMD.getConfig),
-    invoke(CMD.updState),
-    invoke(CMD.recentLogs),
-  ]);
-  Object.assign(S, st);
-  S.cfg = cfg;
-  S.upd = upd;
-  S.logs = logs;
-  S.wizPort = String(cfg.proxy_port ?? "");
-  S.wizIp = (cfg.allowed_ips || []).join(", ");
-  S.wizRegion = cfg.egress_region ?? "";
-  if (!S.checking && S.last) S.lastAt = Date.now();
-  if (S.smokeSettings) S.openCards.settings = true;
-
-  listen(EV.status, (e) => {
-    const wasTripped = !!S.tripped;
-    Object.assign(S, e.payload);
-    if (!S.checking && S.last) S.lastAt = Date.now();
-    if (!wasTripped && S.tripped) {
-      const names = trippedNames();
-      notify(
-        `Claude 守护器：已暂停 ${names}`,
-        `${(S.last && S.last.reason) || "出口与约定不一致"}。切回节点后自动恢复。`,
-      );
-    } else if (wasTripped && !S.tripped && S.last && S.last.passed) {
-      notify("Claude 守护器：已恢复守护", "出口校验通过，守护已恢复。");
+    if (t.state === "fail") return "不符合白名单";
+    if (t.country) {
+      const parts = [regionText(t.country)];
+      const city = cityText(t.city);
+      if (city) parts.push(city);
+      if (t.colo) parts.push(t.colo);
+      return parts.join(" · ");
     }
-    render();
-  });  listen(EV.log, (e) => {
-    S.logs.push(e.payload);
-    if (S.logs.length > 200) S.logs.splice(0, S.logs.length - 200);
-    renderLog();
-  });
-  listen(EV.update, (e) => {
-    S.upd = e.payload;
-    renderSettings();
-  });
-
-  wireStatic();
-  window.addEventListener("cg-open-settings", () => {
-    S.openCards.settings = true;
-    render();
-    document.getElementById("feishu-group")?.scrollIntoView({ block: "center", behavior: "smooth" });
-  });
-  render();
-  playBoot();
-  // 相对时间心跳：只改文本节点，不触发整卡重渲（避免打断日志 tail-f 等局部状态）。
-  setInterval(() => {
-    if (!S.lastAt) return;
-    const el = document.querySelector("#details-state .rel");
-    if (el) el.textContent = `· ${relTime(S.lastAt)}`;
-    renderStatusLine();
-  }, 5000);
-  // 通知权限只在用户首次交互时问一次（避免一上来就弹权限条）。
-  document.addEventListener(
-    "click",
-    () => {
-      if ("Notification" in window && Notification.permission === "default") {
-        Notification.requestPermission().catch(() => {});
-      }
-    },
-    { once: true },
-  );
-  if (S.smokeSettings) {
-    // 手风琴展开(280ms)完成后再滚到底，否则内容长高后停在中途
-    setTimeout(() => {
-      $("feishu-group")?.scrollIntoView({ block: "center" });
-    }, 450);
+    if (t.state === "checking") return "检测中…";
+    if (t.state === "pass") return "已通过";
+    if (t.state === "unverified") return "地区未确认";
+    if (t.reason) return t.reason;
+    return "待检测";
   }
-}
-
-/* ===== 静态事件接线 ===== */
-function wireStatic() {
-  $("btn-min").onclick = () => win.minimize();
-  $("btn-max").onclick = () => win.toggleMaximize();
-  $("btn-close").onclick = () => win.close();
-  win.onResized(() => {
-    win.isMaximized().then((m) => {
-      $("btn-max").innerHTML = m ? ICONS.restore : ICONS.maximize;
-    });
-    updateCompact();
-  });
-
-  // 边缘缩放热区（ResizeDirection 枚举是 PascalCase 变体名）
-  const EDGE_DIR = { n: "North", s: "South", e: "East", w: "West", ne: "NorthEast", nw: "NorthWest", se: "SouthEast", sw: "SouthWest" };
-  document.querySelectorAll(".edge").forEach((el) => {
-    el.addEventListener("pointerdown", (ev) => {
-      win.startResizeDragging(EDGE_DIR[el.dataset.edge] || "East");
-      ev.preventDefault();
-    });
-  });
-
-  // 折叠卡头（div+role=button：键盘 Enter/Space 等价点击）
-  document.querySelectorAll(".card-head[data-toggle]").forEach((head) => {
-    head.onclick = () => {
-      const key = head.dataset.toggle;
-      S.openCards[key] = !S.openCards[key];
-      render();
-      if (S.openCards[key]) staggerIn(key);
-    };
-    head.onkeydown = (e) => {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        head.click();
-      }
-    };
-  });
-
-  // 底栏
-  $("link-data-folder").onclick = (e) => {
-    e.preventDefault();
-    invoke(CMD.openDataFolder);
-  };
-  $("link-guide").onclick = (e) => {
-    e.preventDefault();
-    guideOpen();
-  };
-  $("link-install").onclick = (e) => {
-    e.preventDefault();
-    doInstall();
-  };
-
-  // 向导
-  $("wiz0-next").onclick = () => gotoWizard(1);
-  $("wiz1-prev").onclick = (e) => {
-    e.preventDefault();
-    gotoWizard(0);
-  };
-  $("wiz1-next").onclick = wiz1Continue;
-  $("wiz2-prev").onclick = (e) => {
-    e.preventDefault();
-    gotoWizard(1);
-  };
-  $("wiz2-install").onclick = async () => {
-    await doInstall();
-    finishWizard();
-  };
-  $("wiz2-portable").onclick = () => finishWizard();
-
-  $("cta").onclick = ctaClick;
-
-  updateCompact();
-  new ResizeObserver(updateCompact).observe($("content"));
-
-  // 标题栏发丝线：内容滚到标题栏底下才浮现（macOS 风）
-  const contentEl = $("content");
-  contentEl.addEventListener("scroll", () => {
-    $("titlebar").classList.toggle("scrolled", contentEl.scrollTop > 0);
-  }, { passive: true });
-}
-
-function updateCompact() {
-  const h = $("content").clientHeight;
-  document.body.classList.toggle("compact", h > 0 && h < 400);
-}
-
-/* ===== 渲染总控 ===== */
-function render() {
-  const wizardMode = !!S.cfg && S.cfg.first_run;
-  $("home").classList.toggle("hidden", wizardMode);
-  $("wizard").classList.toggle("hidden", !wizardMode);
-  // 折叠状态应用（默认全收起；点击头部或冒烟钩子展开）
-  const CARD_IDS = { details: "card-details", settings: "card-settings", log: "card-log" };
-  for (const k in CARD_IDS) {
-    const open = !!S.openCards[k];
-    const card = $(CARD_IDS[k]);
-    card.classList.toggle("open", open);
-    card.querySelector(".card-head").setAttribute("aria-expanded", String(open));
+  function targetLat(t) {
+    if (!t) return "";
+    if (t.state === "disabled") return "未启用";
+    if (t.state === "checking") return "…";
+    if (t.state === "pending") return "—";
+    if (t.latencyMs) return t.latencyMs + " ms";
+    if (t.state === "fail") return "校验失败";
+    return "—";
   }
-  if (wizardMode) {
-    renderWizard();
-    return;
+  function dotClass(state) {
+    if (state === "pass") return "dot";
+    if (state === "fail") return "dot fail";
+    if (state === "unverified") return "dot unverified";
+    if (state === "checking") return "dot checking";
+    return "dot idle";
   }
-  renderHero();
-  renderBanners();
-  renderCta();
-  renderDetails();
-  renderSettings();
-  renderLog();
-  renderFooter();
-  renderStatusLine();
-}
-
-/* ===== 状态行（hero 下方：守护运行状态一览） ===== */
-function renderStatusLine() {
-  const dot = document.querySelector("#status-line .status-dot");
-  const txt = $("status-text");
-  if (!dot || !txt) return;
-  let cls = "green";
-  const segs = [];
-  const paused = S.pauseUntil && S.pauseUntil > Date.now() / 1000;
-  // 守护对象进程段：每个分支都带上；CLI 在跑时单独追加提醒段。
-  // 文本按段渲染（.seg 不许内部断行），过宽时整段换行，不会把"运行中"这类词劈成两半。
-  const agents = S.agentsRunning.length
-    ? `${S.agentsRunning.join("、")} 运行中`
-    : "守护对象未运行";
-  if (S.checking && S.manual) {
-    cls = "blue";
-    segs.push("正在检查…", agents);
-  } else if (S.tripped) {
-    cls = "red";
-    segs.push("已熔断", "切回节点后自动恢复", agents);
-  } else if (paused) {
-    cls = "orange";
-    const t = new Date(S.pauseUntil * 1000);
-    segs.push(
-      `已暂停 · ${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")} 自动恢复`,
-      agents
-    );
-  } else {
-    const iv = S.cfg && S.cfg.check_interval_secs ? S.cfg.check_interval_secs : 30;
-    // "上次 X"不放在这里：详情卡头已有相对时间，状态行保持一行内。
-    segs.push("自动守护中", `每 ${iv} 秒检查`, agents);
+  function phaseText(ph) {
+    return PHASE_LABEL[String(ph || "").toLowerCase()] || String(ph || "");
   }
-  if (S.cliRunning.length) segs.push(`CLI ${S.cliRunning.join("、")}`);
-  dot.className = `status-dot ${cls}`;
-  const sig = cls + "|" + segs.join("·");
-  if (txt.dataset.sig !== sig) {
-    txt.dataset.sig = sig;
-    txt.innerHTML = segs.map((s) => `<span class="seg">${s}</span>`).join('<span class="dot-sep">·</span>');
+
+  let toastTimer = 0;
+  function toast(msg, ok) {
+    const el = $("toast");
+    if (!el) return;
+    el.textContent = String(msg || "");
+    el.className = "toast" + (ok ? " is-ok" : "");
+    el.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.hidden = true; }, 3200);
   }
-}
 
-/* ===== hero ===== */
-function heroState() {
-  // 只有"用户在等"的检查才转圈：手动点按钮，或还没有任何结果的首查。
-  // 后台周期检查静默进行（环保持原状态，副标题仅在数据变化时淡换）。
-  if (S.checking && (S.manual || !S.last))
-    return { ring: "spin", title: "正在检查…", sub: "正在核对代理和出口 IP" };
-  if (S.tripped) {
-    const reason = S.last && S.last.reason ? S.last.reason : "出口 IP 与约定不一致";
-    const names = trippedNames();
-    return { ring: "fail", title: `已暂停 ${names}`, sub: `${reason} · 切回节点后自动恢复` };
-  }
-  if (S.last && S.last.passed) {
-    const ip = S.last.egress_ip || "-";
-    // 副标题是给用户看的摘要：剥掉"(via ipify)"这类回退来源标注（详情/日志里保留），超长按词边界截断。
-    let desc = (S.last.egress_desc || "").replace(/\s*\(via ipify\)/, "");
-    if (desc.length > 26) desc = desc.slice(0, 25).replace(/\s+\S*$/, "") + "…";
-    return { ring: "pass", title: S.launchError ? "网络检查通过" : "一切正常", sub: `出口 ${ip} ${desc}`.trim() };
-  }
-  if (S.last) return { ring: "fail", title: "没有通过检查", sub: plainReason(S.last.reason) };
-  return { ring: "idle", title: "准备中", sub: "马上开始第一次检查" };
-}
-
-let prevRing = ""; // 状态没变就不重画环（自旋动画不重置、对勾不重播）
-let firstHero = true; // 首帧交给进场编排，副标题不做淡换
-
-// 熔断时涉及的 agent 显示名：优先用后端给的名单，兜底"守护对象"
-function trippedNames() {
-  const a = (S.tripped && S.tripped.agents) || [];
-  return a.length ? a.join("、") : "守护对象";
-}
-
-// 签名转场：自旋减速收拢成满环——弧长 30%→100% + 旋转对齐到整圈，对勾延迟 160ms 描画
-function settleRing(g, wasSpin) {
-  if (!wasSpin || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-  const t = getComputedStyle(g).transform;
-  let th = 0;
-  if (t && t !== "none") th = (Math.atan2(new DOMMatrixReadOnly(t).b, new DOMMatrixReadOnly(t).a) * 180) / Math.PI;
-  const target = Math.ceil((th + 140) / 360) * 360; // 收在整圈上，动画结束后回落 0° 无跳变
-  const ease = "cubic-bezier(0.23,1,0.32,1)";
-  g.animate([{ transform: `rotate(${th}deg)` }, { transform: `rotate(${target}deg)` }], { duration: 280, easing: ease });
-  g.querySelector(".ring-full").animate([{ strokeDasharray: "30 100" }, { strokeDasharray: "100 0" }], { duration: 280, easing: ease });
-  const mark = g.querySelector(".ring-mark");
-  if (mark) mark.style.animationDelay = "160ms";
-}
-
-function renderHero() {
-  const h = heroState();
-  const sub = $("hero-sub");
-  if (!firstHero && sub.textContent !== h.sub) {
-    sub.classList.remove("swap");
-    void sub.offsetWidth;
-    sub.classList.add("swap");
-  }
-  firstHero = false;
-  $("hero-title").textContent = h.title;
-  sub.textContent = h.sub;
-  const g = $("ring-dynamic");
-  const changed = prevRing !== h.ring;
-  if (h.ring === "spin") {
-    if (changed) {
-      let arcs = "";
-      for (let i = 0; i < 3; i++) {
-        const a0 = (i * 2 * Math.PI) / 3;
-        const a1 = a0 + 1.4;
-        const x0 = 60 + 52 * Math.cos(a0), y0 = 60 + 52 * Math.sin(a0);
-        const x1 = 60 + 52 * Math.cos(a1), y1 = 60 + 52 * Math.sin(a1);
-        arcs += `<path class="spin-arc" d="M${x0.toFixed(1)} ${y0.toFixed(1)} A52 52 0 0 1 ${x1.toFixed(1)} ${y1.toFixed(1)}"/>`;
-      }
-      g.innerHTML = arcs;
+  async function call(cmd, args, quiet) {
+    try {
+      return await invoke(cmd, args || {});
+    } catch (e) {
+      if (!quiet) toast((e && e.message) || "操作失败");
+      return undefined;
     }
-    prevRing = h.ring;
-    g.classList.add("spin");
-    return;
   }
-  g.classList.remove("spin");
-  if (!changed) return;
-  const wasSpin = prevRing === "spin";
-  prevRing = h.ring;
-  const draw = ' pathLength="1" class="ring-mark draw-in"'; // 仅状态切换时描画
-  if (h.ring === "pass") {
-    g.innerHTML = `<circle class="ring-full" pathLength="100" cx="60" cy="60" r="52" stroke="var(--green)"/>
-      <circle class="disc" cx="60" cy="60" r="40" fill="var(--green)" fill-opacity="0.09" stroke="none"/>
-      <path${draw} d="M44 61 L54 72 L77 48" stroke="var(--green)"/>`;
-    settleRing(g, wasSpin);
-  } else if (h.ring === "fail") {
-    g.innerHTML = `<circle class="ring-full" pathLength="100" cx="60" cy="60" r="52" stroke="var(--red)"/>
-      <circle class="disc" cx="60" cy="60" r="40" fill="var(--red)" fill-opacity="0.09" stroke="none"/>
-      <path${draw} d="M60 44 L60 60 M60 70 L60 70.02" stroke="var(--red)"/>`;
-    settleRing(g, wasSpin);
-  } else {
-    g.innerHTML = `<circle class="ring-dot" cx="46" cy="60" r="4.5"/>
-      <circle class="ring-dot" cx="60" cy="60" r="4.5"/>
-      <circle class="ring-dot" cx="74" cy="60" r="4.5"/>`;
+
+  /* ---------- 折叠卡 ---------- */
+
+  const FOLDS = {
+    details: { card: "card-details", head: "head-details", body: "body-details", sub: "details-sub" },
+    settings: { card: "card-settings", head: "head-settings", body: "body-settings", sub: "settings-sub" },
+    logs: { card: "card-logs", head: "head-logs", body: "body-logs", sub: "logs-sub" },
+  };
+
+  function setFold(id, open, scroll) {
+    const f = FOLDS[id];
+    if (!f) return;
+    const card = $(f.card);
+    const body = $(f.body);
+    const head = $(f.head);
+    if (!card || !body) return;
+    const want = !!open;
+    const was = S.folds[id];
+    S.folds[id] = want;
+    card.classList.toggle("is-open", want);
+    body.hidden = !want;
+    if (head) head.setAttribute("aria-expanded", want ? "true" : "false");
+    if (want && !was) {
+      if (id === "settings") mountSettings();
+      if (id === "details") renderDetails();
+      if (id === "logs") loadLogs();
+    }
+    if (want && scroll) {
+      try { card.scrollIntoView({ block: "nearest", behavior: prefersReduced() ? "auto" : "smooth" }); } catch (e) { /* ignore */ }
+    }
   }
-}
-
-// 首屏进场编排：环先落位 → 标题 → 副标题（40ms 步进）；向导完成后回主屏重播
-function playBoot() {
-  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-  const home = $("home");
-  home.classList.remove("boot");
-  void home.offsetWidth;
-  home.classList.add("boot");
-}
-
-// 展开内容错峰：仅展开瞬间挂 .dealing（前 8 行 30ms 步进），状态重渲染不重播
-function staggerIn(key) {
-  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-  const inner = document.querySelector(`#card-${key} .card-inner`);
-  if (!inner) return;
-  inner.classList.remove("dealing");
-  [...inner.children].slice(0, 8).forEach((el, i) => el.style.setProperty("--row", i));
-  void inner.offsetWidth;
-  inner.classList.add("dealing");
-}
-
-/* ===== 横幅（优先级：notice > 非管理员 > tripped > 暂停中 > 网络不明） ===== */
-function renderBanners() {
-  const z = $("banner-zone");
-  let html = "";
-  if (S.notice) {
-    html += `<div class="banner green"><span class="banner-dot"></span><div>
-      <div class="banner-title">${esc(S.notice.title)}</div>
-      ${S.notice.desc ? `<div class="banner-desc">${esc(S.notice.desc)}</div>` : ""}</div></div>`;
-  } else if (!S.admin) {
-    const desc = document.body.classList.contains("compact")
-      ? "请关掉本窗口，用桌面的 ClaudeGuard 快捷方式重新打开。"
-      : "自动断网要用管理员权限。请关掉这个窗口，用桌面的 ClaudeGuard 快捷方式重新打开。";
-    html += `<div class="banner orange"><span class="banner-dot"></span><div>
-      <div class="banner-title">需要管理员权限</div><div class="banner-desc">${esc(desc)}</div></div></div>`;
-  } else if (S.tripped) {
-    const names = trippedNames();
-    html += `<div class="banner red"><span class="banner-dot"></span><div>
-      <div class="banner-title">${esc(names)} 已被暂停</div>
-      <div class="banner-desc">出口和约定不一致：已结束 ${esc(names)} 的进程，并断开了它的网络。切回正确节点后会自动恢复。</div>
-      ${S.cliRunning.length ? `<div class="banner-desc">CLI（${esc(S.cliRunning.join("、"))}）不会自动结束，请自行关闭。</div>` : ""}</div></div>`;
-  } else if (S.pauseUntil && S.pauseUntil > Date.now() / 1000) {
-    const t = new Date(S.pauseUntil * 1000);
-    const hm = `${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")}`;
-    html += `<div class="banner orange"><span class="banner-dot"></span><div>
-      <div class="banner-title">守护已暂停 · ${hm} 自动恢复</div>
-      <div class="banner-desc">检查照常进行，但暂停期间不会结束守护对象的进程或断网。可在托盘菜单提前恢复。</div></div></div>`;
-  } else if (S.last && !S.last.passed && !S.checking && S.last.egress_ip == null) {
-    html += `<div class="banner orange"><span class="banner-dot"></span><div>
-      <div class="banner-title">暂时没法确认网络</div>
-      <div class="banner-desc">刚才的检查没有成功，可能是网络没通。确认代理软件开着，再点重新检查。</div></div></div>`;
+  function toggleFold(id) { setFold(id, !S.folds[id], true); }
+  function expand(id) {
+    if (id === "settings") setFold("settings", true, true);
+    else if (id === "log" || id === "logs") setFold("logs", true, true);
+    else setFold("details", true, true);
   }
-  if (S.launchError) {
-    html += `<div id="launch-error" class="banner orange" role="alert"><span class="banner-dot"></span><div>
-      <div class="banner-title">Claude 未能启动</div><div class="banner-desc">${esc(S.launchError)}</div></div></div>`;
+  function prefersReduced() {
+    try { return window.matchMedia("(prefers-reduced-motion: reduce)").matches; } catch (e) { return false; }
   }
-  // 内容签名去重：状态事件每几秒重渲一次，内容没变就别重建 DOM（否则横幅入场动画会被重播）
-  if (z.dataset.sig !== html) {
-    z.dataset.sig = html;
-    z.innerHTML = html;
+
+  /* ---------- 英雄区 ---------- */
+
+  const RING_STROKE = {
+    pass: "url(#ring-green)",
+    fail: "url(#ring-orange)",
+    tripped: "url(#ring-red)",
+    checking: "url(#ring-blue)",
+    idle: "url(#ring-gray)",
+    paused: "url(#ring-gray)",
+  };
+
+  function renderRing(overall) {
+    const fg = $("ring-fg");
+    const spinner = $("ring-spinner");
+    const core = $("hero-core");
+    if (!fg || !spinner || !core) return;
+    const checking = overall === "checking" || S.manualBusy;
+    fg.style.opacity = checking ? "0" : "1";
+    fg.setAttribute("stroke", RING_STROKE[overall] || RING_STROKE.idle);
+    if (checking) spinner.removeAttribute("hidden");
+    else spinner.setAttribute("hidden", "");
+    let name = "";
+    let size = 40;
+    if (checking) name = "";
+    else if (overall === "pass") name = "check";
+    else if (overall === "tripped") { name = "x"; size = 36; }
+    else if (overall === "fail") name = "alert";
+    else if (overall === "paused") name = "pause";
+    else name = "dash";
+    core.innerHTML = name ? icon(name, size) : "";
   }
-}
-function showNotice(title, desc) {
-  if (S.noticeTimer) clearTimeout(S.noticeTimer);
-  S.notice = { title, desc };
-  renderBanners();
-  S.noticeTimer = setTimeout(dismissNotice, 4000);
-}
-function dismissNotice() {
-  S.noticeTimer = null;
-  const b = document.querySelector("#banner-zone .banner");
-  if (b) {
-    // 退场淡出后再清（进出同曲线，退场更快）
-    b.classList.add("leaving");
-    setTimeout(() => {
-      S.notice = null;
-      renderBanners();
-    }, 170);
-  } else {
-    S.notice = null;
-    renderBanners();
-  }
-}
 
-/* ===== CTA ===== */
-function ctaClick() {
-  if (S.tripped || !S.last || !S.last.passed || S.checking) {
-    invoke(CMD.recheck);
-  } else {
-    invoke(CMD.launch);
-  }
-}
-
-function renderCta() {
-  const btn = $("cta");
-  const sec = $("cta-secondary");
-  if (S.tripped) {
-    btn.disabled = S.checking && S.manual;
-    btn.textContent = "我已切回节点，重新检查";
-  } else if ((S.checking && S.manual) || !S.last) {
-    btn.disabled = true;
-    btn.textContent = "正在检查，稍候…";
-  } else if (S.last.passed) {
-    btn.disabled = false;
-    btn.textContent = "启动 Claude";
-  } else {
-    btn.disabled = false;
-    btn.textContent = "重新检查";
-  }
-  const lastOk = S.last && S.last.passed && !S.tripped;
-  sec.innerHTML = lastOk
-    ? `<button id="cta-recheck" class="btn-outline"${S.checking ? " disabled" : ""}>${S.checking ? "正在检查…" : "重新检查"}</button>`
-    : "";
-  if (lastOk) {
-    $("cta-recheck").onclick = () => {
-      if (S.checking) return;
-      invoke(CMD.recheck);
-    };
-  }
-}
-
-/* ===== 检查详情卡 ===== */
-function renderDetails() {
-  const side = $("details-state");
-  const body = $("details-body");
-  if (!S.last) {
-    side.textContent = S.checking ? "检查中" : "还没检查";
-    side.className = "card-head-side";
-    body.innerHTML = `<div class="details-empty">还没有结果，稍等片刻…</div>`;
-    return;
-  }
-  const rel = S.lastAt ? ` <span class="rel">· ${relTime(S.lastAt)}</span>` : "";
-  if (S.last.passed) {
-    side.innerHTML = `全部通过${rel}`;
-    side.className = "card-head-side ok";
-  } else {
-    side.innerHTML = `有问题${rel}`;
-    side.className = "card-head-side bad";
-  }
-  // Rust StepState 枚举序列化为 "Pass"/"Fail"/"Skip"（v1 --check JSON 格式，保持不动），
-  // 前端归一成小写再当 CSS class / 比较用。
-  const rows = [
-    ["代理已开启", S.last.proxy],
-    ["代理能连通", S.last.port],
-    ["出口 IP 正确", S.last.egress],
-  ]
-    .map(([name, step]) => {
-      const st = String(step.state ?? "").toLowerCase();
-      return `<div class="step-row">
-        <span class="step-dot ${st}"></span>
-        <span class="step-name">${esc(name)}</span>
-        <span class="step-text">${esc(st === "skip" ? "未检测" : step.text)}</span>
-      </div>`;
-    })
-    .join("");
-  body.innerHTML = `<div class="steps">${rows}</div>`;
-}
-
-/* ===== 设置卡 ===== */
-function renderSettings() {
-  const cfg = S.cfg;
-  if (!cfg) return;
-  const body = $("settings-body");
-  const settingsKey = JSON.stringify([cfg, S.installed]);
-  if (body.dataset.settingsKey === settingsKey) { renderUpdateGroup(); return; }
-  body.dataset.settingsKey = settingsKey;
-  const err = (id, msg) => `<div class="field-error" id="${id}">${esc(msg || "")}</div>`;
-
-  body.innerHTML = `
-    <div class="group-title">检测</div>
-    ${settingInput("set-port", "代理端口", "代理软件的端口，常见是 7890", String(cfg.proxy_port), "text")}
-    ${ipListRow(cfg)}
-    ${settingSelect("set-region", "出口地区", "出口 IP 不固定时，按国家/地区放行", cfg.egress_region || "")}
-    ${settingInput("set-interval", "检查间隔", "每隔几秒复查一次（秒）", String(cfg.check_interval_secs), "text")}
-    <div class="group-title">发现出口不对时</div>
-    ${settingToggle("set-kill", "停掉守护对象", "立刻结束勾选应用的所有进程", cfg.kill_on_fail)}
-    ${settingToggle("set-quarantine", "断开它的网络", "用防火墙拦住这些应用联网，恢复后自动解除", cfg.quarantine_on_fail)}
-    <div class="group-title">守护对象</div>
-    ${agentToggle("set-guard-claude", "Claude 桌面版", "claude")}
-    ${agentToggle("set-guard-chatgpt", "ChatGPT 桌面版", "chatgpt")}
-    ${agentToggle("set-guard-antigravity", "反重力桌面版", "antigravity")}
-    ${settingToggle("set-cliwarn", "CLI 只提醒不处理", "检测到 Claude Code / Codex / Gemini CLI 时在日志和横幅里提醒", cfg.cli_warn)}
-    <div class="group-title">飞书通知</div>
-    <div id="feishu-group"></div>
-    <div class="group-title">Claude 客户端更新</div>
-    <div id="claude-update-group"></div>
-    <div class="group-title">Codex 客户端更新</div>
-    <div id="codex-update-group"></div>
-    <div class="group-title">通用</div>
-    ${settingToggle("set-tray", "关窗后驻留托盘", "守护继续在后台运行", cfg.close_to_tray)}
-    ${settingToggle("set-autostart", "开机自启", S.installed ? "开机后自动在托盘里默默守护" : "安装之后才能开启", cfg.auto_start_with_system, !S.installed)}
-    <div class="group-title">守护器软件更新</div>
-    <div id="upd-group"></div>
-  `;
-
-  wireSettingInput("set-port", (v) => {
-    if (!portOk(v)) return { ok: false, msg: "端口要填 1-65535" };
-    return { ok: true, apply: (c) => (c.proxy_port = +v.trim()) };
-  });
-  wireIpList();
-  wireRegionSelect();
-  wireSettingInput("set-interval", (v) => {
-    if (!intOk(v)) return { ok: false, msg: "填数字" };
-    const n = +v.trim();
-    if (n < 5 || n > 3600) return { ok: false, msg: "范围 5-3600 秒" };
-    return { ok: true, apply: (c) => (c.check_interval_secs = n) };
-  });
-  wireSettingToggle("set-kill", "kill_on_fail");
-  wireSettingToggle("set-quarantine", "quarantine_on_fail");
-  wireSettingToggle("set-cliwarn", "cli_warn");
-  wireAgentToggle("set-guard-claude", "claude");
-  wireAgentToggle("set-guard-chatgpt", "chatgpt");
-  wireAgentToggle("set-guard-antigravity", "antigravity");
-  wireSettingToggle("set-tray", "close_to_tray");
-  wireAutostart();
-  window.CG_FEISHU.mount($("feishu-group"));
-  window.CG_CLAUDE_UPDATES.mount($("claude-update-group"));
-  window.CG_CODEX_UPDATES.mount($("codex-update-group"));
-  renderUpdateGroup();
-}
-
-function settingInput(id, title, desc, value) {
-  return `<div class="setting-row">
-    <div class="setting-label"><div class="st-title">${esc(title)}</div><div class="st-desc">${esc(desc)}</div></div>
-    <div class="setting-control">
-      <input id="${id}" class="text-input" type="text" value="${esc(value)}">
-      <div class="field-error" id="${id}-err"></div>
-    </div>
-  </div>`;
-}
-
-function settingToggle(id, title, desc, on, disabled = false) {
-  return `<div class="setting-row">
-    <div class="setting-label"><div class="st-title">${esc(title)}</div><div class="st-desc">${esc(desc)}</div></div>
-    <div class="setting-control">
-      <button id="${id}" class="toggle ${on ? "on" : ""}" role="switch" aria-checked="${on ? "true" : "false"}" ${disabled ? "disabled" : ""}><span class="knob"></span></button>
-    </div>
-  </div>`;
-}
-
-/* 守护对象勾选：开关写进 guarded_agents 列表 */
-function agentToggle(id, title, agentId) {
-  const on = (S.cfg.guarded_agents || []).includes(agentId);
-  const desc = {
-    claude: "Anthropic Claude 桌面端",
-    chatgpt: "OpenAI ChatGPT 桌面端",
-    antigravity: "Antigravity / 反重力桌面端",
-  }[agentId];
-  return settingToggle(id, title, desc, on);
-}
-
-function wireAgentToggle(id, agentId) {
-  const el = $(id);
-  if (!el) return;
-  el.onclick = async () => {
-    const cfg = S.cfg;
-    if (!cfg) return;
-    const list = new Set(cfg.guarded_agents || []);
-    if (list.has(agentId)) list.delete(agentId);
-    else list.add(agentId);
-    const next = [...list];
-    cfg.guarded_agents = next;
-    await invoke(CMD.setConfig, { cfg });
-    el.classList.toggle("on", list.has(agentId));
-    if (!next.length && !(cfg.egress_region || "").trim()) {
-      // 全关且没配地区 = 没有守护对象。用户显式行为，允许，但提醒一句后果。
-      showNotice("已全部关闭", "没有守护对象时，检查仍在，但不会结束任何进程。");
+  function renderHero() {
+    const st = S.state;
+    const title = $("hero-title");
+    const sub = $("hero-sub");
+    const meta = $("hero-meta");
+    if (!st || !title || !sub || !meta) return;
+    const overall = st.overall || "idle";
+    renderRing(overall);
+    let t = "守护待命";
+    let s = "等待首次检测";
+    let m = "";
+    if (overall === "pass") {
+      t = "守护正常";
+      s = (st.targets || []).length + " 个出口全部校验通过";
+      if (S.manualBusy) s = "正在重新校验出口 IP…";
+    } else if (overall === "checking") {
+      t = "正在检查";
+      s = "正在校验出口 IP…";
+    } else if (overall === "fail") {
+      const bad = (st.targets || []).filter((x) => x.state === "fail" || x.state === "unverified").length;
+      t = "校验未通过";
+      s = bad + " 个出口不符合白名单";
+    } else if (overall === "tripped") {
+      t = "已熔断";
+      s = (st.tripped && st.tripped.reason) || "出口 IP 不符合白名单";
+    } else if (overall === "paused") {
+      const left = minutesLeft(st.pausedUntil);
+      t = "已暂停";
+      s = left > 0 ? "守护暂停中，" + left + " 分钟后自动恢复" : "守护已暂停";
     } else {
-      showNotice("完成", "已保存");
+      const passed = (st.targets || []).some((x) => x.state === "pass");
+      s = passed ? "等待下一次自动检测" : "等待首次检测";
+      if (st.intervalSecs) m = "每 " + st.intervalSecs + " 秒自动检查";
     }
-  };
-}
-
-/* 约定出口 IP 列表：每行一个可编辑 IP（× 删除），底部一格"添加 IP" */
-function ipListRow(cfg) {
-  const rows = (cfg.allowed_ips || [])
-    .map(
-      (ip, i) => `<div class="ip-row">
-        <input id="set-ip-${i}" class="text-input" type="text" value="${esc(ip)}">
-        <button class="ip-del" data-i="${i}" title="删除这个 IP" aria-label="删除"><svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true"><path d="M1.5 1.5 L8.5 8.5 M8.5 1.5 L1.5 8.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>
-      </div>`,
-    )
-    .join("");
-  return `<div class="setting-row ip-list-row">
-    <div class="setting-label"><div class="st-title">约定的出口 IP</div><div class="st-desc">可填多个，命中任意一个就放行</div></div>
-    <div class="setting-control ip-list-ctl">
-      ${rows}
-      <div class="ip-row">
-        <input id="set-ip-new" class="text-input" type="text" placeholder="添加 IP">
-      </div>
-      <div class="field-error" id="set-ip-err"></div>
-    </div>
-  </div>`;
-}
-
-function settingSelect(id, title, desc, value) {
-  const opts = REGIONS.map(
-    ([code, name]) => `<option value="${esc(code)}"${code === value ? " selected" : ""}>${esc(name)}</option>`,
-  ).join("");
-  return `<div class="setting-row">
-    <div class="setting-label"><div class="st-title">${esc(title)}</div><div class="st-desc">${esc(desc)}</div></div>
-    <div class="setting-control">
-      <select id="${id}" class="text-input select-input">${opts}</select>
-    </div>
-  </div>`;
-}
-
-/* IP 列表编辑：逐行失焦改写、× 删除、"添加 IP" 行失焦/回车追加 */
-async function saveIps(next, errEl) {
-  const region = (S.cfg.egress_region || "").trim();
-  if (!next.length && !region) {
-    if (errEl) errEl.textContent = "至少留一个 IP，或先选一个出口地区";
-    return false;
+    if (overall === "tripped" && st.tripped) {
+      const cut = CUT_TEXT[st.tripped.networkCut] || "未断网";
+      m = fmtClock(st.tripped.since) + " · 已结束 " + (st.tripped.killed || 0) + " 个应用 · " + cut;
+    } else if (overall === "checking") {
+      m = "每 " + (st.intervalSecs || 0) + " 秒自动检查";
+    } else if (st.checkedAt) {
+      m = "上次检测 " + fmtClock(st.checkedAt) + " · 每 " + (st.intervalSecs || 0) + " 秒";
+    }
+    title.textContent = t;
+    sub.textContent = s;
+    meta.textContent = m;
   }
-  if (errEl) errEl.textContent = "";
-  const old = JSON.stringify(S.cfg);
-  S.cfg.allowed_ips = next;
-  if (JSON.stringify(S.cfg) !== old) {
-    await invoke(CMD.setConfig, { cfg: S.cfg });
-    showNotice("完成", "已保存");
-  }
-  return true;
-}
 
-function wireIpList() {
-  const ctl = document.querySelector(".ip-list-ctl");
-  if (!ctl) return;
-  const errEl = $("set-ip-err");
-  const ips = () => (S.cfg && S.cfg.allowed_ips) || [];
-  // 逐行编辑：失焦/回车校验并写回
-  ips().forEach((_, i) => {
-    const input = $(`set-ip-${i}`);
-    if (!input) return;
-    const commit = async () => {
-      const v = input.value.trim();
-      if (v === ips()[i]) return;
-      if (!ipOk(v)) {
-        input.classList.add("invalid");
-        errEl.textContent = "要写成 4 段数字，如 203.0.113.10";
-        return;
-      }
-      input.classList.remove("invalid");
-      errEl.textContent = "";
-      const next = ips().slice();
-      next[i] = v;
-      await saveIps(next, errEl);
-    };
-    input.addEventListener("blur", commit);
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") input.blur();
-    });
-  });
-  // 删除行
-  ctl.querySelectorAll(".ip-del").forEach((btn) => {
-    btn.onclick = () => {
-      const i = +btn.dataset.i;
-      const next = ips().slice();
-      next.splice(i, 1);
-      saveIps(next, errEl).then((ok) => {
-        if (ok) renderSettings();
+  /* ---------- 目标列表 ---------- */
+
+  function renderTargets() {
+    const host = $("targets");
+    if (!host) return;
+    const st = S.state;
+    const targets = (st && st.targets) || [];
+    if (!targets.length) {
+      host.innerHTML = '<div class="egress-empty">还没有监控目标，可在设置里添加</div>';
+      return;
+    }
+    host.innerHTML = targets
+      .map((t) => {
+        const ipText = t.ip || "—";
+        const ipCls = "ip" + (t.state === "fail" ? " fail" : !t.ip ? " idle" : "");
+        const latCls = "lat" + (t.state === "fail" ? " fail" : !t.ip ? " idle" : "");
+        return (
+          '<div class="row" data-target="' +
+          esc(t.id) +
+          '">' +
+          '<span class="' + dotClass(t.state) + '" aria-hidden="true"></span>' +
+          '<span class="name">' + esc(t.name) + "</span>" +
+          '<span class="geo">' + esc(targetGeo(t)) + "</span>" +
+          '<span class="right"><div class="' + ipCls + '">' + esc(ipText) + '</div><div class="' + latCls + '">' + esc(targetLat(t)) + "</div></span>" +
+          "</div>"
+        );
+      })
+      .join("");
+  }
+
+  /* ---------- 横幅 ---------- */
+
+  function banner(kind, lines, action) {
+    const txt = (Array.isArray(lines) ? lines : [lines]).filter(Boolean).map(esc).join("<br>");
+    const act = action
+      ? '<button class="bact" data-bact="' + esc(action.id) + '" type="button">' + esc(action.label) + "</button>"
+      : "";
+    return '<div class="banner ' + kind + '" role="status"><div class="btxt">' + txt + "</div>" + act + "</div>";
+  }
+
+  function renderBanners() {
+    const host = $("banners");
+    if (!host) return;
+    const st = S.state;
+    if (!st) { host.innerHTML = ""; return; }
+    const parts = [];
+    const overall = st.overall || "idle";
+    const trip = st.tripped;
+    if (overall === "tripped" && trip) {
+      const fails = (st.targets || []).filter((t) => t.state === "fail");
+      const failIp = fails.map((t) => t.ip).find(Boolean);
+      const line1 = failIp ? "出口 " + failIp + " 不在允许列表" : trip.reason || "出口不符合允许列表";
+      const line2 = trip.networkNote || "网络已阻断，修正配置后可解除";
+      parts.push(banner("trip", [line1, line2], { id: "release", label: "解除隔离" }));
+    } else if (overall === "paused") {
+      const left = minutesLeft(st.pausedUntil);
+      const text = left > 0 ? "已暂停 " + left + " 分钟，期间不会熔断" : "守护已暂停，可随时恢复";
+      parts.push(banner("info", [text], { id: "resume", label: "恢复守护" }));
+    } else if (overall === "fail") {
+      const bad = (st.targets || []).filter((x) => x.state === "fail").map((x) => x.name);
+      parts.push(banner("warn", ["出口校验未通过", (bad.length ? bad.join("、") + " " : "") + "不符合白名单，熔断前可修正"], { id: "details", label: "查看详情" }));
+    }
+    if (st.launchError && st.launchError !== S.launchErrShown) {
+      S.launchErrShown = st.launchError;
+      parts.push(banner("warn", ["启动 Claude 失败", st.launchError], { id: "launch-dismiss", label: "知道了" }));
+    }
+    // 主横幅（熔断/暂停/未通过）已占位时不再叠加 CLI 提醒，避免把 CTA 挤出窗口；CLI 信息仍写入详情与日志。
+    const hasPrimary = overall === "tripped" || overall === "paused" || overall === "fail";
+    if (!hasPrimary && (st.cliRunning || []).length) {
+      parts.push(banner("info", ["检测到 Claude Code 命令行运行中，仅提醒不结束"]));
+    }
+    host.innerHTML = parts.join("");
+    host.querySelectorAll("[data-bact]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const id = el.getAttribute("data-bact");
+        if (id === "release") doRelease();
+        else if (id === "resume") doResume();
+        else if (id === "details") expand("details");
+        else if (id === "launch-dismiss") {
+          S.launchErrShown = st.launchError;
+          el.closest(".banner").remove();
+        }
       });
-    };
-  });
-  // 添加行：空值忽略；合法则追加
-  const add = $("set-ip-new");
-  if (add) {
-    const commit = async () => {
-      const v = add.value.trim();
-      add.classList.remove("invalid");
-      if (!v) return;
-      if (!ipOk(v)) {
-        add.classList.add("invalid");
-        errEl.textContent = "要写成 4 段数字，如 203.0.113.10";
-        return;
-      }
-      errEl.textContent = "";
-      const next = ips().slice();
-      if (!next.includes(v)) next.push(v);
-      const ok = await saveIps(next, errEl);
-      if (ok) renderSettings();
-    };
-    add.addEventListener("blur", commit);
-    add.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") add.blur();
     });
   }
-}
 
-function wireRegionSelect() {
-  const sel = $("set-region");
-  if (!sel) return;
-  sel.addEventListener("change", async () => {
-    const v = sel.value;
-    if (!v && !(S.cfg.allowed_ips || []).length) {
-      showNotice("提示", "至少留一个 IP，或选一个出口地区");
-      sel.value = S.cfg.egress_region || "";
+  /* ---------- CTA ---------- */
+
+  function renderCta() {
+    const st = S.state;
+    const btn = $("btn-primary");
+    const side = $("btn-side");
+    if (!btn || !side) return;
+    const overall = (st && st.overall) || "idle";
+    const checking = S.manualBusy || (st && st.checking);
+    let label;
+    let icons = "";
+    let blocked = false;
+    let busy = false;
+    let sideIcon = "refresh";
+    let sideLabel = "重新检查";
+    let sideDanger = false;
+    let sideDisabled = false;
+    if (overall === "tripped") {
+      label = "启动已禁止";
+      icons = icon("ban", 15);
+      blocked = true;
+      sideIcon = "refresh";
+      sideLabel = "解除隔离并恢复网络";
+      sideDanger = true;
+      sideDisabled = S.releaseBusy;
+    } else if (checking) {
+      label = "正在检查…";
+      busy = true;
+      sideDisabled = true;
+    } else if (overall === "pass") {
+      label = S.launchBusy ? "正在启动…" : "启动 Claude";
+      icons = icon("play", 15);
+      busy = S.launchBusy;
+    } else {
+      label = "重新检查";
+      icons = icon("refresh", 15);
+    }
+    btn.innerHTML = icons + "<span>" + esc(label) + "</span>";
+    btn.disabled = blocked || busy;
+    btn.className = "btn-primary" + (blocked ? " is-blocked" : "") + (busy ? " is-busy" : "");
+    side.innerHTML = S.releaseBusy && sideDanger ? icon("rotate", 17) : icon(sideIcon, 17);
+    side.className = "iconbtn" + (sideDanger ? " is-danger" : "");
+    side.title = sideLabel;
+    side.setAttribute("aria-label", sideLabel);
+    side.disabled = !!sideDisabled;
+    side.dataset.role = overall === "tripped" ? "release" : "recheck";
+  }
+
+  /* ---------- 详情 ---------- */
+
+  function renderDetails() {
+    const body = $("body-details");
+    const sub = $("details-sub");
+    if (!body) return;
+    const st = S.state;
+    if (!st) {
+      body.innerHTML = '<div class="dempty">还没有结果，稍等片刻…</div>';
+      if (sub) sub.textContent = "等待首次检测";
       return;
     }
-    S.cfg.egress_region = v;
-    await invoke(CMD.setConfig, { cfg: S.cfg });
-    showNotice("完成", v ? `按${regionName(v)}出口放行` : "已改为不限地区");
-  });
-}
+    const targets = st.targets || [];
+    const parts = [];
+    const trip = st.tripped;
+    if (trip) {
+      parts.push(
+        '<div class="dgroup"><div class="dhead">' + icon("alert", 12) + " 熔断记录</div>" +
+          '<div class="dkv"><span class="k">时间</span><span>' + esc(fmtClock(trip.since)) + "</span>" +
+          '<span class="k">原因</span><span>' + esc(trip.reason) + "</span></div>" +
+          '<div class="dkv"><span class="k">结束进程</span><span>' + esc(String(trip.killed || 0)) + " 个</span>" +
+          '<span class="k">防火墙规则</span><span>' + esc(String(trip.firewallRules || 0)) + " 条</span></div>" +
+          '<div class="dkv"><span class="k">隔离应用</span><span>' + esc(listText(trip.quarantinedAgents) || "无") + "</span></div>" +
+          '<div class="dkv"><span class="k">断网</span><span>' + esc(CUT_LABEL[trip.networkCut] || trip.networkCut || "未断网") +
+          (trip.networkNote ? "（" + esc(trip.networkNote) + "）" : "") + "</span></div>" +
+          (trip.agents && trip.agents.length ? '<div class="dkv"><span class="k">涉及应用</span><span>' + esc(trip.agents.join("、")) + "</span></div>" : "") +
+          "</div>"
+      );
+    }
+    if (targets.length) {
+      const rows = targets
+        .map((t) => {
+          const exp = [];
+          if ((t.expectIps || []).length) exp.push("IP " + t.expectIps.join(", "));
+          if ((t.expectRegions || []).length) exp.push("地区 " + (t.expectRegions || []).map(regionText).join(", "));
+          return (
+            '<div class="drow">' +
+            '<span class="' + dotClass(t.state) + '" aria-hidden="true"></span>' +
+            '<span class="dname">' + esc(t.name) + "</span>" +
+            '<span class="dmid">' + esc(STATE_LABEL[t.state] || t.state) +
+            (t.reason ? " · " + esc(t.reason) : "") + "</span>" +
+            '<span class="dright">' + (t.latencyMs ? "<b>" + esc(String(t.latencyMs)) + "</b> ms" : esc(targetLat(t))) + "</span>" +
+            "</div>" +
+            '<div class="dkv"><span class="k">锚点</span><span>' + esc(shortHost(t.anchorUrl) || "内置") + "</span>" +
+            (exp.length ? '<span class="k">期望</span><span>' + esc(exp.join("；")) + "</span>" : "") +
+            (t.failStreak ? '<span class="k">连续失败</span><span>' + esc(String(t.failStreak)) + " 次</span>" : "") +
+            "</div>"
+          );
+        })
+        .join("");
+      parts.push('<div class="dgroup"><div class="dhead">目标判定</div>' + rows + "</div>");
+    }
+    const cfg = S.cfg || {};
+    const cfgBits = [];
+    if (cfg.proxy_port) cfgBits.push("端口 " + cfg.proxy_port);
+    if (st.intervalSecs) cfgBits.push("间隔 " + st.intervalSecs + " 秒");
+    if (st.tripThreshold) cfgBits.push("连续失败 " + st.tripThreshold + " 次");
+    cfgBits.push("断网档位 " + (CUT_LABEL[st.cutMode] || "不断网"));
+    parts.push(
+      '<div class="dgroup"><div class="dhead">运行参数</div><div class="dkv"><span class="k">配置</span><span>' +
+        esc(cfgBits.join(" · ")) +
+        "</span></div>" +
+        '<div class="dkv"><span class="k">上次检测</span><span>' + esc(st.checkedAt ? fmtClock(st.checkedAt) : "尚未检测") + "</span>" +
+        '<span class="k">通知</span><span>' + (st.notifyEnabled ? "已开启" : "已关闭") + "</span>" +
+        '<span class="k">管理员</span><span>' + (st.admin ? "是" : "否") + "</span></div></div>"
+    );
+    const procs = [];
+    if ((st.agentsRunning || []).length) procs.push("桌面端：" + st.agentsRunning.map((a) => a.name + "×" + a.count).join("、"));
+    if ((st.cliRunning || []).length) procs.push("命令行：" + st.cliRunning.join("、"));
+    if (procs.length) {
+      parts.push('<div class="dgroup"><div class="dhead">进程</div><div class="dkv"><span>' + esc(procs.join("；")) + "</span></div></div>");
+    }
+    body.innerHTML = parts.join("");
+    if (sub) {
+      if (trip) sub.textContent = "熔断记录";
+      else if (st.overall === "pass") sub.textContent = "全部通过" + (st.checkedAt ? " · " + fmtClock(st.checkedAt) : "");
+      else if (st.overall === "fail") sub.textContent = "有异常";
+      else if (st.overall === "checking") sub.textContent = "检查中";
+      else sub.textContent = st.checkedAt ? "上次 " + fmtClock(st.checkedAt) : "等待首次检测";
+    }
+  }
 
-/* 失焦/回车校验写回（v1 同款） */
-function wireSettingInput(id, validate) {
-  const input = $(id);
-  const errEl = $(id + "-err");
-  const commit = async () => {
-    const v = input.value;
-    const r = validate(v);
-    if (!r.ok) {
-      input.classList.add("invalid");
-      errEl.textContent = r.msg;
-      return;
+  /* ---------- 日志 ---------- */
+
+  async function loadLogs() {
+    const lines = await call(CMD.recent_logs, { limit: 200 }, true);
+    if (Array.isArray(lines)) S.logs = lines.slice();
+    renderLogs();
+  }
+  function renderLogs() {
+    const host = $("log-lines");
+    const sub = $("logs-sub");
+    if (!host) return;
+    if (!S.logs.length) {
+      host.innerHTML = '<div class="log-empty">还没有日志。检查发生时这里会逐行追加。</div>';
+    } else {
+      host.innerHTML = S.logs.map((l) => '<div class="log-line">' + esc(l) + "</div>").join("");
+      host.scrollTop = host.scrollHeight;
     }
-    input.classList.remove("invalid");
-    errEl.textContent = "";
-    const old = JSON.stringify(S.cfg);
-    r.apply(S.cfg);
-    if (JSON.stringify(S.cfg) !== old) {
-      await invoke(CMD.setConfig, { cfg: S.cfg });
-      showNotice("完成", "已保存");
+    if (sub) sub.textContent = S.logs.length ? "最近 " + S.logs.length + " 条" : "暂无";
+  }
+  function appendLog(line) {
+    if (line == null) return;
+    S.logs.push(String(line));
+    if (S.logs.length > 400) S.logs.splice(0, S.logs.length - 400);
+    if (S.folds.logs) {
+      const host = $("log-lines");
+      if (host) {
+        if (host.querySelector(".log-empty")) host.innerHTML = "";
+        const div = document.createElement("div");
+        div.className = "log-line";
+        div.textContent = String(line);
+        host.appendChild(div);
+        while (host.childElementCount > 400) host.removeChild(host.firstElementChild);
+        host.scrollTop = host.scrollHeight;
+      }
+      const sub = $("logs-sub");
+      if (sub) sub.textContent = "最近 " + S.logs.length + " 条";
     }
+  }
+
+  /* ---------- 设置卡 ---------- */
+
+  function mountSettings() {
+    if (S.settingsMounted) return;
+    const host = $("body-settings");
+    const comp = root.CG_UI && root.CG_UI.settings;
+    if (!host || !comp) return;
+    S.settingsMounted = true;
+    comp.mount(host, {
+      getState: () => S.state,
+      getConfig: () => S.cfg,
+      reloadConfig: async () => {
+        S.cfg = (await call(CMD.get_config, {}, true)) || S.cfg;
+        if (S.state) { renderDetails(); }
+        return S.cfg;
+      },
+      onToast: toast,
+      onExpanded: () => setFold("settings", true, false),
+      expandCard: expand,
+    });
+  }
+
+  /* ---------- 状态应用 ---------- */
+
+  function stableView(st) {
+    if (!st || typeof st !== "object") return st;
+    if (!st.checking) {
+      S.stable = st;
+      return st;
+    }
+    // 自动巡检每轮都会短暂 checking；没有手动重检时沿用上一轮的稳定结果，避免整页闪烁。
+    if (S.manualBusy || !S.stable) return st;
+    return Object.assign({}, st, {
+      checking: false,
+      overall: S.stable.overall,
+      targets: S.stable.targets,
+    });
+  }
+
+  function applyState(st) {
+    if (!st || typeof st !== "object") return;
+    const view = stableView(st);
+    S.state = view;
+    const overall = view.overall || "idle";
+    document.body.setAttribute("data-overall", overall);
+    renderHero();
+    renderTargets();
+    renderBanners();
+    renderCta();
+    renderDetails();
+    const ver = $("foot-version");
+    if (ver && view.version) ver.textContent = "v" + view.version;
+    const comp = root.CG_UI && root.CG_UI.settings;
+    if (S.settingsMounted && comp && comp.setState) comp.setState(view);
+    if (view.smokeSettings && !S.smokeOpened) {
+      S.smokeOpened = true;
+      // 自动展开设置卡（联调/截图钩子）
+      setTimeout(() => { mountSettings(); setFold("settings", true, false); }, 60);
+    }
+    maybeWizard();
+  }
+
+  async function refreshState() {
+    const st = await call(CMD.get_state, {}, true);
+    if (st) applyState(st);
+    return st;
+  }
+  async function refreshConfig() {
+    S.cfg = (await call(CMD.get_config, {}, true)) || S.cfg;
+    return S.cfg;
+  }
+
+  /* ---------- 动作 ---------- */
+
+  async function doRecheck() {
+    if (S.manualBusy) return;
+    S.manualBusy = true;
+    renderHero();
+    renderCta();
+    try {
+      await call(CMD.recheck);
+      await refreshState();
+    } finally {
+      S.manualBusy = false;
+      S.state = stableView(S.state);
+      renderHero();
+      renderCta();
+    }
+  }
+
+  async function doLaunch() {
+    if (S.launchBusy) return;
+    S.launchBusy = true;
+    renderCta();
+    const r = await call(CMD.launch);
+    if (r === undefined) {
+      S.launchErrShown = "";
+      await refreshState();
+    } else {
+      toast("Claude 已启动", true);
+    }
+    S.launchBusy = false;
+    renderCta();
+  }
+
+  async function doRelease() {
+    if (S.releaseBusy) return;
+    S.releaseBusy = true;
+    renderCta();
+    await call(CMD.release);
+    await refreshState();
+    S.releaseBusy = false;
+    renderCta();
+  }
+
+  async function doResume() {
+    await call(CMD.resume);
+    await refreshState();
+  }
+
+  /* ---------- 首启向导 ---------- */
+
+  function wizStep(n) {
+    S.wizard.step = Math.max(0, Math.min(2, n));
+    document.querySelectorAll("#wizard .wiz-page").forEach((p) => {
+      p.classList.toggle("is-on", Number(p.dataset.step) === S.wizard.step);
+    });
+    document.querySelectorAll("#wiz-dots span").forEach((d, i) => d.classList.toggle("is-on", i === S.wizard.step));
+    const prev = $("wiz-prev");
+    const next = $("wiz-next");
+    const skip = $("wiz-skip");
+    if (prev) prev.hidden = S.wizard.step === 0;
+    if (next) {
+      next.hidden = S.wizard.step === 2;
+      next.textContent = S.wizard.step === 0 ? "开始" : "下一步";
+    }
+    if (skip) skip.hidden = S.wizard.step === 2;
+    wizErr("");
+  }
+  function wizErr(msg) {
+    const el = $("wiz-err");
+    if (!el) return;
+    el.textContent = msg || "";
+    el.hidden = !msg;
+  }
+  function openWizard() {
+    const wiz = $("wizard");
+    if (!wiz) return;
+    S.wizard.open = true;
+    wiz.hidden = false;
+    document.body.classList.add("wiz-open");
+    wizStep(0);
+    const cfg = S.cfg || {};
+    const port = $("wiz-port");
+    if (port && !port.value) port.value = cfg.proxy_port ? String(cfg.proxy_port) : "";
+    const ips = $("wiz-ips");
+    if (ips && !ips.value) {
+      const local = (cfg.targets || []).find((t) => t.id === "local");
+      const expect = (local && local.expect_ips) || [];
+      if (expect.length) ips.value = expect.join(", ");
+    }
+  }
+  function closeWizard() {
+    const wiz = $("wizard");
+    if (!wiz) return;
+    S.wizard.open = false;
+    wiz.hidden = true;
+    document.body.classList.remove("wiz-open");
+  }
+  function maybeWizard() {
+    if (!S.cfg) return;
+    if (!S.cfg.first_run) return;
+    if (S.state && S.state.smokeSettings) return;
+    if (S.wizard.open) return;
+    openWizard();
+  }
+  function parseIpList(raw) {
+    return String(raw || "")
+      .split(/[\s,，;；]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  function validPort(v) {
+    if (!String(v || "").trim()) return null;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 1 || n > 65535) return NaN;
+    return n;
+  }
+  async function finishWizard(install) {
+    if (S.wizard.busy) return;
+    const portRaw = ($("wiz-port") || {}).value || "";
+    const port = validPort(portRaw);
+    if (Number.isNaN(port)) { wizErr("代理端口要填 1-65535 之间的数字"); return; }
+    const ips = parseIpList(($("wiz-ips") || {}).value || "");
+    const region = (($("wiz-region") || {}).value || "").trim().toUpperCase();
+    S.wizard.busy = true;
+    const buttons = ["wiz-install", "wiz-portable"].map((id) => $(id)).filter(Boolean);
+    buttons.forEach((b) => (b.disabled = true));
+    try {
+      if (install) {
+        wizErr("");
+        const note = $("wiz-install-note");
+        if (note) { note.hidden = false; note.textContent = "正在注册安装…"; }
+        const r = await call(CMD.install_app, {}, true);
+        if (r === undefined) {
+          if (note) { note.hidden = false; note.textContent = "安装没有成功，可以改用便携版。"; }
+          wizErr("注册安装失败（可能是调试版或权限不足），可改用便携版。");
+          return;
+        }
+      }
+      if (!S.cfg) await refreshConfig();
+      const cfg = S.cfg || {};
+      const targets = JSON.parse(JSON.stringify(cfg.targets || []));
+      const builtins = ["local", "claude", "codex"];
+      let touched = false;
+      targets.forEach((t) => {
+        if (!builtins.includes(t.id)) return;
+        touched = true;
+        if (ips.length) t.expect_ips = ips.slice();
+        if (region) t.expect_regions = [region];
+        else if (ips.length) t.expect_regions = [];
+      });
+      // 两个输入都留空时保持现有白名单不动；否则只在确实填了内容时才整表保存，
+      // 避免全新安装（默认目标尚无白名单）直接触发后端的“至少填一项”校验。
+      if (touched && (ips.length || region)) {
+        const r = await call(CMD.save_targets, { targets }, true);
+        if (r === undefined) { wizErr("保存监控目标失败，请检查白名单 IP 格式。"); return; }
+      }
+      const patch = { first_run: false };
+      if (port != null) patch.proxy_port = port;
+      const r2 = await call(CMD.update_settings, { patch }, true);
+      if (r2 === undefined) { wizErr("保存设置失败，请稍后重试。"); return; }
+      closeWizard();
+      toast("设置已保存", true);
+      await refreshConfig();
+      await refreshState();
+    } finally {
+      S.wizard.busy = false;
+      buttons.forEach((b) => (b.disabled = false));
+    }
+  }
+
+  /* ---------- 事件绑定 ---------- */
+
+  function bind() {
+    const min = $("btn-min");
+    const close = $("btn-close");
+    if (min) min.addEventListener("click", () => IPC.minimize && IPC.minimize());
+    if (close) close.addEventListener("click", () => IPC.close && IPC.close());
+
+    Object.keys(FOLDS).forEach((id) => {
+      const head = $(FOLDS[id].head);
+      if (head) head.addEventListener("click", () => toggleFold(id));
+    });
+    const linkDetails = $("link-details");
+    const linkSettings = $("link-settings");
+    const linkLogs = $("link-logs");
+    if (linkDetails) linkDetails.addEventListener("click", () => expand("details"));
+    if (linkSettings) linkSettings.addEventListener("click", () => expand("settings"));
+    if (linkLogs) linkLogs.addEventListener("click", () => expand("logs"));
+    const folder = $("link-folder");
+    const guide = $("link-guide");
+    if (folder) folder.addEventListener("click", () => call(CMD.open_data_folder));
+    if (guide) guide.addEventListener("click", () => call(CMD.open_guide));
+
+    const primary = $("btn-primary");
+    if (primary) {
+      primary.addEventListener("click", () => {
+        const st = S.state;
+        if (!st || st.overall === "tripped") return;
+        if (st.overall === "pass") doLaunch();
+        else doRecheck();
+      });
+    }
+    const side = $("btn-side");
+    if (side) {
+      side.addEventListener("click", () => {
+        if (side.dataset.role === "release") doRelease();
+        else doRecheck();
+      });
+    }
+
+    const wizNext = $("wiz-next");
+    const wizPrev = $("wiz-prev");
+    const wizSkip = $("wiz-skip");
+    const wizInstall = $("wiz-install");
+    const wizPortable = $("wiz-portable");
+    if (wizNext) wizNext.addEventListener("click", () => wizStep(S.wizard.step + 1));
+    if (wizPrev) wizPrev.addEventListener("click", () => wizStep(S.wizard.step - 1));
+    if (wizSkip) wizSkip.addEventListener("click", async () => {
+      closeWizard();
+      if (S.cfg && S.cfg.first_run) await call(CMD.update_settings, { patch: { first_run: false } }, true);
+      await refreshConfig();
+    });
+    if (wizInstall) wizInstall.addEventListener("click", () => finishWizard(true));
+    if (wizPortable) wizPortable.addEventListener("click", () => finishWizard(false));
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && S.wizard.open) {
+        closeWizard();
+        if (S.cfg && S.cfg.first_run) call(CMD.update_settings, { patch: { first_run: false } }, true);
+      }
+    });
+
+    document.querySelectorAll(".chev").forEach((el) => { el.innerHTML = icon("chevronDown", 12); });
+
+    if (IPC.listen) {
+      IPC.listen(EV.state, (e) => {
+        const payload = e && e.payload !== undefined ? e.payload : e;
+        if (payload) applyState(payload);
+      });
+      IPC.listen(EV.log, (e) => {
+        const payload = e && e.payload !== undefined ? e.payload : e;
+        appendLog(payload);
+      });
+    }
+  }
+
+  /* ---------- 时钟（暂停倒计时） ---------- */
+
+  function tick() {
+    const st = S.state;
+    if (!st) return;
+    if (st.overall === "paused") {
+      renderHero();
+      renderBanners();
+    }
+    if (S.folds.logs && !S.folds.details) { /* 日志卡打开时无需额外刷新 */ }
+  }
+
+  /* ---------- 启动 ---------- */
+
+  async function init() {
+    bind();
+    await refreshConfig();
+    await refreshState();
+    if (!S.state) {
+      // 事件未到也没有快照：给一个安全的空态
+      const idle = { overall: "idle", targets: [], checking: false, intervalSecs: 0, notifyEnabled: true, cutMode: "off", admin: false, version: "3.0.0", smokeSettings: false, upd: { state: "idle" } };
+      S.state = idle;
+      applyState(idle);
+    }
+    if (S.state && S.state.smokeSettings) {
+      setTimeout(() => { mountSettings(); setFold("settings", true, false); }, 80);
+    }
+    maybeWizard();
+    setTimeout(() => document.body.setAttribute("data-ready", "1"), 30);
+    setInterval(tick, 1000);
+    void renderLogs;
+  }
+
+  root.CG_UI = {
+    expand,
+    openSettings: () => expand("settings"),
+    openDetails: () => expand("details"),
+    openLog: () => expand("logs"),
+    toast,
+    getState: () => S.state,
+    getConfig: () => S.cfg,
+    refresh: async () => { await refreshConfig(); await refreshState(); },
+    applyState,
   };
-  input.addEventListener("blur", commit);
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      input.blur();
-    }
-  });
-}
 
-function wireSettingToggle(id, field) {
-  $(id).onclick = async () => {
-    S.cfg[field] = !S.cfg[field];
-    $(id).classList.toggle("on", S.cfg[field]);
-    await invoke(CMD.setConfig, { cfg: S.cfg });
-    showNotice("完成", "已保存");
-  };
-}
-
-function wireAutostart() {
-  const btn = $("set-autostart");
-  btn.onclick = async () => {
-    const enabled = !S.cfg.auto_start_with_system;
-    const ok = await invoke(CMD.setAutostart, { enabled });
-    S.cfg.auto_start_with_system = enabled;
-    btn.classList.toggle("on", enabled);
-    showNotice("完成", "已保存");
-  };
-}
-
-/* 软件更新组（UpdState 状态机文案 = PARITY §2） */
-function renderUpdateGroup() {
-  const el = $("upd-group");
-  if (!el) return;
-  const u = S.upd;
-  let row = "";
-  if (u.state === "idle") {
-    row = settingRow("从 GitHub 看看有没有新版本", `<a href="#" id="upd-check" class="inline-link">检查更新</a>`);
-  } else if (u.state === "up_to_date") {
-    row = settingRow("已经是最新版本了", `<a href="#" id="upd-check" class="inline-link">检查更新</a>`);
-  } else if (u.state === "checking") {
-    row = settingRow("正在向 GitHub 查询", `<span style="font-size:13px;color:var(--txt2)">正在检查…</span>`);
-  } else if (u.state === "available") {
-    row = settingRow("有新版本，下载完会自动重启", `<a href="#" id="upd-download" class="inline-link">下载 v${esc(u.ver)} 并更新</a>`);
-  } else if (u.state === "downloading") {
-    const pct = u.total > 0 ? Math.floor((u.done / u.total) * 100) : 0;
-    row = settingRow("正在下载新版本", `<div class="upd-row"><span class="upd-pct">${pct}%</span>
-      <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div></div>`);
-  } else if (u.state === "restarting") {
-    row = settingRow("下载完成，马上重启", `<span style="font-size:13px;color:var(--txt2)">即将重启…</span>`);
-  } else if (u.state === "failed") {
-    row = settingRow("上次没成功，可以再试", `<a href="#" id="upd-check" class="inline-link">重试</a>`);
-    row += `<div class="field-error" style="text-align:left">${esc(u.msg)}</div>`;
-  }
-  el.innerHTML = row;
-  const c = $("upd-check");
-  if (c) c.onclick = (e) => { e.preventDefault(); invoke(CMD.updCheck); };
-  const d = $("upd-download");
-  if (d) d.onclick = (e) => {
-    e.preventDefault();
-    invoke(CMD.updDownload, { url: u.url, size: u.size });
-  };
-}
-
-function settingRow(title, control) {
-  return `<div class="setting-row">
-    <div class="setting-label"><div class="st-title" style="font-size:13px;color:var(--txt2)">${esc(title)}</div></div>
-    <div class="setting-control">${control}</div>
-  </div>`;
-}
-
-/* ===== 运行日志卡 ===== */
-function renderLog() {
-  const el = $("log-body");
-  if (!el) return;
-  // 空状态：引导语而不是空白
-  if (!S.logs.length) {
-    if (el.dataset.sig !== "empty") {
-      el.dataset.sig = "empty";
-      el.innerHTML = `<div class="log-empty">还没有日志，检查开始后这里会显示记录</div>`;
-    }
-    return;
-  }
-  const shown = S.logs.slice(-30);
-  // 与上次相比真正新出现的尾部行才播落位动画（环形缓冲翻转时 count 变小，全部按新行处理）
-  let prevShown = 0;
-  if (typeof renderLog.prevShown === "number") prevShown = renderLog.prevShown;
-  renderLog.prevShown = shown.length;
-  const fresh = prevShown < shown.length ? shown.length - prevShown : shown.length;
-  const html = `<div id="log-scroll">${shown
-    .map((l, i) => renderLogLine(l, i >= shown.length - fresh))
-    .join("")}</div>`;
-  if (el.dataset.sig === html) return;
-  el.dataset.sig = html;
-  // 用户没往上翻时像 tail -f 一样钉在底部；翻了就别拽
-  const prev = $("log-scroll");
-  const stick = !prev || prev.scrollHeight - prev.scrollTop - prev.clientHeight < 30;
-  el.innerHTML = html;
-  if (stick) {
-    const s = $("log-scroll");
-    s.scrollTop = s.scrollHeight;
-  }
-}
-
-/* 时间戳弱化 + 结果关键词着色（都在 esc 之后做，不引入注入面）；fresh=本次新增行，播落位 */
-function renderLogLine(l, fresh) {
-  let s = esc(l);
-  const m = /^(\d{1,2}:\d{2}:\d{2})\s/.exec(s);
-  let ts = "";
-  if (m) {
-    ts = `<span class="log-ts">${m[1]}</span>`;
-    s = s.slice(m[0].length);
-  }
-  s = s
-    .replace(/(passed=true|全部通过|已恢复|恢复守护|解除)/g, '<span class="log-ok">$1</span>')
-    .replace(/(passed=false|失败|错误|暂停|拦截|隔离|不一致)/g, '<span class="log-err">$1</span>');
-  return `<div${fresh ? ' class="log-enter"' : ""}>${ts}${s}</div>`;
-}
-
-/* ===== 底栏 ===== */
-function renderFooter() {
-  $("footer-version").textContent = `ClaudeGuard v${S.version}`;
-  $("link-install").classList.toggle("hidden", S.installed);
-  $("foot-sep-install").classList.toggle("hidden", S.installed);
-}
-
-async function doInstall() {
-  try {
-    await invoke(CMD.installApp);
-    S.installed = true;
-    showNotice("完成", "安装完成，桌面已建快捷方式");
-  } catch (e) {
-    showNotice("完成", `安装失败：${e}`);
-  }
-  renderFooter();
-}
-
-/* ===== 用户指南模态（纯前端；打开者焦点在关闭时归还） ===== */
-let guideOpener = null;
-function guideOpen() {
-  const g = $("guide");
-  if (!g || !g.classList.contains("hidden")) return;
-  guideOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  g.classList.remove("hidden");
-  $("guide-close").focus();
-}
-function guideClose() {
-  const g = $("guide");
-  if (!g || g.classList.contains("hidden")) return;
-  g.classList.add("hidden");
-  if (guideOpener && document.contains(guideOpener)) guideOpener.focus();
-  guideOpener = null;
-}
-
-/* ===== 向导 ===== */
-function gotoWizard(page) {
-  const dir = page > S.wizPage ? "next" : "prev";
-  const from = S.wizPage;
-  S.wizPage = page;
-  renderWizard();
-  if (from !== page) {
-    const el = $(`wiz-${page}`);
-    if (el) {
-      el.classList.remove("enter-next", "enter-prev");
-      void el.offsetWidth; // 强制 reflow 让入场动画可重播
-      el.classList.add(`enter-${dir}`);
-    }
-  }
-}
-
-function renderWizard() {
-  for (let i = 0; i < 3; i++) {
-    const el = $(`wiz-${i}`);
-    if (el) el.classList.toggle("hidden", S.wizPage !== i);
-  }
-  const dots = $("wiz-dots");
-  dots.innerHTML = [0, 1, 2].map((i) => `<span class="${i === S.wizPage ? "cur" : ""}"></span>`).join("");
-  if (S.wizPage === 1) {
-    const port = $("wiz-port"), ip = $("wiz-ip"), region = $("wiz-region");
-    if (!port.value) port.value = S.wizPort;
-    if (!ip.value) ip.value = S.wizIp;
-    if (region && !region.value) region.value = S.wizRegion;
-    port.oninput = ip.oninput = wiz1Validate;
-    if (region) region.onchange = wiz1Validate;
-    port.onkeydown = ip.onkeydown = (e) => { if (e.key === "Enter") wiz1Continue(); };
-  }
-}
-
-function wiz1Validate() {
-  const port = $("wiz-port").value, ip = $("wiz-ip").value;
-  const region = $("wiz-region") ? $("wiz-region").value : "";
-  const ips = splitIps(ip);
-  const okP = portOk(port);
-  const okI = ips.every(ipOk);
-  const okEgress = okI && (ips.length > 0 || region !== "");
-  const errEl = $("wiz1-error");
-  if (!okP) errEl.textContent = "端口需为 1-65535 的数字";
-  else if (!okI) errEl.textContent = "IP 要写成 4 段数字，如 203.0.113.10";
-  else if (!okEgress) errEl.textContent = "至少填一个约定 IP，或选一个出口地区";
-  else errEl.textContent = "";
-  $("wiz-port").classList.toggle("invalid", !okP);
-  $("wiz-ip").classList.toggle("invalid", ips.length > 0 && !okI);
-  $("wiz1-next").disabled = !(okP && okEgress);
-  return okP && okEgress;
-}
-
-async function wiz1Continue() {
-  if (!wiz1Validate()) return;
-  S.wizPort = $("wiz-port").value.trim();
-  S.wizIp = $("wiz-ip").value.trim();
-  S.wizRegion = $("wiz-region") ? $("wiz-region").value : "";
-  // v2 修复（PARITY §0-1）：向导页 1 的端口/IP 即时落盘，不再等到主屏设置卡。
-  S.cfg.proxy_port = +S.wizPort;
-  S.cfg.allowed_ips = splitIps(S.wizIp);
-  S.cfg.egress_region = S.wizRegion;
-  await invoke(CMD.setConfig, { cfg: S.cfg });
-  gotoWizard(2);
-}
-
-async function finishWizard() {
-  S.cfg.first_run = false;
-  await invoke(CMD.setConfig, { cfg: S.cfg });
-  render();
-  playBoot();
-}
-
-/* ===== 入口 ===== */
-window.addEventListener("DOMContentLoaded", () => {
-  $("btn-min").innerHTML = ICONS.minimize;
-  $("btn-max").innerHTML = ICONS.maximize;
-  $("btn-close").innerHTML = ICONS.close;
-  document.querySelectorAll(".chevron").forEach((c) => (c.innerHTML = ICONS.chevron));
-  document.querySelectorAll(".wiz-icon").forEach((el) => (el.innerHTML = ICONS[el.dataset.icon] || ""));
-  document.querySelectorAll("#guide [data-icon]").forEach((el) => (el.innerHTML = ICONS[el.dataset.icon] || ""));
-  $("guide-close").onclick = guideClose;
-  $("guide-scrim").onclick = guideClose;
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") guideClose();
-  });
-  init().catch((e) => {
-    document.body.innerHTML = `<div style="padding:24px;color:#E4002B;font-size:13px">加载失败：${esc(String(e))}</div>`;
-  });
-});
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
+  else init();
 })();

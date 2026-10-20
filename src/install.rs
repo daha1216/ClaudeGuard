@@ -135,6 +135,7 @@ pub fn set_autostart(enabled: bool) -> bool {
 pub fn uninstall() {
     // 解除可能存在的隔离
     let _ = crate::guard::firewall_release();
+    let _ = crate::netcut::restore();
     // 关闭自启
     let _ = set_autostart(false);
     // 删除快捷方式

@@ -103,7 +103,8 @@ fn enqueue(data: &mut Stored, message: &str) {
     });
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Status {
     pub enabled: bool,
     pub has_webhook: bool,

@@ -1,50 +1,104 @@
-/* Tauri IPC 封装 — 命令名与 src/ipc.rs 一一对应。
- * IIFE 隔离词法作用域：classic script 共享全局词法域，顶层 const 会与 main.js 的解构撞名
- * (v2 P0 实测: SyntaxError: Identifier 'invoke' has already been declared，整个 main.js 编译失败)。 */
+/* ClaudeGuard v3 — 极薄的 Tauri 桥。固定契约：window.CG_IPC = { invoke, EV, listen }。
+   命令名严格对齐 docs/SPEC-v3.md §7 与 src/ipc.rs 的 generate_handler! 列表。 */
 (() => {
   "use strict";
 
-  if (!window.__TAURI__) {
-    document.title = "ClaudeGuard · 请打开桌面程序";
-    document.body.innerHTML = `<main style="max-width:520px;margin:12vh auto;padding:32px;font-family:'Microsoft YaHei UI',sans-serif;line-height:1.8">
-      <h1 style="font-size:24px">请从桌面打开 ClaudeGuard</h1>
-      <p>这里是桌面应用的界面文件预览，单独打开网页无法连接守护器。</p>
-      <p>请关闭此页，双击 ClaudeGuard 快捷方式，或从系统托盘打开守护器。</p>
-      <p style="color:#707070">飞书通知设置位于内置版的「设置 → 飞书通知」。</p>
-    </main>`;
-    return;
-  }
-
-  const core = window.__TAURI__.core;
-  const event = window.__TAURI__.event;
-  const winApi = window.__TAURI__.window;
-
-  const invoke = (cmd, args) => core.invoke(cmd, args);
-
+  const root = typeof window !== "undefined" ? window : globalThis;
+  const T = root.__TAURI__ || {};
+  const core = T.core || T.tauri || {};
   const EV = {
-    status: "guard://status",
-    log: "guard://log",
-    update: "guard://update",
+    state: "guard://state",
+    log: "guard://log"
   };
-
   const CMD = {
-    getState: "get_state",
-    getConfig: "get_config",
-    setConfig: "set_config",
+    get_state: "get_state",
+    get_config: "get_config",
+    update_settings: "update_settings",
+    save_targets: "save_targets",
+    reset_targets: "reset_targets",
     recheck: "recheck",
     launch: "launch",
+    recheck_target: "recheck_target",
     release: "release",
-    recentLogs: "recent_logs",
-    openDataFolder: "open_data_folder",
-    openGuide: "open_guide",
-    installApp: "install_app",
-    setAutostart: "set_autostart",
-    updState: "upd_state",
-    updCheck: "upd_check",
-    updDownload: "upd_download",
+    pause: "pause",
+    resume: "resume",
+    recent_logs: "recent_logs",
+    open_data_folder: "open_data_folder",
+    open_guide: "open_guide",
+    install_app: "install_app",
+    set_autostart: "set_autostart",
+    upd_state: "upd_state",
+    upd_check: "upd_check",
+    upd_download: "upd_download",
+    feishu_status: "feishu_status",
+    feishu_save: "feishu_save",
+    feishu_test: "feishu_test",
+    feishu_retry_failed: "feishu_retry_failed",
+    claude_update_status: "claude_update_status",
+    claude_update_configure: "claude_update_configure",
+    claude_update_check: "claude_update_check",
+    codex_update_status: "codex_update_status",
+    codex_update_configure: "codex_update_configure",
+    codex_update_check: "codex_update_check",
+    js_log: "js_log",
+    notify_test: "notify_test"
   };
 
-  const win = winApi.getCurrentWindow();
+  function noBridge() {
+    return new Error("Tauri bridge unavailable");
+  }
 
-  window.CG_IPC = { invoke, EV, CMD, listen: event.listen, win };
+  async function invoke(cmd, args) {
+    if (!core.invoke) throw noBridge();
+    try {
+      return await core.invoke(cmd, args || {});
+    } catch (e) {
+      if (e instanceof Error) throw e;
+      const msg = e && typeof e === "object" ? (e.message || JSON.stringify(e)) : String(e);
+      throw new Error(msg || "Command failed");
+    }
+  }
+
+  let listenWarned = false;
+  async function listen(event, handler) {
+    try {
+      if (T.event && T.event.listen) return await T.event.listen(event, handler);
+      if (core.event && core.event.listen) return await core.event.listen(event, handler);
+    } catch (e) {
+      if (!listenWarned) {
+        listenWarned = true;
+        console.warn("CG_IPC: event.listen unavailable", e);
+      }
+    }
+    return () => {};
+  }
+
+  function currentWindow() {
+    try {
+      if (T.window && T.window.getCurrentWindow) return T.window.getCurrentWindow();
+      if (core.window && core.window.getCurrentWindow) return core.window.getCurrentWindow();
+    } catch (e) { /* 无 Tauri 环境（file:// 浏览器预览）时静默降级 */ }
+    return null;
+  }
+  function quiet(p) {
+    try { if (p && typeof p.catch === "function") p.catch(() => {}); } catch (e) { /* ignore */ }
+  }
+  function minimize() {
+    const w = currentWindow();
+    if (w) { try { quiet(w.minimize()); } catch (e) { /* ignore */ } }
+  }
+  function close() {
+    const w = currentWindow();
+    if (w) { try { quiet(w.close()); } catch (e) { /* ignore */ } }
+  }
+
+  root.CG_IPC = {
+    invoke,
+    EV,
+    CMD,
+    listen,
+    minimize,
+    close,
+    win: { minimize, close }
+  };
 })();

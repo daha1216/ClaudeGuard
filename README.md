@@ -18,10 +18,10 @@
 ---
 
 ### 一句话定位
-ClaudeGuard 是专为 Windows 10/11 设计的 AI 应用网络出口门禁：只有当前代理出口 IP 处于约定名单内，才允许 AI 桌面应用启动和联网；出口一旦变动或异常，立即自动结束进程并使用 Windows 防火墙阻止其联网，切回合规节点后自动解除隔离。
+ClaudeGuard 是 Windows 10/11 上的 AI 应用网络出口门禁：**按每个目标自己的域名**校验它此刻走的是哪条链路、出口 IP 与地区是否在白名单里；全部通过才允许启动 Claude 等桌面应用，任一启用目标不符合就立即熔断——结束相关进程、用防火墙隔离、必要时直接断网，切回合规节点后自动恢复。
 
 ### 为什么需要它
-许多 AI 桌面应用对网络出口环境极其敏感。一旦本地代理节点漂移、断连直连或跳出预期国家地区，极易导致账号封禁或会话异常。ClaudeGuard 充当一道物理级的自动化安全卡口，杜绝应用在非预期网络环境下静默联网。
+Claude、ChatGPT、反重力这些客户端对出口环境很敏感，而代理软件经常“整体一个出口”。当节点漂移、断连直连或者某个应用被单独分流时，应用会在你不知情的情况下从非预期出口联网。v3 的核心变化是把“系统出口”拆成**每个应用各测各的**：Claude 走 claude.ai 的 trace、Codex 走 chatgpt.com 的 trace、反重力测 Google 后端可达性——互不牵连，谁不对谁熔断。
 
 ---
 
@@ -29,160 +29,136 @@ ClaudeGuard 是专为 Windows 10/11 设计的 AI 应用网络出口门禁：只�
 
 <table>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshot-main.png" alt="主界面：一切正常态" width="400" /><br><sub>主界面 · 校验通过，一键启动</sub></td>
-    <td align="center" width="50%"><img src="assets/screenshot-settings.png" alt="设置卡展开态" width="400" /><br><sub>设置 · 端口 / 多 IP 白名单 / 出口地区 / 守护开关</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshot-main.png" alt="主界面：守护正常" width="400" /><br><sub>主界面 · 各目标出口逐一校验通过</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshot-trip.png" alt="熔断态" width="400" /><br><sub>熔断 · 结束进程 + 断网隔离，一键解除</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshot-settings.png" alt="设置卡" width="400" /><br><sub>设置 · 端口 / 白名单 / 断网档位 / 守护对象</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshot-wizard.png" alt="首次向导" width="400" /><br><sub>首次向导 · 三步完成配置</sub></td>
   </tr>
 </table>
 
 <p align="center">
-  <img src="assets/screenshot-guide.png" alt="内置用户指南" width="400" /><br>
-  <sub>内置用户指南 · 随开随查</sub>
+  <img src="assets/screenshot-checking.png" alt="检测中" width="400" /><br>
+  <sub>检测中 · 目标逐个回填出口 IP、地区与耗时</sub>
 </p>
 
 ---
 
 ## 功能亮点
 
-- **启动闸门校验**：启动时执行三步串行校验（系统代理配置 → 代理握手 → 出口 IP），全部通过才放行目标应用启动。
-- **常驻后台监测**：最小化至系统托盘静默运行，默认每 15 秒自动复检一次（检测间隔可自定义）。
-- **异常瞬间熔断**：检测到出口异常时，自动结束守护范围内的 GUI 应用全部进程，并通过 Windows 防火墙添加出站/入站双向阻止规则；下一次检测通过自动恢复，亦支持托盘手动一键解除。
-- **双重规则匹配**：支持“多 IP 白名单”与“出口地区（国家）”两种规则，可同时配置，任一命中即放行。
-- **差异化多 Agent 守护**：GUI 桌面应用支持进程熔断与防火墙断网；CLI 工具仅记录提醒，防范误杀。
-- **严密防误杀设计**：当探测服务双双失败（出口信息无法获取）时不盲目熔断；但若白名单与地区均留空，则永久禁止放行。
-- **可脚本化调用**：提供 `--check` 命令行检测参数，支持输出 JSON 结果供自动化流水线或脚本使用。
-- **飞书群通知**：在异常、熔断、恢复及客户端更新需要处理时发送通知；凭据使用 Windows DPAPI 加密，持续异常去重，发送失败可查看原因并手动补发。见 [飞书通知](docs/FEISHU.md)。
-- **Claude / Codex 客户端更新**：分别启用每周检查，也可立即手动检查；验证官方签名包后，等待桌面应用及相关 CLI 退出，再原位升级。只有 Windows 注册版本达到目标且包状态正常才报告完成。见 [客户端更新](docs/CLIENT-UPDATES.md)。
-- **守护器自身更新**：内建基于 GitHub Releases 的版本检测与自更新机制，与客户端更新分别管理。
+- **按目标校验出口（v3 核心）**：每个监控目标绑定自己的探测地址与期望值。Claude → `claude.ai/cdn-cgi/trace`，Codex → `chatgpt.com/cdn-cgi/trace`，反重力 → `cloudcode-pa.googleapis.com` 可达性，本机出口 → `cloudflare.com/cdn-cgi/trace`。支持 HTTP trace、JSON IP、页面地区标记、仅可达性四类锚点，自定义目标同样适用。
+- **双重白名单**：多 IP 列表 + 出口地区（ISO 国家/地区码），任一命中即放行；期望为空的目标会被校验拦下，避免裸连。
+- **防抖熔断**：连续 `2` 次（可调）失败才熔断，任意一次通过清零；探测失败/拿不到出口信息属于“无法确认”，不熔断。
+- **熔断动作**：结束 Claude / ChatGPT / 反重力的全部进程 + 按开关做防火墙入/出站隔离 + 断网档位（关闭 / 防火墙全局出站阻断（默认）/ 禁用物理网卡）。
+- **恢复零残留**：切回合规节点后下一轮自动解除隔离与断网；托盘“解除隔离并恢复网络”、`--restore` 急救、程序退出都会恢复网络。
+- **常驻托盘**：默认每 15 秒复查一次（5–3600 秒可调），可“暂停守护 30 分钟”（暂停期间照常检测但绝不熔断）。
+- **多 Agent 守护**：GUI 应用熔断杀进程，CLI（Claude Code / Codex CLI / Gemini CLI）只提醒不杀，避免误伤终端。
+- **桌面通知 + 飞书群通知**：熔断、恢复、启动被阻止、失败预警、客户端更新五类桌面通知；飞书机器人支持签名校验、DPAPI 凭据加密、持久队列与失败补发。见 [飞书通知](docs/FEISHU.md)。
+- **Claude / Codex 客户端更新**：只走官方 MSIX 源，校验签名与包身份后原位升级，注册版本达标才算完成。见 [客户端更新](docs/CLIENT-UPDATES.md)。
+- **守护器自身更新**：基于 GitHub Releases 的版本检测、下载与自替换。
+- **可脚本化**：`--check` 输出 JSON 与退出码，适合批处理和前置流水线。
 
 ---
 
-## 守护范围与 CLI 说明
-
-ClaudeGuard 针对桌面端与命令行终端采用了不同的防护机制：
+## 守护范围与熔断方式
 
 | 类型 | 支持目标 | 熔断机制 | 说明 |
 | :--- | :--- | :--- | :--- |
-| **GUI 桌面应用** | Claude / ChatGPT / 反重力 (Antigravity) | **结束进程 + 防火墙断网** | 支持任意组合勾选。触发熔断时，结束全部关联进程，并为其全部可执行文件添加 Windows 防火墙出/入站阻止规则。 |
-| **CLI 命令行** | Claude Code / Codex / Gemini CLI | **仅弹日志提醒，绝不杀进程** | CLI 工具常驻在命令行终端或 Node.js 环境中，直接杀进程会导致终端崩溃伤及无关任务，因此仅记录日志提醒。 |
+| **GUI 桌面应用** | Claude / ChatGPT / 反重力 (Antigravity) | **结束进程 + 防火墙隔离** | 任意组合勾选；熔断时结束全部关联进程，并为其可执行文件添加 Windows 防火墙出/入站阻止规则。 |
+| **CLI 命令行** | Claude Code / Codex / Gemini CLI | **仅日志提醒，绝不杀进程** | CLI 常驻在终端或 Node 环境里，杀进程会误伤整个终端，因此只记录提醒。 |
 
 ---
 
 ## 防误杀与放行语义
 
-- **探测服务故障（双探失败不熔断）**：若检测请求因网络波动导致探测服务双双失败、无法解析出口信息时，程序**不会触发熔断**，避免网络抖动引起误杀。
-- **未配置规则（宁可错杀）**：若设置项中的出口 IP 名单和出口地区**皆留空**，程序判定为**永远不放行**，杜绝未设规则时的非预期裸连。
+- **信息缺失不熔断**：探测超时、返回为空、拿不到 IP/地区时判为“无法确认”，只记录不熔断。
+- **期望为空不放行**：某个目标的期望 IP 与地区都为空时，该目标永远不通过（宁可错杀），需要补白名单。
+- **连续两次才熔断**：单次网络抖动不会立刻熔断；两次检查间隔默认 15 秒。
+- **本机出口默认关闭**：本机常规流量出口往往与 AI 代理出口不同，默认开启会在首次启动就熔断；需要监管本机出口时在设置里打开并补齐白名单。
 
 ---
 
 ## 安装与快速上手
 
-ClaudeGuard 仅支持 **Windows 10 / 11** 系统，界面为全中文。可在 [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases) 获取最新分发包：
+仅支持 **Windows 10 / 11**，界面全中文。在 [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases) 获取最新分发包：
 
-1. **安装版 (`setup.exe`)**
-   - 基于 Inno Setup 打包，默认安装路径为 `C:\Program Files\ClaudeGuard`。
-   - 安装器会自动检测并提示安装 WebView2 运行时。
-   - **为何需要管理员权限**：应用在触发熔断时需要通过 `netsh` 配置 Windows 防火墙出/入站阻止规则，因此安装与运行需要管理员权限。
-   - **卸载**：可在 Windows 系统“安装的应用”中正常卸载，卸载过程会**刻意保留用户配置文件与日志**，避免重新配置。
-2. **便携版 (`zip`)**
-   - 解压即用的裸 exe 文件，适合便携使用（同样需要管理员权限以调用防火墙规则）。
+1. **安装版（`ClaudeGuard-vX.Y.Z-setup.exe`）**
+   - Inno Setup 打包，默认安装到 `C:\Program Files\ClaudeGuard`，自动检测 WebView2 运行时。
+   - 需要管理员权限：熔断时要调用 Windows 防火墙与网卡控制接口。
+   - 卸载可在“安装的应用”中完成，**刻意保留** `%APPDATA%\ClaudeGuard` 里的配置与日志。
+2. **便携版（`ClaudeGuard-vX.Y.Z.zip`）**
+   - 裸 exe，解压即用（同样需要管理员权限）。
 
 ### 首次运行向导
-首次打开应用时将展示**三步初始化向导**，引导配置本地代理端口与放行规则；配置完成后即可最小化进入常驻守护状态。
+三步完成配置：代理端口 → 出口白名单（IP 可多个，或按地区）/ 守护对象 → 是否安装开机自启。完成后即进入常驻守护。
 
 ---
 
 ## 日常使用
 
-### 界面概览
-- **单卡片主界面**：醒目的状态圆环与状态行，即时展示当前放行/熔断状态。
-- **检查详情时间线**：展示代理配置、握手、出口 IP 校验的详细步骤耗时与结果。
-- **运行日志卡片**：环形缓冲区记录最近 200 条日志，便于追溯状态变化。
-- **设置卡片**：直接调整各项运行参数。
-- **内置《用户指南》**：点击主界面底栏“用户指南”即可打开完整的内置指南模态框，支持 `Esc` 键、点击遮罩或关闭按钮快速退出。
+- **主界面**：状态圆环 + 状态文案 + 每个目标一行（出口 IP、地区、耗时）。底部“详情 / 设置 / 日志”展开对应卡片。
+- **设置**：代理端口、检查间隔、白名单（IP / 地区）、断网档位、熔断动作开关、守护对象、监控目标增删改、桌面通知与飞书、客户端更新、开机自启、关窗到托盘。
+- **托盘菜单**（右键图标）：显示主窗口 / 立即检测 / 暂停守护 30 分钟（或恢复守护）/ 解除隔离并恢复网络 / 打开数据文件夹 / 退出。
 
-### 托盘菜单
-应用默认支持最小化/关闭到系统托盘，右键托盘图标提供以下六项操作：
-1. **显示主窗口**
-2. **立即检测**
-3. **暂停守护 30 分钟**（暂停期间网络检查照常进行，但绝不杀进程、不断网）
-4. **解除隔离**（一键清除防火墙阻止规则）
-5. **打开数据文件夹**（直接在文件资源管理器中打开 `%APPDATA%\ClaudeGuard\`）
-6. **退出**
-
-### 配置项说明
-- **代理端口**：本地监听端口（默认 `7890`）。
-- **出口 IP 名单**：允许放行的一个或多个出口 IP 白名单。
-- **出口地区**：允许放行的国家/地区。
-- **检测间隔**：常驻检测轮询频率（默认 `15` 秒）。
-- **守护对象勾选**：Claude / ChatGPT / 反重力 (Antigravity) 自由勾选。
-- **CLI 提醒开关**：是否开启终端工具的日志提醒。
-- **关闭到托盘**：窗口关闭按钮行为切换。
-- **开机自启**：随 Windows 系统启动（默认关闭）。
-- **飞书群通知**：配置群机器人 Webhook 和可选签名密钥，可测试通知和补发失败通知。
-- **客户端更新**：Claude、Codex 各有独立开关、版本、进度和手动检查按钮；默认关闭，启用后每周检查一次。
-
-通知及客户端更新由守护器后台线程处理。启用“关闭到托盘”后，关闭主窗口仍会继续处理；从托盘选择“退出”会停止守护器后台工作。Windows 已接收的延后更新可能继续由系统完成。
-
----
-
-## 命令行模式 (`--check`)
-
-ClaudeGuard 支持免界面执行单次检测，适合批处理脚本或前置流水线调用：
+### 命令行
 
 ```powershell
-ClaudeGuard.exe --check
+ClaudeGuard.exe --check        # 单次检测，JSON 输出；退出码 0 通过 / 2 不通过
+ClaudeGuard.exe --restore      # 急救：恢复网络 + 解除全部隔离
+ClaudeGuard.exe --settings     # 打开/唤起主窗口并展开设置
+ClaudeGuard.exe --notify-test trip   # 测试桌面通知（trip/recover/launch_blocked/warning/client_update）
+ClaudeGuard.exe --feishu-status --claude-update-status --codex-update-status
+ClaudeGuard.exe --install --uninstall
 ```
 
-- **输出格式**：标准控制台输出 JSON 格式的检测诊断详情。
-- **退出码语义**：
-  - `0`：检测通过（代理正常且出口符合预期规则）
-  - `2`：检测未通过（代理异常或出口不在名单/地区内）
+`--check` 示例（截断）：
 
-`--settings` 可打开设置或唤起已有窗口；`--feishu-status`、`--claude-update-status`、`--codex-update-status` 输出本地保存的状态快照。状态命令不会发送通知、联网检查版本或触发安装；飞书状态不包含解密后的凭据。
+```json
+{
+  "version": "3.0.0",
+  "passed": true,
+  "targets": [
+    { "id": "local", "name": "本机出口", "enabled": false, "verdict": "disabled" },
+    { "id": "claude", "name": "Claude 出口", "enabled": true, "verdict": "pass", "ip": "204.1.100.98" },
+    { "id": "codex", "name": "Codex 出口", "enabled": true, "verdict": "pass", "ip": "204.1.100.98" },
+    { "id": "antigravity", "name": "反重力出口", "enabled": true, "verdict": "pass", "note": "可达" }
+  ]
+}
+```
 
 ---
 
 ## 数据与隐私
 
-- **配置与运行状态**：存放于 `%APPDATA%\ClaudeGuard\`：
-  - `config.json`：应用运行配置。
-  - `guard.log`：守护运行日志（自 v2.10.1 起，当日志文件体积超过 1MB 时，程序会自动裁剪并保留最近约 400KB 内容，避免磁盘无限膨胀）。
-  - `feishu.json`：DPAPI 加密凭据、通知队列、失败记录及去重状态。队列中的通知正文未加密，可能包含出口 IP 和诊断信息。
-  - `claude-update.json` / `codex-update.json`：客户端检查及更新状态，不含客户端登录凭据。
-- **客户端安装包缓存**：分别位于守护器可执行文件旁的 `ClaudeUpdates` / `CodexUpdates`，需要该目录有写入权限。不会迁移客户端的原有安装位置或用户档案。
-- **网络探测隐私**：
-  - 出口 IP 探测请求**经由你所配置的本地代理**发往 `ipinfo.io` 和 `ipify` 探测服务。
-  - 守护器自身版本检查通过 GitHub API 查询仓库 Releases；客户端版本检查及下载访问各自的官方发布地址。
-  - 启用飞书通知后，通过直连 HTTPS 向配置的机器人发送事件正文，包括出口 IP、异常原因或更新状态；请求不继承被监测的代理，也不跟随重定向。
-  - 应用不包含其他第三方统计分析或数据回传。
+- 配置与运行状态位于 `%APPDATA%\ClaudeGuard\`：
+  - `config.json`：v3 配置（旧 v2 配置会在首次启动时自动迁移）。
+  - `guard.log`：运行日志（超过 1MB 自动裁剪并保留最近约 400KB）。
+  - `netcut.json`：断网现场，用于崩溃/被杀后的启动自愈。
+  - `feishu.json`：DPAPI 加密凭据、通知队列与失败记录（队列正文未加密，可能含出口 IP）。
+  - `claude-update.json` / `codex-update.json`：客户端更新状态，不含登录凭据。
+- **探测请求**经你配置的本地代理发往各目标自己的探测域名（`claude.ai`、`chatgpt.com`、`cloudflare.com`、`cloudcode-pa.googleapis.com`），只用于读取出口 IP/地区或判断可达性，不上传任何应用数据。
+- 守护器自身更新查询 GitHub Releases；客户端更新只访问官方 MSIX 源；飞书通知直连 HTTPS 发送事件正文。
+- 不包含任何第三方统计或数据回传。
 
 ---
 
 ## 从源码构建
 
-### 技术栈
-- **核心框架**：Rust + Tauri 2 (WebView2)
-- **前端架构**：零构建纯静态页面（无 Node.js、npm 依赖）
-- **底层依赖**：
-  - 防火墙隔离：调用 Windows `netsh` 子进程
-  - 进程遍历与结束：`sysinfo` crate
-  - 本地网络与 TCP 状态表查询：`windows` crate
-- **测试与质量**：Rust 单元测试覆盖守护、通知和更新状态逻辑；另有 Windows 包 API 模拟测试与前端模拟 IPC 测试。运行方式及验收边界见 [测试说明](tests/README.md)。
-
-### 构建步骤
-确保已安装 Windows 10/11 与 MSVC C++ 构建工具链，以及 Rust 工具链：
-
 ```powershell
-# 编译 Release 版本
-cargo build --release
+cargo build --release        # 产物 target/release/claude-guard.exe
+cargo test                   # 107 个单元测试
+cargo clippy --all-targets -- -D warnings
+node --check ui/*.js         # 纯静态前端，无 npm/构建步骤
 ```
 
-编译产物位于 `target/release/claude-guard.exe`。
+- 技术栈：Rust + Tauri 2（WebView2，纯静态前端）、`sysinfo`（进程）、Windows 防火墙与网卡控制、`ureq`（探测）。
+- 维护者约定、模块地图与已知坑见 [AGENTS.md](AGENTS.md)；v3 行为基准见 [docs/SPEC-v3.md](docs/SPEC-v3.md)；用户指南见 [docs/GUIDE.md](docs/GUIDE.md)。
 
 ---
 
 ## 版本沿革
 
-- **v1.x**：初代原型，基于 Rust `egui` 编写的单文件原生 GUI。
-- **v2.x**：全面重写为 Tauri 2 架构，重构界面交互与底层进程/防火墙联动逻辑。
-- **当前源码扩展**：内置飞书通知、Claude / Codex 每周及手动更新、延后注册结果核对与启动失败诊断。已发布版本以 [Releases](https://github.com/daha1216/ClaudeGuard/releases) 为准。
+- **v1.x**：Rust `egui` 单文件原型。
+- **v2.x**：重写为 Tauri 2 架构，加入多 Agent 守护、飞书通知与客户端更新。
+- **v3.x**：从零重构。按目标独立锚点校验、断网两档、桌面通知、A+ 极简仪表盘 UI、断网自愈与 `--restore` 急救。

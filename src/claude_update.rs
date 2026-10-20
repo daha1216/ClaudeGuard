@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
-use crate::monitor::Shared;
+use crate::model::TargetState;
+use crate::state::AppState;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Product {
@@ -31,10 +32,10 @@ impl Product {
             Self::Codex => "codex",
         }
     }
-    fn updater(self, sh: &Shared) -> &Updater {
+    fn updater(self, state: &AppState) -> &Updater {
         match self {
-            Self::Claude => &sh.claude_update,
-            Self::Codex => &sh.codex_update,
+            Self::Claude => &state.claude_update,
+            Self::Codex => &state.codex_update,
         }
     }
 }
@@ -45,8 +46,21 @@ fn check_due(last_check: u64, timestamp: u64) -> bool {
     last_check == 0 || timestamp.saturating_sub(last_check) >= CHECK_INTERVAL
 }
 
-#[derive(Clone, Default, Deserialize, Serialize)]
-#[serde(default)]
+/// 与 v2 的「最近一轮全部启用目标通过且未熔断」等价；自动安装前的安全门。
+fn guard_healthy(app: &AppState) -> bool {
+    if app.is_tripped() {
+        return false;
+    }
+    let statuses = app.statuses();
+    let enabled: Vec<_> = statuses
+        .iter()
+        .filter(|s| s.state != TargetState::Disabled)
+        .collect();
+    !enabled.is_empty() && enabled.iter().all(|s| s.state == TargetState::Pass)
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Status {
     pub enabled: bool,
     pub phase: String,
@@ -576,28 +590,28 @@ impl Updater {
         state.phase = phase.into();
         state.wait_reason.clear();
     }
-    pub fn request(sh: &Arc<Shared>, product: Product, finish: bool) -> Result<(), String> {
-        Self::request_inner(sh, product, true, finish)
+    pub fn request(state: &Arc<AppState>, product: Product, finish: bool) -> Result<(), String> {
+        Self::request_inner(state, product, true, finish)
     }
     fn request_inner(
-        sh: &Arc<Shared>,
+        state: &Arc<AppState>,
         product: Product,
         manual: bool,
         finish: bool,
     ) -> Result<(), String> {
         if product
-            .updater(sh)
+            .updater(state)
             .busy
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
             return Err("正在检查或更新客户端".into());
         }
-        let sh = Arc::clone(sh);
+        let state = Arc::clone(state);
         std::thread::spawn(move || {
-            let updater = product.updater(&sh);
+            let updater = product.updater(&state);
             let name = product.name();
-            let outcome = updater.run(&sh, manual, finish);
+            let outcome = updater.run(&state, manual, finish);
             if let Err(error) = outcome {
                 {
                     let mut state = updater.state.lock().unwrap();
@@ -607,42 +621,48 @@ impl Updater {
                     state.error = error.clone();
                     state.last_check = now();
                 }
-                sh.log(format!("{name} 更新已停止：{error}"));
+                state.log(format!("{name} 更新已停止：{error}"));
                 if updater.status().pending_version.is_empty() {
                     let schedule = if updater.status().next_check > 0 {
                         "本次检查或下载已停止，下周按计划再检查；也可手动立即重试。"
                     } else {
                         "已停止自动安装重试，请在守护器查看原因后手动处理。"
                     };
-                    sh.feishu.notify(&format!(
-                        "{name} 更新失败\n{error}\n{schedule}\n未卸载、重置或清理登录数据。"
-                    ));
+                    let _ = state.notify(
+                        "client_update",
+                        &format!("{name} 更新失败"),
+                        &format!("{error}\n{schedule}\n未卸载、重置或清理登录数据。"),
+                    );
                 } else {
-                    sh.feishu.notify(&format!("{name} 更新尚未完成\n{error}\n已停止自动重试。待生效目标已保留，未卸载、重置或清理登录数据；请在守护器查看具体原因。"));
+                    let _ = state.notify(
+                        "client_update",
+                        &format!("{name} 更新尚未完成"),
+                        &format!("{error}\n已停止自动重试。待生效目标已保留，未卸载、重置或清理登录数据；请在守护器查看具体原因。"),
+                    );
                 }
             }
             if let Err(error) = updater.persist() {
-                sh.log(format!("无法保存 {name} 更新状态：{error}"));
+                state.log(format!("无法保存 {name} 更新状态：{error}"));
             }
             updater.installing.store(false, Ordering::SeqCst);
             updater.busy.store(false, Ordering::SeqCst);
+            state.emit_state();
         });
         Ok(())
     }
-    pub fn start(sh: &Arc<Shared>, product: Product) {
-        let sh = Arc::clone(sh);
+    pub fn start(state: &Arc<AppState>, product: Product) {
+        let state = Arc::clone(state);
         std::thread::spawn(move || {
-            while !sh.stop.load(Ordering::SeqCst) {
-                let s = product.updater(&sh).status();
-                let healthy = sh.last.lock().unwrap().as_ref().is_some_and(|s| s.passed)
-                    && sh.tripped.lock().unwrap().is_none();
+            while !state.stop.load(Ordering::SeqCst) {
+                let s = product.updater(&state).status();
+                let healthy = guard_healthy(&state);
                 // Unsafe installation failures stay stopped. Read-only checks may
                 // recover on the next weekly schedule; never fall back to repair.
                 if s.should_check(now(), healthy) {
-                    let _ = Self::request_inner(&sh, product, false, false);
+                    let _ = Self::request_inner(&state, product, false, false);
                 }
                 for _ in 0..30 {
-                    if sh.stop.load(Ordering::SeqCst) {
+                    if state.stop.load(Ordering::SeqCst) {
                         return;
                     }
                     std::thread::sleep(Duration::from_secs(1));
@@ -650,7 +670,7 @@ impl Updater {
             }
         });
     }
-    fn run(&self, sh: &Shared, manual: bool, finish: bool) -> Result<(), String> {
+    fn run(&self, app: &AppState, manual: bool, finish: bool) -> Result<(), String> {
         let name = self.product.name();
         let previous = self.status();
         self.state.lock().unwrap().wait_reason.clear();
@@ -684,18 +704,20 @@ impl Updater {
                 } else {
                     "请在守护器中点击完成已下载更新，安排一次原位安装尝试。"
                 };
-                sh.feishu.notify(&format!(
-                    "{name} 更新需要处理\n新版长时间尚未完成注册，当前仍未确认更新成功。{next}"
-                ));
+                let _ = app.notify(
+                    "client_update",
+                    &format!("{name} 更新需要处理"),
+                    &format!("新版长时间尚未完成注册，当前仍未确认更新成功。{next}"),
+                );
             }
             if finish && !previous.resume_pending && self.status().resume_pending {
-                sh.log(format!(
+                app.log(format!(
                     "{name} 已安排完成已下载更新；只尝试一次，等待重启或程序正常退出"
                 ));
             }
             match action {
-                PendingAction::Completed => self.notify_completed(sh, &installed.version),
-                PendingAction::Finish => self.finish_pending(sh, &previous.pending_version)?,
+                PendingAction::Completed => self.notify_completed(app, &installed.version),
+                PendingAction::Finish => self.finish_pending(app, &previous.pending_version)?,
                 PendingAction::Observe => {}
             }
             return Ok(());
@@ -712,7 +734,7 @@ impl Updater {
             self.phase("blocked");
             return Err(unhealthy_package(&installed.package_status));
         }
-        let cfg = sh.cfg.lock().unwrap().clone();
+        let cfg = app.config();
         let agent = agent(&cfg)?;
         // While waiting for an already verified package, avoid repeated network checks.
         let reuse_pending = !manual
@@ -741,7 +763,7 @@ impl Updater {
                 self.phase("updated");
                 self.state.lock().unwrap().last_updated = now();
                 self.persist()?;
-                self.notify_completed(sh, &installed.version);
+                self.notify_completed(app, &installed.version);
             }
             return Ok(());
         }
@@ -754,8 +776,7 @@ impl Updater {
             self.state.lock().unwrap().wait_reason = running_reason(self.product, &installed);
             return Ok(());
         }
-        let healthy = sh.last.lock().unwrap().as_ref().is_some_and(|s| s.passed)
-            && sh.tripped.lock().unwrap().is_none();
+        let healthy = guard_healthy(app);
         if !healthy {
             self.phase("available");
             self.state.lock().unwrap().wait_reason =
@@ -782,14 +803,19 @@ impl Updater {
             self.phase("waiting");
             self.state.lock().unwrap().wait_reason = running_reason(self.product, &installed);
             if previous.phase != "waiting" {
-                sh.feishu.notify(&format!("{name} 更新已准备\n{} → {latest}\n官方签名已验证。等待客户端和相关任务退出后自动原位升级，保留登录数据。", installed.version));
+                let _ = app.notify(
+                    "client_update",
+                    &format!("{name} 更新已准备"),
+                    &format!(
+                        "{} → {latest}\n官方签名已验证。等待客户端和相关任务退出后自动原位升级，保留登录数据。",
+                        installed.version
+                    ),
+                );
             }
             return Ok(());
         }
         // A download can outlast a healthy egress check. Recheck before deployment.
-        if !sh.last.lock().unwrap().as_ref().is_some_and(|s| s.passed)
-            || sh.tripped.lock().unwrap().is_some()
-        {
+        if !guard_healthy(app) {
             self.phase("waiting");
             self.state.lock().unwrap().wait_reason =
                 "等待守护检查通过后继续；当前不提交安装。".into();
@@ -815,8 +841,12 @@ impl Updater {
                     state.installed_version = result.version;
                 }
                 self.persist()?;
-                sh.feishu.notify(&format!("{name} 更新尚未生效\n目标版本：{latest}\nWindows 已接收延后更新，但尚未完成新版注册。守护器会核对结果；如长时间未完成，可在设置中选择“完成已下载更新”。未强制关闭程序或清理登录数据。"));
-                sh.log(format!("{name} 更新已交给 Windows，等待版本 {latest} 注册生效"));
+                let _ = app.notify(
+                    "client_update",
+                    &format!("{name} 更新尚未生效"),
+                    &format!("目标版本：{latest}\nWindows 已接收延后更新，但尚未完成新版注册。守护器会核对结果；如长时间未完成，可在设置中选择“完成已下载更新”。未强制关闭程序或清理登录数据。"),
+                );
+                app.log(format!("{name} 更新已交给 Windows，等待版本 {latest} 注册生效"));
             }
             "updated" | "current" => {
                 if !result.healthy || version(&result.version)? < version(&latest)? {
@@ -828,16 +858,14 @@ impl Updater {
                 state.last_updated = now();
                 drop(state);
                 self.persist()?;
-                self.notify_completed(sh, &result.version);
+                self.notify_completed(app, &result.version);
             }
             _ => return Err("Windows 返回了未知更新结果".into()),
         }
         Ok(())
     }
-    fn finish_pending(&self, sh: &Shared, target: &str) -> Result<(), String> {
-        if !sh.last.lock().unwrap().as_ref().is_some_and(|s| s.passed)
-            || sh.tripped.lock().unwrap().is_some()
-        {
+    fn finish_pending(&self, app: &AppState, target: &str) -> Result<(), String> {
+        if !guard_healthy(app) {
             self.state.lock().unwrap().wait_reason =
                 "等待守护检查通过后完成更新；当前不提交安装。".into();
             return Ok(());
@@ -864,7 +892,7 @@ impl Updater {
                     return Err("Windows 尚未完成新版注册，本次尝试已停止；请重启电脑后核对结果。".into());
                 }
                 self.persist()?;
-                self.notify_completed(sh, &result.version);
+                self.notify_completed(app, &result.version);
             }
             "unavailable" => return Err(unhealthy_package(&result.package_status)),
             "blocked" => return Err("Windows 仍报告应用占用（0x80073D02），本次完成更新的尝试已停止。请保存工作并重启电脑，再核对结果；未强制关闭程序。".into()),
@@ -872,12 +900,14 @@ impl Updater {
         }
         Ok(())
     }
-    fn notify_completed(&self, sh: &Shared, installed: &str) {
+    fn notify_completed(&self, app: &AppState, installed: &str) {
         let name = self.product.name();
-        sh.feishu.notify(&format!(
-            "{name} 更新完成\n当前版本：{installed}\n已确认新版注册生效，未清理登录数据。"
-        ));
-        sh.log(format!("{name} 更新结果已确认：{installed}"));
+        let _ = app.notify(
+            "client_update",
+            &format!("{name} 更新完成"),
+            &format!("当前版本：{installed}\n已确认新版注册生效，未清理登录数据。"),
+        );
+        app.log(format!("{name} 更新结果已确认：{installed}"));
     }
     fn download(&self, agent: &ureq::Agent, url: &str, file: &Path) -> Result<(), String> {
         let head = call_retry(agent.head(url).timeout(Duration::from_secs(30)))

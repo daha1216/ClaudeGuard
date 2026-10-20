@@ -1,194 +1,280 @@
-//! v2 IPC 绑定层：#[tauri::command] 薄封装，全部转发到既有核心模块。
-//! 红线：不改守卫判定/核心模块内部实现，本文件只做参数搬运与序列化。
+//! 前端 IPC 命令：UI 与后端之间唯一的调用面。
+//!
+//! 命名与参数以 `docs/SPEC-v3.md` §7 为准；Tauri 2 会把 JS 的 camelCase 参数映射到 Rust 的 snake_case。
 
-use std::sync::atomic::Ordering;
+use crate::model::{Target, UpdState};
+use crate::monitor::{self, DryResult};
+use crate::state::{AppState, StateView};
 use std::sync::Arc;
-
 use tauri::State;
 
-use crate::config::Config;
-use crate::install;
-use crate::monitor::{self, Shared, UpdState};
+/// 打开数据目录（资源管理器）。
+fn open_folder() {
+    let dir = crate::config::config_dir();
+    let _ = std::process::Command::new("explorer.exe").arg(dir).spawn();
+}
 
-type Sh<'a> = State<'a, Arc<Shared>>;
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .spawn();
+}
+
+// ---------- 状态 / 配置 ----------
 
 #[tauri::command]
-pub fn claude_update_status(sh: Sh) -> crate::claude_update::Status {
-    sh.claude_update.status()
+pub fn get_state(state: State<'_, Arc<AppState>>) -> StateView {
+    state.state_view()
+}
+
+#[tauri::command]
+pub fn get_config(state: State<'_, Arc<AppState>>) -> crate::config::Config {
+    state.config()
+}
+
+#[tauri::command]
+pub fn update_settings(
+    state: State<'_, Arc<AppState>>,
+    patch: serde_json::Value,
+) -> Result<StateView, String> {
+    let next = state.config().apply_patch(&patch)?;
+    state.set_config(next);
+    state.reset_statuses_from_config();
+    state.emit_state();
+    Ok(state.state_view())
+}
+
+#[tauri::command]
+pub fn save_targets(
+    state: State<'_, Arc<AppState>>,
+    targets: Vec<Target>,
+) -> Result<StateView, String> {
+    let targets = crate::targets::validate(targets)?;
+    let mut cfg = state.config();
+    cfg.targets = targets;
+    cfg.save();
+    state.set_config(cfg);
+    state.reset_statuses_from_config();
+    state.log("监控目标已保存");
+    state.emit_state();
+    Ok(state.state_view())
+}
+
+#[tauri::command]
+pub fn reset_targets(state: State<'_, Arc<AppState>>) -> StateView {
+    let mut cfg = state.config();
+    let (ips, regions) = cfg
+        .target("claude")
+        .map(|t| (t.expect_ips.clone(), t.expect_regions.clone()))
+        .unwrap_or_default();
+    cfg.targets = crate::targets::default_targets(&ips, &regions);
+    cfg.save();
+    state.set_config(cfg);
+    state.reset_statuses_from_config();
+    state.log("监控目标已恢复默认锚点（白名单保留）");
+    state.emit_state();
+    state.state_view()
+}
+
+// ---------- 检查 / 熔断 ----------
+
+#[tauri::command]
+pub fn recheck(state: State<'_, Arc<AppState>>) {
+    monitor::recheck(state.inner());
+}
+
+#[tauri::command]
+pub fn launch(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    monitor::launch(state.inner())
+}
+
+#[tauri::command]
+pub fn recheck_target(state: State<'_, Arc<AppState>>, id: String) -> Result<DryResult, String> {
+    let cfg = state.config();
+    let target = cfg
+        .target(&id)
+        .cloned()
+        .ok_or_else(|| "目标不存在".to_string())?;
+    let probe = crate::anchors::probe(&cfg.proxy_url(), &target);
+    let eval = crate::policy::evaluate(&target, &probe);
+    Ok(DryResult {
+        id: target.id.clone(),
+        name: target.name.clone(),
+        pass: eval.verdict == crate::model::Verdict::Pass,
+        verdict: eval.verdict,
+        reason: eval.reason,
+        ip: probe.ip,
+        country: probe.country,
+        latency_ms: probe.latency_ms,
+    })
+}
+
+#[tauri::command]
+pub fn release(state: State<'_, Arc<AppState>>) {
+    monitor::release(state.inner());
+}
+
+#[tauri::command]
+pub fn pause(state: State<'_, Arc<AppState>>) {
+    monitor::pause(state.inner(), monitor::PAUSE_MINUTES);
+}
+
+#[tauri::command]
+pub fn resume(state: State<'_, Arc<AppState>>) {
+    monitor::resume(state.inner());
+}
+
+// ---------- 日志 / 数据 ----------
+
+#[tauri::command]
+pub fn recent_logs(state: State<'_, Arc<AppState>>, limit: Option<usize>) -> Vec<String> {
+    state.recent_logs(limit.unwrap_or(200))
+}
+
+#[tauri::command]
+pub fn open_data_folder() {
+    open_folder();
+}
+
+#[tauri::command]
+pub fn open_guide() {
+    open_url("https://github.com/daha1216/ClaudeGuard/blob/master/docs/GUIDE.md");
+}
+
+#[tauri::command]
+pub fn js_log(state: State<'_, Arc<AppState>>, level: String, msg: String) {
+    state.log(format!("ui[{level}] {msg}"));
+}
+
+// ---------- 安装 / 自启 ----------
+
+#[tauri::command]
+pub fn install_app() -> Result<String, String> {
+    crate::install::install().map(|path| path.display().to_string())
+}
+
+#[tauri::command]
+pub fn set_autostart(state: State<'_, Arc<AppState>>, on: bool) -> Result<bool, String> {
+    let ok = crate::install::set_autostart(on);
+    if ok {
+        let mut cfg = state.config();
+        cfg.auto_start_with_system = on;
+        cfg.save();
+        state.set_config(cfg);
+        state.emit_state();
+    }
+    Ok(ok)
+}
+
+// ---------- 自身更新 ----------
+
+#[tauri::command]
+pub fn upd_state(state: State<'_, Arc<AppState>>) -> UpdState {
+    state.upd()
+}
+
+#[tauri::command]
+pub fn upd_check(state: State<'_, Arc<AppState>>) {
+    crate::update::spawn_check(state.inner());
+}
+
+#[tauri::command]
+pub fn upd_download(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    match state.upd() {
+        UpdState::Available { url, size, .. } => {
+            crate::update::spawn_download(state.inner(), url, size);
+            Ok(())
+        }
+        _ => Err("当前没有可下载的更新".into()),
+    }
+}
+
+// ---------- 飞书 ----------
+
+#[tauri::command]
+pub fn feishu_status(state: State<'_, Arc<AppState>>) -> crate::feishu::Status {
+    state.feishu.status()
+}
+
+#[tauri::command]
+pub fn feishu_save(
+    state: State<'_, Arc<AppState>>,
+    cfg_json: String,
+) -> Result<crate::feishu::Status, String> {
+    let settings: crate::feishu::Settings =
+        serde_json::from_str(&cfg_json).map_err(|err| format!("飞书设置无效：{err}"))?;
+    state.feishu.configure(settings)
+}
+
+#[tauri::command]
+pub fn feishu_test(state: State<'_, Arc<AppState>>) -> Result<crate::feishu::Status, String> {
+    state.feishu.test()
+}
+
+#[tauri::command]
+pub fn feishu_retry_failed(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::feishu::Status, String> {
+    state.feishu.retry_failed()
+}
+
+// ---------- 客户端更新 ----------
+
+#[tauri::command]
+pub fn claude_update_status(state: State<'_, Arc<AppState>>) -> crate::claude_update::Status {
+    state.claude_update.status()
 }
 
 #[tauri::command]
 pub fn claude_update_configure(
-    sh: Sh,
+    state: State<'_, Arc<AppState>>,
     enabled: bool,
-) -> Result<crate::claude_update::Status, String> {
-    sh.claude_update.configure(enabled)
+) -> Result<(), String> {
+    state.claude_update.configure(enabled).map(|_| ())
 }
 
 #[tauri::command]
-pub fn claude_update_check(sh: Sh, finish: Option<bool>) -> Result<(), String> {
+pub fn claude_update_check(
+    state: State<'_, Arc<AppState>>,
+    finish: Option<bool>,
+) -> Result<(), String> {
     crate::claude_update::Updater::request(
-        &sh,
+        state.inner(),
         crate::claude_update::Product::Claude,
         finish.unwrap_or(false),
     )
 }
 
 #[tauri::command]
-pub fn codex_update_status(sh: Sh) -> crate::claude_update::Status {
-    sh.codex_update.status()
+pub fn codex_update_status(state: State<'_, Arc<AppState>>) -> crate::claude_update::Status {
+    state.codex_update.status()
 }
 
 #[tauri::command]
 pub fn codex_update_configure(
-    sh: Sh,
+    state: State<'_, Arc<AppState>>,
     enabled: bool,
-) -> Result<crate::claude_update::Status, String> {
-    sh.codex_update.configure(enabled)
+) -> Result<(), String> {
+    state.codex_update.configure(enabled).map(|_| ())
 }
 
 #[tauri::command]
-pub fn codex_update_check(sh: Sh, finish: Option<bool>) -> Result<(), String> {
+pub fn codex_update_check(
+    state: State<'_, Arc<AppState>>,
+    finish: Option<bool>,
+) -> Result<(), String> {
     crate::claude_update::Updater::request(
-        &sh,
+        state.inner(),
         crate::claude_update::Product::Codex,
         finish.unwrap_or(false),
     )
 }
 
-#[tauri::command]
-pub fn feishu_status(sh: Sh) -> crate::feishu::Status {
-    sh.feishu.status()
-}
+// ---------- 通知 ----------
 
 #[tauri::command]
-pub fn feishu_retry_failed(sh: Sh) -> Result<crate::feishu::Status, String> {
-    sh.feishu.retry_failed()
-}
-
-#[tauri::command]
-pub fn feishu_save(
-    sh: Sh,
-    settings: crate::feishu::Settings,
-) -> Result<crate::feishu::Status, String> {
-    sh.feishu.configure(settings)
-}
-
-#[tauri::command]
-pub async fn feishu_test(sh: Sh<'_>) -> Result<crate::feishu::Status, String> {
-    let notifier = Arc::clone(&sh.feishu);
-    tauri::async_runtime::spawn_blocking(move || notifier.test())
-        .await
-        .map_err(|_| "测试通知任务失败".to_string())?
-}
-
-/// 守卫快照（前端进入时拉一次，之后靠 guard://status 事件）。
-#[tauri::command]
-pub fn get_state(sh: Sh) -> monitor::StatusSnapshot {
-    monitor::sh_full_snapshot(&sh)
-}
-
-#[tauri::command]
-pub fn get_config(sh: Sh) -> Config {
-    sh.cfg.lock().unwrap().clone()
-}
-
-/// 前端校验通过后整体写回（v1 语义：字段合法才保存）。
-/// 更新 Shared 里的活配置，监测线程下一轮即用新值。
-#[tauri::command]
-pub fn set_config(sh: Sh, cfg: Config) -> Result<(), String> {
-    if let Err(e) = cfg.save() {
-        return Err(format!("保存失败：{e}"));
-    }
-    *sh.cfg.lock().unwrap() = cfg;
-    Ok(())
-}
-
-/// 手动"重新检查"（托盘同款）。
-#[tauri::command]
-pub fn recheck(sh: Sh) {
-    monitor::spawn_check(&sh, monitor::Purpose::Manual);
-}
-
-/// "启动 Claude"：先完整复查，通过才启动（v1 Purpose::Launch）。
-#[tauri::command]
-pub fn launch(sh: Sh) {
-    monitor::spawn_check(&sh, monitor::Purpose::Launch);
-}
-
-/// 托盘"解除隔离"。
-#[tauri::command]
-pub fn release(sh: Sh) {
-    monitor::release_now(&sh);
-}
-
-#[tauri::command]
-pub fn recent_logs(sh: Sh) -> Vec<String> {
-    sh.loglines.lock().unwrap().clone()
-}
-
-/// 底栏"打开数据文件夹"：%APPDATA%\ClaudeGuard。
-#[tauri::command]
-pub fn open_data_folder() {
-    let dir = crate::config::config_dir();
-    let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
-}
-
-/// 底栏"用户指南"：用系统默认浏览器打开仓库里的使用文档。
-/// 写死 URL（不收前端参数），避免任意 URL 打开面。
-#[tauri::command]
-pub fn open_guide() {
-    const GUIDE_URL: &str = "https://github.com/daha1216/ClaudeGuard/blob/master/docs/GUIDE.md";
-    let _ = std::process::Command::new("explorer.exe")
-        .arg(GUIDE_URL)
-        .spawn();
-}
-
-/// 向导页 2 选项 A / 底栏"安装到电脑"（install::install 原样调用）。
-#[tauri::command]
-pub fn install_app(sh: Sh) -> Result<String, String> {
-    match install::install() {
-        Ok(path) => {
-            monitor::INSTALLED_FLAG.store(true, Ordering::SeqCst);
-            sh.log(format!("安装完成： {}", path.display()));
-            Ok(path.to_string_lossy().into_owned())
-        }
-        Err(e) => {
-            sh.log(format!("安装失败： {e}"));
-            Err(e)
-        }
-    }
-}
-
-/// 设置卡"开机自启"开关：install::set_autostart + 配置落盘（v1 同款三连）。
-#[tauri::command]
-pub fn set_autostart(sh: Sh, enabled: bool) -> bool {
-    let ok = install::set_autostart(enabled);
-    {
-        let mut cfg = sh.cfg.lock().unwrap();
-        cfg.auto_start_with_system = enabled;
-        let _ = cfg.save();
-    }
-    ok
-}
-
-#[tauri::command]
-pub fn upd_state(sh: Sh) -> UpdState {
-    sh.upd.lock().unwrap().clone()
-}
-
-#[tauri::command]
-pub fn upd_check(sh: Sh) {
-    monitor::spawn_update_check(&sh);
-}
-
-#[tauri::command]
-pub fn upd_download(sh: Sh, url: String, size: u64) {
-    monitor::spawn_update_download(&sh, url, size);
-}
-
-/// 前端诊断桥（P0 调试期）：JS 错误/里程碑写 guard.log——无 devtools 的冒烟环境靠它定位。
-#[tauri::command]
-pub fn js_log(sh: Sh, msg: String) {
-    sh.log(format!("[js] {msg}"));
+pub fn notify_test(kind: Option<String>) -> Result<(), String> {
+    let kind = kind.unwrap_or_else(|| "trip".to_string());
+    let (title, body) = crate::notify::test_message(&kind);
+    crate::notify::send_blocking(title, &body)
 }

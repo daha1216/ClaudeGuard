@@ -4,9 +4,12 @@
 //! 网络路径: 优先走用户配置的本地代理(国内直连 GitHub 不稳), 失败回退直连。
 
 use crate::config::Config;
-use serde::Deserialize;
+use crate::model::UpdState;
+use crate::state::AppState;
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const GITHUB_REPO: &str = "daha1216/ClaudeGuard";
@@ -19,7 +22,7 @@ const T_DOWNLOAD: Duration = Duration::from_secs(300);
 
 // ------------------------------------------------------------------ 数据结构
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Release {
     pub tag_name: String,
     /// 更新说明用（暂未在 UI 展示，保留给后续版本）
@@ -31,7 +34,7 @@ pub struct Release {
     pub assets: Vec<Asset>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Asset {
     pub name: String,
     pub size: u64,
@@ -233,6 +236,91 @@ pub fn cleanup_old() {
         let old = cur.with_extension("exe.old");
         let _ = std::fs::remove_file(&old);
     }
+}
+
+// ------------------------------------------------------------------ 后台编排
+
+/// 后台检查 GitHub 最新版本，结果写入 `AppState::upd` 并推给 UI。
+pub fn spawn_check(state: &Arc<AppState>) {
+    let state = Arc::clone(state);
+    std::thread::spawn(move || {
+        state.set_upd(UpdState::Checking);
+        state.emit_state();
+        state.log("检查更新…");
+        match check_latest(&state.config()) {
+            Ok(release) => {
+                let ver = release.version().to_string();
+                if !is_newer(&ver, current_version()) {
+                    state.set_upd(UpdState::UpToDate);
+                    state.log(format!("已是最新版本 v{ver}"));
+                } else if let Some(asset) = release.exe_asset() {
+                    state.set_upd(UpdState::Available {
+                        ver: ver.clone(),
+                        url: asset.browser_download_url.clone(),
+                        size: asset.size,
+                    });
+                    state.log(format!("发现新版本 v{ver}"));
+                } else {
+                    state.set_upd(UpdState::Failed {
+                        msg: format!("发现新版本 v{ver}，但发布页没有可下载的主程序"),
+                    });
+                    state.log("发现新版本，但发布页缺少可下载的主程序");
+                }
+            }
+            Err(err) => {
+                state.set_upd(UpdState::Failed { msg: err.clone() });
+                state.log(format!("检查更新失败：{err}"));
+            }
+        }
+        state.emit_state();
+    });
+}
+
+/// 后台下载并自替换重启；下载进度写入 `AppState::upd`。
+pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
+    let state = Arc::clone(state);
+    std::thread::spawn(move || {
+        state.set_upd(UpdState::Downloading {
+            done: 0,
+            total: size,
+        });
+        state.emit_state();
+        state.log(format!(
+            "开始下载更新（{:.1} MB）…",
+            size as f64 / 1_048_576.0
+        ));
+        // emit_state 会重扫进程，进度按 5% 节流而不是每个 64KB 块都推一次。
+        let progress_state = Arc::clone(&state);
+        let mut last_percent = 0u64;
+        let result = download(&state.config(), &url, size, move |done, total| {
+            progress_state.set_upd(UpdState::Downloading { done, total });
+            let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0);
+            if percent >= last_percent + 5 || done == total {
+                last_percent = percent;
+                progress_state.emit_state();
+            }
+        });
+        match result {
+            Ok(path) => {
+                state.set_upd(UpdState::Restarting);
+                state.emit_state();
+                state.log("更新已下载，正在替换并重启…");
+                match apply_update(&path, true) {
+                    Ok(()) => std::process::exit(0),
+                    Err(err) => {
+                        state.set_upd(UpdState::Failed { msg: err.clone() });
+                        state.log(format!("更新失败：{err}"));
+                        state.emit_state();
+                    }
+                }
+            }
+            Err(err) => {
+                state.set_upd(UpdState::Failed { msg: err.clone() });
+                state.log(format!("更新下载失败：{err}"));
+                state.emit_state();
+            }
+        }
+    });
 }
 
 #[cfg(test)]
