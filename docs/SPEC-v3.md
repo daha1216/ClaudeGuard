@@ -90,9 +90,14 @@
 - 退出：真退出前必须 `netcut::restore`（网络绝不能因程序退出保持断开）；隔离规则是否保留：v3 一并解除（比 v2 更干净，AGENTS 记录）。
 - `--restore` CLI：执行恢复并输出 JSON，退出码 0。
 
-## 6. 桌面通知（`src/notify.rs`，tauri-plugin-notification）
+## 6. 桌面通知（`src/notify.rs`，powershell.exe + WinRT Toast，无第三方 crate）
 
-五类（均受 `notify.*` 开关与总开关控制；插件失败只写日志不 panic）：
+五类（均受 `notify.*` 开关与总开关控制；发送失败只写日志不 panic；发送在后台线程，最多阻塞 15 秒）：
+
+**身份登记（必须）**：`CreateToastNotifier('ClaudeGuard')` 要求该 AUMID 已在
+`HKCU\Software\Classes\AppUserModelId\ClaudeGuard` 登记（DisplayName / IconUri = 当前 exe）。
+未登记时 `Show()` 既不抛错也不投递——即“通知不生效”。`notify::ensure_identity()` 在启动时与每次发送前幂等补登记，安装版与便携版同样生效。
+
 1. `trip`："ClaudeGuard 已熔断" / "{失败目标名} 出口不符合白名单，已结束相关应用并切断网络。修正后自动恢复。"
 2. `recover`："ClaudeGuard 已恢复" / "出口检查通过，已解除隔离并恢复网络。"
 3. `launch_blocked`："ClaudeGuard 已阻止启动" / reason。

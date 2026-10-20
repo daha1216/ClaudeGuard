@@ -1,4 +1,4 @@
-﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 //! ClaudeGuard v3 入口：CLI 分派、单实例、窗口/托盘装配、启动自愈与后台线程。
 //!
 //! 判定与调度在 `monitor`；这里只负责把各模块接起来并保持程序生命周期干净：
@@ -181,6 +181,10 @@ fn run_gui(start_hidden: bool, want_settings: bool) {
 
             // 冒烟钩子：造出指定界面状态，且不启动真实探测/更新线程（截图与 UI 验证用）。
             let smoke_state = std::env::var("CG_SMOKE_STATE").ok();
+
+            if let Err(err) = crate::notify::ensure_identity() {
+                state.log(format!("通知身份登记失败：{err}"));
+            }
 
             let healed = crate::netcut::heal();
             if !healed.is_empty() {

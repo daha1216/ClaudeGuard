@@ -273,8 +273,13 @@ pub fn codex_update_check(
 // ---------- 通知 ----------
 
 #[tauri::command]
-pub fn notify_test(kind: Option<String>) -> Result<(), String> {
+pub async fn notify_test(kind: Option<String>) -> Result<(), String> {
     let kind = kind.unwrap_or_else(|| "trip".to_string());
-    let (title, body) = crate::notify::test_message(&kind);
-    crate::notify::send_blocking(title, &body)
+    // 发一条 Toast 要起 powershell，最多阻塞十几秒；扔到阻塞线程池，别冻界面。
+    tauri::async_runtime::spawn_blocking(move || {
+        let (title, body) = crate::notify::test_message(&kind);
+        crate::notify::send_blocking(title, &body)
+    })
+    .await
+    .map_err(|e| format!("测试通知执行失败：{e}"))?
 }

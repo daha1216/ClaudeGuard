@@ -1,4 +1,4 @@
-# AGENTS.md — ClaudeGuard v3 维护者守则（人类与 AI 通用）
+﻿# AGENTS.md — ClaudeGuard v3 维护者守则（人类与 AI 通用）
 
 > 本文件是所有维护者（包括 AI agent）的约定与经验记录。改代码前先读完；不确定就按本文件保守执行。
 >
@@ -113,30 +113,34 @@ node --check ui/*.js           # 逐个检查，跨文件词法冲突查不出�
     规则存在性只做幂等删除前的计数兜底。
 11. **WinRT Toast 必须先加载类型**：PowerShell 5.1 里 `[Windows.UI.Notifications.ToastNotificationManager, …]
     | Out-Null` 不执行会报"找不到类型 [Windows.Data.Xml.Dom.XmlDocument]"。见 `notify.rs`。
-12. **v2 与 v3 共用 identifier 与配置目录**：本机若还驻留 v2.10.1，启动 v3（debug 也一样）会被
+12. **Toast 的 AUMID 必须登记，否则静默丢弃**：`CreateToastNotifier('ClaudeGuard').Show(..)` 在
+    `HKCU\Software\Classes\AppUserModelId\ClaudeGuard` 不存在时不抛错也不弹通知（v3.1.2 之前
+    “桌面通知不生效”就是这个）。`notify::ensure_identity()` 每次发送前幂等写入 DisplayName / IconUri；
+    验证办法：发一条后看 `HKCU\…\Notifications\Settings\ClaudeGuard\LastNotificationAddedTime` 是否更新。
+13. **v2 与 v3 共用 identifier 与配置目录**：本机若还驻留 v2.10.1，启动 v3（debug 也一样）会被
     single-instance 转到已有实例——**新进程静默退出、退出码 0**，看起来像"启动失败"。调试/升级/截屏前先
     `Get-CimInstance Win32_Process` 匹配 `*laudeguard*` 杀干净
     （装机 exe 名 `ClaudeGuard.exe` 无连字符）；装机实例是提权进程，普通 taskkill 会被拒，需
     `Start-Process taskkill -Verb RunAs`。v2 残留的 `ClaudeGuard Block In/Out` 规则 v3 会 dedupe，
     但解除隔离要用 v3 的"解除隔离并恢复网络"或 `--restore`。
-13. **客户端更新只走官方 MSIX 源**：Claude 走 claude.ai 重定向后的 downloads.claude.ai，Codex 走
+14. **客户端更新只走官方 MSIX 源**：Claude 走 claude.ai 重定向后的 downloads.claude.ai，Codex 走
     persistent.oaistatic.com。部署脚本固定用 **Windows PowerShell 5.1**（Appx 模块只在 5.1 可用），
     参数全走环境变量；`Add-AppxPackage` 只用原位升级参数，不做卸载/重置/强制关闭。
     改 `src/claude_package.ps1` 后必须重跑 `tests/package-deployment.ps1` 的部署模拟。
-14. 新增设置存**独立 json**（`feishu.json` / `claude-update.json` / `codex-update.json`），不进 `config.json`；
+15. 新增设置存**独立 json**（`feishu.json` / `claude-update.json` / `codex-update.json`），不进 `config.json`；
     飞书凭据用 DPAPI 加密，但通知队列正文是明文且含出口 IP——文档已披露，别把凭据写进日志或状态。
-15. CLI 快照：`--check`（只读探测，exit 0 通过/2 不通过）、`--restore`（急救恢复网络+解隔离）、
+16. CLI 快照：`--check`（只读探测，exit 0 通过/2 不通过）、`--restore`（急救恢复网络+解隔离）、
     `--settings` 唤起设置页、`--feishu-status`/`--claude-update-status`/`--codex-update-status`
     只读本地状态文件，不联网、不发通知、不触发安装。
-16. **每个目标的锚点要用目标自己的域名**：claude.ai / chatgpt.com / cloudflare.com 的 `/cdn-cgi/trace`
+17. **每个目标的锚点要用目标自己的域名**：claude.ai / chatgpt.com / cloudflare.com 的 `/cdn-cgi/trace`
     回显的是该链路出口；Google 组域名没有 Cloudflare 回显，反重力用 `cloudcode-pa.googleapis.com` 仅测可达性
     （HTTP 任意响应都算通）。DoH ECS 只能拿到 /24，不能当精确 IP 用。
-17. **UI 冒烟截图（CDP）三段式**：每轮用独立的 `WEBVIEW2_USER_DATA_FOLDER`——残留 profile 或孤儿
+18. **UI 冒烟截图（CDP）三段式**：每轮用独立的 `WEBVIEW2_USER_DATA_FOLDER`——残留 profile 或孤儿
     `msedgewebview2` 会让新实例起不来/渲染旧帧，截图前先按 `claude-guard.exe` + 命令行含
     `com.daha.claudeguard` 循环清理。连上后先等 `document.readyState==="complete" && window.CG_IPC
     && document.body.dataset.overall` 再截，不要 `Page.reload` 后固定 sleep；`#card-settings/#card-details`
     折叠时 `display:none`，截图前先 `CG_UI.openSettings()/openDetails()` 并 `scrollIntoView`，
     动画要等 400ms 以上。截图后用像素扫描确认 PNG 尺寸（应 840×1240@2x）与色值，防止拿到空白页。
-18. **本机出口（local）目标默认关闭**：本机常规流量出口通常与 AI 代理出口不是同一个 IP，默认开启会在
+19. **本机出口（local）目标默认关闭**：本机常规流量出口通常与 AI 代理出口不是同一个 IP，默认开启会在
     首次启动/升级后立即熔断。`targets::default_targets` 里 local 的 `enabled:false` 是产品语义（用户可在
     设置里开启并补齐白名单），不要"修"成 true。

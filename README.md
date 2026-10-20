@@ -1,4 +1,4 @@
-﻿<p align="center">
+<p align="center">
   <img src="assets/icon.png" alt="ClaudeGuard Logo" width="128" height="128" />
 </p>
 
@@ -162,3 +162,4 @@ node --check ui/*.js         # 纯静态前端，无 npm/构建步骤
 - **v1.x**：Rust `egui` 单文件原型。
 - **v2.x**：重写为 Tauri 2 架构，加入多 Agent 守护、飞书通知与客户端更新。
 - **v3.x**：从零重构。按目标独立锚点校验、断网两档、桌面通知、A+ 极简仪表盘 UI、断网自愈与 `--restore` 急救。
+- **v3.1.2**：修复桌面通知在未登记过本应用的系统上不弹出（Toast AUMID 需在 `HKCU\Software\Classes\AppUserModelId` 登记）；测试通知改为后台线程发送，不再卡界面。

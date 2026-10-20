@@ -8,9 +8,34 @@ use base64::Engine;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Toast 的 AUMID。安装版由 Inno 快捷方式登记同名 AppUserModelID；
-/// 便携/调试模式下 Windows 仍会显示，只是可能显示为通用来源。
+/// Toast 的 AUMID。
 pub const AUMID: &str = "ClaudeGuard";
+
+/// 让 Windows 认识这个 AUMID。
+///
+/// 未在 `HKCU\Software\Classes\AppUserModelId` 登记时，`CreateToastNotifier(..).Show(..)`
+/// 既不会抛错也不会投递——表现就是“通知不生效”，所以每次发送前都幂等登记一次
+/// （安装版、便携版都走到这里）。
+pub fn ensure_identity() -> Result<(), String> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = hkcu
+        .create_subkey(aumid_key_path())
+        .map_err(|e| format!("登记 AUMID 失败：{e}"))?;
+    key.set_value("DisplayName", &"ClaudeGuard")
+        .map_err(|e| format!("写入通知应用名失败：{e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("取当前程序路径失败：{e}"))?;
+    key.set_value("IconUri", &exe.to_string_lossy().to_string())
+        .map_err(|e| format!("写入通知图标失败：{e}"))?;
+    Ok(())
+}
+
+/// AUMID 在用户注册表中的位置（`HKCU` 下）。
+fn aumid_key_path() -> String {
+    format!(r"Software\Classes\AppUserModelId\{AUMID}")
+}
 
 /// XML 转义（Toast 内容是 XML）。
 pub fn escape_xml(raw: &str) -> String {
@@ -57,8 +82,11 @@ fn powershell_path() -> std::path::PathBuf {
     crate::guard::sys32(r"WindowsPowerShell\v1.0\powershell.exe")
 }
 
-/// 同步发送一条 Toast；阻塞最多 8 秒。
+/// 同步发送一条 Toast；阻塞最多 15 秒。
 pub fn send_blocking(title: &str, body: &str) -> Result<(), String> {
+    if let Err(err) = ensure_identity() {
+        crate::guard::log_line(&format!("notify: AUMID 登记失败：{err}"));
+    }
     let script = build_script(title, body);
     let encoded = encode_command(&script);
     let mut cmd = Command::new(powershell_path());
@@ -84,7 +112,7 @@ pub fn send_blocking(title: &str, body: &str) -> Result<(), String> {
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("无法启动 powershell：{e}"))?;
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -184,6 +212,14 @@ mod tests {
             .decode(encoded)
             .unwrap();
         assert_eq!(bytes, vec![b'a', 0, b'b', 0]);
+    }
+
+    #[test]
+    fn aumid_key_path_matches_toast_app_id() {
+        assert_eq!(
+            aumid_key_path(),
+            r"Software\Classes\AppUserModelId\ClaudeGuard"
+        );
     }
 
     #[test]
