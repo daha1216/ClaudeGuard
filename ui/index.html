@@ -10,7 +10,6 @@
 
 <header class="titlebar" data-tauri-drag-region>
   <div class="brand" data-tauri-drag-region>
-    <span class="mark" data-tauri-drag-region aria-hidden="true"></span>
     <span class="brand-name" data-tauri-drag-region>ClaudeGuard</span>
   </div>
   <div class="winbtns">
@@ -37,16 +36,15 @@
             <linearGradient id="ring-gray" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#D2D2D7"/><stop offset="1" stop-color="#AEAEB2"/></linearGradient>
           </defs>
           <g transform="rotate(-90 59 59)">
-            <circle class="ring-track" cx="59" cy="59" r="54" fill="none" stroke="#E7E7EC" stroke-width="6"/>
-            <circle class="ring-fg" id="ring-fg" cx="59" cy="59" r="54" fill="none" stroke="url(#ring-green)" stroke-width="6" stroke-linecap="round" stroke-dasharray="339.3" stroke-dashoffset="0"/>
+            <circle class="ring-track" cx="59" cy="59" r="54" fill="none" stroke="#E9E9EE" stroke-width="5.6"/>
+            <circle class="ring-fg" id="ring-fg" cx="59" cy="59" r="54" fill="none" stroke="#03AA49" stroke-width="5.6" stroke-linecap="round" stroke-dasharray="339.3" stroke-dashoffset="0"/>
           </g>
-          <circle class="ring-spinner" id="ring-spinner" cx="59" cy="59" r="54" fill="none" stroke="url(#ring-blue)" stroke-width="6" stroke-linecap="round" stroke-dasharray="72 267.3" hidden/>
+          <circle class="ring-spinner" id="ring-spinner" cx="59" cy="59" r="54" fill="none" stroke="url(#ring-blue)" stroke-width="5.6" stroke-linecap="round" stroke-dasharray="72 267.3" hidden/>
         </svg>
         <div class="core" id="hero-core" aria-hidden="true"></div>
       </div>
       <h1 class="hero-title" id="hero-title">守护待命</h1>
       <div class="hero-sub" id="hero-sub">等待首次检测</div>
-      <div class="hero-meta" id="hero-meta"></div>
     </section>
 
     <div class="banners" id="banners" aria-live="polite"></div>
@@ -55,7 +53,7 @@
 
     <div class="cta">
       <button class="btn-primary" id="btn-primary" type="button"></button>
-      <button class="iconbtn" id="btn-side" type="button"></button>
+      <button class="link-action" id="btn-recheck" type="button"></button>
     </div>
 
     <section class="card fold" id="card-details" data-card="details">
@@ -97,9 +95,7 @@
     <button class="link" id="link-logs" type="button">日志</button>
   </div>
   <div class="foot-right">
-    <span class="foot-version" id="foot-version">v3.0.0</span>
-    <button class="link link-sm" id="link-folder" type="button">数据文件夹</button>
-    <button class="link link-sm" id="link-guide" type="button">用户指南</button>
+    <span class="foot-version" id="foot-version">v3.1.0</span>
   </div>
 </footer>
 

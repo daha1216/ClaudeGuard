@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 //! ClaudeGuard v3 入口：CLI 分派、单实例、窗口/托盘装配、启动自愈与后台线程。
 //!
 //! 判定与调度在 `monitor`；这里只负责把各模块接起来并保持程序生命周期干净：
@@ -423,6 +423,9 @@ fn apply_smoke_state(state: &Arc<AppState>, kind: &str) {
     }
     if kind == "paused" {
         state.set_paused_until(Some(now + 30 * 60));
+    }
+    if kind == "checking" {
+        state.set_checking(true);
     }
     state.emit_state();
 }

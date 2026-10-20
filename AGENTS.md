@@ -104,8 +104,9 @@ node --check ui/*.js           # 逐个检查，跨文件词法冲突查不出�
    写完用 `[IO.File]::WriteAllText($p, $t, [Text.UTF8Encoding]::new($true))` 补。
 7. pwsh 内嵌 C#（DllImport）时 `$`/引号转义会被外层吃掉：一律写 .ps1 文件再 `-File` 执行。
 8. **测试钩子（仅 debug/截图用，生产路径不许依赖）**：`CG_WIN_H`=覆盖窗口高；
-   `CG_SMOKE_SETTINGS=1`=自动展开设置卡；`CG_SMOKE_STATE=pass|fail|trip|paused`=造界面状态且**跳过**
-   真实探测/更新线程（不杀进程、不碰防火墙网卡）。冒烟脚本不入库。
+   `--settings`=启动即唤起主窗口并展开设置卡（截图最可靠）；`CG_SMOKE_SETTINGS=1` 只置 StateView 标记；
+   `CG_SMOKE_STATE=pass|fail|trip|paused`=造界面状态且**跳过**真实探测/更新线程（不杀进程、不碰防火墙网卡）。
+   截屏流程：杀干净驻留实例 → 设环境变量启动 debug exe → 等 CDP 9222 → node 脚本截图。冒烟脚本不入库。
 9. 屏幕是 1080p@200% 缩放：窗口高度按工作区算（`main.rs`，`CG_WIN_H` 可覆盖）；窗口尺寸 API 传逻辑像素。
 10. **netsh 输出是本地化的，禁止解析文本**：防火墙规则查询/删除走 PowerShell `Get-NetFirewallRule`
     （按 InstanceID GUID 精确删）；断网状态以 `%APPDATA%\ClaudeGuard\netcut.json` 为准，
@@ -113,8 +114,10 @@ node --check ui/*.js           # 逐个检查，跨文件词法冲突查不出�
 11. **WinRT Toast 必须先加载类型**：PowerShell 5.1 里 `[Windows.UI.Notifications.ToastNotificationManager, …]
     | Out-Null` 不执行会报"找不到类型 [Windows.Data.Xml.Dom.XmlDocument]"。见 `notify.rs`。
 12. **v2 与 v3 共用 identifier 与配置目录**：本机若还驻留 v2.10.1，启动 v3（debug 也一样）会被
-    single-instance 转到 v2 实例；调试/升级前先 `Get-CimInstance Win32_Process` 匹配 `*laudeguard*` 杀干净
-    （装机 exe 名 `ClaudeGuard.exe` 无连字符）。v2 残留的 `ClaudeGuard Block In/Out` 规则 v3 会 dedupe，
+    single-instance 转到已有实例——**新进程静默退出、退出码 0**，看起来像"启动失败"。调试/升级/截屏前先
+    `Get-CimInstance Win32_Process` 匹配 `*laudeguard*` 杀干净
+    （装机 exe 名 `ClaudeGuard.exe` 无连字符）；装机实例是提权进程，普通 taskkill 会被拒，需
+    `Start-Process taskkill -Verb RunAs`。v2 残留的 `ClaudeGuard Block In/Out` 规则 v3 会 dedupe，
     但解除隔离要用 v3 的"解除隔离并恢复网络"或 `--restore`。
 13. **客户端更新只走官方 MSIX 源**：Claude 走 claude.ai 重定向后的 downloads.claude.ai，Codex 走
     persistent.oaistatic.com。部署脚本固定用 **Windows PowerShell 5.1**（Appx 模块只在 5.1 可用），

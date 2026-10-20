@@ -121,6 +121,8 @@
       '<div class="sgroup-title">通用</div>' +
       rowSwitch("st-autostart", "开机自启", "开机后自动在托盘里默默守护", !!(CFG && CFG.auto_start_with_system), false) +
       rowSwitch("st-close-tray", "关闭窗口时驻留托盘", "关闭按钮只隐藏窗口，守护继续运行", !CFG || CFG.close_to_tray !== false, false) +
+      '<div class="srow"><div class="slabel">数据文件夹<span class="shint">配置、日志与更新缓存所在目录</span></div><div class="sval"><button class="btn" id="st-folder" type="button">打开</button></div></div>' +
+      '<div class="srow"><div class="slabel">用户指南<span class="shint">在浏览器中查看使用说明</span></div><div class="sval"><button class="btn" id="st-guide" type="button">打开</button></div></div>' +
       "</div>" +
 
       '<div class="sgroup"><div class="sgroup-title">软件更新</div><div id="upd-group"></div></div>' +
@@ -519,6 +521,11 @@
         await patch({ close_to_tray: want }, want ? "已开启关窗驻留" : "关闭窗口将直接退出守护");
       });
     }
+    // 数据文件夹 / 用户指南
+    const folderBtn = $("st-folder");
+    if (folderBtn) folderBtn.addEventListener("click", () => invoke(CMD.open_data_folder));
+    const guideBtn = $("st-guide");
+    if (guideBtn) guideBtn.addEventListener("click", () => invoke(CMD.open_guide));
   }
 
   /* ---------- 子组件（更新 / 飞书） ---------- */

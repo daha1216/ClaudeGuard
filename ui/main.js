@@ -54,7 +54,6 @@
   };
   const STATE_LABEL = { pass: "通过", fail: "不合规", unverified: "未确认", pending: "待检测", checking: "检测中", disabled: "未启用" };
   const CUT_LABEL = { off: "不断网", firewall: "防火墙全局阻断", nics: "禁用物理网卡" };
-  const CUT_TEXT = { off: "未断网", firewall: "已断网隔离", nics: "已禁用网卡" };
   const PHASE_LABEL = {
     idle: "待检查", checking: "检查中", downloading: "正在下载", downloading_setup: "正在下载安装包",
     waiting_exit: "等待退出", installing: "正在安装", pending_reboot: "等待重启", done: "已完成",
@@ -210,12 +209,12 @@
   /* ---------- 英雄区 ---------- */
 
   const RING_STROKE = {
-    pass: "url(#ring-green)",
-    fail: "url(#ring-orange)",
-    tripped: "url(#ring-red)",
-    checking: "url(#ring-blue)",
-    idle: "url(#ring-gray)",
-    paused: "url(#ring-gray)",
+    pass: "#03AA49",
+    fail: "#ED6300",
+    tripped: "#E4002B",
+    checking: "#0071E3",
+    idle: "#C7C7CC",
+    paused: "#B0B0B6",
   };
 
   function renderRing(overall) {
@@ -229,10 +228,10 @@
     if (checking) spinner.removeAttribute("hidden");
     else spinner.setAttribute("hidden", "");
     let name = "";
-    let size = 40;
+    let size = 44;
     if (checking) name = "";
     else if (overall === "pass") name = "check";
-    else if (overall === "tripped") { name = "x"; size = 36; }
+    else if (overall === "tripped") { name = "x"; size = 40; }
     else if (overall === "fail") name = "alert";
     else if (overall === "paused") name = "pause";
     else name = "dash";
@@ -243,22 +242,21 @@
     const st = S.state;
     const title = $("hero-title");
     const sub = $("hero-sub");
-    const meta = $("hero-meta");
-    if (!st || !title || !sub || !meta) return;
+    if (!st || !title || !sub) return;
     const overall = st.overall || "idle";
     renderRing(overall);
+    const targets = st.targets || [];
     let t = "守护待命";
     let s = "等待首次检测";
-    let m = "";
     if (overall === "pass") {
       t = "守护正常";
-      s = (st.targets || []).length + " 个出口全部校验通过";
+      s = heroPassText(st, targets);
       if (S.manualBusy) s = "正在重新校验出口 IP…";
     } else if (overall === "checking") {
       t = "正在检查";
       s = "正在校验出口 IP…";
     } else if (overall === "fail") {
-      const bad = (st.targets || []).filter((x) => x.state === "fail" || x.state === "unverified").length;
+      const bad = targets.filter((x) => x.state === "fail" || x.state === "unverified").length;
       t = "校验未通过";
       s = bad + " 个出口不符合白名单";
     } else if (overall === "tripped") {
@@ -269,21 +267,19 @@
       t = "已暂停";
       s = left > 0 ? "守护暂停中，" + left + " 分钟后自动恢复" : "守护已暂停";
     } else {
-      const passed = (st.targets || []).some((x) => x.state === "pass");
+      const passed = targets.some((x) => x.state === "pass");
       s = passed ? "等待下一次自动检测" : "等待首次检测";
-      if (st.intervalSecs) m = "每 " + st.intervalSecs + " 秒自动检查";
-    }
-    if (overall === "tripped" && st.tripped) {
-      const cut = CUT_TEXT[st.tripped.networkCut] || "未断网";
-      m = fmtClock(st.tripped.since) + " · 已结束 " + (st.tripped.killed || 0) + " 个应用 · " + cut;
-    } else if (overall === "checking") {
-      m = "每 " + (st.intervalSecs || 0) + " 秒自动检查";
-    } else if (st.checkedAt) {
-      m = "上次检测 " + fmtClock(st.checkedAt) + " · 每 " + (st.intervalSecs || 0) + " 秒";
     }
     title.textContent = t;
     sub.textContent = s;
-    meta.textContent = m;
+  }
+
+  function heroPassText(st, targets) {
+    const ok = targets.filter((x) => x.state === "pass");
+    const primary = ok.find((x) => /claude/i.test(x.name)) || ok[0];
+    const head = primary ? primary.name.replace(/\s*出口$/, "") + " 出口校验通过" : "出口校验通过";
+    const n = (st.guardedAgents || []).length;
+    return n > 0 ? head + " · " + n + " 个应用受守护" : head;
   }
 
   /* ---------- 目标列表 ---------- */
@@ -307,9 +303,8 @@
           esc(t.id) +
           '">' +
           '<span class="' + dotClass(t.state) + '" aria-hidden="true"></span>' +
-          '<span class="name">' + esc(t.name) + "</span>" +
-          '<span class="geo">' + esc(targetGeo(t)) + "</span>" +
-          '<span class="right"><div class="' + ipCls + '">' + esc(ipText) + '</div><div class="' + latCls + '">' + esc(targetLat(t)) + "</div></span>" +
+          '<div class="body"><div class="name">' + esc(t.name) + '</div><div class="geo">' + esc(targetGeo(t)) + "</div></div>" +
+          '<div class="right"><div class="' + ipCls + '">' + esc(ipText) + '</div><div class="' + latCls + '">' + esc(targetLat(t)) + "</div></div>" +
           "</div>"
         );
       })
@@ -352,11 +347,7 @@
       S.launchErrShown = st.launchError;
       parts.push(banner("warn", ["启动 Claude 失败", st.launchError], { id: "launch-dismiss", label: "知道了" }));
     }
-    // 主横幅（熔断/暂停/未通过）已占位时不再叠加 CLI 提醒，避免把 CTA 挤出窗口；CLI 信息仍写入详情与日志。
-    const hasPrimary = overall === "tripped" || overall === "paused" || overall === "fail";
-    if (!hasPrimary && (st.cliRunning || []).length) {
-      parts.push(banner("info", ["检测到 Claude Code 命令行运行中，仅提醒不结束"]));
-    }
+    // CLI 提醒不占首屏横幅位（设计 A：信息量最少），仅写入详情卡与日志。
     host.innerHTML = parts.join("");
     host.querySelectorAll("[data-bact]").forEach((el) => {
       el.addEventListener("click", () => {
@@ -377,47 +368,51 @@
   function renderCta() {
     const st = S.state;
     const btn = $("btn-primary");
-    const side = $("btn-side");
-    if (!btn || !side) return;
+    const act = $("btn-recheck");
+    if (!btn || !act) return;
     const overall = (st && st.overall) || "idle";
     const checking = S.manualBusy || (st && st.checking);
     let label;
     let icons = "";
     let blocked = false;
     let busy = false;
-    let sideIcon = "refresh";
-    let sideLabel = "重新检查";
-    let sideDanger = false;
-    let sideDisabled = false;
+    let actLabel = "";
+    let actIcon = "refresh";
+    let actRole = "recheck";
+    let actDanger = false;
+    let actDisabled = false;
     if (overall === "tripped") {
       label = "启动已禁止";
-      icons = icon("ban", 15);
+      icons = icon("ban", 16);
       blocked = true;
-      sideIcon = "refresh";
-      sideLabel = "解除隔离并恢复网络";
-      sideDanger = true;
-      sideDisabled = S.releaseBusy;
+      actLabel = "解除隔离并恢复网络";
+      actRole = "release";
+      actDanger = true;
+      actDisabled = S.releaseBusy;
     } else if (checking) {
       label = "正在检查…";
       busy = true;
-      sideDisabled = true;
+      actLabel = "立即检测";
+      actDisabled = true;
     } else if (overall === "pass") {
       label = S.launchBusy ? "正在启动…" : "启动 Claude";
-      icons = icon("play", 15);
+      icons = icon("play", 16);
       busy = S.launchBusy;
+      actLabel = "立即检测";
     } else {
       label = "重新检查";
-      icons = icon("refresh", 15);
+      icons = icon("refresh", 16);
     }
     btn.innerHTML = icons + "<span>" + esc(label) + "</span>";
     btn.disabled = blocked || busy;
     btn.className = "btn-primary" + (blocked ? " is-blocked" : "") + (busy ? " is-busy" : "");
-    side.innerHTML = S.releaseBusy && sideDanger ? icon("rotate", 17) : icon(sideIcon, 17);
-    side.className = "iconbtn" + (sideDanger ? " is-danger" : "");
-    side.title = sideLabel;
-    side.setAttribute("aria-label", sideLabel);
-    side.disabled = !!sideDisabled;
-    side.dataset.role = overall === "tripped" ? "release" : "recheck";
+    act.hidden = !actLabel;
+    act.innerHTML = actLabel
+      ? (S.releaseBusy && actDanger ? icon("rotate", 13) : icon(actIcon, 13)) + "<span>" + esc(actLabel) + "</span>"
+      : "";
+    act.className = "link-action" + (actDanger ? " is-danger" : "");
+    act.disabled = !!actDisabled;
+    act.dataset.role = actRole;
   }
 
   /* ---------- 详情 ---------- */
@@ -801,11 +796,6 @@
     if (linkDetails) linkDetails.addEventListener("click", () => expand("details"));
     if (linkSettings) linkSettings.addEventListener("click", () => expand("settings"));
     if (linkLogs) linkLogs.addEventListener("click", () => expand("logs"));
-    const folder = $("link-folder");
-    const guide = $("link-guide");
-    if (folder) folder.addEventListener("click", () => call(CMD.open_data_folder));
-    if (guide) guide.addEventListener("click", () => call(CMD.open_guide));
-
     const primary = $("btn-primary");
     if (primary) {
       primary.addEventListener("click", () => {
@@ -815,10 +805,10 @@
         else doRecheck();
       });
     }
-    const side = $("btn-side");
-    if (side) {
-      side.addEventListener("click", () => {
-        if (side.dataset.role === "release") doRelease();
+    const act = $("btn-recheck");
+    if (act) {
+      act.addEventListener("click", () => {
+        if (act.dataset.role === "release") doRelease();
         else doRecheck();
       });
     }
@@ -879,7 +869,7 @@
     await refreshState();
     if (!S.state) {
       // 事件未到也没有快照：给一个安全的空态
-      const idle = { overall: "idle", targets: [], checking: false, intervalSecs: 0, notifyEnabled: true, cutMode: "off", admin: false, version: "3.0.0", smokeSettings: false, upd: { state: "idle" } };
+      const idle = { overall: "idle", targets: [], checking: false, intervalSecs: 0, notifyEnabled: true, cutMode: "off", admin: false, version: "3.1.0", smokeSettings: false, upd: { state: "idle" } };
       S.state = idle;
       applyState(idle);
     }

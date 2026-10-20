@@ -47,6 +47,7 @@ pub struct StateView {
     pub smoke_settings: bool,
     pub notify_enabled: bool,
     pub cut_mode: CutMode,
+    pub guarded_agents: Vec<String>,
 }
 
 pub struct AppState {
@@ -303,6 +304,7 @@ impl AppState {
             smoke_settings: self.smoke_settings,
             notify_enabled: cfg.notify.enabled,
             cut_mode: cfg.cut_mode(),
+            guarded_agents: cfg.guarded_agents.clone(),
         }
     }
 

@@ -1,4 +1,4 @@
-# ClaudeGuard 用户指南（v3）
+﻿# ClaudeGuard 用户指南（v3）
 
 ClaudeGuard 是常驻托盘的“网络出口门禁”：它按**每个目标自己的域名**分别检查出口，确认这些应用此刻走的是不是约定的那条链路、出口 IP / 地区是否在白名单里。全部通过才允许启动；任一启用目标不符合就立即熔断——结束相关进程、按开关做防火墙隔离，必要时直接断网；切回正确节点后自动恢复。
 
@@ -80,7 +80,7 @@ ClaudeGuard 是常驻托盘的“网络出口门禁”：它按**每个目标自
 
 ## 数据在哪里
 
-- 配置与日志：`%APPDATA%\ClaudeGuard`（主界面底部「打开数据文件夹」）
+- 配置与日志：`%APPDATA%\ClaudeGuard`（设置卡 → 通用 → 数据文件夹 → 打开）
 - `config.json` 配置、`guard.log` 日志、`netcut.json` 断网现场（用于崩溃后自愈）、`feishu.json` 通知、`claude-update.json` / `codex-update.json` 客户端更新状态。
 - 卸载不会删除这些文件；想彻底清理就删掉整个文件夹。
 
