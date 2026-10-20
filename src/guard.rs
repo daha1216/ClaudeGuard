@@ -815,7 +815,7 @@ fn duplicate_rule_instances(rules: &[FwRuleInstance]) -> Vec<String> {
 /// netsh 按名字删会整组删掉，没法只删多余实例，所以走 PowerShell 拿实例 GUID（Name）
 /// 后用 `Remove-NetFirewallRule -Name` 精确删；失败（非管理员等）时返回 0，不影响熔断。
 pub fn firewall_dedupe() -> usize {
-    let script = r"$rules = @(Get-NetFirewallRule -DisplayName 'ClaudeGuard*' | ForEach-Object { $app = $_ | Get-NetFirewallApplicationFilter; [pscustomobject]@{ name = $_.Name; display = $_.DisplayName; program = [string]$app.Program } }); $json = $rules | ConvertTo-Json -Compress; [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$json))";
+    let script = r"$rules = @(Get-NetFirewallRule -DisplayName 'ClaudeGuard*' -ErrorAction SilentlyContinue | ForEach-Object { $app = $_ | Get-NetFirewallApplicationFilter; [pscustomobject]@{ name = $_.Name; display = $_.DisplayName; program = [string]$app.Program } }); if ($rules.Count -gt 0) { $json = $rules | ConvertTo-Json -Compress } else { $json = '[]' }; [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$json))";
     let out = match run_hidden(
         &sys32(POWERSHELL),
         &["-NoProfile", "-NonInteractive", "-Command", script],
