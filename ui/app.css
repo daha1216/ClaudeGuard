@@ -255,13 +255,15 @@ body[data-overall="tripped"] .btn-primary { height: 44px; }
 
 .link-action {
   align-self: center;
-  margin-top: 11px;
   border: 0; background: none;
   display: inline-flex; align-items: center; justify-content: center; gap: 5px;
   font: inherit; font-size: 12px; font-weight: 500; color: var(--link);
   padding: 3px 6px; border-radius: 7px;
   transition: transform .15s var(--ease);
 }
+.cta-links { margin-top: 11px; display: flex; align-items: center; justify-content: center; gap: 4px; flex-wrap: wrap; }
+.cta-links .link-action { margin-top: 0; }
+.cta-links .dot { flex: none; color: var(--muted2); font-size: 12px; }
 .link-action:active { transform: scale(.97); }
 .link-action svg { width: 13px; height: 13px; }
 .link-action.is-danger { color: var(--red); }

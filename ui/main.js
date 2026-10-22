@@ -812,6 +812,43 @@
         else doRecheck();
       });
     }
+    // 一键清理 Claude 进程（CTA 下方，与「立即检测」并排）：两段确认，防误触
+    const sweep = $("btn-sweep");
+    if (sweep) {
+      let armed = false;
+      let armTimer = 0;
+      const sweepLabel = (txt, danger) => {
+        sweep.innerHTML = icon(danger ? "stop" : "trash", 13) + "<span>" + esc(txt) + "</span>";
+        sweep.classList.toggle("is-danger", !!danger);
+      };
+      sweepLabel("清理 Claude 进程", false);
+      sweep.addEventListener("click", async () => {
+        if (sweep.disabled) return;
+        if (!armed) {
+          armed = true;
+          sweepLabel("确认结束全部 Claude 进程？", true);
+          clearTimeout(armTimer);
+          armTimer = setTimeout(() => { armed = false; sweepLabel("清理 Claude 进程", false); }, 3200);
+          return;
+        }
+        clearTimeout(armTimer);
+        armed = false;
+        sweep.disabled = true;
+        sweepLabel("正在清理…", true);
+        try {
+          const rep = await invoke(CMD.sweep_claude);
+          const n = rep && rep.killed != null ? rep.killed : 0;
+          toast(n > 0
+            ? "已结束 " + n + " 个 Claude 进程（桌面 " + (rep.desktopKilled || 0) + " / CLI " + (rep.cliKilled || 0) + "）"
+            : "未发现 Claude 进程", true);
+        } catch (e) {
+          toast((e && e.message) || "清理失败");
+        } finally {
+          sweep.disabled = false;
+          sweepLabel("清理 Claude 进程", false);
+        }
+      });
+    }
 
     const wizNext = $("wiz-next");
     const wizPrev = $("wiz-prev");
