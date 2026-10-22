@@ -64,82 +64,116 @@
     );
   }
 
-  /* ---------- 构建静态骨架 ---------- */
+  /* ---------- 构建静态骨架（折叠手风琴，单开） ---------- */
+
+  function group(key, title, bodyHtml, sum) {
+    return (
+      '<div class="sgroup acc" data-g="' + key + '">' +
+      '<button class="acc-head" type="button" aria-expanded="false">' +
+      '<span class="ttl">' + esc(title) + "</span>" +
+      '<span class="sum" id="sum-' + key + '">' + esc(sum || "") + "</span>" +
+      '<span class="chev" aria-hidden="true">' + ic("chevronDown", 12) + "</span>" +
+      "</button>" +
+      '<div class="acc-body"><div class="acc-inner"><div class="acc-pad">' + bodyHtml + "</div></div></div></div>"
+    );
+  }
 
   function build() {
     if (!HOST) return;
     const notify = (CFG && CFG.notify) || {};
     HOST.innerHTML =
-      '<div class="sgroup">' +
-      '<div class="sgroup-title">检测</div>' +
-      '<div class="srow"><div class="slabel">代理端口<span class="shint">本机代理软件的端口</span></div><div class="sval"><input class="in num" id="st-port" type="number" min="1" max="65535" step="1"></div></div>' +
-      '<div class="srow"><div class="slabel">检查间隔<span class="shint">自动复查的周期</span></div><div class="sval"><input class="in num" id="st-interval" type="number" min="5" max="3600" step="1"><span class="unit">秒</span></div></div>' +
-      '<div class="srow"><div class="slabel">立即重新检查<span class="shint">不改配置，马上校验一轮</span></div><div class="sval"><button class="btn" id="st-recheck" type="button">' + ic("refresh", 12) + "重新检查</button></div></div>" +
-      "</div>" +
+      group("detect", "检测",
+        '<div class="srow"><div class="slabel">代理端口<span class="shint">本机代理软件的端口</span></div><div class="sval"><input class="in num" id="st-port" type="number" min="1" max="65535" step="1"></div></div>' +
+        '<div class="srow"><div class="slabel">检查间隔<span class="shint">自动复查的周期</span></div><div class="sval"><input class="in num" id="st-interval" type="number" min="5" max="3600" step="1"><span class="unit">秒</span></div></div>' +
+        '<div class="srow"><div class="slabel">立即重新检查<span class="shint">不改配置，马上校验一轮</span></div><div class="sval"><button class="btn" id="st-recheck" type="button">' + ic("refresh", 12) + "重新检查</button></div></div>") +
 
-      '<div class="sgroup">' +
-      '<div class="sgroup-title">熔断</div>' +
-      '<div class="srow col"><div class="slabel">断网档位<span class="shint">判定失败时切断出口的方式</span></div>' +
-      '<div class="seg" id="st-cut" role="group" aria-label="断网档位">' +
-      '<button type="button" data-mode="off" aria-pressed="false">不断网</button>' +
-      '<button type="button" data-mode="firewall" aria-pressed="false">防火墙全局阻断</button>' +
-      '<button type="button" data-mode="nics" aria-pressed="false">禁用物理网卡</button>' +
-      "</div></div>" +
-      rowSwitch("st-kill", "结束守护对象进程", "熔断时结束勾选应用的所有进程", !!(CFG && CFG.kill_on_fail), false) +
-      rowSwitch("st-quarantine", "防火墙隔离", "阻断这些应用联网，解除后自动恢复", !!(CFG && CFG.quarantine_on_fail), false) +
-      "</div>" +
+      group("guard", "熔断与清理",
+        '<div class="srow col"><div class="slabel">断网档位<span class="shint">判定失败时切断出口的方式</span></div>' +
+        '<div class="seg" id="st-cut" role="group" aria-label="断网档位">' +
+        '<button type="button" data-mode="off" aria-pressed="false">不断网</button>' +
+        '<button type="button" data-mode="firewall" aria-pressed="false">防火墙全局阻断</button>' +
+        '<button type="button" data-mode="nics" aria-pressed="false">禁用物理网卡</button>' +
+        "</div></div>" +
+        rowSwitch("st-kill", "结束守护对象进程", "熔断时结束勾选应用的所有进程", !!(CFG && CFG.kill_on_fail), false) +
+        rowSwitch("st-quarantine", "防火墙隔离", "阻断这些应用联网，解除后自动恢复", !!(CFG && CFG.quarantine_on_fail), false) +
+        '<div class="sgroup-title">进程清理</div>' +
+        rowSwitch("st-sweep", "退出后清理残留", "Claude 桌面端退出后，自动结束残留进程与孤儿 CLI", !CFG || CFG.sweep_on_exit !== false, false) +
+        '<div class="srow"><div class="slabel">一键清理 Claude 进程<span class="shint">立即结束全部 Claude 桌面端与 Claude Code CLI 进程</span></div><div class="sval"><button class="btn is-danger" id="st-sweep-now" type="button">扫描并清理</button></div></div>' +
+        '<div class="formhint" id="st-sweep-result" hidden></div>') +
 
-      '<div class="sgroup">' +
-      '<div class="sgroup-title">进程清理</div>' +
-      rowSwitch("st-sweep", "退出后清理残留", "Claude 桌面端退出后，自动结束残留进程与孤儿 CLI", !CFG || CFG.sweep_on_exit !== false, false) +
-      '<div class="srow"><div class="slabel">一键清理 Claude 进程<span class="shint">立即结束全部 Claude 桌面端与 Claude Code CLI 进程</span></div><div class="sval"><button class="btn is-danger" id="st-sweep-now" type="button">扫描并清理</button></div></div>' +
-      '<div class="formhint" id="st-sweep-result" hidden></div>' +
-      "</div>" +
+      group("agents", "守护对象",
+        rowSwitch("st-ag-claude", "Claude 桌面版", "Anthropic Claude 桌面端", false, false) +
+        rowSwitch("st-ag-chatgpt", "ChatGPT 桌面版", "OpenAI ChatGPT / Codex 桌面端", false, false) +
+        rowSwitch("st-ag-antigravity", "反重力桌面版", "Antigravity 桌面端", false, false)) +
 
-      '<div class="sgroup">' +
-      '<div class="sgroup-title">守护对象</div>' +
-      rowSwitch("st-ag-claude", "Claude 桌面版", "Anthropic Claude 桌面端", false, false) +
-      rowSwitch("st-ag-chatgpt", "ChatGPT 桌面版", "OpenAI ChatGPT / Codex 桌面端", false, false) +
-      rowSwitch("st-ag-antigravity", "反重力桌面版", "Antigravity 桌面端", false, false) +
-      "</div>" +
+      group("targets", "监控目标",
+        '<div class="sgroup-note">每行是一个探测目标。白名单 IP 与地区至少填一项（仅可达性类型除外），地区填两字母代码。</div>' +
+        '<div class="tlist" id="st-targets"></div>' +
+        '<div class="tactions"><button class="btn" id="st-target-add" type="button">' + ic("plus", 12) + "添加目标</button><span class=\"spacer\"></span>" +
+        '<button class="btn is-ghost" id="st-target-reset" type="button">恢复默认</button>' +
+        '<button class="btn is-primary" id="st-target-save" type="button">保存监控目标</button></div>' +
+        '<div class="formerr" id="st-target-msg" hidden></div>') +
 
-      '<div class="sgroup">' +
-      '<div class="sgroup-title">监控目标</div>' +
-      '<div class="sgroup-note">每行是一个探测目标。白名单 IP 与地区至少填一项（仅可达性类型除外），地区填两字母代码。</div>' +
-      '<div class="tlist" id="st-targets"></div>' +
-      '<div class="tactions"><button class="btn" id="st-target-add" type="button">' + ic("plus", 12) + "添加目标</button><span class=\"spacer\"></span>" +
-      '<button class="btn is-ghost" id="st-target-reset" type="button">恢复默认</button>' +
-      '<button class="btn is-primary" id="st-target-save" type="button">保存监控目标</button></div>' +
-      '<div class="formerr" id="st-target-msg" hidden></div>' +
-      "</div>" +
+      group("notify", "通知",
+        rowSwitch("st-notify-on", "启用桌面通知", "关闭后不再弹出任何通知", notify.enabled !== false, false) +
+        rowSwitch("st-notify-trip", "熔断通知", "检测到出口不合规并熔断时", notify.trip !== false, false) +
+        rowSwitch("st-notify-recover", "恢复通知", "解除隔离、恢复正常时", notify.recover !== false, false) +
+        rowSwitch("st-notify-blocked", "启动被拦截", "出口不合规时尝试启动 Claude", notify.launch_blocked !== false, false) +
+        rowSwitch("st-notify-warning", "预警通知", "连续失败但尚未熔断时", notify.warning !== false, false) +
+        rowSwitch("st-notify-client", "客户端更新", "Claude / Codex 客户端需要更新时", notify.client_update !== false, false) +
+        '<div class="srow"><div class="slabel">发送测试通知<span class="shint">确认系统通知能正常弹出</span></div><div class="sval"><button class="btn" id="st-notify-test" type="button">' + ic("bell", 12) + '发送测试</button></div></div>') +
 
-      '<div class="sgroup">' +
-      '<div class="sgroup-title">通知</div>' +
-      rowSwitch("st-notify-on", "启用桌面通知", "关闭后不再弹出任何通知", notify.enabled !== false, false) +
-      rowSwitch("st-notify-trip", "熔断通知", "检测到出口不合规并熔断时", notify.trip !== false, false) +
-      rowSwitch("st-notify-recover", "恢复通知", "解除隔离、恢复正常时", notify.recover !== false, false) +
-      rowSwitch("st-notify-blocked", "启动被拦截", "出口不合规时尝试启动 Claude", notify.launch_blocked !== false, false) +
-      rowSwitch("st-notify-warning", "预警通知", "连续失败但尚未熔断时", notify.warning !== false, false) +
-      rowSwitch("st-notify-client", "客户端更新", "Claude / Codex 客户端需要更新时", notify.client_update !== false, false) +
-      '<div class="srow"><div class="slabel">发送测试通知<span class="shint">确认系统通知能正常弹出</span></div><div class="sval"><button class="btn" id="st-notify-test" type="button">' + ic("bell", 12) + "发送测试</button></div></div>" +
-      "</div>" +
+      group("feishu", "飞书通知", '<div id="feishu-group"></div>', "群机器人 Webhook") +
 
-      '<div class="sgroup">' +
-      '<div class="sgroup-title">通用</div>' +
-      rowSwitch("st-autostart", "开机自启", "开机后自动在托盘里默默守护", !!(CFG && CFG.auto_start_with_system), false) +
-      rowSwitch("st-close-tray", "关闭窗口时驻留托盘", "关闭按钮只隐藏窗口，守护继续运行", !CFG || CFG.close_to_tray !== false, false) +
-      '<div class="srow"><div class="slabel">数据文件夹<span class="shint">配置、日志与更新缓存所在目录</span></div><div class="sval"><button class="btn" id="st-folder" type="button">打开</button></div></div>' +
-      '<div class="srow"><div class="slabel">用户指南<span class="shint">在浏览器中查看使用说明</span></div><div class="sval"><button class="btn" id="st-guide" type="button">打开</button></div></div>' +
-      "</div>" +
+      group("generic", "通用",
+        rowSwitch("st-autostart", "开机自启", "开机后自动在托盘里默默守护", !!(CFG && CFG.auto_start_with_system), false) +
+        rowSwitch("st-close-tray", "关闭窗口时驻留托盘", "关闭按钮只隐藏窗口，守护继续运行", !CFG || CFG.close_to_tray !== false, false) +
+        '<div class="srow"><div class="slabel">数据文件夹<span class="shint">配置、日志与更新缓存所在目录</span></div><div class="sval"><button class="btn" id="st-folder" type="button">打开</button></div></div>' +
+        '<div class="srow"><div class="slabel">用户指南<span class="shint">在浏览器中查看使用说明</span></div><div class="sval"><button class="btn" id="st-guide" type="button">打开</button></div></div>') +
 
-      '<div class="sgroup"><div class="sgroup-title">软件更新</div><div id="upd-group"></div></div>' +
-      '<div class="sgroup" id="feishu-group"><div class="sgroup-title">飞书通知</div></div>' +
-      '<div class="sgroup"><div class="sgroup-title">Claude 客户端更新</div><div id="claude-update-group"></div></div>' +
-      '<div class="sgroup"><div class="sgroup-title">Codex 客户端更新</div><div id="codex-update-group"></div></div>';
+      group("update", "更新",
+        '<div class="sgroup-title">守护器自身</div><div id="upd-group"></div>' +
+        '<div class="sgroup-title">Claude 客户端</div><div id="claude-update-group"></div>' +
+        '<div class="sgroup-title">Codex 客户端</div><div id="codex-update-group"></div>',
+        "自身 · Claude · Codex");
 
     wire();
     fill();
     mountChildren();
+    syncAcc();
+  }
+
+  /* ---------- 折叠手风琴（单开） ---------- */
+
+  let openAcc = "detect";
+
+  function syncAcc() {
+    if (!HOST) return;
+    HOST.querySelectorAll(".sgroup.acc").forEach((g) => {
+      const on = g.dataset.g === openAcc;
+      g.classList.toggle("is-open", on);
+      const head = g.querySelector(".acc-head");
+      if (head) head.setAttribute("aria-expanded", on ? "true" : "false");
+    });
+  }
+
+  function cutLabel(mode) {
+    return mode === "firewall" ? "断网：防火墙阻断" : mode === "nics" ? "断网：禁用网卡" : "断网：关闭";
+  }
+
+  function updateSummaries() {
+    const cfg = CFG || {};
+    const sum = (key, text) => { const el = $("sum-" + key); if (el) el.textContent = text; };
+    sum("detect", "端口 " + (cfg.proxy_port || "—") + " · " + (cfg.check_interval_secs || 15) + " 秒");
+    sum("guard", cutLabel(cutMode(cfg)));
+    const names = (Array.isArray(cfg.guarded_agents) ? cfg.guarded_agents : [])
+      .map((a) => (a === "claude" ? "Claude" : a === "chatgpt" ? "ChatGPT" : a === "antigravity" ? "反重力" : a))
+      .join("、");
+    sum("agents", names || "未选择");
+    const list = Array.isArray(cfg.targets) ? cfg.targets : [];
+    sum("targets", list.length ? list.filter((t) => t && t.enabled !== false).length + " / " + list.length + " 启用" : "未配置");
+    sum("notify", ((cfg.notify || {}).enabled !== false ? "桌面通知开" : "桌面通知关"));
+    sum("generic", cfg.auto_start_with_system ? "开机自启开" : "开机自启关");
   }
 
   /* ---------- 填值 ---------- */
@@ -179,6 +213,7 @@
     syncNotifyEnabled(n.enabled !== false);
     TARGETS = JSON.parse(JSON.stringify(Array.isArray(cfg.targets) ? cfg.targets : []));
     renderTargetList();
+    updateSummaries();
   }
 
   function syncCutButtons(mode) {
@@ -328,6 +363,7 @@
     try {
       await invoke(CMD.update_settings, { patch: p });
       await reloadConfig().catch(() => {});
+      updateSummaries();
       if (okMsg) notifyToast(okMsg, true);
       if (typeof OPTS.reloadConfig === "function") OPTS.reloadConfig();
     } catch (e) {
@@ -346,6 +382,18 @@
   /* ---------- 绑定 ---------- */
 
   function wire() {
+    // 折叠手风琴（单开）：HOST 元素跨 build 复用，只绑一次
+    if (HOST && !HOST.dataset.accWired) {
+      HOST.dataset.accWired = "1";
+      HOST.addEventListener("click", (e) => {
+        const head = e.target.closest(".acc-head");
+        if (!head) return;
+        const g = head.closest(".sgroup.acc");
+        if (!g) return;
+        openAcc = openAcc === g.dataset.g ? "" : g.dataset.g;
+        syncAcc();
+      });
+    }
     const port = $("st-port");
     const interval = $("st-interval");
     if (port) {
@@ -541,6 +589,7 @@
         try {
           await invoke(CMD.set_autostart, { on: want });
           await reloadConfig();
+          updateSummaries();
           notifyToast(want ? "已开启开机自启" : "已关闭开机自启", true);
         } catch (e) {
           auto.checked = !want;

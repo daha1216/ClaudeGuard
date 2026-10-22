@@ -316,7 +316,19 @@ body[data-overall="tripped"] .btn-primary { height: 44px; }
 
 .sgroup { padding: 10px 0; border-top: 1px solid var(--hairline); }
 .sgroup:first-child { border-top: 0; padding-top: 0; }
-.sgroup-title { display: flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 600; letter-spacing: .2px; color: var(--muted2); margin-bottom: 4px; }
+.sgroup-title { display: flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 600; letter-spacing: .2px; color: var(--muted2); margin: 10px 0 4px; }
+.sgroup.acc { padding: 0; border-top: 1px solid var(--hairline); }
+.sgroup.acc:first-child { border-top: 0; }
+.acc-head { display: flex; align-items: center; gap: 8px; width: 100%; padding: 12px 0; background: none; border: 0; cursor: pointer; font: inherit; text-align: left; }
+.acc-head .ttl { flex: none; font-size: 13px; font-weight: 600; color: var(--text); }
+.acc-head .sum { flex: 1; min-width: 0; font-size: 11px; color: var(--muted2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right; }
+.acc-head .chev { flex: none; width: 14px; height: 14px; color: var(--muted2); display: flex; align-items: center; justify-content: center; transition: transform .22s var(--ease); }
+.acc-head .chev svg { width: 12px; height: 12px; }
+.sgroup.acc.is-open .acc-head .chev { transform: rotate(180deg); }
+.acc-body { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .24s var(--ease); }
+.sgroup.acc.is-open .acc-body { grid-template-rows: 1fr; }
+.acc-body > .acc-inner { overflow: hidden; min-height: 0; }
+.acc-pad { padding: 2px 0 12px; }
 .sgroup-note { font-size: 10px; color: var(--muted2); line-height: 1.45; padding: 3px 0 2px; }
 
 .srow { display: flex; align-items: center; gap: 10px; padding: 5px 0; min-width: 0; }
