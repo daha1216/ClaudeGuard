@@ -5,15 +5,22 @@
 //! 退出前必须恢复网络、解除隔离（网络绝不能因为程序退出而保持断开）。
 
 mod anchors;
+#[cfg_attr(target_os = "macos", path = "macos/claude_update.rs")]
 mod claude_update;
 mod config;
 mod feishu;
+#[cfg_attr(target_os = "macos", path = "macos/guard.rs")]
 mod guard;
+#[cfg_attr(target_os = "macos", path = "macos/install.rs")]
 mod install;
 mod ipc;
+#[cfg(target_os = "macos")]
+mod macos;
 mod model;
 mod monitor;
+#[cfg_attr(target_os = "macos", path = "macos/netcut.rs")]
 mod netcut;
+#[cfg_attr(target_os = "macos", path = "macos/notify.rs")]
 mod notify;
 mod policy;
 mod state;
@@ -29,10 +36,62 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent};
 
+fn application_context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
 
+    #[cfg(target_os = "macos")]
+    if has("--macos-ui-selftest") {
+        crate::macos::ui_acceptance::run(application_context());
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if has("--macos-monitor-selftest") {
+        run_monitor_acceptance();
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if has("--notification-status") {
+        match crate::notify::status() {
+            Ok(status) => {
+                print_json(&status);
+                return;
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if has("--macos-client-check") {
+        let product = args
+            .iter()
+            .position(|a| a == "--macos-client-check")
+            .and_then(|i| args.get(i + 1));
+        let product = match product.map(String::as_str) {
+            Some("claude") => Product::Claude,
+            Some("codex") => Product::Codex,
+            _ => {
+                eprintln!("需要 claude 或 codex");
+                std::process::exit(1);
+            }
+        };
+        match crate::claude_update::check_only(product, &config::Config::load()) {
+            Ok(result) => {
+                print_json(&result);
+                return;
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if has("--version") {
         println!("ClaudeGuard {}", crate::model::VERSION);
         return;
@@ -47,6 +106,12 @@ fn main() {
         std::process::exit(cli_install());
     }
     if has("--uninstall") {
+        #[cfg(target_os = "macos")]
+        if let Err(error) = crate::install::uninstall() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        #[cfg(not(target_os = "macos"))]
         crate::install::uninstall();
         return;
     }
@@ -69,10 +134,45 @@ fn main() {
             .and_then(|index| args.get(index + 1))
             .cloned()
             .unwrap_or_else(|| "trip".to_string());
+        #[cfg(target_os = "macos")]
+        {
+            run_notification_test(kind);
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
         std::process::exit(cli_notify_test(&kind));
     }
 
     run_gui(has("--tray"), has("--settings"));
+}
+
+#[cfg(target_os = "macos")]
+fn run_monitor_acceptance() {
+    let _isolation = crate::macos::monitor_acceptance::prepare().expect("无法创建隔离测试环境");
+    let app = tauri::Builder::default()
+        .build(application_context())
+        .expect("原生调度验收启动失败");
+    let mut started = false;
+    app.run(move |app, event| {
+        if matches!(event, RunEvent::Ready) && !started {
+            started = true;
+            let handle = app.clone();
+            std::thread::spawn(move || {
+                let result = crate::macos::monitor_acceptance::run(handle.clone());
+                let code = match result {
+                    Ok(result) => {
+                        print_json(&result);
+                        0
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        1
+                    }
+                };
+                handle.exit(code);
+            });
+        }
+    });
 }
 
 // ---------- CLI ----------
@@ -149,9 +249,14 @@ fn cli_update_selftest() -> i32 {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn cli_notify_test(kind: &str) -> i32 {
     let (title, body) = crate::notify::test_message(kind);
-    match crate::notify::send_blocking(title, &body) {
+    #[cfg(target_os = "macos")]
+    let result = crate::notify::test_blocking(title, &body);
+    #[cfg(not(target_os = "macos"))]
+    let result = crate::notify::send_blocking(title, &body);
+    match result {
         Ok(()) => {
             println!("ok");
             0
@@ -163,13 +268,57 @@ fn cli_notify_test(kind: &str) -> i32 {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn run_notification_test(kind: String) {
+    let app = tauri::Builder::default()
+        .setup(|app| {
+            let window = tauri::WebviewWindowBuilder::new(
+                app,
+                "notification-test",
+                tauri::WebviewUrl::App("notification-test.html".into()),
+            )
+            .title("ClaudeGuard 通知测试")
+            .inner_size(430.0, 220.0)
+            .resizable(false)
+            .build()?;
+            window.set_focus()?;
+            Ok(())
+        })
+        .build(application_context())
+        .expect("通知测试启动失败");
+    let mut kind = Some(kind);
+    app.run(move |app, event| {
+        if matches!(event, RunEvent::Ready) {
+            if let Some(kind) = kind.take() {
+                let handle = app.clone();
+                std::thread::spawn(move || {
+                    let (title, body) = crate::notify::test_message(&kind);
+                    let code = match crate::notify::test_blocking(title, &body) {
+                        Ok(()) => {
+                            println!("ok: notification delivered");
+                            0
+                        }
+                        Err(error) => {
+                            eprintln!("{error}");
+                            1
+                        }
+                    };
+                    handle.exit(code);
+                });
+            }
+        }
+    });
+}
+
 // ---------- GUI ----------
 
 fn run_gui(start_hidden: bool, want_settings: bool) {
     crate::update::cleanup_old();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            show_main(app);
+            if !argv.iter().any(|arg| arg == "--tray") {
+                show_main(app);
+            }
             if argv.iter().any(|arg| arg == "--settings") {
                 open_settings_ui(app);
             }
@@ -213,46 +362,34 @@ fn run_gui(start_hidden: bool, want_settings: bool) {
                 open_settings_ui(&handle);
             }
             Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
-            ipc::get_state,
-            ipc::get_config,
-            ipc::update_settings,
-            ipc::save_targets,
-            ipc::reset_targets,
-            ipc::recheck,
-            ipc::launch,
-            ipc::recheck_target,
-            ipc::release,
-            ipc::pause,
-            ipc::resume,
-            ipc::sweep_claude,
-            ipc::recent_logs,
-            ipc::open_data_folder,
-            ipc::open_guide,
-            ipc::js_log,
-            ipc::install_app,
-            ipc::set_autostart,
-            ipc::upd_state,
-            ipc::upd_check,
-            ipc::upd_download,
-            ipc::feishu_status,
-            ipc::feishu_save,
-            ipc::feishu_test,
-            ipc::feishu_retry_failed,
-            ipc::claude_update_status,
-            ipc::claude_update_configure,
-            ipc::claude_update_check,
-            ipc::codex_update_status,
-            ipc::codex_update_configure,
-            ipc::codex_update_check,
-            ipc::notify_test,
-        ]);
+        });
+    let builder = with_ipc(builder);
 
     let app = builder
-        .build(tauri::generate_context!())
+        .build(application_context())
         .expect("ClaudeGuard 启动失败");
     app.run(|app_handle, event| {
+        #[cfg(target_os = "macos")]
+        if matches!(
+            event,
+            RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            }
+        ) {
+            // Finder/Dock foreground reopen should restore the hidden window.
+            // A login LaunchAgent uses open -g and must remain in the background.
+            let handle = app_handle.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                let activate = handle.clone();
+                let _ = handle.run_on_main_thread(move || {
+                    if crate::macos::application_is_active() {
+                        show_main(&activate);
+                    }
+                });
+            });
+        }
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
             let state = app_handle.state::<Arc<AppState>>();
             state.stop.store(true, Ordering::SeqCst);
@@ -262,7 +399,45 @@ fn run_gui(start_hidden: bool, want_settings: bool) {
     });
 }
 
+fn with_ipc(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    builder.invoke_handler(tauri::generate_handler![
+        ipc::get_state,
+        ipc::get_config,
+        ipc::update_settings,
+        ipc::save_targets,
+        ipc::reset_targets,
+        ipc::recheck,
+        ipc::launch,
+        ipc::recheck_target,
+        ipc::release,
+        ipc::pause,
+        ipc::resume,
+        ipc::sweep_claude,
+        ipc::recent_logs,
+        ipc::open_data_folder,
+        ipc::open_guide,
+        ipc::js_log,
+        ipc::install_app,
+        ipc::set_autostart,
+        ipc::upd_state,
+        ipc::upd_check,
+        ipc::upd_download,
+        ipc::feishu_status,
+        ipc::feishu_save,
+        ipc::feishu_test,
+        ipc::feishu_retry_failed,
+        ipc::claude_update_status,
+        ipc::claude_update_configure,
+        ipc::claude_update_check,
+        ipc::codex_update_status,
+        ipc::codex_update_configure,
+        ipc::codex_update_check,
+        ipc::notify_test,
+    ])
+}
+
 /// 窗口高度 = 工作区逻辑高 − 8，限制在 420..=620；`CG_WIN_H` 可覆盖（截图/冒烟用）。
+#[cfg(not(target_os = "macos"))]
 fn window_height(app: &AppHandle) -> f64 {
     if let Ok(raw) = std::env::var("CG_WIN_H") {
         if let Ok(value) = raw.trim().parse::<f64>() {
@@ -276,17 +451,45 @@ fn window_height(app: &AppHandle) -> f64 {
     620.0
 }
 
+#[cfg(target_os = "macos")]
+fn window_height(app: &AppHandle) -> f64 {
+    if let Ok(value) = std::env::var("CG_WIN_H").unwrap_or_default().parse::<f64>() {
+        return value.clamp(420.0, 1400.0);
+    }
+    app.primary_monitor()
+        .ok()
+        .flatten()
+        .map(|m| (m.size().to_logical::<f64>(m.scale_factor()).height - 100.0).clamp(420.0, 860.0))
+        .unwrap_or(860.0)
+}
+
 fn build_window(app: &tauri::App, height: f64, visible: bool) -> tauri::Result<()> {
-    let window =
+    let builder =
         tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
             .title("ClaudeGuard")
-            .inner_size(420.0, height)
-            .min_inner_size(400.0, 420.0)
+            .inner_size(
+                if cfg!(target_os = "macos") {
+                    980.0
+                } else {
+                    420.0
+                },
+                height,
+            )
+            .min_inner_size(
+                if cfg!(target_os = "macos") {
+                    520.0
+                } else {
+                    400.0
+                },
+                420.0,
+            )
             .resizable(true)
-            .decorations(false)
+            .decorations(cfg!(target_os = "macos"))
             .visible(visible)
-            .center()
-            .build()?;
+            .center();
+    #[cfg(target_os = "macos")]
+    let builder = builder.theme(Some(tauri::Theme::Dark));
+    let window = builder.build()?;
 
     let handle = window.clone();
     window.on_window_event(move |event| {
@@ -306,7 +509,17 @@ fn build_tray(state: &Arc<AppState>) -> tauri::Result<()> {
     let show = MenuItem::with_id(&app, "cg_show", "显示主窗口", true, None::<&str>)?;
     let recheck = MenuItem::with_id(&app, "cg_recheck", "立即检测", true, None::<&str>)?;
     let pause = MenuItem::with_id(&app, "cg_pause", "暂停守护 30 分钟", true, None::<&str>)?;
-    let release = MenuItem::with_id(&app, "cg_release", "解除隔离并恢复网络", true, None::<&str>)?;
+    let release = MenuItem::with_id(
+        &app,
+        "cg_release",
+        if cfg!(target_os = "macos") {
+            "清除熔断状态（启动仍需检测）"
+        } else {
+            "解除隔离并恢复网络"
+        },
+        true,
+        None::<&str>,
+    )?;
     let data = MenuItem::with_id(&app, "cg_data", "打开数据文件夹", true, None::<&str>)?;
     let quit = MenuItem::with_id(&app, "cg_quit", "退出", true, None::<&str>)?;
     let separator_top = PredefinedMenuItem::separator(&app)?;
@@ -329,6 +542,15 @@ fn build_tray(state: &Arc<AppState>) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .tooltip("ClaudeGuard");
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder
+            .icon(tauri::image::Image::from_bytes(include_bytes!(
+                "../assets/macos-tray.png"
+            ))?)
+            .icon_as_template(true);
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Some(icon) = app.default_window_icon().cloned() {
         builder = builder.icon(icon);
     }
@@ -348,9 +570,7 @@ fn build_tray(state: &Arc<AppState>) -> tauri::Result<()> {
                 monitor::release(state.inner());
             }
             "cg_data" => {
-                let _ = std::process::Command::new("explorer.exe")
-                    .arg(crate::config::config_dir())
-                    .spawn();
+                ipc::open_data_folder();
             }
             "cg_quit" => {
                 let state = app.state::<Arc<AppState>>();
@@ -437,7 +657,10 @@ fn apply_smoke_state(state: &Arc<AppState>, kind: &str) {
 }
 
 fn show_main(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
     if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }

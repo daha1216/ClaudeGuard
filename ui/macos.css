@@ -1,0 +1,78 @@
+/* macOS-only presentation, based on the user's existing ClaudeGuard Mac dashboard.
+   Keep upstream markup, IPC commands and decision semantics. */
+body[data-platform="macos"] {
+  color-scheme: dark;
+  --bg: #202020; --bg-fade: #202020; --card: #262626; --card-solid: #262626;
+  --txt: #dedede; --txt2: #b6b6b6; --muted: #999; --muted2: #929292;
+  --hairline: #3a3a3a; --green: #31c45f; --green-deep: #31c45f;
+  --orange: #ff9b33; --orange-deep: #ffb066; --red: #ff6666; --red-deep: #ff9999;
+  --blue: #0a84ff; --blue-top: #0a84ff; --link: #9ac5ff;
+  --shadow-card: none; --shadow-cta: none;
+  background: #202020;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+  font-size: 14px;
+}
+body[data-platform="macos"] .titlebar { display: none; }
+body[data-platform="macos"] .content { max-width: 1200px; margin: auto; padding: 32px 32px 28px; }
+body[data-platform="macos"] .hero { display: grid; grid-template-columns: 38px 1fr; column-gap: 14px; align-items: center; text-align: left; padding: 0; }
+body[data-platform="macos"] .ring { grid-row: 1 / 3; width: 38px; height: 38px; filter: none; }
+body[data-platform="macos"] .core svg { width: 16px; height: 16px; }
+body[data-platform="macos"] .ring-track { stroke: #3a3a3a; }
+body[data-platform="macos"] .hero-title { margin: 0; font-size: 23px; letter-spacing: -.3px; }
+body[data-platform="macos"] .hero-sub { margin-top: 5px; max-width: none; font-size: 13px; }
+body[data-platform="macos"] .banners { margin: 24px 0 20px; }
+body[data-platform="macos"] .banner { border-radius: 10px; box-shadow: none; font-size: 12px; line-height: 1.65; }
+body[data-platform="macos"] .banner.warn { background: #302820; border-color: #6c4a2b; }
+body[data-platform="macos"] .banner.trip { background: #342326; border-color: #713d43; }
+body[data-platform="macos"] .banner.info { background: #2b2b2b; border: 1px solid #484848; }
+body[data-platform="macos"] .banner .bact { background: #373737; color: #dedede; }
+body[data-platform="macos"] .egress { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; background: transparent; border: 0; overflow: visible; backdrop-filter: none; -webkit-backdrop-filter: none; }
+body[data-platform="macos"] .row { min-height: 110px; height: auto; padding: 20px; border: 1px solid #3a3a3a; border-radius: 13px; flex-wrap: wrap; align-content: center; gap: 10px; }
+body[data-platform="macos"] .row .body { flex-basis: calc(100% - 24px); }
+body[data-platform="macos"] .row .right { margin-left: 17px; max-width: calc(100% - 17px); text-align: left; }
+body[data-platform="macos"] .name { font-size: 14px; }
+body[data-platform="macos"] .geo { font-size: 12px; margin-top: 5px; }
+body[data-platform="macos"] .ip { font-size: 20px; }
+body[data-platform="macos"] .lat { font-size: 12px; color: #aaa; }
+body[data-platform="macos"] .card { margin-top: 24px; border-radius: 12px; background: #202020; backdrop-filter: none; -webkit-backdrop-filter: none; }
+body[data-platform="macos"] .fold-head { padding: 17px 18px; font-size: 15px; }
+body[data-platform="macos"] .fold-sub { font-size: 12px; }
+body[data-platform="macos"] .fold-body { padding: 14px 18px; }
+body[data-platform="macos"] .slabel, body[data-platform="macos"] .acc-head { font-size: 14px; }
+body[data-platform="macos"] .shint, body[data-platform="macos"] .formhint { font-size: 12px; line-height: 1.6; }
+body[data-platform="macos"] .srow { padding-top: 12px; padding-bottom: 12px; }
+body[data-platform="macos"] .in, body[data-platform="macos"] .titem { background: #292929; border-color: #484848; color: #dedede; font-size: 13px; }
+body[data-platform="macos"] .btn { background: #363636; border: 1px solid #484848; color: #dedede; height: 34px; font-size: 12px; }
+body[data-platform="macos"] .btn.is-primary { background: #0a84ff; border-color: #0a84ff; color: white; }
+body[data-platform="macos"] .seg { background: #292929; }
+body[data-platform="macos"] .seg button { color: #aaa; }
+body[data-platform="macos"] .seg button:disabled { opacity: .45; cursor: default; }
+body[data-platform="macos"] .footer { background: #202020; border-top: 1px solid #3c3c3c; min-height: 68px; padding: 12px 24px; gap: 16px; }
+body[data-platform="macos"] .footer .cta { margin: 0 0 0 auto; display: flex; flex-direction: row-reverse; align-items: center; gap: 16px; }
+body[data-platform="macos"] .footer .btn-primary { width: auto; min-width: 150px; height: 40px; padding: 0 18px; border-radius: 8px; font-size: 13px; background: #0a84ff; }
+body[data-platform="macos"] .footer .btn-primary:disabled { background: #363636; color: #929292; }
+body[data-platform="macos"] .footer .cta-links { margin: 0; gap: 14px; }
+body[data-platform="macos"] .footer .link-action, body[data-platform="macos"] .footer .link { font-size: 12px; }
+body[data-platform="macos"] .footer .foot-right { font-size: 11px; }
+body[data-platform="macos"] .wizard { background: rgba(0,0,0,.65); }
+body[data-platform="macos"] .wiz-card { background: #262626; color: #dedede; }
+body[data-platform="macos"] .wiz-choice { background: #292929; color: #dedede; border-color: #484848; }
+@media(max-width:700px) {
+  body[data-platform="macos"] .content { padding: 24px 20px; }
+  body[data-platform="macos"] .egress { grid-template-columns: 1fr; }
+  body[data-platform="macos"] .footer { padding: 12px; flex-wrap: wrap; gap: 10px; }
+  body[data-platform="macos"] .footer .cta { gap: 10px; }
+  body[data-platform="macos"] .footer .cta-links { gap: 8px; }
+  body[data-platform="macos"] .footer .btn-primary { min-width: 120px; }
+  body[data-platform="macos"] .footer .foot-right { display: none; }
+}
+/* Typography follows the existing Mac project: 15px body, 23px primary heading,
+   13px controls, SF/PingFang for text and SF Mono for addresses/logs. */
+body[data-platform="macos"] { font-size: 15px; }
+body[data-platform="macos"] .dname { font-size: 14px; }
+body[data-platform="macos"] .dmid, body[data-platform="macos"] .dlat,
+body[data-platform="macos"] .dkv, body[data-platform="macos"] .sgroup-note,
+body[data-platform="macos"] .sum { font-size: 12px; line-height: 1.6; }
+body[data-platform="macos"] .btn, body[data-platform="macos"] .link-action,
+body[data-platform="macos"] .footer .link { font-size: 13px; }
+body[data-platform="macos"] .log { font: 12px/1.7 ui-monospace, SFMono-Regular, monospace; }

@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ClaudeGuard macOS 使用说明</title>
+<style>:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;padding:32px;max-width:760px;font:15px/1.8 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;color:#e9e9eb;background:#202020}h1{font-size:25px;line-height:1.4;margin:0 0 10px}h2{font-size:18px;margin:24px 0 6px}p{margin:6px 0 12px}ol{padding-left:23px}li{margin:8px 0}.note{padding:14px 18px;background:#2c2c2e;border-radius:12px;color:#d5d5db}code{overflow-wrap:anywhere;font-size:13px}strong{font-weight:600}</style></head>
+<body><h1>ClaudeGuard macOS 使用说明</h1><p>检测代理出口，在出口异常时关闭选中的 AI 应用。</p>
+<h2>首次设置</h2><ol><li>将完整的 <strong>ClaudeGuard.app</strong> 放入“应用程序”文件夹，或在首次向导中选择“安装并继续”。已有版本时，请退出后再手动替换。</li><li>在设置中填写本机代理端口。守护器不会修改你的代理软件设置。</li><li>为启用的监控目标填写允许的 IP 或地区；两者任一命中即可通过。根据实际需要选择监控目标和守护应用。</li><li>保持“结束守护对象进程”开启，点击“立即检测”。从守护器启动 Claude 时，会再次检查全部启用目标。</li></ol>
+<h2>异常时的行为</h2><p>连续失败达到设置的阈值后，关闭选中的 AI 桌面应用，并禁止从守护器启动 Claude。出口恢复正常后解除限制，应用需手动启动。Claude 被选中时，熔断沿用原版行为，也会清理 Claude Code CLI。</p>
+<p class="note">这是进程守护模式。它保持整机网络连接，不是按应用防火墙；两次检测之间存在时间间隔。无法确认出口时不主动触发新的熔断，但也不允许从守护器启动 Claude。</p>
+<h2>暂停与恢复</h2><p>暂停后不触发新的熔断；启动门禁仍会检测出口。手动“清除熔断状态”不会绕过启动前检测，也不会自动重新打开应用。</p>
+<h2>通知、自启与更新</h2><p>通知测试需要在系统设置中允许 ClaudeGuard 通知。登录自启需要从“应用程序”文件夹中的完整应用启用。客户端自动更新默认关闭；启用后只在全部出口正常且客户端自行退出时安装官方签名更新，不强制关闭应用。</p>
+<p>守护器自身自动更新需维护者提供签名发布包和内置发布公钥；当前本地预览尚未接入正式发布。</p>
+<h2>退出与数据</h2><p>关闭窗口默认保留菜单栏守护；使用菜单栏“退出”或 Command-Q 结束程序。配置与日志位于 <code>~/Library/Application Support/ClaudeGuard</code>。删除应用不会自动删除这些数据。飞书凭据经加密保存，密钥位于登录钥匙串。</p>
+</body></html>

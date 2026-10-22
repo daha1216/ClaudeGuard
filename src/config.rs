@@ -10,9 +10,15 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub fn config_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::data_dir()
+    }
+    #[cfg(not(target_os = "macos"))]
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
+    #[cfg(not(target_os = "macos"))]
     base.join("ClaudeGuard")
 }
 

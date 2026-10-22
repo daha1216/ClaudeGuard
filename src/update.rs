@@ -7,10 +7,15 @@ use crate::config::Config;
 use crate::model::UpdState;
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(target_os = "macos")]
+#[path = "macos/self_update.rs"]
+mod self_update;
 
 pub const GITHUB_REPO: &str = "daha1216/ClaudeGuard";
 const USER_AGENT: &str = "ClaudeGuard-Updater";
@@ -18,6 +23,7 @@ const USER_AGENT: &str = "ClaudeGuard-Updater";
 /// 检查超时
 const T_CHECK: Duration = Duration::from_secs(10);
 /// 下载超时(整体)
+#[cfg(windows)]
 const T_DOWNLOAD: Duration = Duration::from_secs(300);
 
 // ------------------------------------------------------------------ 数据结构
@@ -42,6 +48,13 @@ pub struct Asset {
 }
 
 impl Release {
+    // Mac updates require a pinned key and a full signed-manifest asset set.
+    // A Windows EXE can never satisfy this selector.
+    #[cfg(target_os = "macos")]
+    pub fn exe_asset(&self) -> Option<&Asset> {
+        self_update::asset(self)
+    }
+
     /// 语义化版本号(去掉 v 前缀)
     pub fn version(&self) -> &str {
         self.tag_name.trim_start_matches('v')
@@ -49,6 +62,7 @@ impl Release {
 
     /// 找主程序资产: 名字含 ClaudeGuard 且以 .exe 结尾, 但排除 Inno 安装包(-setup)——
     /// 自更新下载的必须是裸版 exe, 拿到安装包会把它当主程序写盘。
+    #[cfg(windows)]
     pub fn exe_asset(&self) -> Option<&Asset> {
         self.assets.iter().find(|a| {
             a.name.ends_with(".exe") && a.name.contains("ClaudeGuard") && !a.name.contains("-setup")
@@ -137,6 +151,7 @@ pub fn check_latest(cfg: &Config) -> Result<Release, String> {
 // ------------------------------------------------------------------ 下载
 
 /// 下载到临时文件, 返回路径。progress(已下载字节, 总字节)。
+#[cfg(windows)]
 pub fn download(
     cfg: &Config,
     url: &str,
@@ -195,6 +210,7 @@ pub fn download(
 /// 流程: 当前 exe 改名为 .old → 新文件复制到原路径(失败则回滚) → 启动新实例。
 /// 安装版以管理员运行, 重命名/复制/启动均无权限问题; 便携版在可写目录同样适用。
 /// `spawn_new=false` 供自测使用: 只做替换不启动。
+#[cfg(windows)]
 pub fn apply_update(new_exe: &Path, spawn_new: bool) -> Result<(), String> {
     let cur = std::env::current_exe().map_err(|e| format!("定位自身: {e}"))?;
     let old = cur.with_extension("exe.old");
@@ -230,8 +246,28 @@ pub fn apply_update(new_exe: &Path, spawn_new: bool) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+pub fn apply_update(new_exe: &Path, spawn_new: bool) -> Result<(), String> {
+    self_update::apply_update(new_exe, spawn_new)
+}
+
+#[cfg(target_os = "macos")]
+pub fn download(
+    cfg: &Config,
+    url: &str,
+    size: u64,
+    progress: impl FnMut(u64, u64),
+) -> Result<PathBuf, String> {
+    self_update::download(cfg, url, size, progress)
+}
+
 /// 启动时清理上次更新残留的 .old 文件。
 pub fn cleanup_old() {
+    #[cfg(target_os = "macos")]
+    if let Err(error) = self_update::recover_current() {
+        eprintln!("macOS 自更新恢复未完成：{error}");
+    }
+    #[cfg(windows)]
     if let Ok(cur) = std::env::current_exe() {
         let old = cur.with_extension("exe.old");
         let _ = std::fs::remove_file(&old);
@@ -262,7 +298,7 @@ pub fn spawn_check(state: &Arc<AppState>) {
                     state.log(format!("发现新版本 v{ver}"));
                 } else {
                     state.set_upd(UpdState::Failed {
-                        msg: format!("发现新版本 v{ver}，但发布页没有可下载的主程序"),
+                        msg: missing_asset_message(&ver),
                     });
                     state.log("发现新版本，但发布页缺少可下载的主程序");
                 }
@@ -400,9 +436,35 @@ pub fn spawn_periodic_check(state: &Arc<AppState>) {
 }
 
 /// 后台下载并自替换重启；下载进度写入 `AppState::upd`。
+#[cfg(target_os = "macos")]
+static MACOS_DOWNLOAD_BUSY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+struct MacDownloadGuard;
+#[cfg(target_os = "macos")]
+impl Drop for MacDownloadGuard {
+    fn drop(&mut self) {
+        MACOS_DOWNLOAD_BUSY.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
 pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
+    #[cfg(target_os = "macos")]
+    if MACOS_DOWNLOAD_BUSY
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        state.log("自身更新正在执行；忽略重复请求");
+        return;
+    }
     let state = Arc::clone(state);
     std::thread::spawn(move || {
+        #[cfg(target_os = "macos")]
+        let _download_guard = MacDownloadGuard;
         state.set_upd(UpdState::Downloading {
             done: 0,
             total: size,
@@ -429,7 +491,17 @@ pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
                 state.emit_state();
                 state.log("更新已下载，正在替换并重启…");
                 match apply_update(&path, true) {
-                    Ok(()) => std::process::exit(0),
+                    Ok(()) => {
+                        #[cfg(windows)]
+                        std::process::exit(0);
+                        #[cfg(target_os = "macos")]
+                        {
+                            state.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                            crate::netcut::restore();
+                            crate::guard::firewall_release();
+                            state.app.exit(0);
+                        }
+                    }
                     Err(err) => {
                         state.set_upd(UpdState::Failed { msg: err.clone() });
                         state.log(format!("更新失败：{err}"));
@@ -444,6 +516,17 @@ pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
             }
         }
     });
+}
+
+fn missing_asset_message(ver: &str) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        format!("发现新版本 v{ver}；{}", self_update::unavailable_reason())
+    }
+    #[cfg(windows)]
+    {
+        format!("发现新版本 v{ver}，但发布页没有可下载的主程序")
+    }
 }
 
 #[cfg(test)]
@@ -489,6 +572,7 @@ mod tests {
     /// 行为锁: release 资产匹配规则——名字含 ClaudeGuard 且以 .exe 结尾。
     /// 资产命名偏离此规则时, 所有用户端的检查更新都会失败。
     #[test]
+    #[cfg(windows)]
     fn exe_asset_matching() {
         let mk = |names: &[&str]| Release {
             tag_name: "v9.9.9".into(),

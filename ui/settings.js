@@ -164,7 +164,7 @@
     const cfg = CFG || {};
     const sum = (key, text) => { const el = $("sum-" + key); if (el) el.textContent = text; };
     sum("detect", "端口 " + (cfg.proxy_port || "—") + " · " + (cfg.check_interval_secs || 15) + " 秒");
-    sum("guard", cutLabel(cutMode(cfg)));
+    sum("guard", CG.platform === "macos" ? "进程守护模式" : cutLabel(cutMode(cfg)));
     const names = (Array.isArray(cfg.guarded_agents) ? cfg.guarded_agents : [])
       .map((a) => (a === "claude" ? "Claude" : a === "chatgpt" ? "ChatGPT" : a === "antigravity" ? "反重力" : a))
       .join("、");
@@ -210,10 +210,24 @@
     chk("st-autostart", cfg.auto_start_with_system);
     chk("st-close-tray", cfg.close_to_tray !== false);
     syncCutButtons(cutMode(cfg));
+    syncPlatformCapabilities();
     syncNotifyEnabled(n.enabled !== false);
     TARGETS = JSON.parse(JSON.stringify(Array.isArray(cfg.targets) ? cfg.targets : []));
     renderTargetList();
     updateSummaries();
+  }
+
+  function syncPlatformCapabilities() {
+    const mac = document.body.dataset.platform === "macos";
+    const seg = $("st-cut");
+    if (seg) seg.querySelectorAll("button").forEach((b) => {
+      b.disabled = mac;
+      b.setAttribute("aria-pressed", b.dataset.mode === (mac ? "off" : cutMode(CFG)) ? "true" : "false");
+    });
+    const quarantine = $("st-quarantine");
+    if (quarantine) { quarantine.disabled = mac; quarantine.checked = !mac && !!(CFG && CFG.quarantine_on_fail); }
+    const summary = $("sum-guard");
+    if (mac && summary) summary.textContent = "进程守护模式";
   }
 
   function syncCutButtons(mode) {
@@ -565,7 +579,8 @@
       auto.addEventListener("change", async () => {
         const want = !!auto.checked;
         try {
-          await invoke(CMD.set_autostart, { on: want });
+          const saved = await invoke(CMD.set_autostart, { on: want });
+          if (saved !== true) throw new Error("系统未能保存登录自启设置");
           await reloadConfig();
           updateSummaries();
           notifyToast(want ? "已开启开机自启" : "已关闭开机自启", true);
@@ -630,6 +645,7 @@
       load();
     },
     setState(state) {
+      syncPlatformCapabilities();
       // 设置表单不随状态刷新重建；只把状态转给更新/飞书小组件。
       const U = CG.updates;
       if (U && U.setState) U.setState(state);

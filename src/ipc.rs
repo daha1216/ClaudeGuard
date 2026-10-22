@@ -6,15 +6,24 @@ use crate::model::{Target, UpdState};
 use crate::monitor::{self, DryResult};
 use crate::state::{AppState, StateView};
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use tauri::Manager;
 use tauri::State;
 
 /// 打开数据目录（资源管理器）。
 fn open_folder() {
     let dir = crate::config::config_dir();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("/usr/bin/open").arg(dir).spawn();
+    #[cfg(not(target_os = "macos"))]
     let _ = std::process::Command::new("explorer.exe").arg(dir).spawn();
 }
 
+#[cfg(not(target_os = "macos"))]
 fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("/usr/bin/open").arg(url).spawn();
+    #[cfg(not(target_os = "macos"))]
     let _ = std::process::Command::new("cmd")
         .args(["/c", "start", "", url])
         .spawn();
@@ -153,8 +162,30 @@ pub fn open_data_folder() {
 }
 
 #[tauri::command]
-pub fn open_guide() {
-    open_url("https://github.com/daha1216/ClaudeGuard/blob/master/docs/GUIDE.md");
+pub fn open_guide(app: tauri::AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(window) = app.get_webview_window("macos-guide") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        } else if let Err(error) = tauri::WebviewWindowBuilder::new(
+            &app,
+            "macos-guide",
+            tauri::WebviewUrl::App("macos-guide.html".into()),
+        )
+        .title("ClaudeGuard macOS 使用说明")
+        .inner_size(700.0, 620.0)
+        .theme(Some(tauri::Theme::Dark))
+        .build()
+        {
+            crate::guard::log_line(&format!("打开使用说明失败：{error}"));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        open_url("https://github.com/daha1216/ClaudeGuard/blob/master/docs/GUIDE.md");
+    }
 }
 
 #[tauri::command]
@@ -171,6 +202,12 @@ pub fn install_app() -> Result<String, String> {
 
 #[tauri::command]
 pub fn set_autostart(state: State<'_, Arc<AppState>>, on: bool) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    let ok = {
+        crate::macos::autostart::set_enabled(on)?;
+        true
+    };
+    #[cfg(not(target_os = "macos"))]
     let ok = crate::install::set_autostart(on);
     if ok {
         let mut cfg = state.config();
@@ -294,7 +331,14 @@ pub async fn notify_test(kind: Option<String>) -> Result<(), String> {
     // 发一条 Toast 要起 powershell，最多阻塞十几秒；扔到阻塞线程池，别冻界面。
     tauri::async_runtime::spawn_blocking(move || {
         let (title, body) = crate::notify::test_message(&kind);
-        crate::notify::send_blocking(title, &body)
+        #[cfg(target_os = "macos")]
+        {
+            crate::notify::test_blocking(title, &body)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            crate::notify::send_blocking(title, &body)
+        }
     })
     .await
     .map_err(|e| format!("测试通知执行失败：{e}"))?
