@@ -12,7 +12,8 @@
 
 <p align="center">
   <a href="https://github.com/daha1216/ClaudeGuard/releases"><img src="https://img.shields.io/github/v/release/daha1216/ClaudeGuard" alt="GitHub Release" /></a>
-  <img src="https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-blue" alt="Platform" />
+  <img src="https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-blue" alt="Windows" />
+  <img src="https://img.shields.io/badge/Platform-macOS%20(移植预览)-9aa0a6" alt="macOS preview" />
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Rust" />
   <img src="https://img.shields.io/badge/GUI-Tauri%202-brightgreen" alt="Tauri 2" />
 </p>
@@ -20,7 +21,7 @@
 ---
 
 ### 一句话定位
-ClaudeGuard 是 Windows 10/11 上的 AI 应用网络出口门禁：**按每个目标自己的域名**校验它此刻走的是哪条链路、出口 IP 与地区是否在白名单里；全部通过才允许启动 Claude 等桌面应用，任一启用目标不符合就立即熔断——结束相关进程、用防火墙隔离、必要时直接断网，切回合规节点后自动恢复。
+ClaudeGuard 是 AI 桌面应用的“网络出口门禁”（Windows 完整支持，macOS 移植预览）：**按每个目标自己的域名**校验它此刻走的是哪条链路、出口 IP 与地区是否在白名单里；全部通过才允许启动 Claude 等桌面应用，任一启用目标不符合就立即熔断——结束相关进程、用防火墙隔离、必要时直接断网，切回合规节点后自动恢复。
 
 ### 为什么需要它
 Claude、ChatGPT、反重力这些客户端对出口环境很敏感，而代理软件经常“整体一个出口”。当节点漂移、断连直连或者某个应用被单独分流时，应用会在你不知情的情况下从非预期出口联网。v3 的核心变化是把“系统出口”拆成**每个应用各测各的**：Claude 走 claude.ai 的 trace、Codex 走 chatgpt.com 的 trace、反重力测 Google 后端可达性——互不牵连，谁不对谁熔断。
@@ -97,6 +98,33 @@ Claude、ChatGPT、反重力这些客户端对出口环境很敏感，而代理�
 
 ---
 
+## macOS 版（移植预览）
+
+v3.6.0 起仓库内置 macOS 适配（社区贡献，进程守护模式，深色界面）。**暂无预编译包**，需从源码构建：
+
+```bash
+git clone https://github.com/daha1216/ClaudeGuard && cd ClaudeGuard
+cargo build --release            # 需要 Xcode Command Line Tools
+python3 scripts/package-macos.py # 产出 ClaudeGuard.app（ad-hoc 签名）
+```
+
+把 `ClaudeGuard.app` 拖入「应用程序」后首次启动，走与 Windows 相同的三步向导。
+
+**与 Windows 版的能力对照**：
+
+| 能力 | Windows | macOS（移植预览） |
+| :--- | :--- | :--- |
+| 按目标出口校验 / 白名单 / 防抖熔断 | ✅ | ✅ 同一套语义 |
+| 熔断动作 | 结束进程 + 防火墙隔离 + 断网档位 | **仅结束进程**（进程守护模式，不断网） |
+| 启动门禁（出口未过禁止启动 Claude） | ✅ | ✅ |
+| 飞书 / 桌面通知 / 客户端更新 | ✅ DPAPI / Toast / MSIX 原位升级 | ✅ Keychain+AES-GCM / 原生通知 / 官方包签名校验升级 |
+| 守护器自更新 | ✅ GitHub Releases 自替换 | 本地签名包流程已验证；远端发布需维护者 Minisign 公钥 |
+| 登录自启 | ✅ | ✅ LaunchAgent |
+
+已知边界：无系统级按应用网络隔离（两次检测之间有窗口期）；未做 Developer ID 公证；Intel 产物仅 Rosetta 验证。详见 [docs/MACOS.md](docs/MACOS.md)（使用说明）与 [docs/MACOS-VALIDATION.md](docs/MACOS-VALIDATION.md)（验证记录）。
+
+---
+
 ## 日常使用
 
 - **主界面**：状态圆环 + 状态文案 + 每个目标一行（左：名称/地区，右：出口 IP/耗时），主按钮下「立即检测」随时手动复查。底部“详情 / 设置 / 日志”展开对应卡片。
@@ -109,7 +137,7 @@ Claude、ChatGPT、反重力这些客户端对出口环境很敏感，而代理�
 ClaudeGuard.exe --check        # 单次检测，JSON 输出；退出码 0 通过 / 2 不通过
 ClaudeGuard.exe --restore      # 急救：恢复网络 + 解除全部隔离
 ClaudeGuard.exe --settings     # 打开/唤起主窗口并展开设置
-ClaudeGuard.exe --notify-test trip   # 测试桌面通知（trip/recover/launch_blocked/warning/client_update）
+ClaudeGuard.exe --notify-test trip   # 测试桌面通知（trip/recover/launch_blocked/warning/client_update/self_update）
 ClaudeGuard.exe --feishu-status --claude-update-status --codex-update-status
 ClaudeGuard.exe --install --uninstall
 ```
@@ -149,10 +177,12 @@ ClaudeGuard.exe --install --uninstall
 
 ```powershell
 cargo build --release        # 产物 target/release/claude-guard.exe
-cargo test                   # 107 个单元测试
+cargo test                   # 111 个单元测试
 cargo clippy --all-targets -- -D warnings
 node --check ui/*.js         # 纯静态前端，无 npm/构建步骤
 ```
+
+macOS：`cargo build --release && python3 scripts/package-macos.py`（详见上节）。
 
 - 技术栈：Rust + Tauri 2（WebView2，纯静态前端）、`sysinfo`（进程）、Windows 防火墙与网卡控制、`ureq`（探测）。
 - 维护者约定、模块地图与已知坑见 [AGENTS.md](AGENTS.md)；v3 行为基准见 [docs/SPEC-v3.md](docs/SPEC-v3.md)；用户指南见 [docs/GUIDE.md](docs/GUIDE.md)。
@@ -165,3 +195,5 @@ node --check ui/*.js         # 纯静态前端，无 npm/构建步骤
 - **v2.x**：重写为 Tauri 2 架构，加入多 Agent 守护、飞书通知与客户端更新。
 - **v3.x**：从零重构。按目标独立锚点校验、断网两档、桌面通知、A+ 极简仪表盘 UI、断网自愈与 `--restore` 急救。
 - **v3.1.2**：修复桌面通知在未登记过本应用的系统上不弹出（Toast AUMID 需在 `HKCU\Software\Classes\AppUserModelId` 登记）；测试通知改为后台线程发送，不再卡界面。
+- **v3.5.0**：后台每 6 小时静默检查守护器新版本并弹桌面通知（同版本只提醒一次）。
+- **v3.6.0**：合并社区 macOS 移植（进程守护模式 + 深色界面，PR #2）；Windows 端无行为变化。
