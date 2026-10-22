@@ -119,6 +119,7 @@
         rowSwitch("st-notify-blocked", "启动被拦截", "出口不合规时尝试启动 Claude", notify.launch_blocked !== false, false) +
         rowSwitch("st-notify-warning", "预警通知", "连续失败但尚未熔断时", notify.warning !== false, false) +
         rowSwitch("st-notify-client", "客户端更新", "Claude / Codex 客户端需要更新时", notify.client_update !== false, false) +
+        rowSwitch("st-notify-self", "守护器更新提醒", "发现 ClaudeGuard 新版本时", notify.self_update !== false, false) +
         '<div class="srow"><div class="slabel">发送测试通知<span class="shint">确认系统通知能正常弹出</span></div><div class="sval"><button class="btn" id="st-notify-test" type="button">' + ic("bell", 12) + '发送测试</button></div></div>') +
 
       group("feishu", "飞书通知", '<div id="feishu-group"></div>', "群机器人 Webhook") +
@@ -205,6 +206,7 @@
     chk("st-notify-blocked", n.launch_blocked !== false);
     chk("st-notify-warning", n.warning !== false);
     chk("st-notify-client", n.client_update !== false);
+    chk("st-notify-self", n.self_update !== false);
     chk("st-autostart", cfg.auto_start_with_system);
     chk("st-close-tray", cfg.close_to_tray !== false);
     syncCutButtons(cutMode(cfg));
@@ -220,7 +222,7 @@
     seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", b.dataset.mode === mode ? "true" : "false"));
   }
   function syncNotifyEnabled(on) {
-    ["st-notify-trip", "st-notify-recover", "st-notify-blocked", "st-notify-warning", "st-notify-client"].forEach((id) => {
+    ["st-notify-trip", "st-notify-recover", "st-notify-blocked", "st-notify-warning", "st-notify-client", "st-notify-self"].forEach((id) => {
       const el = $(id);
       if (el) el.disabled = !on;
     });
@@ -524,6 +526,7 @@
       "st-notify-blocked": "launch_blocked",
       "st-notify-warning": "warning",
       "st-notify-client": "client_update",
+      "st-notify-self": "self_update",
     };
     const notifyOn = $("st-notify-on");
     if (notifyOn) {

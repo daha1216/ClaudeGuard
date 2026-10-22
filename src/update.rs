@@ -276,6 +276,129 @@ pub fn spawn_check(state: &Arc<AppState>) {
     });
 }
 
+// ------------------------------------------------------------------ 静默周期检查
+
+/// 已提醒过的版本号落在 %APPDATA%\ClaudeGuard\upd-notify.json，
+/// 同一个新版本跨重启只弹一次桌面通知。
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+struct UpdNotify {
+    #[serde(default)]
+    ver: String,
+}
+
+fn upd_notify_path() -> PathBuf {
+    crate::config::config_dir().join("upd-notify.json")
+}
+
+fn notified_ver() -> String {
+    std::fs::read_to_string(upd_notify_path())
+        .ok()
+        .and_then(|text| serde_json::from_str::<UpdNotify>(&text).ok())
+        .map(|n| n.ver)
+        .unwrap_or_default()
+}
+
+fn mark_notified(ver: &str) {
+    let path = upd_notify_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string(&UpdNotify {
+        ver: ver.to_string(),
+    }) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// 发现新版本时弹一次桌面通知；`upd-notify.json` 里记过的版本不再提醒。
+/// 分类开关关闭时不标记（用户之后打开开关仍能收到这一次提醒）；
+/// 真正尝试过发送就标记，避免持续失败时每 6 小时重复打扰。
+fn notify_new_version(state: &Arc<AppState>, ver: &str) {
+    if notified_ver() == ver {
+        return;
+    }
+    let prefs = state.config().notify;
+    if !crate::notify::send(
+        &prefs,
+        "self_update",
+        "ClaudeGuard 有新版本",
+        &format!("v{ver} 已发布，打开 设置 → 更新 一键升级。"),
+    ) {
+        return;
+    }
+    state.log(format!("已发送新版本桌面通知（v{ver}）"));
+    mark_notified(ver);
+}
+
+/// 可被 stop 打断的休眠；返回 false 表示应当退出线程。
+fn sleep_stop(state: &Arc<AppState>, mut ms: u64) -> bool {
+    while ms > 0 {
+        if state.stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        let chunk = ms.min(1_000);
+        std::thread::sleep(Duration::from_millis(chunk));
+        ms -= chunk;
+    }
+    !state.stop.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 测试/调试用的延时覆盖：`CG_UPD_FIRST_DELAY_MS` / `CG_UPD_INTERVAL_MS`。
+fn env_ms(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v >= 100)
+        .unwrap_or(default)
+}
+
+/// 后台静默检查自身更新：启动 90 秒后首查，此后每 6 小时一轮。
+///
+/// 与手动「检查更新」共用 `check_latest`，但静默模式不打 `Checking` 状态、
+/// 失败不写 `Failed`（只记日志，下一轮重试），避免界面无端闪烁。
+/// 发现新版本时写入 `Available` 状态并弹一次桌面通知（同版本跨重启只提醒一次）。
+pub fn spawn_periodic_check(state: &Arc<AppState>) {
+    let state = Arc::clone(state);
+    std::thread::spawn(move || {
+        let first_ms = env_ms("CG_UPD_FIRST_DELAY_MS", 90_000);
+        let interval_ms = env_ms("CG_UPD_INTERVAL_MS", 6 * 3_600_000);
+        let mut first = true;
+        loop {
+            let wait = if first { first_ms } else { interval_ms };
+            if !sleep_stop(&state, wait) {
+                return;
+            }
+            first = false;
+            if !state.config().auto_upd_check {
+                continue;
+            }
+            match check_latest(&state.config()) {
+                Ok(release) => {
+                    let ver = release.version().to_string();
+                    if !is_newer(&ver, current_version()) {
+                        state.set_upd(UpdState::UpToDate);
+                        state.log(format!("静默检查：已是最新版本 v{ver}"));
+                        state.emit_state();
+                    } else if let Some(asset) = release.exe_asset() {
+                        state.set_upd(UpdState::Available {
+                            ver: ver.clone(),
+                            url: asset.browser_download_url.clone(),
+                            size: asset.size,
+                        });
+                        state.log(format!("发现新版本 v{ver}"));
+                        state.emit_state();
+                        notify_new_version(&state, &ver);
+                    }
+                    // 有新版本但发布页没有裸 exe 资产：静默跳过，手动检查会给出原因
+                }
+                Err(err) => {
+                    state.log(format!("静默检查更新失败（下一轮重试）：{err}"));
+                }
+            }
+        }
+    });
+}
+
 /// 后台下载并自替换重启；下载进度写入 `AppState::upd`。
 pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
     let state = Arc::clone(state);
@@ -326,6 +449,32 @@ pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upd_notify_roundtrip() {
+        let n = UpdNotify {
+            ver: "3.5.0".into(),
+        };
+        let json = serde_json::to_string(&n).unwrap();
+        assert_eq!(
+            serde_json::from_str::<UpdNotify>(&json).unwrap().ver,
+            "3.5.0"
+        );
+        // 旧/空文件: 缺字段回退空串, 不 panic
+        assert_eq!(
+            serde_json::from_str::<UpdNotify>("{}").unwrap().ver,
+            String::new()
+        );
+        // 同版本不再提醒; 新版本要提醒
+        assert!(!should_notify("3.5.0", "3.5.0"));
+        assert!(should_notify("", "3.5.0"));
+        assert!(should_notify("3.4.0", "3.5.0"));
+    }
+
+    /// 纯逻辑: 已提醒版本与最新版本比较决定是否再次提醒。
+    fn should_notify(stored: &str, ver: &str) -> bool {
+        stored != ver
+    }
 
     #[test]
     fn version_compare() {

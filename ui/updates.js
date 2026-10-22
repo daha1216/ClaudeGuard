@@ -79,6 +79,9 @@
 
   function buildUpd(host) {
     host.innerHTML =
+      '<div class="srow"><div class="slabel">自动检查更新<span class="shint">每 6 小时后台静默检查，发现新版本弹通知</span></div>' +
+      '<div class="sval"><label class="switch"><input type="checkbox" id="st-auto-upd" aria-label="自动检查更新">' +
+      '<span class="switch-track"><span class="switch-knob"></span></span></label></div></div>' +
       '<div class="srow"><div class="slabel">当前版本<span class="shint" id="upd-cur"></span></div>' +
       '<div class="sval"><button class="btn" type="button" id="upd-btn">检查更新</button></div></div>' +
       '<div class="srow col"><div class="slabel">更新状态</div>' +
@@ -86,6 +89,20 @@
       '<div class="progress" id="upd-progress" hidden><i id="upd-bar"></i></div></div>';
     const btn = $("upd-btn");
     if (btn) btn.addEventListener("click", onUpdAction);
+    const sw = $("st-auto-upd");
+    if (sw) {
+      invoke(CMD.get_config)
+        .then((cfg) => { if (sw) sw.checked = !(cfg && cfg.auto_upd_check === false); })
+        .catch(() => {});
+      sw.addEventListener("change", async () => {
+        try {
+          await invoke(CMD.update_settings, { patch: { auto_upd_check: !!sw.checked } });
+          toast("已保存", true);
+        } catch (e) {
+          toast((e && e.message) || "保存失败");
+        }
+      });
+    }
   }
 
   function updKind(u) {

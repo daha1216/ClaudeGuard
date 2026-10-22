@@ -202,6 +202,7 @@ fn run_gui(start_hidden: bool, want_settings: bool) {
                 crate::claude_update::Updater::start(&state, Product::Claude);
                 crate::claude_update::Updater::start(&state, Product::Codex);
                 monitor::spawn(state.clone());
+                crate::update::spawn_periodic_check(&state);
             }
 
             let height = window_height(&handle);

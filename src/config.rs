@@ -51,6 +51,8 @@ pub struct NotifyPrefs {
     pub warning: bool,
     #[serde(default = "default_true")]
     pub client_update: bool,
+    #[serde(default = "default_true")]
+    pub self_update: bool,
 }
 
 impl Default for NotifyPrefs {
@@ -62,6 +64,7 @@ impl Default for NotifyPrefs {
             launch_blocked: true,
             warning: true,
             client_update: true,
+            self_update: true,
         }
     }
 }
@@ -77,6 +80,7 @@ impl NotifyPrefs {
             "launch_blocked" => self.launch_blocked,
             "warning" => self.warning,
             "client_update" => self.client_update,
+            "self_update" => self.self_update,
             _ => true,
         }
     }
@@ -117,6 +121,9 @@ pub struct Config {
     pub auto_start_with_system: bool,
     #[serde(default)]
     pub notify: NotifyPrefs,
+    /// 后台每 6 小时静默检查 ClaudeGuard 自身新版本
+    #[serde(default = "default_true")]
+    pub auto_upd_check: bool,
     #[serde(default = "default_true")]
     pub first_run: bool,
 
@@ -154,6 +161,7 @@ impl Default for Config {
             close_to_tray: true,
             auto_start_with_system: false,
             notify: NotifyPrefs::default(),
+            auto_upd_check: true,
             first_run: true,
             allowed_ips: Vec::new(),
             egress_region: String::new(),

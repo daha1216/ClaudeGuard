@@ -169,6 +169,10 @@ pub fn test_message(kind: &str) -> (&'static str, String) {
             "Claude 有新版本",
             "客户端更新已就绪，打开主窗口即可安装。".to_string(),
         ),
+        "self_update" => (
+            "ClaudeGuard 有新版本",
+            "v3.5.0 已发布，打开 设置 → 更新 一键升级。".to_string(),
+        ),
         _ => (
             "ClaudeGuard 已熔断",
             "出口不符合白名单，已结束相关应用并切断网络。".to_string(),

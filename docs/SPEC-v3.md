@@ -20,7 +20,7 @@
 - **整体状态**：`idle|checking|pass|fail|tripped|paused`。
 - **熔断 TripInfo**：`since,reason,failing_ids,killed,firewall_rules,network_cut(off|firewall|nics),quarantined_agents,agents`。
 - **配置 Config**（`config.json`，snake_case）：
-  `version=3, proxy_host, proxy_port, targets[], check_interval_secs(默认15,5..3600), trip_threshold(默认2,1..5), cut_network(默认true), disable_network_adapters(默认false), kill_on_fail(默认true), quarantine_on_fail(默认true), guarded_agents(默认["claude"]), cli_warn(默认true), sweep_on_exit(默认true), close_to_tray(默认true), auto_start_with_system(默认false), notify{enabled,trip,recover,launch_blocked,warning,client_update}(默认全true), first_run(默认true)`。
+  `version=3, proxy_host, proxy_port, targets[], check_interval_secs(默认15,5..3600), trip_threshold(默认2,1..5), cut_network(默认true), disable_network_adapters(默认false), kill_on_fail(默认true), quarantine_on_fail(默认true), guarded_agents(默认["claude"]), cli_warn(默认true), sweep_on_exit(默认true), close_to_tray(默认true), auto_start_with_system(默认false), notify{enabled,trip,recover,launch_blocked,warning,client_update,self_update}(默认全true), auto_upd_check(默认true), first_run(默认true)`。
 - **Target**：`id, name, builtin, enabled, anchor_url, anchor_kind, expect_ips[], expect_regions[], timeout_secs(默认12,3..60), bind_agent: Option<String>`。
 
 **内置目标（4 个，`builtin=true`，可禁用不可删除）**：
@@ -96,7 +96,7 @@ Claude 进程清理引擎（v3.2）：`ProcInfo` 快照 + 纯函数判定（`cla
 
 ## 6. 桌面通知（`src/notify.rs`，powershell.exe + WinRT Toast，无第三方 crate）
 
-五类（均受 `notify.*` 开关与总开关控制；发送失败只写日志不 panic；发送在后台线程，最多阻塞 15 秒）：
+六类（均受 `notify.*` 开关与总开关控制；发送失败只写日志不 panic；发送在后台线程，最多阻塞 15 秒）：
 
 **身份登记（必须）**：`CreateToastNotifier('ClaudeGuard')` 要求该 AUMID 已在
 `HKCU\Software\Classes\AppUserModelId\ClaudeGuard` 登记（DisplayName / IconUri = 当前 exe）。
@@ -107,6 +107,9 @@ Claude 进程清理引擎（v3.2）：`ProcInfo` 快照 + 纯函数判定（`cla
 3. `launch_blocked`："ClaudeGuard 已阻止启动" / reason。
 4. `warning`："ClaudeGuard 检查未通过" / "第 {n} 次连续失败，再失败一次将熔断。"
 5. `client_update`：来自客户端更新模块（"Claude 有新版本 {ver}" / "ChatGPT 更新已安装"）。
+6. `self_update`："ClaudeGuard 有新版本" / "v{ver} 已发布，打开 设置 → 更新 一键升级。"（由 `update::spawn_periodic_check` 静默检查触发；同一版本跨重启只提醒一次，去重记录 `%APPDATA%\ClaudeGuard\upd-notify.json`。）
+
+**自身更新静默检查**：`update::spawn_periodic_check`（GUI 启动即开，`auto_upd_check` 配置门控）——启动 90 秒后首查、每 6 小时一轮，与手动检查共用 `check_latest`；静默模式不打 `Checking` 状态、失败不写 `Failed` 只记日志；发现新版本写 `Available` 并弹 `self_update` 通知。调试用 `CG_UPD_FIRST_DELAY_MS` / `CG_UPD_INTERVAL_MS` 覆盖周期（最小 100ms）。
 
 飞书（移植 `feishu.rs`）：trip / recover 事件照发；队列、签名、DPAPI 凭据、去重、手动补发语义不变。
 
