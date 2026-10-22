@@ -1,4 +1,4 @@
-﻿# AGENTS.md — ClaudeGuard v3 维护者守则（人类与 AI 通用）
+# AGENTS.md — ClaudeGuard v3 维护者守则（人类与 AI 通用）
 
 > 本文件是所有维护者（包括 AI agent）的约定与经验记录。改代码前先读完；不确定就按本文件保守执行。
 >
@@ -35,7 +35,8 @@ Windows 桌面守护器：按监控目标分别校验本地代理出口（IP / �
 | `src/claude_update.rs` | Claude/Codex 桌面客户端 MSIX 检查、下载校验、原位升级状态机（内嵌 `src/claude_package.ps1`） | 改更新流程 | 绕过签名/包身份校验，或加卸载/重置等破坏性回退 |
 | `src/update.rs` | ClaudeGuard 自身 GitHub Releases 检查/下载/自替换 | 改更新 | 改资产命名规则（见下） |
 | `src/install.rs` | 安装/卸载/自启/快捷方式 | 改安装逻辑 | 写死用户路径；卸载不恢复网络 |
-| `ui/` | 纯静态前端（index.html/app.css + ipc/icons/main/settings/updates/feishu.js，无构建步骤） | 改前端（先读 SPEC §8） | 引入 npm/框架/构建步骤 |
+| `src/macos/`（cfg(target_os="macos")） | macOS 移植预览：`guard/netcut/notify/install/autostart/credentials(Keychain+AES-GCM)/claude_update/self_update(Minisign)/package/ui_acceptance/monitor_acceptance`；`main.rs` 用 `#[cfg_attr(path)]` 挂接同名模块 | 改 macOS 行为（先读 docs/MACOS.md） | 在 Windows 分支引 macOS 依赖语义 |
+| `ui/` | 纯静态前端（index.html/app.css + ipc/icons/main/settings/updates/feishu.js，无构建步骤；macos.css/macos-guide.html 仅 macOS 外观） | 改前端（先读 SPEC §8） | 引入 npm/框架/构建步骤 |
 
 ## 判定与熔断的不变量（改任何判定相关代码前必看）
 
@@ -144,3 +145,15 @@ node --check ui/*.js           # 逐个检查，跨文件词法冲突查不出�
 19. **本机出口（local）目标默认关闭**：本机常规流量出口通常与 AI 代理出口不是同一个 IP，默认开启会在
     首次启动/升级后立即熔断。`targets::default_targets` 里 local 的 `enabled:false` 是产品语义（用户可在
     设置里开启并补齐白名单），不要"修"成 true。
+20. **macOS 移植（PR #2）后 Windows 门禁要去掉 `--offline` 首跑**：`Cargo.toml` 的 macOS 目标依赖
+    （aes-gcm/minisign/security-framework 等）不在 Windows 本机 cargo 缓存里，`cargo --offline` 直接
+    resolve 失败（`no matching package named aes-gcm`）。在线 `cargo fetch`/`clippy` 一次后缓存齐了，
+    之后 `--offline` 照常可用（Windows 只 resolve 不编译这些 crate）。
+21. **StateView 新增 `platform`/`networkIsolationSupported` 字段**（PR #2）：前端按
+    `document.body.dataset.platform` 分支，macOS 外观全部 scoped 在 `body[data-platform="macos"]`
+    （ui/macos.css），Windows 不受影响。macOS 是进程守护模式：不防火墙隔离、不断网，`cut_mode` 在
+    StateView/do_trip 里被钳制为 Off；`launch()` 语义收紧为 tripped 状态一律拒绝启动（有单测锁）。
+    macOS 细节见 `docs/MACOS.md` 与 `docs/MACOS-VALIDATION.md`。
+22. **single-instance 行为（PR #2 后）**：二次启动带 `--tray` 参数不再强制弹主窗（登录自启场景）；
+    `--settings` 仍会唤起。CDP 页面 URL 现在是 `http://tauri.localhost/`（不再含 "index.html"），
+    匹配页面时用 `tauri.localhost` 过滤。

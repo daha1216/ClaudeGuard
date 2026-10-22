@@ -131,6 +131,7 @@ src/feishu.rs      飞书通知（移植）
 src/update.rs      自身更新（移植）
 src/claude_update.rs Claude/Codex 客户端更新（移植，含 src/claude_package.ps1）
 src/install.rs     安装/自启（移植）
+src/macos/         macOS 移植预览（PR #2，cfg(target_os="macos")；进程守护模式，不防火墙/不断网）——详见 docs/MACOS.md
 src/ipc.rs         #[tauri::command]
 ui/index.html|app.css|main.js|ipc.js|icons.js|settings.js|updates.js|feishu.js
 ```

@@ -1,4 +1,4 @@
-> **macOS 移植预览**：本分支增加 macOS 平台适配与深色界面。本版不提供系统级按应用网络隔离；客户端升级、回滚与本地自更新已验证，正式远端自更新仍需维护者公钥和 macOS 发布资产。详情与测试方式见 [macOS 说明](docs/MACOS.md)。原 Windows 文档保留如下。
+> **macOS 移植预览**：仓库现含 macOS 平台适配与深色界面（进程守护模式）。本版不提供系统级按应用网络隔离；客户端升级、回滚与本地自更新已验证，正式远端自更新仍需维护者公钥和 macOS 发布资产。详情与测试方式见 [macOS 说明](docs/MACOS.md)。Windows 版文档如下。
 
 <p align="center">
   <img src="assets/icon.png" alt="ClaudeGuard Logo" width="128" height="128" />
