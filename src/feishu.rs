@@ -154,12 +154,14 @@ fn validate_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct Blob {
     len: u32,
     data: *mut u8,
 }
 
+#[cfg(windows)]
 #[link(name = "crypt32")]
 extern "system" {
     fn CryptProtectData(
@@ -181,11 +183,13 @@ extern "system" {
         output: *mut Blob,
     ) -> i32;
 }
+#[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
     fn LocalFree(memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 }
 
+#[cfg(windows)]
 fn crypt(bytes: &[u8], decrypt: bool) -> Result<Vec<u8>, String> {
     if bytes.len() > 65_536 {
         return Err("凭据长度无效".into());
@@ -232,6 +236,11 @@ fn crypt(bytes: &[u8], decrypt: bool) -> Result<Vec<u8>, String> {
         LocalFree(output.data.cast());
         Ok(result)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn crypt(bytes: &[u8], decrypt: bool) -> Result<Vec<u8>, String> {
+    crate::macos::credentials::crypt(bytes, decrypt)
 }
 
 fn encrypt(text: &str) -> Result<String, String> {
@@ -692,6 +701,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg(windows)]
     fn dpapi_roundtrip() {
         let encoded = encrypt("test-only-中文").unwrap();
         assert!(!encoded.contains("test-only"));

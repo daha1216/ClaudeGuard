@@ -12,6 +12,10 @@ hmac = "0.12"
 sha2 = "0.10"
 ureq = "2"
 sysinfo = "0.30"
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
+
+[target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 windows = { version = "0.58", features = [
     "Win32_NetworkManagement_IpHelper",
@@ -19,8 +23,23 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_HiDpi",
 ] }
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
-tauri-plugin-single-instance = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSRunningApplication"] }
+aes-gcm = "0.10"
+plist = "1"
+libc = "0.2"
+libloading = "0.8"
+tempfile = "3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = { version = "0.38", features = ["serialize"] }
+url = "2"
+minisign-verify = "0.3"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+minisign = "0.10"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

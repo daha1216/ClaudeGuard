@@ -22,6 +22,7 @@
   const BUSY_PHASES = new Set(["checking", "downloading", "verifying", "installing"]);
 
   const PHASE_TEXT = {
+    unsupported: "macOS 自动更新尚未实现",
     idle: "尚未检查",
     checking: "正在检查和验证…",
     available: "发现新版本，自动更新尚未执行",
@@ -233,7 +234,7 @@
     const finishRow = $(prefix + "-finish-row");
     const sw = $(prefix + "-enabled");
     const check = $(prefix + "-check");
-    const busyNow = BUSY_PHASES.has(phase);
+    const busyNow = BUSY_PHASES.has(phase) || phase === "unsupported";
 
     if (sw && sw.checked !== enabled) sw.checked = enabled;
     if (sw) sw.disabled = busyNow;

@@ -273,7 +273,11 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
 }
 
 fn do_trip(state: &Arc<AppState>, cfg: &Config, failing_ids: &[String], reason: &str) {
-    let mode = cfg.cut_mode();
+    let mode = if cfg!(target_os = "macos") {
+        CutMode::Off
+    } else {
+        cfg.cut_mode()
+    };
     state.log(format!("触发熔断：{reason}；断网档位 {}", mode.label()));
     let trip = crate::guard::trip(cfg, reason);
     let (cut_ok, cut_note) = crate::netcut::cut(mode);
@@ -292,8 +296,15 @@ fn do_trip(state: &Arc<AppState>, cfg: &Config, failing_ids: &[String], reason: 
             Vec::new()
         },
         agents: trip.agents.clone(),
-        network_cut: mode,
-        network_note: if cut_ok {
+        network_cut: if cfg!(target_os = "macos") && !cut_ok {
+            CutMode::Off
+        } else {
+            mode
+        },
+        network_note: if cfg!(target_os = "macos") {
+            "进程守护模式：已执行配置的进程关闭操作；出口未通过时禁止从守护器启动，网络保持连接"
+                .into()
+        } else if cut_ok {
             String::new()
         } else {
             cut_note.clone()
@@ -307,14 +318,22 @@ fn do_trip(state: &Arc<AppState>, cfg: &Config, failing_ids: &[String], reason: 
         trip.firewall_rules,
         if cut_ok { mode.label() } else { "执行失败" }
     ));
-    let body = format!("{reason}，已结束相关应用并切断网络。修正后自动恢复。");
+    let body = if cfg!(target_os = "macos") {
+        format!("{reason}，已执行配置的进程关闭操作；出口未通过时禁止从守护器启动。")
+    } else {
+        format!("{reason}，已结束相关应用并切断网络。修正后自动恢复。")
+    };
     state.notify("trip", "ClaudeGuard 已熔断", &body);
     state.feishu.observe(
         false,
         &format!("{reason}（{cut_note}）"),
         None,
         true,
-        "已熔断隔离",
+        if cfg!(target_os = "macos") {
+            "已熔断，禁止守护器启动"
+        } else {
+            "已熔断隔离"
+        },
     );
 }
 
@@ -335,7 +354,11 @@ fn do_recover(state: &Arc<AppState>, _cfg: &Config, ip: Option<&str>) {
     state.notify(
         "recover",
         "ClaudeGuard 已恢复",
-        "出口检查通过，已解除隔离并恢复网络。",
+        if cfg!(target_os = "macos") {
+            "出口检查通过，已恢复启动许可；应用需手动启动。"
+        } else {
+            "出口检查通过，已解除隔离并恢复网络。"
+        },
     );
     state
         .feishu
@@ -350,24 +373,30 @@ pub fn recheck(state: &Arc<AppState>) {
     });
 }
 
+fn launch_permission(summary: &RoundSummary, tripped: bool) -> Result<(), String> {
+    if !summary.passed {
+        return Err(if summary.block_reason.is_empty() {
+            "出口检查未通过".into()
+        } else {
+            summary.block_reason.clone()
+        });
+    }
+    if tripped {
+        return Err("熔断状态尚未解除".into());
+    }
+    Ok(())
+}
+
 /// 启动门禁：必须所有启用目标通过才放行 Claude。
 pub fn launch(state: &Arc<AppState>) -> Result<(), String> {
     let cfg = state.config();
     let summary = run_round(state, Purpose::Launch);
-    if !summary.passed {
-        let reason = if summary.block_reason.is_empty() {
-            "出口检查未通过".to_string()
-        } else {
-            summary.block_reason.clone()
-        };
+    if let Err(reason) = launch_permission(&summary, state.is_tripped()) {
         state.set_launch_error(reason.clone());
         state.log(format!("阻止启动：{reason}"));
         state.notify("launch_blocked", "ClaudeGuard 已阻止启动", &reason);
         state.emit_state();
         return Err(reason);
-    }
-    if !cfg.kill_on_fail && state.is_tripped() {
-        return Err("熔断状态尚未解除".into());
     }
     let app_id = crate::guard::resolve_app_id(CLAUDE_APP_ID_FALLBACK);
     match crate::guard::launch_claude(&app_id) {
@@ -427,7 +456,11 @@ pub fn release(state: &Arc<AppState>) {
     state.notify(
         "recover",
         "ClaudeGuard 已恢复",
-        "已手动解除隔离并恢复网络。",
+        if cfg!(target_os = "macos") {
+            "已清除熔断状态；启动前仍需出口检测通过。"
+        } else {
+            "已手动解除隔离并恢复网络。"
+        },
     );
     state.emit_state();
 }
@@ -513,6 +546,22 @@ fn spawn_sweeper(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_denies_failed_unverified_empty_and_unreleased_trip() {
+        for reason in ["出口不在白名单", "部分目标无法确认，暂不允许启动", ""]
+        {
+            let summary = RoundSummary {
+                passed: false,
+                block_reason: reason.into(),
+                failing: vec![],
+            };
+            assert!(launch_permission(&summary, false).is_err());
+            assert!(launch_permission(&summary, true).is_err());
+        }
+        assert!(launch_permission(&RoundSummary::ok(), true).is_err());
+        assert!(launch_permission(&RoundSummary::ok(), false).is_ok());
+    }
 
     #[test]
     fn summary_blocks_when_failing() {

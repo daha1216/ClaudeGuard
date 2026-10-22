@@ -26,6 +26,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StateView {
+    pub platform: &'static str,
+    pub network_isolation_supported: bool,
     pub checking: bool,
     pub checked_at: Option<u64>,
     pub interval_secs: u64,
@@ -283,6 +285,8 @@ impl AppState {
         let statuses = self.statuses();
         let (agents_running, cli_running) = agent_usage();
         StateView {
+            platform: std::env::consts::OS,
+            network_isolation_supported: cfg!(windows),
             checking: self.is_checking(),
             checked_at: self.last_check(),
             interval_secs: cfg.interval_secs(),
@@ -303,7 +307,11 @@ impl AppState {
             launch_error: self.launch_error(),
             smoke_settings: self.smoke_settings,
             notify_enabled: cfg.notify.enabled,
-            cut_mode: cfg.cut_mode(),
+            cut_mode: if cfg!(target_os = "macos") {
+                CutMode::Off
+            } else {
+                cfg.cut_mode()
+            },
             guarded_agents: cfg.guarded_agents.clone(),
         }
     }

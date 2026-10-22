@@ -56,7 +56,7 @@
       '<div class="sval"><button class="btn" type="button" id="fs-retry">补发</button></div></div>' +
       '<div class="upd-status" id="fs-status" aria-live="polite">尚未启用</div>' +
       '<div class="formhint" id="fs-meta"></div>' +
-      '<div class="formhint">凭据由 Windows 当前账户加密保存；通知随守护器通过直连 HTTPS 发送；断网时会有限次重试。机器人若设置了关键词，请使用 ClaudeGuard。</div>';
+      '<div class="formhint">' + (CG.platform === 'macos' ? '凭据经 AES-GCM 加密保存，密钥存放于 macOS 登录钥匙串。' : '凭据由 Windows 当前账户加密保存。') + '通知随守护器通过直连 HTTPS 发送；断网时会有限次重试。机器人若设置了关键词，请使用 ClaudeGuard。</div>';
 
     $("fs-save").addEventListener("click", onSave);
     $("fs-test").addEventListener("click", onTest);

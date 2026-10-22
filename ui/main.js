@@ -327,14 +327,17 @@
     const st = S.state;
     if (!st) { host.innerHTML = ""; return; }
     const parts = [];
+    if (st.platform === "macos" && !st.networkIsolationSupported) {
+      parts.push(banner("warn", ["macOS 移植预览 · 进程守护模式", "出口异常达到阈值后关闭勾选应用，检测未通过时禁止从守护器启动 Claude。请开启「结束守护对象进程」；此模式不阻断网络连接。"]));
+    }
     const overall = st.overall || "idle";
     const trip = st.tripped;
     if (overall === "tripped" && trip) {
       const fails = (st.targets || []).filter((t) => t.state === "fail");
       const failIp = fails.map((t) => t.ip).find(Boolean);
       const line1 = failIp ? "出口 " + failIp + " 不在允许列表" : trip.reason || "出口不符合允许列表";
-      const line2 = trip.networkNote || "网络已阻断，修正配置后可解除";
-      parts.push(banner("trip", [line1, line2], { id: "release", label: "解除隔离" }));
+      const line2 = trip.networkNote || (st.platform === "macos" ? "进程守护模式：出口检测通过后才允许从守护器启动" : "网络已阻断，修正配置后可解除");
+      parts.push(banner("trip", [line1, line2], { id: "release", label: st.platform === "macos" ? "清除熔断" : "解除隔离" }));
     } else if (overall === "paused") {
       const left = minutesLeft(st.pausedUntil);
       const text = left > 0 ? "已暂停 " + left + " 分钟，期间不会熔断" : "守护已暂停，可随时恢复";
@@ -385,7 +388,7 @@
       label = "启动已禁止";
       icons = icon("ban", 16);
       blocked = true;
-      actLabel = "解除隔离并恢复网络";
+      actLabel = st.platform === "macos" ? "清除熔断状态（启动仍需检测）" : "解除隔离并恢复网络";
       actRole = "release";
       actDanger = true;
       actDisabled = S.releaseBusy;
@@ -577,6 +580,23 @@
 
   function applyState(st) {
     if (!st || typeof st !== "object") return;
+    root.CG_UI.platform = st.platform;
+    document.body.dataset.platform = st.platform || "";
+    if (st.platform === "macos") {
+      const cta = document.querySelector(".cta");
+      const footer = document.querySelector(".footer");
+      if (cta && footer && cta.parentElement !== footer) footer.insertBefore(cta, footer.querySelector(".foot-right"));
+      const intro = document.querySelector('.wiz-page[data-step="0"] .wiz-p');
+      if (intro) intro.textContent = "它在后台按目标校验出口 IP 与地区，异常时按配置结束进程。此移植预览尚不能阻断应用网络连接。";
+    }
+    if (st.platform === "macos") {
+      const page = document.querySelector('.wiz-page[data-step="2"]');
+      if (page) {
+        page.querySelector(".wiz-p").textContent = "安装到用户 Applications 文件夹；登录自启可在设置中开启。";
+        document.querySelector("#wiz-install span").textContent = "复制完整 .app 到 ~/Applications，不覆盖已有应用。";
+        document.querySelector("#wiz-portable span").textContent = "在当前位置运行，不安装、不更改登录项。";
+      }
+    }
     const view = stableView(st);
     S.state = view;
     const overall = view.overall || "idle";
@@ -919,7 +939,7 @@
     void renderLogs;
   }
 
-  root.CG_UI = {
+  root.CG_UI = Object.assign(root.CG_UI || {}, {
     expand,
     openSettings: () => expand("settings"),
     openDetails: () => expand("details"),
@@ -929,7 +949,7 @@
     getConfig: () => S.cfg,
     refresh: async () => { await refreshConfig(); await refreshState(); },
     applyState,
-  };
+  });
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
   else init();
