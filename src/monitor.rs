@@ -250,7 +250,10 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     } else if state.is_tripped() {
         if !failing.is_empty() {
             if cfg.kill_on_fail {
-                let killed = crate::guard::kill_agents(&cfg);
+                let mut killed = crate::guard::kill_agents(&cfg);
+                if cfg.guarded_agents.iter().any(|id| id == "claude") {
+                    killed += crate::guard::kill_claude_cli();
+                }
                 if killed > 0 {
                     state.log(format!("持续异常：再次结束 {killed} 个进程"));
                 }
@@ -298,8 +301,9 @@ fn do_trip(state: &Arc<AppState>, cfg: &Config, failing_ids: &[String], reason: 
     };
     state.set_tripped(Some(info));
     state.log(format!(
-        "熔断完成：结束 {} 个进程，防火墙隔离 {} 条，断网 {}",
+        "熔断完成：结束 {} 个进程（其中 CLI {}），防火墙隔离 {} 条，断网 {}",
         trip.killed,
+        trip.cli_killed,
         trip.firewall_rules,
         if cut_ok { mode.label() } else { "执行失败" }
     ));
@@ -430,6 +434,7 @@ pub fn release(state: &Arc<AppState>) {
 
 /// 后台监控线程：启动 1 秒后首轮，之后按配置间隔轮询。
 pub fn spawn(state: Arc<AppState>) {
+    spawn_sweeper(Arc::clone(&state));
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(1));
         let mut last_run = 0u64;
@@ -444,6 +449,63 @@ pub fn spawn(state: Arc<AppState>) {
                 run_round(&state, Purpose::Monitor);
             }
             std::thread::sleep(Duration::from_millis(300));
+        }
+    });
+}
+
+/// 残留清理线程（v3.2）：盯 Claude 桌面端是否退出；退出并度过宽限期后清掉残留进程
+/// （桌面家族 + 孤儿 CLI）。暂停守护 / 未守护 claude / 配置关闭时不动作。
+fn spawn_sweeper(state: Arc<AppState>) {
+    std::thread::spawn(move || {
+        const TICK_MS: u64 = 2000;
+        const GRACE_SECS: u64 = 4;
+        let mut desktop_seen = false;
+        let mut gone_at: Option<u64> = None;
+        loop {
+            if state.stop.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(TICK_MS));
+            let cfg = state.config();
+            let active = cfg.sweep_on_exit
+                && cfg.guarded_agents.iter().any(|a| a == "claude")
+                && !state.is_paused();
+            if !active {
+                desktop_seen = false;
+                gone_at = None;
+                continue;
+            }
+            let claude_dir_l =
+                crate::guard::find_claude_dir().map(|d| d.to_string_lossy().to_lowercase());
+            let procs = crate::guard::snapshot_processes();
+            let desktop_now = procs.iter().any(|p| {
+                crate::guard::classify_claude(p, claude_dir_l.as_deref())
+                    == Some(crate::guard::ClaudeKind::Desktop)
+            });
+            if desktop_now {
+                desktop_seen = true;
+                gone_at = None;
+                continue;
+            }
+            if !desktop_seen {
+                gone_at = None;
+                continue;
+            }
+            // 下降沿：桌面端刚消失。宽限几秒复查（自动更新/快速重启会自己回来），过后清残留。
+            let ts = now();
+            let gone = *gone_at.get_or_insert(ts);
+            if ts.saturating_sub(gone) < GRACE_SECS {
+                continue;
+            }
+            let report = crate::guard::sweep_claude(crate::guard::SweepMode::Residual);
+            if report.killed > 0 {
+                state.log(format!(
+                    "清理残留：Claude 退出后结束 {} 个进程（桌面 {} / CLI {}）",
+                    report.killed, report.desktop_killed, report.cli_killed
+                ));
+            }
+            desktop_seen = false;
+            gone_at = None;
         }
     });
 }

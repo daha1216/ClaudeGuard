@@ -20,7 +20,7 @@
 - **整体状态**：`idle|checking|pass|fail|tripped|paused`。
 - **熔断 TripInfo**：`since,reason,failing_ids,killed,firewall_rules,network_cut(off|firewall|nics),quarantined_agents,agents`。
 - **配置 Config**（`config.json`，snake_case）：
-  `version=3, proxy_host, proxy_port, targets[], check_interval_secs(默认15,5..3600), trip_threshold(默认2,1..5), cut_network(默认true), disable_network_adapters(默认false), kill_on_fail(默认true), quarantine_on_fail(默认true), guarded_agents(默认["claude"]), cli_warn(默认true), close_to_tray(默认true), auto_start_with_system(默认false), notify{enabled,trip,recover,launch_blocked,warning,client_update}(默认全true), first_run(默认true)`。
+  `version=3, proxy_host, proxy_port, targets[], check_interval_secs(默认15,5..3600), trip_threshold(默认2,1..5), cut_network(默认true), disable_network_adapters(默认false), kill_on_fail(默认true), quarantine_on_fail(默认true), guarded_agents(默认["claude"]), cli_warn(默认true), sweep_on_exit(默认true), close_to_tray(默认true), auto_start_with_system(默认false), notify{enabled,trip,recover,launch_blocked,warning,client_update}(默认全true), first_run(默认true)`。
 - **Target**：`id, name, builtin, enabled, anchor_url, anchor_kind, expect_ips[], expect_regions[], timeout_secs(默认12,3..60), bind_agent: Option<String>`。
 
 **内置目标（4 个，`builtin=true`，可禁用不可删除）**：
@@ -78,7 +78,11 @@
 
 ## 5. 熔断执行与断网（`src/guard.rs`、`src/netcut.rs`）
 
-`guard.rs`（移植 v2 语义）：GUI agents = claude / chatgpt / antigravity（fingerprint 不变）；CLI agents = claude-code / codex / gemini（只提醒不杀）；`trip()` 结束进程 + 按 agent 加防火墙（claude 沿用旧规则名 `ClaudeGuard Block Out/In`，其他带 agent 后缀）；`log_line` 写 `%APPDATA%\ClaudeGuard\guard.log`（>1MB 原子裁剪保留约 400KB，行边界）；`version_key`、`find_windowsapps_dir`、`find_claude_dir`、`find_chatgpt_dir`、`resolve_app_id`、`launch_claude`、`is_admin`、`firewall_dedupe`。
+`guard.rs`（移植 v2 语义）：GUI agents = claude / chatgpt / antigravity（fingerprint 不变；claude 指纹排除 CLI 原生二进制路径 `\claude\claude-code\` 与 `\.local\bin\claude`）；CLI agents = claude-code（指纹含 npm js、`\.local\bin\claude`、新安装布局 `%APPDATA%\Claude\claude-code\<ver>\<hash>\claude.exe`）/ codex / gemini。v3.2 起 Claude 是守护对象时熔断连 Claude Code CLI 一并结束（codex/gemini 仍只提醒）；`trip()` 结束进程 + 按 agent 加防火墙（claude 沿用旧规则名 `ClaudeGuard Block Out/In`，其他带 agent 后缀）。
+
+Claude 进程清理引擎（v3.2）：`ProcInfo` 快照 + 纯函数判定（`classify_claude` 桌面/CLI 二分、`pick_manual` 全量、`pick_residual` 残留=桌面家族全部 + 孤儿 CLI【父进程已死】，桌面端仍在运行时返回 None 不清理）；`sweep_claude(mode)` 三态 Manual（一键全清）/ CliOnly（熔断路径）/ Residual（退出后清理）返回 `SweepReport{scanned,killed,desktopKilled,cliKilled,detail[],note}`。残留监视线程（`monitor.rs::spawn_sweeper`）：2 秒一拍盯桌面端在否，消失后宽限 4 秒复查（自动更新/快速重启自救）再清残留；`sweep_on_exit=false`、未守护 claude、暂停守护时不动作。
+
+`log_line` 写 `%APPDATA%\ClaudeGuard\guard.log`（>1MB 原子裁剪保留约 400KB，行边界）；`version_key`、`find_windowsapps_dir`、`find_claude_dir`、`find_chatgpt_dir`、`resolve_app_id`、`launch_claude`、`is_admin`、`firewall_dedupe`。
 
 `netcut.rs`（新增）：
 - 档位：`off`（cut_network=false）/`firewall`（默认）/`nics`（disable_network_adapters=true 时，额外禁用物理网卡）。
@@ -129,7 +133,7 @@ ui/index.html|app.css|main.js|ipc.js|icons.js|settings.js|updates.js|feishu.js
 ```
 
 **IPC 命令**（`invoke('cmd', {args})`，Tauri 2 snake_case↔camelCase 自动映射）：
-`get_state`、`get_config`、`update_settings(patch)`、`save_targets(targets)`、`reset_targets`、`recheck`、`launch`、`recheck_target(id)`、`release`、`recent_logs(limit)`、`open_data_folder`、`install_app`、`set_autostart(on)`、`upd_state`、`upd_check`、`upd_download`、`feishu_status`、`feishu_save(cfgJson)`、`feishu_test`、`feishu_retry_failed`、`claude_update_status`、`claude_update_configure(json)`、`claude_update_check`、`codex_update_status`、`codex_update_configure(json)`、`codex_update_check`、`js_log(level,msg)`、`notify_test(kind)`。
+`get_state`、`get_config`、`update_settings(patch)`、`save_targets(targets)`、`reset_targets`、`recheck`、`launch`、`recheck_target(id)`、`release`、`pause`、`resume`、`sweep_claude`（一键清理，返回 SweepReport）、`recent_logs(limit)`、`open_data_folder`、`install_app`、`set_autostart(on)`、`upd_state`、`upd_check`、`upd_download`、`feishu_status`、`feishu_save(cfgJson)`、`feishu_test`、`feishu_retry_failed`、`claude_update_status`、`claude_update_configure(json)`、`claude_update_check`、`codex_update_status`、`codex_update_configure(json)`、`codex_update_check`、`js_log(level,msg)`、`notify_test(kind)`。
 **事件**：`guard://state`（StateView）、`guard://log`（单行）。
 
 **StateView（camelCase）**：`checking,checkedAt,intervalSecs,tripThreshold,overall,targets[TargetStatus],tripped, pausedUntil,admin,installed,version,upd,feishu,claudeUpdate,codexUpdate,agentsRunning[{id,name,count}],cliRunning[],guardedAgents[],launchError,smokeSettings,notifyEnabled,cutMode`。
@@ -137,7 +141,7 @@ ui/index.html|app.css|main.js|ipc.js|icons.js|settings.js|updates.js|feishu.js
 ## 8. UI 规格（初版方向 A·极简仪表盘；设计稿为唯一视觉基准）
 
 - 窗口 420 × clamp(工作区逻辑高−8, 420, 620)，min 400×420；`decorations:false`，`data-tauri-drag-region`；标题栏 44px 毛玻璃、左侧纯文字 `ClaudeGuard`（13px/600，无图标）、右侧仅最小化/关闭；边缘八向缩放（tao 自带）。
-- 结构（自上而下，主区可滚动，footer sticky）：hero（128px 环、stroke 5.6、平色 #03AA49/#E4002B/灰，中心勾/叉/暂停/spinner；h1 22px/600；sub 12px #86868B；不再有 meta 行）→ 目标列表卡（圆角 14、白 88% + blur 20px、行高 54px（熔断/暂停压缩为 50px）、分隔 hairline；每行：状态点 + 左列（名称 13px/600 + 地区/组说明 11px） + 右列（IP 12.5px 等宽 tabular + 延迟 10.5px））→ 横幅区（仅熔断红/暂停灰/未通过橙/启动失败橙；CLI 运行提醒只在详情卡与日志，不占首屏）→ CTA（全宽 46px 渐变蓝主按钮：启动 Claude / 重新检查 / 启动已禁止；下方居中文字链接：立即检测，熔断态变红色「解除隔离并恢复网络」）→ 详情卡（默认收起：每目标一行的判定步骤、锚点 host、延迟、原因、运行中进程）→ 设置卡（默认收起：检测组=端口/检查间隔/断网档位/继续探测；熔断组=停进程/防火墙隔离/断网开关；守护对象组；监控目标组=列表编辑+添加+恢复默认；通用组=关窗驻留/开机自启/通知开关/数据文件夹/用户指南；更新组；飞书组；客户端更新组）→ 日志卡（默认收起，11px mono）→ footer（左：详情/设置/日志 链接；右：`vX.Y.Z`）。
+- 结构（自上而下，主区可滚动，footer sticky）：hero（128px 环、stroke 5.6、平色 #03AA49/#E4002B/灰，中心勾/叉/暂停/spinner；h1 22px/600；sub 12px #86868B；不再有 meta 行）→ 目标列表卡（圆角 14、白 88% + blur 20px、行高 54px（熔断/暂停压缩为 50px）、分隔 hairline；每行：状态点 + 左列（名称 13px/600 + 地区/组说明 11px） + 右列（IP 12.5px 等宽 tabular + 延迟 10.5px））→ 横幅区（仅熔断红/暂停灰/未通过橙/启动失败橙；CLI 运行提醒只在详情卡与日志，不占首屏）→ CTA（全宽 46px 渐变蓝主按钮：启动 Claude / 重新检查 / 启动已禁止；下方居中文字链接：立即检测，熔断态变红色「解除隔离并恢复网络」）→ 详情卡（默认收起：每目标一行的判定步骤、锚点 host、延迟、原因、运行中进程）→ 设置卡（默认收起：检测组=端口/检查间隔/断网档位/继续探测；熔断组=停进程/防火墙隔离/断网开关；进程清理组=退出后清理残留开关/一键清理 Claude 进程按钮；守护对象组；监控目标组=列表编辑+添加+恢复默认；通用组=关窗驻留/开机自启/通知开关/数据文件夹/用户指南；更新组；飞书组；客户端更新组）→ 日志卡（默认收起，11px mono）→ footer（左：详情/设置/日志 链接；右：`vX.Y.Z`）。
 - 状态语义：环/标题跟随 overall；busy 只在手动检查/首查转圈（后台刷新不动环）；目标行四态点：绿/红/橙（unverified）/灰（disabled）；熔断态红色横幅 + 置灰 CTA + 解除隔离按钮。
 - 动效红线（沿用 v2 标准）：只动 transform/opacity；无 transition:all/ease-in/scale(0)；按压 :active scale(0.97)；入场 scale(0.95)+opacity；≤300ms；stagger 30–80ms；reduced-motion → 交叉淡入；reduced-transparency → 实底；hover 包 `@media(hover:hover) and (pointer:fine)`。所有 JS 文件 IIFE 包裹（跨文件只经 `window.CG_IPC`/`window.ICONS`/`window.CG_UI`）。
 - 首启向导 3 页（沿用 v2 文案结构）：页 0 欢迎；页 1 代理端口 + 白名单 IP（逗号分隔）+ 出口地区（写入 local/claude/codex 三个目标的 expect）；页 2 安装 vs 便携。向导期间监测照跑。

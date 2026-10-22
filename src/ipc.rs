@@ -124,6 +124,22 @@ pub fn resume(state: State<'_, Arc<AppState>>) {
     monitor::resume(state.inner());
 }
 
+/// 一键扫描并结束全部 Claude 进程（桌面端 + Claude Code CLI）。
+#[tauri::command]
+pub fn sweep_claude(state: State<'_, Arc<AppState>>) -> crate::guard::SweepReport {
+    let report = crate::guard::sweep_claude(crate::guard::SweepMode::Manual);
+    if report.killed > 0 {
+        state.log(format!(
+            "一键清理：结束 {} 个 Claude 进程（桌面 {} / CLI {}）",
+            report.killed, report.desktop_killed, report.cli_killed
+        ));
+    } else {
+        state.log("一键清理：未发现 Claude 进程");
+    }
+    state.emit_state();
+    report
+}
+
 // ---------- 日志 / 数据 ----------
 
 #[tauri::command]

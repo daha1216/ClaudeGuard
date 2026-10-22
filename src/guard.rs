@@ -73,6 +73,12 @@ pub fn gui_agent_matches(
 ) -> bool {
     match id {
         "claude" => {
+            // CLI 原生二进制也叫 claude.exe（claude-code 安装布局），先排除再按桌面端匹配
+            if exe_path_l.contains(r"\claude\claude-code\")
+                || exe_path_l.contains(r"\.local\bin\claude")
+            {
+                return false;
+            }
             exe_name_l == "claude.exe"
                 || claude_dir_l
                     .map(|d| exe_path_l.starts_with(d))
@@ -90,9 +96,11 @@ pub fn gui_agent_matches(
 pub fn cli_agent_matches(id: &str, exe_name_l: &str, exe_path_l: &str, cmd_l: &str) -> bool {
     match id {
         // npm: node …\npm\node_modules\@anthropic-ai\claude-code\cli.js；原生: …\.local\bin\claude.exe
+        // 或新安装布局 %APPDATA%\Claude\claude-code\<ver>\<hash>\claude.exe（2026-10 实机确认）
         "claude-code" => {
             cmd_l.contains(r"@anthropic-ai\claude-code")
                 || exe_path_l.contains(r"\.local\bin\claude")
+                || exe_path_l.contains(r"\claude\claude-code\")
         }
         // 原生 codex*.exe（排除 ChatGPT 桌面版内置的 codex-command-runner）或 npm js
         "codex" => {
@@ -178,6 +186,180 @@ pub fn kill_agent(id: &str) -> usize {
 /// 按配置的守护对象逐个查杀（持续异常时的"只杀不加规则"路径）。
 pub fn kill_agents(cfg: &crate::config::Config) -> usize {
     cfg.guarded_agents.iter().map(|id| kill_agent(id)).sum()
+}
+
+// ---------- Claude 进程清理（v3.2：熔断连 CLI、退出后清残留、一键全清） ----------
+
+/// 进程快照里与清理判定相关的字段（统一小写）。
+/// 清理的全部决策都在这份快照上做纯函数计算，方便单测。
+pub struct ProcInfo {
+    pub pid: u32,
+    pub ppid: u32,
+    pub name_l: String,
+    pub path_l: String,
+    pub cmd_l: String,
+}
+
+fn proc_info_of(p: &sysinfo::Process) -> ProcInfo {
+    ProcInfo {
+        pid: p.pid().as_u32(),
+        ppid: p.parent().map(|x| x.as_u32()).unwrap_or(0),
+        name_l: p.name().to_string().to_lowercase(),
+        path_l: p
+            .exe()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default(),
+        cmd_l: p
+            .cmd()
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase(),
+    }
+}
+
+pub fn snapshot_processes() -> Vec<ProcInfo> {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_processes();
+    sys.processes().values().map(proc_info_of).collect()
+}
+
+/// Claude 进程分类：桌面端 / Claude Code CLI。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeKind {
+    Desktop,
+    Cli,
+}
+
+impl ClaudeKind {
+    fn label(self) -> &'static str {
+        match self {
+            ClaudeKind::Desktop => "桌面端",
+            ClaudeKind::Cli => "CLI",
+        }
+    }
+}
+
+pub fn classify_claude(p: &ProcInfo, claude_dir_l: Option<&str>) -> Option<ClaudeKind> {
+    if cli_agent_matches("claude-code", &p.name_l, &p.path_l, &p.cmd_l) {
+        return Some(ClaudeKind::Cli);
+    }
+    if gui_agent_matches("claude", &p.name_l, &p.path_l, claude_dir_l) {
+        return Some(ClaudeKind::Desktop);
+    }
+    None
+}
+
+/// 全部 Claude 进程（桌面 + CLI，不管父子关系）。一键清理用。
+pub fn pick_manual(procs: &[ProcInfo], claude_dir_l: Option<&str>) -> Vec<(usize, ClaudeKind)> {
+    procs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| classify_claude(p, claude_dir_l).map(|k| (i, k)))
+        .collect()
+}
+
+/// 残留判定（纯函数）：桌面端全部消失后，哪些 Claude 进程算"残留"。
+/// - 桌面家族进程：主进程不在了，剩下的 crashpad/gpu/renderer 全算残留；
+/// - CLI：父进程已死（孤儿）才算残留——挂在活终端下的会话不清，避免误杀正在用的终端。
+///
+/// 返回 `None` 表示桌面端还在运行（不算退出，不清）。
+pub fn pick_residual(
+    procs: &[ProcInfo],
+    claude_dir_l: Option<&str>,
+) -> Option<Vec<(usize, ClaudeKind)>> {
+    let all = pick_manual(procs, claude_dir_l);
+    if all.iter().any(|(_, k)| *k == ClaudeKind::Desktop) {
+        return None;
+    }
+    let alive: std::collections::HashSet<u32> = procs.iter().map(|p| p.pid).collect();
+    Some(
+        all.into_iter()
+            .filter(|(i, k)| match k {
+                ClaudeKind::Desktop => true,
+                ClaudeKind::Cli => {
+                    let p = &procs[*i];
+                    p.ppid == 0 || !alive.contains(&p.ppid)
+                }
+            })
+            .collect(),
+    )
+}
+
+/// 清理模式：一键全清 / 仅 CLI（熔断路径）/ 桌面端退出后的残留清理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepMode {
+    Manual,
+    CliOnly,
+    Residual,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SweepReport {
+    /// 扫描到的 Claude 进程数（residual 模式下是判定为残留的数量）
+    pub scanned: usize,
+    pub killed: usize,
+    pub desktop_killed: usize,
+    pub cli_killed: usize,
+    /// 每条 "pid 名称（类型）"
+    pub detail: Vec<String>,
+    /// 特殊情况说明（桌面端仍在运行等），空串表示正常执行
+    pub note: String,
+}
+
+/// 扫描并结束 Claude 进程。Manual = 桌面端 + CLI 全清；Residual = 仅残留（桌面家族 + 孤儿 CLI）。
+pub fn sweep_claude(mode: SweepMode) -> SweepReport {
+    use sysinfo::System;
+    let claude_dir_l = find_claude_dir().map(|d| d.to_string_lossy().to_lowercase());
+    let mut sys = System::new();
+    sys.refresh_processes();
+    let procs: Vec<ProcInfo> = sys.processes().values().map(proc_info_of).collect();
+    let picks = match mode {
+        SweepMode::Manual => pick_manual(&procs, claude_dir_l.as_deref()),
+        SweepMode::CliOnly => pick_manual(&procs, claude_dir_l.as_deref())
+            .into_iter()
+            .filter(|(_, k)| *k == ClaudeKind::Cli)
+            .collect(),
+        SweepMode::Residual => match pick_residual(&procs, claude_dir_l.as_deref()) {
+            Some(v) => v,
+            None => {
+                return SweepReport {
+                    scanned: pick_manual(&procs, claude_dir_l.as_deref()).len(),
+                    note: "桌面端仍在运行，不清理".into(),
+                    ..SweepReport::default()
+                }
+            }
+        },
+    };
+    let mut report = SweepReport {
+        scanned: picks.len(),
+        ..SweepReport::default()
+    };
+    for (i, kind) in picks {
+        let info = &procs[i];
+        let Some(proc) = sys.process(sysinfo::Pid::from_u32(info.pid)) else {
+            continue;
+        };
+        if proc.kill() {
+            report.killed += 1;
+            match kind {
+                ClaudeKind::Desktop => report.desktop_killed += 1,
+                ClaudeKind::Cli => report.cli_killed += 1,
+            }
+            let line = format!("pid={} {}（{}）", info.pid, info.name_l, kind.label());
+            report.detail.push(line.clone());
+            log_line(&format!("sweep: killed {} {line}", kind.label()));
+        }
+    }
+    report
+}
+
+/// 结束全部 Claude Code CLI 进程（熔断路径用），返回结束数。
+pub fn kill_claude_cli() -> usize {
+    sweep_claude(SweepMode::CliOnly).killed
 }
 
 pub fn log_line(msg: &str) {
@@ -323,6 +505,19 @@ mod tests {
             r"c:\program files\windowsapps\claude_2.16120.0.0_x64__pzs8sxrjxfjjc\sub\tool.exe",
             None
         ));
+        // CLI 原生二进制（claude-code 安装布局 / .local\bin）不算桌面端，就算重名 claude.exe
+        assert!(!gui_agent_matches(
+            "claude",
+            "claude.exe",
+            r"c:\users\daha\appdata\roaming\claude\claude-code\2.1.304\abc123\claude.exe",
+            None
+        ));
+        assert!(!gui_agent_matches(
+            "claude",
+            "claude.exe",
+            r"c:\users\daha\.local\bin\claude.exe",
+            None
+        ));
         // chatgpt: 包名 OpenAI.Codex_* 下的 ChatGPT.exe；同名 exe 在别处不算
         let wa_gpt = r"c:\program files\windowsapps\openai.codex_26.928.2636.0_x64__2p2nqsd0c76g0\app\chatgpt.exe";
         assert!(gui_agent_matches("chatgpt", "chatgpt.exe", wa_gpt, None));
@@ -386,6 +581,13 @@ mod tests {
             r"c:\x\claude.exe",
             ""
         ));
+        // 新安装布局：桌面端自带的 claude-code 原生二进制（2026-10 实机路径）
+        assert!(cli_agent_matches(
+            "claude-code",
+            "claude.exe",
+            r"c:\users\daha\appdata\roaming\claude\claude-code\2.1.304\9f4d5c\claude.exe",
+            ""
+        ));
         // codex 原生二进制
         assert!(cli_agent_matches(
             "codex",
@@ -419,6 +621,55 @@ mod tests {
             r"node server.js"
         ));
         assert!(!cli_agent_matches("bogus", "x.exe", "", ""));
+    }
+
+    /// 行为锁: 清理判定——桌面端在则不算退出；桌面家族全算残留；CLI 只清孤儿。
+    #[test]
+    fn sweep_picking_modes() {
+        let mk = |pid: u32, ppid: u32, name: &str, path: &str| ProcInfo {
+            pid,
+            ppid,
+            name_l: name.to_string(),
+            path_l: path.to_string(),
+            cmd_l: String::new(),
+        };
+        let wa_dir = r"c:\program files\windowsapps\claude_2.42304.0.0_x64__pzs8sxrjxfjjc";
+        let wa = format!(r"{wa_dir}\claude.exe");
+        let cli_native = r"c:\users\daha\appdata\roaming\claude\claude-code\2.1.304\abc\claude.exe";
+
+        // 场景 1：桌面主进程 + crashpad + 终端里的 CLI（父=活终端）+ 桌面拉起的 CLI + 孤儿 CLI + 无关进程
+        let procs = vec![
+            mk(100, 50, "claude.exe", &wa),
+            mk(101, 100, "crashpad_handler.exe", &wa),
+            mk(102, 50, "claude.exe", cli_native),
+            mk(103, 100, "claude.exe", cli_native),
+            mk(50, 1, "windowsterminal.exe", r"c:\...\windowsterminal.exe"),
+            mk(104, 9999, "claude.exe", cli_native),
+            mk(105, 50, "node.exe", r"c:\program files\nodejs\node.exe"),
+        ];
+        // 桌面端在 → 不算退出，不清理
+        assert!(pick_residual(&procs, Some(wa_dir)).is_none());
+        // 一键全清 = 桌面 2 + CLI 3
+        let manual = pick_manual(&procs, Some(wa_dir));
+        assert_eq!(manual.len(), 5);
+        assert_eq!(
+            manual
+                .iter()
+                .filter(|(_, k)| *k == ClaudeKind::Desktop)
+                .count(),
+            2
+        );
+
+        // 场景 2：桌面已退出。终端里的 CLI（父活）不清；父已死的 CLI 清。
+        let procs2 = vec![
+            mk(102, 50, "claude.exe", cli_native),
+            mk(103, 100, "claude.exe", cli_native),
+            mk(104, 9999, "claude.exe", cli_native),
+            mk(50, 1, "windowsterminal.exe", r"c:\...\windowsterminal.exe"),
+        ];
+        let residual = pick_residual(&procs2, Some(wa_dir)).expect("桌面已退出应给出残留清单");
+        let ids: Vec<u32> = residual.iter().map(|(i, _)| procs2[*i].pid).collect();
+        assert_eq!(ids, vec![103, 104], "活终端下的 CLI 不清，孤儿/桌面遗孤清");
     }
 
     /// 行为锁: 防火墙规则名——claude 用 v1 老名（存量规则识别），其他带后缀。
@@ -903,6 +1154,11 @@ pub fn trip(cfg: &crate::config::Config, reason: &str) -> TripResult {
         for id in &cfg.guarded_agents {
             res.killed += kill_agent(id);
         }
+        // v3.2：Claude 是守护对象时，Claude Code CLI 一并结束（不再只提醒）
+        if cfg.guarded_agents.iter().any(|id| id == "claude") {
+            res.cli_killed = kill_claude_cli();
+            res.killed += res.cli_killed;
+        }
     }
     if cfg.quarantine_on_fail {
         for id in &cfg.guarded_agents {
@@ -916,6 +1172,8 @@ pub fn trip(cfg: &crate::config::Config, reason: &str) -> TripResult {
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct TripResult {
     pub killed: usize,
+    /// 其中 Claude Code CLI 的进程数（v3.2 起熔断连 CLI 一起清）
+    pub cli_killed: usize,
     pub firewall_rules: usize,
     pub quarantined: bool,
     /// 本次熔断涉及的 agent 显示名（UI 文案用）

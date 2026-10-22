@@ -90,6 +90,13 @@
       "</div>" +
 
       '<div class="sgroup">' +
+      '<div class="sgroup-title">进程清理</div>' +
+      rowSwitch("st-sweep", "退出后清理残留", "Claude 桌面端退出后，自动结束残留进程与孤儿 CLI", !CFG || CFG.sweep_on_exit !== false, false) +
+      '<div class="srow"><div class="slabel">一键清理 Claude 进程<span class="shint">立即结束全部 Claude 桌面端与 Claude Code CLI 进程</span></div><div class="sval"><button class="btn is-danger" id="st-sweep-now" type="button">扫描并清理</button></div></div>' +
+      '<div class="formhint" id="st-sweep-result" hidden></div>' +
+      "</div>" +
+
+      '<div class="sgroup">' +
       '<div class="sgroup-title">守护对象</div>' +
       rowSwitch("st-ag-claude", "Claude 桌面版", "Anthropic Claude 桌面端", false, false) +
       rowSwitch("st-ag-chatgpt", "ChatGPT 桌面版", "OpenAI ChatGPT / Codex 桌面端", false, false) +
@@ -154,6 +161,7 @@
     set("st-interval", cfg.check_interval_secs || "");
     chk("st-kill", cfg.kill_on_fail);
     chk("st-quarantine", cfg.quarantine_on_fail);
+    chk("st-sweep", cfg.sweep_on_exit !== false);
     const agents = Array.isArray(cfg.guarded_agents) ? cfg.guarded_agents : [];
     chk("st-ag-claude", agents.includes("claude"));
     chk("st-ag-chatgpt", agents.includes("chatgpt"));
@@ -385,6 +393,33 @@
     if (kill) kill.addEventListener("change", () => patch({ kill_on_fail: !!kill.checked }, "已保存"));
     const quarantine = $("st-quarantine");
     if (quarantine) quarantine.addEventListener("change", () => patch({ quarantine_on_fail: !!quarantine.checked }, "已保存"));
+
+    // 进程清理：退出后残留开关 + 一键全清
+    const sweep = $("st-sweep");
+    if (sweep) sweep.addEventListener("change", () => patch({ sweep_on_exit: !!sweep.checked }, "已保存"));
+    const sweepNow = $("st-sweep-now");
+    if (sweepNow) {
+      sweepNow.addEventListener("click", async () => {
+        sweepNow.disabled = true;
+        const out = $("st-sweep-result");
+        try {
+          const rep = await invoke(CMD.sweep_claude);
+          const n = rep && rep.killed != null ? rep.killed : 0;
+          if (out) {
+            out.hidden = false;
+            out.textContent = n > 0
+              ? "已结束 " + n + " 个进程（桌面 " + (rep.desktopKilled || 0) + " / CLI " + (rep.cliKilled || 0) + "）"
+              : "未发现 Claude 进程";
+          }
+          notifyToast(n > 0 ? "已结束 " + n + " 个 Claude 进程" : "未发现 Claude 进程", true);
+        } catch (e) {
+          if (out) { out.hidden = false; out.textContent = (e && e.message) || "清理失败"; }
+          notifyToast((e && e.message) || "清理失败");
+        } finally {
+          setTimeout(() => { sweepNow.disabled = false; }, 1200);
+        }
+      });
+    }
 
     ["st-ag-claude:claude", "st-ag-chatgpt:chatgpt", "st-ag-antigravity:antigravity"].forEach((pair) => {
       const [id, agent] = pair.split(":");

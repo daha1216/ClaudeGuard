@@ -225,6 +225,7 @@ fn run_gui(start_hidden: bool, want_settings: bool) {
             ipc::release,
             ipc::pause,
             ipc::resume,
+            ipc::sweep_claude,
             ipc::recent_logs,
             ipc::open_data_folder,
             ipc::open_guide,

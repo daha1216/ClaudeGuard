@@ -108,6 +108,9 @@ pub struct Config {
     pub guarded_agents: Vec<String>,
     #[serde(default = "default_true")]
     pub cli_warn: bool,
+    /// Claude 桌面端退出后自动清理残留进程（桌面家族 + 孤儿 CLI）
+    #[serde(default = "default_true")]
+    pub sweep_on_exit: bool,
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
     #[serde(default)]
@@ -147,6 +150,7 @@ impl Default for Config {
             quarantine_on_fail: true,
             guarded_agents: default_agents(),
             cli_warn: true,
+            sweep_on_exit: true,
             close_to_tray: true,
             auto_start_with_system: false,
             notify: NotifyPrefs::default(),
