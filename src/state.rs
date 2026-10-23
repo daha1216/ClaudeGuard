@@ -59,6 +59,14 @@ pub struct StateView {
     pub lockdown_manual: bool,
 }
 
+/// 本进程的启动代次（启动时间 + PID）。账本用它区分"上一代留下的现场"。
+pub fn generation_id() -> String {
+    use std::sync::OnceLock;
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| format!("{}-{}", crate::model::now(), std::process::id()))
+        .clone()
+}
+
 pub struct AppState {
     pub app: AppHandle,
     pub cfg: Mutex<Config>,

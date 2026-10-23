@@ -15,6 +15,7 @@ mod guard;
 #[cfg_attr(target_os = "macos", path = "macos/install.rs")]
 mod install;
 mod ipc;
+mod ledger;
 #[cfg(target_os = "macos")]
 mod macos;
 mod model;

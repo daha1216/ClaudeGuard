@@ -13,9 +13,76 @@ use crate::model::{now, CutMode};
 /// 断网防火墙规则名（monitor/自愈也按这个名字找规则）。
 pub const CUT_RULE: &str = "ClaudeGuard Cut All";
 
-/// 启用中的物理网卡列表。PowerShell 输出 base64/UTF-8：
+/// 启用中的物理网卡（GUID + 名称）。PowerShell 输出 base64/UTF-8：
 /// Windows PowerShell 5.1 写被重定向的 stdout 时按控制台代码页编码，中文网卡名会被转坏。
-const NIC_ENUM_SCRIPT: &str = r"$json = @(Get-NetAdapter -Physical | Where-Object {$_.Status -eq 'Up'} | Select-Object -ExpandProperty Name) | ConvertTo-Json -Compress; [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$json))";
+const NIC_ENUM_SCRIPT: &str = r"$json = @(Get-NetAdapter -Physical | Where-Object {$_.Status -eq 'Up'} | Select-Object InterfaceGuid,Name) | ConvertTo-Json -Compress; [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$json))";
+
+/// 网卡身份：GUID 是稳定标识（名称可能变、也不唯一），名称只用于展示。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NicRef {
+    pub guid: String,
+    pub name: String,
+}
+
+/// 纯函数：解析网卡列表 JSON，兼容两种历史形态：
+/// - 新形态 `[{"InterfaceGuid":"…","Name":"以太网"}]`
+/// - 旧形态 `["以太网"]`（只有名称，GUID 留空，恢复时按名称兜底）
+pub fn parse_nic_refs(text: &str) -> Vec<NicRef> {
+    let text = text.trim().trim_start_matches('\u{feff}').trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("null") {
+        return Vec::new();
+    }
+    let value: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let items: Vec<serde_json::Value> = match value {
+        serde_json::Value::Array(items) => items,
+        other => vec![other],
+    };
+    let mut out: Vec<NicRef> = Vec::new();
+    for item in items {
+        let nic = match item {
+            serde_json::Value::String(name) => NicRef {
+                guid: String::new(),
+                name: name.trim().to_string(),
+            },
+            serde_json::Value::Object(map) => {
+                let guid = map
+                    .get("InterfaceGuid")
+                    .or_else(|| map.get("interfaceGuid"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let name = map
+                    .get("Name")
+                    .or_else(|| map.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                NicRef { guid, name }
+            }
+            _ => continue,
+        };
+        if nic.name.is_empty() && nic.guid.is_empty() {
+            continue;
+        }
+        // 同一网卡按 GUID（无 GUID 时按名称）去重，保留首次出现的顺序。
+        let dup = out.iter().any(|x| {
+            if !nic.guid.is_empty() && !x.guid.is_empty() {
+                x.guid.eq_ignore_ascii_case(&nic.guid)
+            } else {
+                x.name.eq_ignore_ascii_case(&nic.name)
+            }
+        });
+        if !dup {
+            out.push(nic);
+        }
+    }
+    out
+}
 
 /// 串行化 cut/restore/heal：monitor 线程与退出恢复可能同时进来，
 /// 交错执行会重复禁用/漏恢复网卡。heal 持同一把锁调用 `restore_locked`，避免重入死锁。
@@ -159,8 +226,42 @@ fn cut_locked(mode: CutMode) -> (bool, String) {
         // 档位变化：先完整恢复旧档位，再按新档位断网，避免两种阻断手段叠加。
         let _ = restore_locked();
     }
+    // R02：先把"要改什么、原状态是什么"落盘，再动系统。
+    // 记账失败就不动手——否则一旦禁用网卡后崩溃，机器会带着无记录的网络现场。
+    let planned = if mode == CutMode::Nics {
+        list_up_nics_detailed()
+    } else {
+        Vec::new()
+    };
+    let scope: Vec<String> =
+        std::iter::once(format!("{}{}", crate::ledger::SCOPE_FIREWALL, CUT_RULE))
+            .chain(
+                planned
+                    .iter()
+                    .filter(|n| !n.guid.is_empty())
+                    .map(|n| format!("{}{}", crate::ledger::SCOPE_NIC, n.guid)),
+            )
+            .collect();
+    let mut txn = crate::ledger::Txn::new(
+        crate::ledger::TxnKind::Netcut,
+        &crate::state::generation_id(),
+        scope,
+        serde_json::json!({
+            "mode": mode_name(mode),
+            "nics": planned,
+            "cut_rule_present": cut_rule_count() > 0,
+        }),
+    );
+    if let Err(err) = crate::ledger::save(&txn) {
+        let msg = format!("断网前写入恢复账本失败，已放弃断网：{err}");
+        log_line(&format!("netcut: cut({}) -> {msg}", mode.label()));
+        return (false, msg);
+    }
+
     let mut notes: Vec<String> = Vec::new();
     let (firewall_ok, firewall_detail) = add_cut_rule();
+    txn.record("添加防火墙全局阻断规则", firewall_ok, &firewall_detail);
+    let _ = crate::ledger::save(&txn);
     if !firewall_ok {
         notes.push(format!("防火墙全局阻断失败：{firewall_detail}"));
     }
@@ -176,7 +277,20 @@ fn cut_locked(mode: CutMode) -> (bool, String) {
             notes.push("未找到启用中的物理网卡".to_string());
         }
         for name in &names {
-            if disable_nic(name) {
+            // 账本里记的是 GUID，优先按 GUID 禁用（名称只做展示与旧现场兜底）。
+            let guid = planned
+                .iter()
+                .find(|n| n.name.eq_ignore_ascii_case(name))
+                .map(|n| n.guid.clone())
+                .unwrap_or_default();
+            let ok = if guid.is_empty() {
+                disable_nic(name)
+            } else {
+                set_nic_enabled_by_guid(&guid, false)
+            };
+            txn.record(&format!("禁用网卡 {name}"), ok, "");
+            let _ = crate::ledger::save(&txn);
+            if ok {
                 nics.push(name.clone());
             } else {
                 notes.push(format!("禁用网卡失败：{name}"));
@@ -206,6 +320,25 @@ fn cut_locked(mode: CutMode) -> (bool, String) {
         log_line(&format!("netcut: cut({}) -> {msg}", mode.label()));
         return (false, msg);
     }
+    // 后置核验：规则条数与网卡实际状态都要查，不能只看命令返回码。
+    let rule_present = cut_rule_count() > 0;
+    txn.record("核验全局阻断规则", rule_present, "");
+    let mut nics_verified = true;
+    if mode == CutMode::Nics {
+        for name in &nics {
+            let down = !nic_is_up(name);
+            nics_verified &= down;
+            txn.record(&format!("核验网卡已断开 {name}"), down, "");
+        }
+    }
+    let verified = rule_present && nics_verified;
+    txn.done = verified;
+    if let Err(err) = crate::ledger::save(&txn) {
+        log_line(&format!(
+            "netcut: 账本提交失败（{err}），保持未完成状态供恢复"
+        ));
+    }
+
     let mut msg = if mode == CutMode::Nics {
         format!("已禁用 {} 个物理网卡", nics.len())
     } else {
@@ -214,12 +347,15 @@ fn cut_locked(mode: CutMode) -> (bool, String) {
     if mode == CutMode::Nics && nics.is_empty() {
         msg = "物理网卡禁用未生效，仅剩防火墙全局阻断".to_string();
     }
+    if !verified {
+        msg.push_str("；断网核验未通过，下次启动会按账本恢复");
+    }
     if !notes.is_empty() {
         msg.push('；');
         msg.push_str(&notes.join("；"));
     }
     log_line(&format!("netcut: cut({}) -> {msg}", mode.label()));
-    (true, msg)
+    (verified || engaged, msg)
 }
 
 fn restore_locked() -> (bool, String) {
@@ -228,10 +364,76 @@ fn restore_locked() -> (bool, String) {
     let state = load_state_from(&path);
     let mut actions: Vec<String> = Vec::new();
     let mut nics_ok = true;
+    // R02：账本是"我改过什么"的权威记录。损坏/读不出时不能当成没有残留，
+    // 也不能凭 netcut.json 里的名字乱动，先按可恢复的部分做并如实报告。
+    let txn = match crate::ledger::load() {
+        crate::ledger::Loaded::Pending(t) | crate::ledger::Loaded::Done(t) => Some(t),
+        crate::ledger::Loaded::Corrupt(err) => {
+            log_line(&format!("netcut: 恢复账本损坏（{err}），保留证据"));
+            actions.push("恢复账本损坏，已保留原文件待人工确认".to_string());
+            None
+        }
+        crate::ledger::Loaded::Unreadable(err) => {
+            log_line(&format!("netcut: 恢复账本读取失败（{err}）"));
+            actions.push("恢复账本读取失败，未做任何变更".to_string());
+            return (false, actions.join("；"));
+        }
+        crate::ledger::Loaded::NotFound => None,
+    };
+    if let Some(t) = txn.as_ref() {
+        if !t.all_steps_ok() {
+            // 上次事务没走完：把失败步骤带进恢复报告，别让用户以为一切正常。
+            let failed = t.failure_summary();
+            if !failed.is_empty() {
+                log_line(&format!("netcut: 上次断网未完成 -> {failed}"));
+                actions.push(format!("上次断网未完成：{failed}"));
+            }
+        }
+    }
+    let (managed, rejected) = txn
+        .as_ref()
+        .map(|t| crate::ledger::split_managed(&t.scope))
+        .unwrap_or_default();
+    if !rejected.is_empty() {
+        log_line(&format!(
+            "netcut: 账本含不可管理范围，已忽略 {} 项",
+            rejected.len()
+        ));
+        actions.push(format!("已忽略 {} 项无法识别的账本条目", rejected.len()));
+    }
+    let ledger_nics: Vec<String> = managed
+        .iter()
+        .filter_map(|s| s.strip_prefix(crate::ledger::SCOPE_NIC))
+        .map(|g| g.to_string())
+        .collect();
     if let Some(state) = state.as_ref() {
         // 先恢复网卡、最后删规则：恢复过程中网络仍受规则管着。
         for name in &state.nics {
-            if enable_nic(name) {
+            let guid = ledger_nics
+                .iter()
+                .find(|g| {
+                    txn.as_ref()
+                        .and_then(|t| t.original.get("nics"))
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| {
+                            arr.iter().find(|n| {
+                                n.get("name")
+                                    .and_then(|x| x.as_str())
+                                    .map(|x| x.eq_ignore_ascii_case(name))
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .and_then(|n| n.get("guid"))
+                        .and_then(|x| x.as_str())
+                        .map(|x| x.eq_ignore_ascii_case(g))
+                        .unwrap_or(false)
+                })
+                .cloned();
+            let ok = match guid {
+                Some(g) => set_nic_enabled_by_guid(&g, true),
+                None => enable_nic(name),
+            };
+            if ok {
                 actions.push(format!("已启用网卡 {name}"));
             } else {
                 nics_ok = false;
@@ -248,6 +450,12 @@ fn restore_locked() -> (bool, String) {
         }
     }
     let ok = nics_ok && rule_ok;
+    if ok {
+        // 核验通过才清账本；否则保留，下次自愈重试（账本是唯一可信的现场记录）。
+        if let Err(err) = crate::ledger::clear() {
+            actions.push(format!("清理恢复账本失败：{err}"));
+        }
+    }
     if state_exists {
         // 有失败就保留现场，下次启动自愈重试；否则删干净。
         if ok {
@@ -271,9 +479,29 @@ fn restore_locked() -> (bool, String) {
 fn heal_locked() -> Vec<String> {
     let mut actions: Vec<String> = Vec::new();
     let path = state_path();
+    // R02：账本损坏/读不出时不能当成"没有残留"直接开网——先报告，交给人工/后续恢复。
+    match crate::ledger::load() {
+        crate::ledger::Loaded::Corrupt(err) => {
+            let line = format!("恢复账本损坏，保留现场待确认（{err}）");
+            log_line(&format!("netcut: {line}"));
+            actions.push(line);
+            return actions;
+        }
+        crate::ledger::Loaded::Unreadable(err) => {
+            let line = format!("恢复账本读取失败，未自动恢复网络（{err}）");
+            log_line(&format!("netcut: {line}"));
+            actions.push(line);
+            return actions;
+        }
+        _ => {}
+    }
     if path.exists() {
-        let (_ok, msg) = restore_locked();
-        let line = format!("检测到上次熔断残留，已恢复网络（{msg}）");
+        let (ok, msg) = restore_locked();
+        let line = if ok {
+            format!("检测到上次熔断残留，已恢复网络（{msg}）")
+        } else {
+            format!("上次残留恢复未完成，已保留现场（{msg}）")
+        };
         log_line(&format!("netcut: {line}"));
         actions.push(line);
     }
@@ -411,6 +639,19 @@ fn powershell(script: &str) -> (bool, String) {
     )
 }
 
+/// 网卡当前是否处于 Up（核验断网是否真的生效）。
+fn nic_is_up(name: &str) -> bool {
+    let script = format!(
+        "$a = Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue; if ($a) {{ [string]$a.Status }} else {{ 'Missing' }}",
+        name.replace('\'', "''")
+    );
+    let (ok, detail) = powershell(&script);
+    if !ok {
+        return true; // 查不出来就不敢说"已断开"，按仍在线处理
+    }
+    detail.trim().eq_ignore_ascii_case("Up")
+}
+
 fn list_up_nics() -> Vec<String> {
     let (ok, raw) = powershell(NIC_ENUM_SCRIPT);
     if !ok {
@@ -420,6 +661,42 @@ fn list_up_nics() -> Vec<String> {
     let names = parse_nic_json(&json);
     log_line(&format!("netcut: 启用中的物理网卡 {}", names.join(", ")));
     names
+}
+
+/// 按 GUID 启停网卡（名称可能重复/被改，GUID 才稳定）。
+fn set_nic_enabled_by_guid(guid: &str, enabled: bool) -> bool {
+    let verb = if enabled {
+        "Enable-NetAdapter"
+    } else {
+        "Disable-NetAdapter"
+    };
+    let script = format!(
+        "{verb} -InterfaceGuid '{}' -Confirm:$false -ErrorAction Stop",
+        guid.replace('\'', "''")
+    );
+    let (ok, detail) = powershell(&script);
+    if !ok {
+        log_line(&format!("netcut: {verb} guid={guid} 失败（{detail}）"));
+    }
+    ok
+}
+
+/// 启用中的物理网卡（含 GUID）。
+fn list_up_nics_detailed() -> Vec<NicRef> {
+    let (ok, raw) = powershell(NIC_ENUM_SCRIPT);
+    if !ok {
+        return Vec::new();
+    }
+    let json = decode_b64_text(&raw).unwrap_or(raw);
+    let nics = parse_nic_refs(&json);
+    log_line(&format!(
+        "netcut: 启用中的物理网卡 {}",
+        nics.iter()
+            .map(|n| n.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    nics
 }
 
 fn set_nic_enabled(name: &str, enabled: bool) -> bool {
@@ -523,6 +800,35 @@ mod tests {
     }
 
     /// 行为锁: 网卡 JSON 的两种形态（单字符串/数组）与脏输入。
+    #[test]
+    fn parse_nic_refs_accepts_guid_and_legacy_name_forms() {
+        // 新形态：GUID + 名称（中文名原样保留）
+        let json = r#"[{"InterfaceGuid":"6f1c2f9a-1b2c-4d5e-8f90-1234567890ab","Name":"以太网"},{"InterfaceGuid":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","Name":"WLAN"}]"#;
+        let nics = parse_nic_refs(json);
+        assert_eq!(nics.len(), 2);
+        assert_eq!(nics[0].name, "以太网");
+        assert!(nics[0].guid.starts_with("6f1c2f9a"));
+
+        // 旧形态：只有名称，GUID 留空（恢复时按名称兜底）
+        let legacy = parse_nic_refs(r#"["以太网","WLAN"]"#);
+        assert_eq!(legacy.len(), 2);
+        assert!(legacy.iter().all(|n| n.guid.is_empty()));
+
+        // 单对象（ConvertTo-Json 单元素）、null、垃圾输入
+        assert_eq!(
+            parse_nic_refs(r#"{"InterfaceGuid":"a","Name":"E"}"#).len(),
+            1
+        );
+        assert!(parse_nic_refs("null").is_empty());
+        assert!(parse_nic_refs("not json").is_empty());
+
+        // 同 GUID 去重
+        let dup = parse_nic_refs(
+            r#"[{"InterfaceGuid":"same","Name":"A"},{"InterfaceGuid":"same","Name":"B"}]"#,
+        );
+        assert_eq!(dup.len(), 1);
+    }
+
     #[test]
     fn parses_nic_json_single_and_array() {
         assert_eq!(parse_nic_json(r#""WLAN""#), vec!["WLAN"]);
