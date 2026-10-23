@@ -542,9 +542,9 @@ fn notify_new_version(state: &Arc<AppState>, ver: &str) {
     if notified_ver() == ver {
         return;
     }
-    let prefs = state.config().notify;
-    if !crate::notify::send(
-        &prefs,
+    // 走 AppState::notify 这个唯一出口（分类开关 + 脱敏都在那里），
+    // 不要直接调 notify::send——那会绕过 R14 的脱敏与统一策略。
+    if !state.notify(
         "self_update",
         "ClaudeGuard 有新版本",
         &format!("v{ver} 已发布，打开 设置 → 更新 一键升级。"),
