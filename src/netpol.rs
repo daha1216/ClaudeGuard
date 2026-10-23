@@ -35,22 +35,22 @@ pub fn route(cfg: &Config) -> Route {
 ///
 /// 禁用 `try_proxy_from_env` 是刻意的：环境变量可能指向另一个代理或直接为空，
 /// 让 ureq 自己猜会让"实际走了哪条路"变得不可预测。
-pub fn agent(cfg: &Config, timeout: std::time::Duration) -> ureq::Agent {
-    match route(cfg) {
-        Route::Proxy(url) => {
-            let builder = ureq::AgentBuilder::new()
-                .timeout_connect(timeout)
-                .try_proxy_from_env(false);
-            match ureq::Proxy::new(&url) {
-                Ok(proxy) => builder.proxy(proxy).build(),
-                // 代理地址非法时也不直连：宁可失败，也不偷偷换路。
-                Err(_) => builder.build(),
-            }
-        }
-        Route::Direct => ureq::AgentBuilder::new()
+pub fn agent(cfg: &Config, timeout: std::time::Duration) -> Result<ureq::Agent, String> {
+    let base = || {
+        ureq::AgentBuilder::new()
             .timeout_connect(timeout)
+            // 不让 ureq 自己从环境变量猜代理：实际走了哪条路必须是确定的。
             .try_proxy_from_env(false)
-            .build(),
+            // 外发请求只认官方地址，重定向一律不跟（防止被引到别的主机）。
+            .redirects(0)
+    };
+    match route(cfg) {
+        Route::Proxy(url) => match ureq::Proxy::new(&url) {
+            Ok(proxy) => Ok(base().proxy(proxy).build()),
+            // 代理地址非法时也不直连：宁可失败，也不偷偷换路。
+            Err(err) => Err(proxy_required_error(&format!("代理地址无效：{err}"))),
+        },
+        Route::Direct => Ok(base().build()),
     }
 }
 

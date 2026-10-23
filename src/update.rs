@@ -105,13 +105,13 @@ pub fn is_newer(remote: &str, current: &str) -> bool {
 // ------------------------------------------------------------------ 网络构建
 
 /// 统一按外发策略取 Agent（R14 / D5）。代理不可用时不回退直连。
-fn agent(cfg: &Config) -> ureq::Agent {
+fn agent(cfg: &Config) -> Result<ureq::Agent, String> {
     crate::netpol::agent(cfg, T_CHECK)
 }
 
 // ------------------------------------------------------------------ 检查更新
 
-/// 查询最新 release。代理优先, 失败回退直连。
+/// 查询最新 release。代理不可用即失败，不回退直连。
 pub fn check_latest(cfg: &Config) -> Result<Release, String> {
     let api = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
     let fetch = |agent: &ureq::Agent| -> Result<Release, String> {
@@ -128,7 +128,8 @@ pub fn check_latest(cfg: &Config) -> Result<Release, String> {
 
     // R14 / D5：代理不可用就如实失败。旧实现会在这里静默直连，
     // 结果是把家宽 IP 直接送到 GitHub——这正是要禁止的泄漏。
-    fetch(&agent(cfg)).map_err(|e| {
+    let agent = agent(cfg)?;
+    fetch(&agent).map_err(|e| {
         if crate::netpol::route(cfg) == crate::netpol::Route::Direct {
             e
         } else {
@@ -258,7 +259,8 @@ pub fn download(
         };
 
     let prog = &mut progress;
-    do_download(&agent(cfg), prog).map_err(|e| {
+    let agent = agent(cfg)?;
+    do_download(&agent, prog).map_err(|e| {
         if crate::netpol::route(cfg) == crate::netpol::Route::Direct {
             e
         } else {
