@@ -506,10 +506,14 @@ impl Notifier {
                 // R14 / D5：通知正文默认脱敏，出口 IP 只在用户显式开启后才出现。
                 let include = crate::config::Config::load().notify.include_egress;
                 let egress = ip.unwrap_or("本次未获取");
-                let egress = crate::redact::redact(egress, include);
-                let text = format!(
-                    "{kind}通知\n出口：{egress}\n检查：{}\n处理状态：{detail}",
-                    if passed { "已恢复正常" } else { reason }
+                // 整段一起脱敏：`reason` / `detail` 里也可能带出口 IP
+                // （例如"出口 IP 是 …，不在约定列表"），只打码 egress 会漏。
+                let text = crate::redact::redact(
+                    &format!(
+                        "{kind}通知\n出口：{egress}\n检查：{}\n处理状态：{detail}",
+                        if passed { "已恢复正常" } else { reason }
+                    ),
+                    include,
                 );
                 enqueue(&mut data, &text);
             }
