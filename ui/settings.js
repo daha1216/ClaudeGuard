@@ -125,6 +125,7 @@
         rowSwitch("st-notify-warning", "预警通知", "连续失败但尚未熔断时", notify.warning !== false, false) +
         rowSwitch("st-notify-client", "客户端更新", "Claude / Codex 客户端需要更新时", notify.client_update !== false, false) +
         rowSwitch("st-notify-self", "守护器更新提醒", "发现 ClaudeGuard 新版本时", notify.self_update !== false, false) +
+        rowSwitch("st-notify-egress", "通知附带出口信息", "默认脱敏；开启后通知正文包含出口 IP 与地区", notify.include_egress === true, false) +
         '<div class="srow"><div class="slabel">发送测试通知<span class="shint">确认系统通知能正常弹出</span></div><div class="sval"><button class="btn" id="st-notify-test" type="button">' + ic("bell", 12) + '发送测试</button></div></div>') +
 
       group("feishu", "飞书通知", '<div id="feishu-group"></div>', "群机器人 Webhook") +
@@ -203,11 +204,12 @@
     chk("st-sweep", cfg.sweep_on_exit !== false);
     chk("st-lockdown-auto", cfg.lockdown_on_uncovered !== false);
     const lockState0 = $("st-lockdown-state");
-    if (lockState0 && S.state) {
-      if (S.state.lockdownManual) {
+    const view = OPTS.getState ? OPTS.getState() : null;
+    if (lockState0 && view) {
+      if (view.lockdownManual) {
         lockState0.textContent = "当前为手动封锁：会一直保持到你点「解除封锁」";
         lockState0.style.display = "";
-      } else if (S.state.lockdown) {
+      } else if (view.lockdown) {
         lockState0.textContent = "当前为自动封锁：未接入代理时生效，接入后自动解除";
         lockState0.style.display = "";
       }
@@ -224,6 +226,7 @@
     chk("st-notify-warning", n.warning !== false);
     chk("st-notify-client", n.client_update !== false);
     chk("st-notify-self", n.self_update !== false);
+    chk("st-notify-egress", n.include_egress === true);
     chk("st-autostart", cfg.auto_start_with_system);
     chk("st-close-tray", cfg.close_to_tray !== false);
     syncCutButtons(cutMode(cfg));
@@ -587,6 +590,7 @@
       "st-notify-warning": "warning",
       "st-notify-client": "client_update",
       "st-notify-self": "self_update",
+      "st-notify-egress": "include_egress",
     };
     const notifyOn = $("st-notify-on");
     if (notifyOn) {

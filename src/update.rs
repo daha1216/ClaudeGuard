@@ -101,20 +101,9 @@ pub fn is_newer(remote: &str, current: &str) -> bool {
 
 // ------------------------------------------------------------------ 网络构建
 
-/// 代理感知 Agent: 与 checks.rs 相同的构建方式。
-fn agent_with_proxy(cfg: &Config) -> Option<ureq::Agent> {
-    ureq::Proxy::new(format!("http://{}:{}", cfg.proxy_host, cfg.proxy_port))
-        .ok()
-        .map(|p| {
-            ureq::AgentBuilder::new()
-                .timeout_connect(T_CHECK)
-                .proxy(p)
-                .build()
-        })
-}
-
-fn agent_direct() -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout_connect(T_CHECK).build()
+/// 统一按外发策略取 Agent（R14 / D5）。代理不可用时不回退直连。
+fn agent(cfg: &Config) -> ureq::Agent {
+    crate::netpol::agent(cfg, T_CHECK)
 }
 
 // ------------------------------------------------------------------ 检查更新
@@ -134,18 +123,15 @@ pub fn check_latest(cfg: &Config) -> Result<Release, String> {
         serde_json::from_str::<Release>(&text).map_err(|e| format!("解析 release: {e}"))
     };
 
-    if let Some(agent) = agent_with_proxy(cfg) {
-        match fetch(&agent) {
-            Ok(r) => return Ok(r),
-            Err(e1) => match fetch(&agent_direct()) {
-                Ok(r) => return Ok(r),
-                Err(e2) => {
-                    return Err(format!("代理失败: {e1}; 直连失败: {e2}"));
-                }
-            },
+    // R14 / D5：代理不可用就如实失败。旧实现会在这里静默直连，
+    // 结果是把家宽 IP 直接送到 GitHub——这正是要禁止的泄漏。
+    fetch(&agent(cfg)).map_err(|e| {
+        if crate::netpol::route(cfg) == crate::netpol::Route::Direct {
+            e
+        } else {
+            crate::netpol::proxy_required_error(&e)
         }
-    }
-    fetch(&agent_direct())
+    })
 }
 
 // ------------------------------------------------------------------ 下载
@@ -190,16 +176,13 @@ pub fn download(
         };
 
     let prog = &mut progress;
-    if let Some(agent) = agent_with_proxy(cfg) {
-        if let Err(e1) = do_download(&agent, prog) {
-            let p2 = &mut progress;
-            do_download(&agent_direct(), p2)
-                .map_err(|e2| format!("代理失败: {e1}; 直连失败: {e2}"))?;
-            return Ok(tmp);
+    do_download(&agent(cfg), prog).map_err(|e| {
+        if crate::netpol::route(cfg) == crate::netpol::Route::Direct {
+            e
+        } else {
+            crate::netpol::proxy_required_error(&e)
         }
-        return Ok(tmp);
-    }
-    do_download(&agent_direct(), prog)?;
+    })?;
     Ok(tmp)
 }
 

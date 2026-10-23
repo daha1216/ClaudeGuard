@@ -483,11 +483,13 @@ impl AppState {
 
     pub fn notify(&self, class: &str, title: &str, body: &str) -> bool {
         let prefs: NotifyPrefs = self.config().notify;
+        // R14 / D5：桌面通知与飞书共用同一脱敏出口，默认不带出口 IP/地区。
+        let body = crate::redact::redact(body, prefs.include_egress);
         // 客户端更新与 v2 一致走双通道：桌面通知 + 飞书队列（飞书是否真的发由 Notifier 的 enabled 决定）。
         if class == "client_update" {
             self.feishu.notify(&format!("{title}\n{body}"));
         }
-        notify::send(&prefs, class, title, body)
+        notify::send(&prefs, class, title, &body)
     }
 
     // ---------- 快照 / 事件 ----------

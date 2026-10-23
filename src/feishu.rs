@@ -503,9 +503,12 @@ impl Notifier {
         data.previous_trip = tripped;
         if data.enabled {
             if let Some(kind) = kind {
+                // R14 / D5：通知正文默认脱敏，出口 IP 只在用户显式开启后才出现。
+                let include = crate::config::Config::load().notify.include_egress;
+                let egress = ip.unwrap_or("本次未获取");
+                let egress = crate::redact::redact(egress, include);
                 let text = format!(
-                    "{kind}通知\n出口：{}\n检查：{}\n处理状态：{detail}",
-                    ip.unwrap_or("本次未获取"),
+                    "{kind}通知\n出口：{egress}\n检查：{}\n处理状态：{detail}",
                     if passed { "已恢复正常" } else { reason }
                 );
                 enqueue(&mut data, &text);

@@ -61,6 +61,9 @@ pub struct NotifyPrefs {
     pub client_update: bool,
     #[serde(default = "default_true")]
     pub self_update: bool,
+    /// R14 / D5：通知正文是否附带出口 IP/地区。默认脱敏。
+    #[serde(default)]
+    pub include_egress: bool,
 }
 
 impl Default for NotifyPrefs {
@@ -73,6 +76,7 @@ impl Default for NotifyPrefs {
             warning: true,
             client_update: true,
             self_update: true,
+            include_egress: false,
         }
     }
 }

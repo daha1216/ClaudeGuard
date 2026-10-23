@@ -23,10 +23,12 @@ mod model;
 mod monitor;
 #[cfg_attr(target_os = "macos", path = "macos/netcut.rs")]
 mod netcut;
+mod netpol;
 #[cfg_attr(target_os = "macos", path = "macos/notify.rs")]
 mod notify;
 mod policy;
 mod recover;
+mod redact;
 mod state;
 mod targets;
 mod update;
