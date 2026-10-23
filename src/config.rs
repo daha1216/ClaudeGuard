@@ -118,7 +118,8 @@ pub struct Config {
     /// v3.9：未接入时自动维持守护对象的出站防火墙封锁（兜底，接入后自动解除）。
     #[serde(default = "default_true")]
     pub lockdown_on_uncovered: bool,
-    #[serde(default = "default_true")]
+    /// D1：新装默认不做全局断网（应用级隔离为主）；旧配置里的显式值原样保留。
+    #[serde(default)]
     pub cut_network: bool,
     #[serde(default)]
     pub disable_network_adapters: bool,
@@ -163,7 +164,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            version: 3,
+            version: CONFIG_VERSION,
             proxy_host: default_proxy_host(),
             proxy_port: default_proxy_port(),
             targets: targets::default_targets(&[], &[]),
@@ -171,7 +172,7 @@ impl Default for Config {
             trip_threshold: default_threshold(),
             enforce_access_path: true,
             lockdown_on_uncovered: true,
-            cut_network: true,
+            cut_network: false,
             disable_network_adapters: false,
             kill_on_fail: true,
             quarantine_on_fail: true,
@@ -192,6 +193,10 @@ impl Default for Config {
         }
     }
 }
+
+/// 当前配置版本。v3.10/D1 起为 4：新装默认 `cut_network=false`（应用级隔离为主），
+/// 旧配置保留用户原有档位、不静默改档。
+pub const CONFIG_VERSION: u32 = 4;
 
 impl Config {
     pub fn load() -> Self {
@@ -218,6 +223,39 @@ impl Config {
         // v3.10 R11：加载是只读路径（`--check` 等 CLI 也走它），绝不在这里写文件。
         // 迁移是幂等的，真正的落盘发生在用户下一次成功保存时。
         cfg
+    }
+
+    /// D1：升级到 v3.10 前，把旧配置原样备份一份，便于回滚。
+    ///
+    /// 只在**应用启动时**调用（`--check` 等只读路径不碰磁盘，见不变量 7）。
+    /// 已有备份就不覆盖——那份才是真正的"升级前"状态。
+    /// 返回备份文件路径（本次新建时）或 `None`（无需备份/已存在/读不到）。
+    pub fn backup_legacy(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let src = dir.join("config.json");
+        let text = std::fs::read_to_string(&src).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        if version >= CONFIG_VERSION {
+            return None;
+        }
+        let dst = dir.join(format!("config.v{version}.bak.json"));
+        if dst.exists() {
+            return None;
+        }
+        std::fs::create_dir_all(dir).ok()?;
+        match std::fs::write(&dst, text.as_bytes()) {
+            Ok(()) => {
+                guard::log_line(&format!(
+                    "config: 已备份 v{version} 配置到 {}",
+                    dst.display()
+                ));
+                Some(dst)
+            }
+            Err(err) => {
+                guard::log_line(&format!("config: 备份旧配置失败：{err}"));
+                None
+            }
+        }
     }
 
     /// v2 → v3 迁移：旧白名单写进内置目标，旧字段清空，跨字段钳制。
@@ -262,7 +300,7 @@ impl Config {
         self.connect_target = None;
         self.app_id = None;
         self.launch_on_pass = None;
-        self.version = 3;
+        self.version = CONFIG_VERSION;
     }
 
     /// 原子写入配置。失败时返回原因，调用方**不得**把改动提交到内存
@@ -467,7 +505,7 @@ mod tests {
         let mut cfg: Config = serde_json::from_str(v2_json()).unwrap();
         assert!(cfg.targets.is_empty());
         cfg.migrate();
-        assert_eq!(cfg.version, 3);
+        assert_eq!(cfg.version, CONFIG_VERSION);
         assert!(cfg.targets.len() >= 4);
         for id in ["local", "claude", "codex"] {
             let t = cfg.target(id).expect(id);
@@ -538,13 +576,68 @@ mod tests {
         assert_eq!(cfg.trip_threshold, 5);
     }
 
+    /// D1：新装默认不做全局断网；显式打开后按"防火墙/禁用网卡"两档。
     #[test]
     fn cut_mode_respects_flags() {
         let mut cfg = Config::default();
+        assert_eq!(cfg.cut_mode(), CutMode::Off, "新装默认不全局断网");
+        cfg.cut_network = true;
         assert_eq!(cfg.cut_mode(), CutMode::Firewall);
         cfg.disable_network_adapters = true;
         assert_eq!(cfg.cut_mode(), CutMode::Nics);
         cfg.cut_network = false;
+        assert_eq!(cfg.cut_mode(), CutMode::Off);
+    }
+
+    /// D1 备份：v3 配置启动时留一份 `config.v3.bak.json`，且不覆盖已有备份。
+    #[test]
+    fn legacy_backup_is_created_once_and_never_overwritten() {
+        let dir = std::env::temp_dir().join("cg-cfg-backup-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, br#"{"version":3,"proxy_port":7890}"#).unwrap();
+
+        let first = Config::backup_legacy(&dir).expect("v3 配置应被备份");
+        assert!(first.exists());
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            br#"{"version":3,"proxy_port":7890}"#
+        );
+
+        // 第二次调用（用户已经改过配置）不得覆盖那份"升级前"的快照
+        std::fs::write(&path, br#"{"version":3,"proxy_port":9999}"#).unwrap();
+        assert!(Config::backup_legacy(&dir).is_none(), "已有备份不覆盖");
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            br#"{"version":3,"proxy_port":7890}"#
+        );
+
+        // 已是当前版本：不需要备份
+        std::fs::write(&path, br#"{"version":4,"proxy_port":7890}"#).unwrap();
+        assert!(Config::backup_legacy(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旧配置里显式写着 `cut_network: true` 时，迁移不得静默改成 false（D1 不改档）。
+    #[test]
+    fn legacy_cut_network_true_survives_migration() {
+        let json = r#"{"version":3,"proxy_host":"127.0.0.1","proxy_port":7890,
+            "cut_network":true,"first_run":false}"#;
+        let mut cfg: Config = serde_json::from_str(json).unwrap();
+        cfg.migrate();
+        assert!(cfg.cut_network, "用户原有档位必须保留");
+        assert_eq!(cfg.cut_mode(), CutMode::Firewall);
+        assert_eq!(cfg.version, CONFIG_VERSION);
+    }
+
+    /// 缺字段的老文件（v2）迁移后按新装默认值走：不全局断网。
+    #[test]
+    fn missing_cut_network_defaults_to_off() {
+        let json = r#"{"version":2,"proxy_host":"127.0.0.1","proxy_port":7890}"#;
+        let mut cfg: Config = serde_json::from_str(json).unwrap();
+        cfg.migrate();
+        assert!(!cfg.cut_network);
         assert_eq!(cfg.cut_mode(), CutMode::Off);
     }
 }

@@ -352,6 +352,8 @@ fn run_notification_test(kind: String) {
 
 fn run_gui(start_hidden: bool, want_settings: bool) {
     crate::update::cleanup_old();
+    // D1：升级前先留一份旧配置，回滚时可直接放回去。
+    crate::config::Config::backup_legacy(&crate::config::config_dir());
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             if !argv.iter().any(|arg| arg == "--tray") {
