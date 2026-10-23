@@ -475,8 +475,14 @@
           '<div class="dkv"><span class="k">时间</span><span>' + esc(fmtClock(trip.since)) + "</span>" +
           '<span class="k">原因</span><span>' + esc(trip.reason) + "</span></div>" +
           '<div class="dkv"><span class="k">结束进程</span><span>' + esc(String(trip.killed || 0)) + " 个</span>" +
-          '<span class="k">防火墙规则</span><span>' + esc(String(trip.firewallRules || 0)) + " 条</span></div>" +
-          '<div class="dkv"><span class="k">隔离应用</span><span>' + esc(listText(trip.quarantinedAgents) || "无") + "</span></div>" +
+          '<span class="k">防火墙规则</span><span>' +
+          (trip.firewallRules ? "已核验 " + esc(String(trip.firewallRules)) + " 条" : "未核验（隔离可能未生效）") +
+          "</span></div>" +
+          '<div class="dkv"><span class="k">隔离应用</span><span>' +
+          (trip.quarantinedAgents && trip.quarantinedAgents.length
+            ? esc(listText(trip.quarantinedAgents)) + "（出/入站已阻断）"
+            : "未确认隔离") +
+          "</span></div>" +
           '<div class="dkv"><span class="k">断网</span><span>' + esc(CUT_LABEL[trip.networkCut] || trip.networkCut || "未断网") +
           (trip.networkNote ? "（" + esc(trip.networkNote) + "）" : "") + "</span></div>" +
           (trip.agents && trip.agents.length ? '<div class="dkv"><span class="k">涉及应用</span><span>' + esc(trip.agents.join("、")) + "</span></div>" : "") +

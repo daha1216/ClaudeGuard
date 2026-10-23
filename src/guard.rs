@@ -479,6 +479,179 @@ mod tests {
     }
 
     /// 行为锁: 版本比较必须按数字段, 不许退回字典序。
+    fn rule(
+        display: &str,
+        program: &str,
+        dir: &str,
+        action: &str,
+        enabled: &str,
+    ) -> FwRuleInstance {
+        FwRuleInstance {
+            name: "guid".into(),
+            display: display.into(),
+            program: program.into(),
+            dir: dir.into(),
+            action: action.into(),
+            enabled: enabled.into(),
+        }
+    }
+
+    #[test]
+    fn verified_requires_enabled_block_on_the_right_direction() {
+        let exe = PathBuf::from(r"C:\Apps\Claude\claude.exe");
+        let expected = vec![("ClaudeGuard Block Out".to_string(), exe.clone(), "out")];
+        // 完全匹配（大小写不敏感）→ 核验通过
+        assert_eq!(
+            count_verified(
+                &[rule(
+                    "ClaudeGuard Block Out",
+                    r"c:\apps\claude\claude.exe",
+                    "Out",
+                    "Block",
+                    "True"
+                )],
+                &expected
+            ),
+            1
+        );
+        // 规则被禁用 → 不算生效
+        assert_eq!(
+            count_verified(
+                &[rule(
+                    "ClaudeGuard Block Out",
+                    r"C:\Apps\Claude\claude.exe",
+                    "Out",
+                    "Block",
+                    "False"
+                )],
+                &expected
+            ),
+            0
+        );
+        // 方向反了 → 不算生效
+        assert_eq!(
+            count_verified(
+                &[rule(
+                    "ClaudeGuard Block Out",
+                    r"C:\Apps\Claude\claude.exe",
+                    "In",
+                    "Block",
+                    "True"
+                )],
+                &expected
+            ),
+            0
+        );
+        // 动作是 Allow → 不算生效
+        assert_eq!(
+            count_verified(
+                &[rule(
+                    "ClaudeGuard Block Out",
+                    r"C:\Apps\Claude\claude.exe",
+                    "Out",
+                    "Allow",
+                    "True"
+                )],
+                &expected
+            ),
+            0
+        );
+        // 程序路径不同（升级换了目录）→ 不算覆盖
+        assert_eq!(
+            count_verified(
+                &[rule(
+                    "ClaudeGuard Block Out",
+                    r"C:\Apps\Claude2\claude.exe",
+                    "Out",
+                    "Block",
+                    "True"
+                )],
+                &expected
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn coverage_never_claims_success_without_query() {
+        let cov = Coverage {
+            desired: 4,
+            verified: 0,
+            added: 4,
+            query_ok: false,
+        };
+        assert!(!cov.complete(), "查询失败时不得宣称已封锁");
+        assert!(cov.summary().contains("无法核验"));
+
+        let partial = Coverage {
+            desired: 4,
+            verified: 2,
+            added: 4,
+            query_ok: true,
+        };
+        assert!(!partial.complete(), "部分失败不得宣称已封锁");
+        assert!(partial.summary().contains("2/4"));
+
+        let none = Coverage {
+            desired: 0,
+            verified: 0,
+            added: 0,
+            query_ok: true,
+        };
+        assert!(!none.complete(), "零条期望也不算封锁成立");
+
+        let ok = Coverage {
+            desired: 4,
+            verified: 4,
+            added: 4,
+            query_ok: true,
+        };
+        assert!(ok.complete());
+        assert!(ok.summary().contains("已核验 4 条"));
+    }
+
+    #[test]
+    fn covered_dirs_prefers_registered_packages_and_keeps_all_versions() {
+        // R05：升级过渡期新旧版本都要覆盖，新版本排在前（先纳入新、最后撤旧）。
+        let pkgs = vec![
+            (
+                "Claude_2.42304.2.0_x64__pzs8sxrjxfjjc".to_string(),
+                PathBuf::from(
+                    r"C:\Program Files\WindowsApps\Claude_2.42304.2.0_x64__pzs8sxrjxfjjc",
+                ),
+            ),
+            (
+                "Claude_2.42304.0.0_x64__pzs8sxrjxfjjc".to_string(),
+                PathBuf::from(
+                    r"C:\Program Files\WindowsApps\Claude_2.42304.0.0_x64__pzs8sxrjxfjjc",
+                ),
+            ),
+        ];
+        let dirs = covered_dirs_from(&pkgs, None);
+        assert_eq!(dirs.len(), 2, "两个已注册版本都要在覆盖清单里");
+        assert!(
+            dirs[0].to_string_lossy().contains("2.42304.2.0"),
+            "新版本应排在前面"
+        );
+        assert!(dirs[1].to_string_lossy().contains("2.42304.0.0"));
+    }
+
+    #[test]
+    fn covered_dirs_falls_back_only_when_registry_unreadable() {
+        let fallback = PathBuf::from(r"C:\Program Files\WindowsApps\Claude_9.9.9.9_x64__x");
+        assert_eq!(
+            covered_dirs_from(&[], Some(fallback.clone())),
+            vec![fallback.clone()],
+            "读不到注册表才用目录名兜底"
+        );
+        let pkgs = vec![("Claude_1.0.0.0_x64__x".to_string(), PathBuf::from(r"C:"))];
+        assert_eq!(
+            covered_dirs_from(&pkgs, Some(fallback)),
+            vec![PathBuf::from(r"C:")],
+            "有注册包时不得混入兜底目录"
+        );
+    }
+
     #[test]
     fn version_key_numeric_compare() {
         let v9 = version_key("Claude_2.9.0.0_x64__hash");
@@ -760,6 +933,54 @@ mod tests {
 
 /// 定位 WindowsApps 下指定前缀的安装目录（版本数值最大者）。
 /// Claude_ → Claude 桌面端；OpenAI.Codex_ → ChatGPT 桌面版（OpenAI 用这个包名发 ChatGPT）。
+/// 已注册的包目录（R05：唯一可信来源是 AppModel 仓库，不是"字典序最大的目录"）。
+///
+/// 返回 (PackageFullName, PackageRootFolder)，按版本从新到旧。
+fn registered_package_dirs(family_prefix: &str) -> Vec<(String, PathBuf)> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+
+    const REPO: &str = r"SOFTWARE\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let Ok(key) = hklm.open_subkey(REPO) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    for name in key.enum_keys().flatten() {
+        if !name.starts_with(family_prefix) {
+            continue;
+        }
+        let Ok(sub) = key.open_subkey(&name) else {
+            continue;
+        };
+        let Ok(root) = sub.get_value::<String, _>("PackageRootFolder") else {
+            continue;
+        };
+        let path = PathBuf::from(root);
+        if path.is_dir() {
+            found.push((name, path));
+        }
+    }
+    found.sort_by_key(|a| std::cmp::Reverse(version_key(&a.0)));
+    found
+}
+
+/// 纯函数：把注册表读到的 (包全名, 目录) 转成去重后的覆盖目录（新版本在前）。
+fn covered_dirs_from(packages: &[(String, PathBuf)], fallback: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for (_, dir) in packages {
+        if !out.contains(dir) {
+            out.push(dir.clone());
+        }
+    }
+    if out.is_empty() {
+        if let Some(dir) = fallback {
+            out.push(dir);
+        }
+    }
+    out
+}
+
 fn find_windowsapps_dir(prefix: &str) -> Option<PathBuf> {
     let root = Path::new(r"C:\Program Files\WindowsApps");
     let mut best: Option<(Vec<u64>, std::ffi::OsString)> = None;
@@ -785,9 +1006,20 @@ pub fn find_claude_dir() -> Option<PathBuf> {
     find_windowsapps_dir("Claude_")
 }
 
-/// ChatGPT 桌面版安装目录（UWP 包 OpenAI.Codex_*）
-pub fn find_chatgpt_dir() -> Option<PathBuf> {
-    find_windowsapps_dir("OpenAI.Codex_")
+/// R05：Claude 的覆盖目录清单（已注册包优先，全部版本；读不到注册表才退回目录名兜底）。
+pub fn claude_covered_dirs() -> Vec<PathBuf> {
+    covered_dirs_from(
+        &registered_package_dirs("Claude_"),
+        find_windowsapps_dir("Claude_"),
+    )
+}
+
+/// R05：ChatGPT 的覆盖目录清单。
+pub fn chatgpt_covered_dirs() -> Vec<PathBuf> {
+    covered_dirs_from(
+        &registered_package_dirs("OpenAI.Codex_"),
+        find_windowsapps_dir("OpenAI.Codex_"),
+    )
 }
 
 /// Claude_2.16120.0.0_x64__pzs8sxrjxfjjc -> Claude_pzs8sxrjxfjjc
@@ -894,12 +1126,13 @@ fn agent_exes(id: &str) -> Vec<PathBuf> {
     let mut exes = Vec::new();
     match id {
         "claude" => {
-            if let Some(dir) = find_claude_dir() {
+            // R05：已注册包 + 升级过渡期的旧版本目录都要覆盖（新版本先纳入，旧版最后撤）。
+            for dir in claude_covered_dirs() {
                 collect_exes(&dir, 0, &mut exes);
             }
         }
         "chatgpt" => {
-            if let Some(dir) = find_chatgpt_dir() {
+            for dir in chatgpt_covered_dirs() {
                 collect_exes(&dir, 0, &mut exes);
             }
         }
@@ -923,44 +1156,119 @@ fn agent_exes(id: &str) -> Vec<PathBuf> {
 }
 
 /// 防火墙隔离：为指定 agent 的全部 exe 添加出入站 Block 规则。返回出站规则添加数。
-pub fn firewall_quarantine_agent(id: &str) -> usize {
-    let exes = agent_exes(id);
-    if exes.is_empty() {
-        log_line(&format!("quarantine({id}): no exes found"));
-        return 0;
+/// 覆盖核验结果（R01）：区分"添加了几条"与"核验到几条真的生效"。
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct Coverage {
+    /// 期望覆盖的规则条数（按 exe × 方向）。
+    pub desired: usize,
+    /// 查询后确认已启用、方向/程序/动作都对的条数。
+    pub verified: usize,
+    /// 本次新添加的条数。
+    pub added: usize,
+    /// 查询是否成功；false 时 `verified` 不可信，不得宣称已封锁。
+    pub query_ok: bool,
+}
+
+impl Coverage {
+    /// 覆盖是否完整：查询成功且期望条数全部核验通过。
+    pub fn complete(&self) -> bool {
+        self.query_ok && self.desired > 0 && self.verified == self.desired
     }
-    let (name_out, name_in) = fw_names(id);
-    log_line(&format!("quarantine({id}): {} exes", exes.len()));
-    let mut added = 0usize;
-    for exe in exes {
-        let p = exe.to_string_lossy().to_string();
+
+    /// 给 UI/日志的一句话结论（不含 IP 等敏感信息）。
+    pub fn summary(&self) -> String {
+        if !self.query_ok {
+            format!("无法核验（期望 {} 条）", self.desired)
+        } else if self.complete() {
+            format!("已核验 {} 条", self.verified)
+        } else {
+            format!("仅核验 {}/{} 条", self.verified, self.desired)
+        }
+    }
+}
+
+/// 按期望集合补齐并核验规则：先查 → 补缺 → 再查核验（不删已有，避免空窗）。
+fn ensure_rules(expected: &[(String, PathBuf, &'static str)]) -> Coverage {
+    let mut cov = Coverage {
+        desired: expected.len(),
+        ..Coverage::default()
+    };
+    let Some(before) = query_rules() else {
+        log_line("firewall ensure: 查询失败，未做任何变更（不宣称已封锁）");
+        return cov;
+    };
+    let have = count_verified(&before, expected);
+    cov.added = 0;
+    for (display, program, dir) in expected {
+        let want = program.to_string_lossy().to_ascii_lowercase();
+        let exists = before.iter().any(|r| {
+            r.display.trim().eq_ignore_ascii_case(display.trim())
+                && r.program.trim().to_ascii_lowercase() == want
+                && r.dir.trim().eq_ignore_ascii_case(dir)
+                && r.action.trim().eq_ignore_ascii_case("Block")
+                && r.enabled.trim().eq_ignore_ascii_case("True")
+        });
+        if exists {
+            continue;
+        }
         if netsh(&[
             "advfirewall",
             "firewall",
             "add",
             "rule",
-            &format!("name={name_out}"),
-            "dir=out",
+            &format!("name={display}"),
+            &format!("dir={dir}"),
             "action=block",
             "enable=yes",
-            &format!("program={p}"),
+            &format!("program={}", program.to_string_lossy()),
         ]) {
-            added += 1;
+            cov.added += 1;
         }
-        let _ = netsh(&[
-            "advfirewall",
-            "firewall",
-            "add",
-            "rule",
-            &format!("name={name_in}"),
-            "dir=in",
-            "action=block",
-            "enable=yes",
-            &format!("program={p}"),
-        ]);
     }
-    log_line(&format!("quarantine({id}): {added} outbound rules added"));
-    added
+    // 补完必须回查：netsh 返回成功不等于规则真的生效（服务关闭、策略覆盖等）。
+    match query_rules() {
+        Some(after) => {
+            cov.query_ok = true;
+            cov.verified = count_verified(&after, expected);
+        }
+        None => {
+            cov.query_ok = false;
+            cov.verified = have;
+        }
+    }
+    cov
+}
+
+pub fn firewall_quarantine_agent(id: &str) -> Coverage {
+    let exes = agent_exes(id);
+    if exes.is_empty() {
+        log_line(&format!("quarantine({id}): 未发现可覆盖的 exe"));
+        return Coverage::default();
+    }
+    let (name_out, name_in) = fw_names(id);
+    log_line(&format!(
+        "quarantine({id}): 覆盖 {} 个 exe（{} 条规则）",
+        exes.len(),
+        exes.len() * 2
+    ));
+    let mut expected: Vec<(String, PathBuf, &'static str)> = Vec::new();
+    for exe in &exes {
+        expected.push((name_out.clone(), exe.clone(), "out"));
+        expected.push((name_in.clone(), exe.clone(), "in"));
+    }
+    let cov = ensure_rules(&expected);
+    log_line(&format!(
+        "quarantine({id}): {}（新增 {} 条）",
+        cov.summary(),
+        cov.added
+    ));
+    if !cov.complete() {
+        log_line(&format!(
+            "quarantine({id}): 覆盖不完整，隔离可能无效（query_ok={}）",
+            cov.query_ok
+        ));
+    }
+    cov
 }
 
 /// 解除单个 agent 的隔离规则
@@ -995,30 +1303,6 @@ pub fn firewall_release() -> bool {
     any
 }
 
-/// 是否存在任何 ClaudeGuard 隔离规则
-pub fn firewall_active() -> bool {
-    let check = |name: &str| {
-        Command::new(sys32("netsh.exe"))
-            .args([
-                "advfirewall",
-                "firewall",
-                "show",
-                "rule",
-                &format!("name={name}"),
-            ])
-            .output()
-            .map(|o| {
-                let text = String::from_utf8_lossy(&o.stdout);
-                text.contains(name) && !text.trim().is_empty()
-            })
-            .unwrap_or(false)
-    };
-    GUI_AGENTS.iter().any(|a| {
-        let (o, i) = fw_names(a.id);
-        check(&o) || check(&i)
-    })
-}
-
 /// 一条防火墙规则实例。`Get-NetFirewallRule` 的 Name 是实例 ID（GUID），
 /// DisplayName 才是规则显示名；按实例 Name 删才不会把同名规则整组误删。
 #[derive(Debug, serde::Deserialize)]
@@ -1029,6 +1313,12 @@ struct FwRuleInstance {
     display: String,
     #[serde(default)]
     program: String,
+    #[serde(default)]
+    dir: String,
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    enabled: String,
 }
 
 /// `Get-NetFirewallRule ... | ConvertTo-Json`：单条输出对象，多条输出数组。
@@ -1079,28 +1369,56 @@ fn duplicate_rule_instances(rules: &[FwRuleInstance]) -> Vec<String> {
 ///
 /// netsh 按名字删会整组删掉，没法只删多余实例，所以走 PowerShell 拿实例 GUID（Name）
 /// 后用 `Remove-NetFirewallRule -Name` 精确删；失败（非管理员等）时返回 0，不影响熔断。
-pub fn firewall_dedupe() -> usize {
-    let script = r"$rules = @(Get-NetFirewallRule -DisplayName 'ClaudeGuard*' -ErrorAction SilentlyContinue | ForEach-Object { $app = $_ | Get-NetFirewallApplicationFilter; [pscustomobject]@{ name = $_.Name; display = $_.DisplayName; program = [string]$app.Program } }); if ($rules.Count -gt 0) { $json = $rules | ConvertTo-Json -Compress } else { $json = '[]' }; [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$json))";
-    let out = match run_hidden(
+/// 查询本产品全部防火墙规则实例（结构化字段：名称/程序/方向/动作/启用）。
+/// 返回 None 表示**查询失败**——此时不得推断"没有规则"，也不得宣称已封锁（R01）。
+fn query_rules() -> Option<Vec<FwRuleInstance>> {
+    let script = r"$rules = @(Get-NetFirewallRule -DisplayName 'ClaudeGuard*' -ErrorAction SilentlyContinue | ForEach-Object { $app = $_ | Get-NetFirewallApplicationFilter; [pscustomobject]@{ name = $_.Name; display = $_.DisplayName; program = [string]$app.Program; dir = [string]$_.Direction; action = [string]$_.Action; enabled = [string]$_.Enabled } }); if ($rules.Count -gt 0) { $json = $rules | ConvertTo-Json -Compress } else { $json = '[]' }; [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$json))";
+    let out = run_hidden(
         &sys32(POWERSHELL),
         &["-NoProfile", "-NonInteractive", "-Command", script],
-    ) {
-        Ok(out) => out,
-        Err(err) => {
-            log_line(&format!("firewall_dedupe: 无法启动 PowerShell（{err}）"));
-            return 0;
-        }
-    };
+    )
+    .ok()?;
     if !out.status.success() {
         log_line(&format!(
-            "firewall_dedupe: 枚举规则失败（exit={:?}）",
+            "firewall query: 枚举规则失败（exit={:?}）",
             out.status.code()
         ));
-        return 0;
+        return None;
     }
     let raw = String::from_utf8_lossy(&out.stdout).to_string();
     let text = decode_b64_text(&raw).unwrap_or(raw);
-    let duplicates = duplicate_rule_instances(&parse_rule_instances(&text));
+    let trimmed = text.trim();
+    // PowerShell 明确输出 '[]' 才是"确实没有规则"；其它异常文本按查询失败处理。
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(parse_rule_instances(trimmed))
+}
+
+/// 纯函数：期望的规则集合里，有多少条已被**核验**为启用中的 Block 规则。
+///
+/// 匹配口径：显示名 + 程序路径（大小写不敏感）+ 方向；必须 action=Block 且 enabled=True。
+fn count_verified(rules: &[FwRuleInstance], expected: &[(String, PathBuf, &str)]) -> usize {
+    expected
+        .iter()
+        .filter(|(display, program, dir)| {
+            let want_prog = program.to_string_lossy().to_ascii_lowercase();
+            rules.iter().any(|r| {
+                r.display.trim().eq_ignore_ascii_case(display.trim())
+                    && r.program.trim().to_ascii_lowercase() == want_prog
+                    && r.dir.trim().eq_ignore_ascii_case(dir)
+                    && r.action.trim().eq_ignore_ascii_case("Block")
+                    && r.enabled.trim().eq_ignore_ascii_case("True")
+            })
+        })
+        .count()
+}
+
+pub fn firewall_dedupe() -> usize {
+    let Some(rules) = query_rules() else {
+        return 0;
+    };
+    let duplicates = duplicate_rule_instances(&rules);
     if duplicates.is_empty() {
         return 0;
     }
@@ -1177,10 +1495,29 @@ pub fn trip(cfg: &crate::config::Config, reason: &str) -> TripResult {
     if cfg.quarantine_on_fail {
         // v3.9：防火墙整体关着时 Block 规则不生效（实测踩过），隔离前先确保开启。
         fw_ensure_on();
+        // R01：隔离是否成立只看**核验结果**，不看"加了几条"或文本匹配。
+        let mut cov = Coverage {
+            query_ok: true,
+            ..Coverage::default()
+        };
         for id in &cfg.guarded_agents {
-            res.firewall_rules += firewall_quarantine_agent(id);
+            let one = firewall_quarantine_agent(id);
+            cov.desired += one.desired;
+            cov.verified += one.verified;
+            cov.added += one.added;
+            cov.query_ok &= one.query_ok;
         }
-        res.quarantined = res.firewall_rules > 0 || firewall_active();
+        res.firewall_rules = cov.verified;
+        res.quarantined = cov.complete();
+        log_line(&format!(
+            "trip: 隔离{}（{}）",
+            if cov.complete() {
+                "已核验生效"
+            } else {
+                "未完成"
+            },
+            cov.summary()
+        ));
     }
     res
 }
@@ -1221,27 +1558,30 @@ pub fn fw_ensure_on() -> bool {
 /// 直连/TUN 流量被拦。返回添加的规则数。
 pub fn lockdown_apply(cfg: &crate::config::Config) -> usize {
     fw_ensure_on();
-    let mut added = 0usize;
+    let mut expected: Vec<(String, PathBuf, &'static str)> = Vec::new();
     for id in &cfg.guarded_agents {
         let name = lockdown_rule_name(id);
         for exe in agent_exes(id) {
-            if netsh(&[
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                &format!("name={name}"),
-                "dir=out",
-                "action=block",
-                "enable=yes",
-                &format!("program={}", exe.to_string_lossy()),
-            ]) {
-                added += 1;
-            }
+            expected.push((name.clone(), exe, "out"));
         }
     }
-    log_line(&format!("lockdown: {added} outbound block rules added"));
-    added
+    if expected.is_empty() {
+        log_line("lockdown: 没有可覆盖的 exe，未添加规则");
+        return 0;
+    }
+    let cov = ensure_rules(&expected);
+    log_line(&format!(
+        "lockdown: {}（新增 {} 条）",
+        cov.summary(),
+        cov.added
+    ));
+    if !cov.complete() {
+        log_line(&format!(
+            "lockdown: 覆盖不完整（query_ok={}），不宣称已封锁",
+            cov.query_ok
+        ));
+    }
+    cov.verified
 }
 
 /// 解除全部兜底封锁规则（防火墙本身保持开启）。返回是否删到规则。
