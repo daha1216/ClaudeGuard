@@ -197,7 +197,10 @@ fn create_staged() -> Result<Staged, String> {
     let dir = staging_dir();
     for _ in 0..8 {
         let path = dir.join(staging_name());
+        // 必须同时要读权限：后面要用同一个句柄算摘要（sha256_of_file）并复制，
+        // 只开 write 会让 ReadFile 直接 ERROR_ACCESS_DENIED。
         match std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(&path)
@@ -906,11 +909,20 @@ mod tests {
     }
 
     /// 受控暂存：目录在 ProgramData 下、名字随机、独占创建、Drop 时自删。
+    ///
+    /// 同时钉住句柄权限：暂存文件必须**可读**，否则后面的摘要校验与复制会
+    /// 在 ReadFile 上失败（这是只开 write 权限时踩过的回归）。
     #[test]
     #[cfg(windows)]
     fn staging_uses_controlled_dir_and_cleans_up() {
-        let staged = create_staged().unwrap();
+        let mut staged = create_staged().unwrap();
         let path = staged.path.clone();
+        std::io::Write::write_all(&mut staged.file, b"payload").unwrap();
+        assert_eq!(
+            sha256_of_file(&mut staged.file).unwrap(),
+            sha256_hex(b"payload"),
+            "暂存句柄必须可读，才能校验并复制同一份字节"
+        );
         assert!(path.exists(), "暂存文件应已创建");
         let text = path.to_string_lossy().to_lowercase();
         assert!(
