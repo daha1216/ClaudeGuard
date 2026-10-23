@@ -104,6 +104,9 @@ pub fn is_newer(remote: &str, current: &str) -> bool {
 
 // ------------------------------------------------------------------ 网络构建
 
+/// 更新包硬上限：正常安装包 4–8 MB，留足余量后仍能挡住被塞进来的大文件。
+const MAX_ARTIFACT: u64 = 128 * 1024 * 1024;
+
 /// 统一按外发策略取 Agent（R14 / D5）。代理不可用时不回退直连。
 fn agent(cfg: &Config) -> Result<ureq::Agent, String> {
     crate::netpol::agent(cfg, T_CHECK)
@@ -232,6 +235,12 @@ pub fn download(
                 .timeout(T_DOWNLOAD)
                 .call()
                 .map_err(|e| format!("下载失败: {e}"))?;
+            // 制品硬上限：超了立刻中止，不先写满磁盘再比大小。
+            let limit = if expected_size > 0 {
+                expected_size.min(MAX_ARTIFACT)
+            } else {
+                MAX_ARTIFACT
+            };
             let mut reader = resp.into_reader();
             let mut written: u64 = 0;
             let mut chunk = [0u8; 65536];
@@ -240,12 +249,18 @@ pub fn download(
                 if n == 0 {
                     break;
                 }
+                written += n as u64;
+                if written > limit {
+                    return Err(format!(
+                        "更新包超过允许的大小上限（{} MB），已中止",
+                        limit / 1_048_576
+                    ));
+                }
                 // 流式落盘，不把整包读进内存（计划要求下载内存与制品大小解耦）。
                 staged
                     .file
                     .write_all(&chunk[..n])
                     .map_err(|e| format!("写暂存文件: {e}"))?;
-                written += n as u64;
                 progress(written, expected_size);
             }
             if expected_size > 0 && written != expected_size {
@@ -446,6 +461,11 @@ pub fn confirm_healthy() {
 pub fn spawn_check(state: &Arc<AppState>) {
     let state = Arc::clone(state);
     std::thread::spawn(move || {
+        // 下载/替换进行中：检查结果一律不写，避免把进度覆盖成"有新版本"。
+        if state.upd_busy() {
+            state.log("更新正在执行，跳过本轮检查");
+            return;
+        }
         state.set_upd(UpdState::Checking);
         state.emit_state();
         state.log("检查更新…");
@@ -453,25 +473,28 @@ pub fn spawn_check(state: &Arc<AppState>) {
             Ok(release) => {
                 let ver = release.version().to_string();
                 if !is_newer(&ver, current_version()) {
-                    state.set_upd(UpdState::UpToDate);
-                    state.log(format!("已是最新版本 v{ver}"));
+                    if state.set_upd_if_idle(UpdState::UpToDate) {
+                        state.log(format!("已是最新版本 v{ver}"));
+                    }
                 } else if let Some(asset) = release.exe_asset() {
-                    state.set_upd(UpdState::Available {
+                    let wrote = state.set_upd_if_idle(UpdState::Available {
                         ver: ver.clone(),
                         url: asset.browser_download_url.clone(),
                         size: asset.size,
                     });
-                    state.log(format!("发现新版本 v{ver}"));
-                } else {
-                    state.set_upd(UpdState::Failed {
-                        msg: missing_asset_message(&ver),
-                    });
+                    if wrote {
+                        state.log(format!("发现新版本 v{ver}"));
+                    }
+                } else if state.set_upd_if_idle(UpdState::Failed {
+                    msg: missing_asset_message(&ver),
+                }) {
                     state.log("发现新版本，但发布页缺少可下载的主程序");
                 }
             }
             Err(err) => {
-                state.set_upd(UpdState::Failed { msg: err.clone() });
-                state.log(format!("检查更新失败：{err}"));
+                if state.set_upd_if_idle(UpdState::Failed { msg: err.clone() }) {
+                    state.log(format!("检查更新失败：{err}"));
+                }
             }
         }
         state.emit_state();
@@ -574,22 +597,28 @@ pub fn spawn_periodic_check(state: &Arc<AppState>) {
             if !state.config().auto_upd_check {
                 continue;
             }
+            if state.upd_busy() {
+                continue;
+            }
             match check_latest(&state.config()) {
                 Ok(release) => {
                     let ver = release.version().to_string();
                     if !is_newer(&ver, current_version()) {
-                        state.set_upd(UpdState::UpToDate);
-                        state.log(format!("静默检查：已是最新版本 v{ver}"));
-                        state.emit_state();
+                        if state.set_upd_if_idle(UpdState::UpToDate) {
+                            state.log(format!("静默检查：已是最新版本 v{ver}"));
+                            state.emit_state();
+                        }
                     } else if let Some(asset) = release.exe_asset() {
-                        state.set_upd(UpdState::Available {
+                        let wrote = state.set_upd_if_idle(UpdState::Available {
                             ver: ver.clone(),
                             url: asset.browser_download_url.clone(),
                             size: asset.size,
                         });
-                        state.log(format!("发现新版本 v{ver}"));
-                        state.emit_state();
-                        notify_new_version(&state, &ver);
+                        if wrote {
+                            state.log(format!("发现新版本 v{ver}"));
+                            state.emit_state();
+                            notify_new_version(&state, &ver);
+                        }
                     }
                     // 有新版本但发布页没有裸 exe 资产：静默跳过，手动检查会给出原因
                 }
@@ -622,6 +651,19 @@ fn digest_for_asset(cfg: &Config, url: &str) -> Result<Option<String>, String> {
         .iter()
         .find(|a| a.browser_download_url == url)
         .and_then(|a| a.digest.clone()))
+}
+
+/// 下载前的准入门槛：URL 必须出现在**当前**官方 release 的资产列表里，
+/// 且必须带可用的 sha256 摘要。返回规范化后的摘要。
+///
+/// 顺序很重要：先确认是官方资产，再决定要不要发请求。旧实现先按 UI 给的
+/// url 下载、下完才查摘要，等于对任意地址都先打一次请求。
+#[cfg(windows)]
+fn official_asset_digest(cfg: &Config, url: &str) -> Result<String, String> {
+    let digest = digest_for_asset(cfg, url)
+        .map_err(|err| format!("无法获取官方校验摘要：{err}"))?
+        .ok_or_else(|| "该版本未提供校验摘要，已取消自动更新；请手动下载安装包".to_string())?;
+    parse_digest(&digest).ok_or_else(|| format!("官方摘要格式无效：{digest}"))
 }
 
 /// 保护进行中是否允许应用自身更新（计划 5.5 的近期阻断策略）。
@@ -669,6 +711,20 @@ pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
             state.log(format!("更新已拒绝：{reason}"));
             return;
         }
+        // R09/D6：先确认这是官方资产并拿到摘要，再发第一个字节。
+        // 旧顺序是先按 UI 传来的 url 下载、下完才查摘要——等于对任意 URL 先发请求。
+        #[cfg(windows)]
+        let expected = match official_asset_digest(&state.config(), &url) {
+            Ok(hex) => hex,
+            Err(reason) => {
+                state.set_upd(UpdState::Failed {
+                    msg: reason.clone(),
+                });
+                state.emit_state();
+                state.log(format!("更新已取消：{reason}"));
+                return;
+            }
+        };
         state.set_upd(UpdState::Downloading {
             done: 0,
             total: size,
@@ -691,33 +747,9 @@ pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
         });
         match result {
             Ok(mut staged) => {
-                // R09/D6：先按官方摘要校验（走句柄），再谈替换。摘要拿不到就不自动装。
+                // R09/D6：下载完立刻用同一句柄核验，再谈替换。
                 #[cfg(windows)]
                 {
-                    // R09/D6：先按官方摘要校验（走句柄），再谈替换。摘要拿不到就不自动装。
-                    let digest = match digest_for_asset(&state.config(), &url) {
-                        Ok(d) => d,
-                        Err(err) => {
-                            state.set_upd(UpdState::Failed {
-                                msg: format!("无法获取官方校验摘要：{err}"),
-                            });
-                            state.emit_state();
-                            state.log(format!("更新已取消：无法获取校验摘要（{err}）"));
-                            return;
-                        }
-                    };
-                    let expected = match digest.as_deref().and_then(parse_digest) {
-                        Some(hex) => hex,
-                        None => {
-                            let msg = "该版本未提供校验摘要，已取消自动更新；请手动下载安装包";
-                            state.set_upd(UpdState::Failed {
-                                msg: msg.to_string(),
-                            });
-                            state.emit_state();
-                            state.log(format!("更新已取消：{msg}"));
-                            return;
-                        }
-                    };
                     let actual = match sha256_of_file(&mut staged.file) {
                         Ok(v) => v,
                         Err(err) => {

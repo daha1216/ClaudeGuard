@@ -417,6 +417,24 @@ impl AppState {
         *lock(&self.upd) = upd;
     }
 
+    /// 更新是否正在下载/替换：这两个状态下任何检查结果都不该覆盖它。
+    pub fn upd_busy(&self) -> bool {
+        upd_busy_state(&lock(&self.upd))
+    }
+
+    /// 只在"没有正在进行的更新"时写入检查结果；返回是否写入。
+    ///
+    /// 后台周期检查与手动检查都可能与下载并发，直接 `set_upd` 会把
+    /// `Downloading` 覆盖成 `Available`，界面进度消失、还可能触发第二次下载。
+    pub fn set_upd_if_idle(&self, upd: UpdState) -> bool {
+        let mut slot = lock(&self.upd);
+        if upd_busy_state(&slot) {
+            return false;
+        }
+        *slot = upd;
+        true
+    }
+
     pub fn launch_error(&self) -> String {
         lock(&self.launch_error).clone()
     }
@@ -573,6 +591,11 @@ impl AppState {
     }
 }
 
+/// 更新处于"正在下载/正在替换"时不允许被检查结果覆盖（纯函数，便于单测）。
+pub fn upd_busy_state(upd: &UpdState) -> bool {
+    matches!(upd, UpdState::Downloading { .. } | UpdState::Restarting)
+}
+
 fn agent_usage() -> (Vec<AgentCount>, Vec<String>) {
     let scan = crate::guard::scan_agents();
     let running = scan
@@ -596,8 +619,28 @@ fn agent_usage() -> (Vec<AgentCount>, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::AppState;
-    use crate::model::{Overall, TargetState};
+    use super::{upd_busy_state, AppState};
+    use crate::model::{Overall, TargetState, UpdState};
+
+    /// 下载/替换期间，检查结果不得覆盖进度（否则界面进度消失、还可能触发二次下载）。
+    #[test]
+    fn busy_update_states_are_protected_from_check_results() {
+        assert!(upd_busy_state(&UpdState::Downloading { done: 1, total: 2 }));
+        assert!(upd_busy_state(&UpdState::Restarting));
+        for idle in [
+            UpdState::Idle,
+            UpdState::Checking,
+            UpdState::UpToDate,
+            UpdState::Available {
+                ver: "9.9.9".into(),
+                url: "u".into(),
+                size: 1,
+            },
+            UpdState::Failed { msg: "e".into() },
+        ] {
+            assert!(!upd_busy_state(&idle), "{idle:?} 不该被视为进行中");
+        }
+    }
 
     /// overall 的纯逻辑（不依赖 AppState/AppHandle）：与 AppState::overall 保持一致。
     fn overall_of(tripped: bool, paused: bool, checking: bool, states: &[TargetState]) -> Overall {
