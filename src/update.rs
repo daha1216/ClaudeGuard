@@ -987,6 +987,31 @@ mod tests {
         assert!(!path.exists(), "Staged 离开作用域后应删除暂存文件");
     }
 
+    /// 生产路径走一遍：暂存句柄写 → 算摘要 → 复制到目标文件，三步同一句柄。
+    ///
+    /// 这条链路就是 `apply_update_from` 做的事；只开 write 权限时它会在
+    /// `sha256_of_file` 或 `std::io::copy` 上失败。
+    #[test]
+    #[cfg(windows)]
+    fn staged_handle_supports_digest_then_copy() {
+        let mut staged = create_staged().unwrap();
+        std::io::Write::write_all(&mut staged.file, b"binary-payload").unwrap();
+        let digest = sha256_of_file(&mut staged.file).unwrap();
+        assert_eq!(digest, sha256_hex(b"binary-payload"));
+
+        let dir = std::env::temp_dir().join("cg-update-copy-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out_path = dir.join("copied.exe");
+        {
+            let mut out = std::fs::File::create(&out_path).unwrap();
+            std::io::copy(&mut staged.file, &mut out).unwrap();
+            out.sync_all().unwrap();
+        }
+        assert_eq!(std::fs::read(&out_path).unwrap(), b"binary-payload");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 独占创建：同名文件已存在时不会复用（防预置文件替换）。
     #[test]
     #[cfg(windows)]
