@@ -22,6 +22,8 @@ pub fn config_dir() -> PathBuf {
     base.join("ClaudeGuard")
 }
 
+/// 仅 macOS 验收测试使用；Windows 侧统一走 `load_from`/`save_to`。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
@@ -189,12 +191,17 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Self {
-        let path = config_path();
+        Self::load_from(&config_dir())
+    }
+
+    /// 只读加载：不写回任何文件（`--check` 等 CLI 与 GUI 共用）。
+    pub fn load_from(dir: &std::path::Path) -> Self {
+        let path = dir.join("config.json");
         let mut cfg = match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Config>(&text) {
                 Ok(cfg) => cfg,
                 Err(err) => {
-                    backup_corrupt(&text);
+                    backup_corrupt_in(dir, &text);
                     guard::log_line(&format!(
                         "config: 配置无法解析（{err}），已备份并重置为默认"
                     ));
@@ -204,7 +211,8 @@ impl Config {
             Err(_) => Self::default(),
         };
         cfg.migrate();
-        cfg.save();
+        // v3.10 R11：加载是只读路径（`--check` 等 CLI 也走它），绝不在这里写文件。
+        // 迁移是幂等的，真正的落盘发生在用户下一次成功保存时。
         cfg
     }
 
@@ -253,30 +261,38 @@ impl Config {
         self.version = 3;
     }
 
-    pub fn save(&self) -> bool {
-        let dir = config_dir();
-        if std::fs::create_dir_all(&dir).is_err() {
-            return false;
-        }
-        let text = match serde_json::to_string_pretty(self) {
-            Ok(text) => text,
-            Err(err) => {
-                guard::log_line(&format!("config: 序列化失败：{err}"));
-                return false;
-            }
-        };
-        let tmp = dir.join("config.json.tmp");
-        if std::fs::write(&tmp, text.as_bytes()).is_err() {
-            return false;
-        }
-        let ok = std::fs::rename(&tmp, config_path()).is_ok();
-        if !ok {
-            let _ = std::fs::remove_file(&tmp);
-            guard::log_line("config: 保存失败（rename）");
-        }
-        ok
+    /// 原子写入配置。失败时返回原因，调用方**不得**把改动提交到内存
+    /// （CONTRACT-v3.10 不变量 7：保存失败不改变内存配置，也不得提示"已保存"）。
+    pub fn save(&self) -> Result<(), String> {
+        self.save_to(&config_dir())
     }
 
+    /// 原子写入指定目录（`save` 的实现，测试与只读路径复用）。
+    pub fn save_to(&self, dir: &std::path::Path) -> Result<(), String> {
+        let dir = dir.to_path_buf();
+        std::fs::create_dir_all(&dir).map_err(|err| {
+            guard::log_line(&format!("config: 无法创建配置目录：{err}"));
+            format!("无法创建配置目录 {}：{err}", dir.display())
+        })?;
+        let text = serde_json::to_string_pretty(self).map_err(|err| {
+            guard::log_line(&format!("config: 序列化失败：{err}"));
+            format!("配置序列化失败：{err}")
+        })?;
+        let tmp = dir.join("config.json.tmp");
+        std::fs::write(&tmp, text.as_bytes()).map_err(|err| {
+            guard::log_line(&format!("config: 写入临时文件失败：{err}"));
+            format!("无法写入 {}：{err}", tmp.display())
+        })?;
+        let target = dir.join("config.json");
+        std::fs::rename(&tmp, &target).map_err(|err| {
+            let _ = std::fs::remove_file(&tmp);
+            guard::log_line(&format!("config: 保存失败（rename）：{err}"));
+            format!("无法替换 {}：{err}", target.display())
+        })
+    }
+
+    /// 仅 macOS 分支使用（Windows 走 `access::resolve` 的系统代理判定）。
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn proxy_url(&self) -> String {
         format!("http://{}:{}", self.proxy_host, self.proxy_port)
     }
@@ -310,7 +326,7 @@ impl Config {
         let mut next: Config =
             serde_json::from_value(merged).map_err(|err| format!("设置字段无效：{err}"))?;
         next.migrate();
-        next.save();
+        next.save()?;
         Ok(next)
     }
 }
@@ -336,9 +352,8 @@ fn deep_merge(base: serde_json::Value, patch: serde_json::Value) -> serde_json::
     }
 }
 
-fn backup_corrupt(text: &str) {
-    let dir = config_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
+fn backup_corrupt_in(dir: &std::path::Path, text: &str) {
+    if std::fs::create_dir_all(dir).is_err() {
         return;
     }
     let stamp = crate::model::now();
@@ -364,6 +379,63 @@ pub fn clean_guarded(raw: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn load_from_is_read_only_even_when_migrating() {
+        let dir = std::env::temp_dir().join("cg-load-readonly");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture");
+        let file = dir.join("config.json");
+        // v2 时代字段：allowed_ips 需要迁移，但加载不得写回。
+        let legacy = r#"{"version":3,"allowed_ips":["127.0.0.1"],"first_run":false}"#;
+        std::fs::write(&file, legacy).expect("fixture");
+        let before = std::fs::read_to_string(&file).expect("read");
+        let cfg = super::Config::load_from(&dir);
+        assert!(!cfg.first_run, "应读到既有配置");
+        // 默认四目标里"本机出口"默认关闭，迁移后仍是 3 个启用。
+        assert_eq!(cfg.targets.len(), 4);
+        assert_eq!(cfg.targets.iter().filter(|t| t.enabled).count(), 3);
+        assert!(
+            cfg.target("local").map(|t| !t.enabled).unwrap_or(false),
+            "本机出口默认关闭"
+        );
+        // v2 的 allowed_ips 应迁进 Claude 目标的白名单。
+        assert_eq!(
+            cfg.target("claude").map(|t| t.expect_ips.clone()),
+            Some(vec!["127.0.0.1".to_string()])
+        );
+        let after = std::fs::read_to_string(&file).expect("read");
+        assert_eq!(before, after, "加载（含迁移）不得改动磁盘文件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_to_reports_failure_without_writing() {
+        let cfg = super::Config::default();
+        // 目标目录是一个已存在文件的下级 → create_dir_all 必然失败。
+        let dir = std::env::temp_dir().join("cg-save-fail");
+        let _ = std::fs::create_dir_all(&dir);
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"x").expect("fixture");
+        let bad = blocker.join("sub");
+        let err = cfg.save_to(&bad).expect_err("必须报告保存失败");
+        assert!(err.contains("无法创建配置目录"), "错误应说明原因：{err}");
+        assert!(!bad.join("config.json").exists(), "失败时不得留下配置文件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_to_writes_atomically_and_leaves_no_temp_file() {
+        let cfg = super::Config::default();
+        let dir = std::env::temp_dir().join("cg-save-ok");
+        let _ = std::fs::remove_dir_all(&dir);
+        cfg.save_to(&dir).expect("应保存成功");
+        assert!(dir.join("config.json").exists());
+        assert!(!dir.join("config.json.tmp").exists(), "临时文件必须被移走");
+        let text = std::fs::read_to_string(dir.join("config.json")).expect("读回");
+        assert!(text.contains("\"first_run\""), "落盘内容应是完整配置");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn v2_json() -> &'static str {

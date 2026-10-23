@@ -275,6 +275,8 @@
       s = "未接入代理链路：" + (st.access.note || "系统代理未开启且未检测到 TUN 网卡");
       // v3.9：兜底封锁生效时说明现状。
       if (st.lockdown) s += "；已启用防火墙兜底封锁";
+    } else if (st.access && st.access.path === "unknown" && st.enforceAccess && overall !== "tripped") {
+      s = "接入路径无法确认：" + (st.access.note || "PAC 或代理配置无法等价复用");
     }
     title.textContent = t;
     sub.textContent = s;
@@ -364,6 +366,18 @@
         ? "系统代理未开启且未检测到 TUN 网卡，Claude 会直连真实出口；已启用防火墙兜底封锁，走系统代理不受影响，接入后自动解除。"
         : "系统代理未开启且未检测到 TUN 网卡，Claude 会直连真实出口；开启系统代理或 TUN 模式即可解除。";
       parts.push(banner("warn", ["未接入代理链路", note]));
+    }
+    // v3.10 R03：接入路径无法确认——不熔断，但不允许通过守护器启动。
+    if (
+      st.access && st.access.path === "unknown" && st.enforceAccess &&
+      overall !== "tripped" && overall !== "paused"
+    ) {
+      parts.push(banner("warn", ["接入路径无法确认",
+        (st.access.note || "PAC 或代理配置无法等价复用") + "；为免误判，暂不允许通过守护器启动。"]));
+    }
+    // v3.10 R12：持久错误（配置保存失败等）常驻显示，直到下一次成功操作清除。
+    if (st.lastError) {
+      parts.unshift(banner("warn", ["操作未生效", st.lastError + "；本次改动未保存，请处理后重试。"]));
     }
     if (st.launchError && st.launchError !== S.launchErrShown) {
       S.launchErrShown = st.launchError;

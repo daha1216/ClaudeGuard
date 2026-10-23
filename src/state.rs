@@ -46,6 +46,8 @@ pub struct StateView {
     pub agents_running: Vec<AgentCount>,
     pub cli_running: Vec<String>,
     pub launch_error: String,
+    /// v3.10 R12：持久错误（配置保存失败等），UI 以横幅常驻直到下一次成功操作。
+    pub last_error: String,
     pub smoke_settings: bool,
     pub notify_enabled: bool,
     pub cut_mode: CutMode,
@@ -69,6 +71,8 @@ pub struct AppState {
     pub claude_update: crate::claude_update::Updater,
     pub codex_update: crate::claude_update::Updater,
     pub launch_error: Mutex<String>,
+    /// v3.10 R12：持久错误——保存失败等"操作未生效"的原因，成功后再清除。
+    pub last_error: Mutex<String>,
     pub access: Mutex<crate::access::AccessInfo>,
     pub access_streak: std::sync::atomic::AtomicU32,
     /// v3.9 兜底封锁：上次同步到防火墙的意图（None=启动后未同步过，首轮会强制对齐）。
@@ -111,6 +115,7 @@ impl AppState {
             ),
             codex_update: crate::claude_update::Updater::load(crate::claude_update::Product::Codex),
             launch_error: Mutex::new(String::new()),
+            last_error: Mutex::new(String::new()),
             access: Mutex::new(crate::access::AccessInfo {
                 path: "skipped".into(),
                 note: "尚未检测".into(),
@@ -283,6 +288,34 @@ impl AppState {
         *lock(&self.launch_error) = msg.into();
     }
 
+    /// v3.10 R12：记录"操作未生效"的持久错误（配置保存失败等），并推给 UI。
+    pub fn set_error(&self, msg: impl Into<String>) {
+        let msg = msg.into();
+        if msg.trim().is_empty() {
+            return;
+        }
+        *lock(&self.last_error) = msg.clone();
+        self.log(format!("操作未生效：{msg}"));
+        self.emit_state();
+    }
+
+    /// 成功后清除持久错误。
+    pub fn clear_error(&self) {
+        let had = {
+            let mut slot = lock(&self.last_error);
+            let had = !slot.is_empty();
+            slot.clear();
+            had
+        };
+        if had {
+            self.emit_state();
+        }
+    }
+
+    pub fn last_error(&self) -> String {
+        lock(&self.last_error).clone()
+    }
+
     // ---------- 日志 ----------
 
     /// 写日志文件 + 内存环 + 推 UI 事件。
@@ -377,6 +410,7 @@ impl AppState {
             agents_running,
             cli_running,
             launch_error: self.launch_error(),
+            last_error: self.last_error(),
             smoke_settings: self.smoke_settings,
             notify_enabled: cfg.notify.enabled,
             cut_mode: if cfg!(target_os = "macos") {

@@ -18,6 +18,36 @@ pub const PAUSE_MINUTES: u64 = 30;
 /// Claude 的 AUMID 兜底值（包家族未找到时仍可尝试）。
 const CLAUDE_APP_ID_FALLBACK: &str = "Claude_pzs8sxrjxfjjc!Claude";
 
+/// v3.10 R08：`Unconfigured`（首启、配置从未有效完成）只允许只读检测与向导，
+/// 不允许 launch / kill / 隔离 / 断网 / lockdown。判据只有一个来源：`cfg.first_run`。
+pub fn is_unconfigured(cfg: &Config) -> bool {
+    cfg.first_run
+}
+
+/// 熔断决策的输入（纯数据，便于单测覆盖首启/暂停/未接入等组合）。
+#[derive(Debug, Clone, Copy)]
+pub struct TripGate {
+    pub unconfigured: bool,
+    pub paused: bool,
+    pub tripped: bool,
+    pub access_uncovered: bool,
+    pub access_streak: u32,
+    pub failing: usize,
+    pub max_streak: u32,
+    pub threshold: u32,
+    pub launch: bool,
+}
+
+/// 是否应当熔断。R08 的约束在这里集中体现：未配置时永不熔断。
+pub fn trip_allowed(g: &TripGate) -> bool {
+    if g.unconfigured || g.paused || g.tripped {
+        return false;
+    }
+    let target_trip = g.failing > 0 && (g.launch || g.max_streak >= g.threshold);
+    let access_trip = g.access_uncovered && (g.launch || g.access_streak >= g.threshold);
+    target_trip || access_trip
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
     Monitor,
@@ -84,12 +114,17 @@ fn probe_all(cfg: &Config, proxy: Option<String>) -> Vec<(Target, ProbeResult)> 
 
 /// 单目标"未接入，跳过探测"的结果（run_round / dry_round / recheck 共用文案）。
 pub fn dry_skipped(target: &crate::model::Target) -> DryResult {
+    dry_skipped_with(target, "未接入代理链路，已跳过探测")
+}
+
+/// 带原因的跳过结果（接入路径无法确认时用）。
+pub fn dry_skipped_with(target: &crate::model::Target, reason: &str) -> DryResult {
     DryResult {
         id: target.id.clone(),
         name: target.name.clone(),
         pass: false,
         verdict: Verdict::Unverified,
-        reason: "未接入代理链路，已跳过探测".into(),
+        reason: reason.into(),
         ip: None,
         country: None,
         latency_ms: 0,
@@ -152,11 +187,15 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     state.set_access(access.clone());
     let access_enforced = cfg!(target_os = "windows") && cfg.enforce_access_path;
     let access_uncovered = access_enforced && access.is_uncovered();
-    let skip_probes = access_uncovered;
+    // v3.10 R03：接入路径无法确认（PAC / socks / 缺地址 / 绕过列表）同样不探测、不熔断。
+    let access_unknown = access_enforced && access.is_unknown();
+    // v3.10 R08：未完成配置时只做只读检测，不探测、不封锁、不熔断。
+    let unconfigured = is_unconfigured(&cfg);
+    let skip_probes = unconfigured || access_uncovered || access_unknown;
 
     // v3.9 防火墙兜底：未接入时维持守护对象出站封锁（回环代理不受影响），接入后自动解除。
     if cfg!(target_os = "windows") {
-        let want_lockdown = access_uncovered && cfg.lockdown_on_uncovered;
+        let want_lockdown = !unconfigured && access_uncovered && cfg.lockdown_on_uncovered;
         state.sync_lockdown(want_lockdown, &cfg);
     }
 
@@ -210,10 +249,17 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
 
     // v3.8：未接入被跳过探测的目标标"无法确认"，界面与 --check 可见原因。
     if skip_probes {
+        let skip_reason = if unconfigured {
+            "尚未完成配置，已跳过探测".to_string()
+        } else if access_unknown {
+            format!("接入路径无法确认，已跳过探测：{}", access.note)
+        } else {
+            "未接入代理链路，已跳过探测".to_string()
+        };
         for slot in statuses.iter_mut() {
             if slot.state == TargetState::Pending {
                 slot.state = TargetState::Unverified;
-                slot.reason = "未接入代理链路，已跳过探测".into();
+                slot.reason = skip_reason.clone();
                 slot.checked_at = Some(crate::model::now());
             }
         }
@@ -291,10 +337,14 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     let access_reason = "系统代理未开启且未检测到 TUN 网卡，应用会直连真实出口";
     let mut summary = RoundSummary {
         passed: all_pass,
-        block_reason: if !failing.is_empty() {
+        block_reason: if unconfigured {
+            "尚未完成配置：请先在向导中设置监控目标与白名单".to_string()
+        } else if !failing.is_empty() {
             reason.clone()
         } else if access_uncovered {
             access_reason.to_string()
+        } else if access_unknown {
+            format!("无法确认应用接入路径，暂不允许启动：{}", access.note)
         } else if all_pass {
             String::new()
         } else {
@@ -306,7 +356,7 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     let paused = state.is_paused();
 
     // v3.7 接入路径防抖：未接入与目标 Fail 走同一套阈值语义。
-    let access_streak = if access_uncovered {
+    let access_streak = if access_uncovered && !unconfigured {
         state.bump_access_streak()
     } else {
         state.reset_access_streak();
@@ -324,16 +374,23 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
             "系统代理未开启且无 TUN 网卡，应用正直连真实出口；下一轮将熔断。",
         );
     }
+    let gate = TripGate {
+        unconfigured,
+        paused,
+        tripped: state.is_tripped(),
+        access_uncovered,
+        access_streak,
+        failing: failing.len(),
+        max_streak,
+        threshold: cfg.trip_threshold,
+        launch: purpose == Purpose::Launch,
+    };
     let access_trip = access_uncovered
-        && !state.is_tripped()
+        && !unconfigured
         && !paused
+        && !state.is_tripped()
         && (purpose == Purpose::Launch || access_streak >= cfg.trip_threshold);
-
-    let should_trip = (!failing.is_empty()
-        && !state.is_tripped()
-        && !paused
-        && (purpose == Purpose::Launch || max_streak >= cfg.trip_threshold))
-        || access_trip;
+    let should_trip = trip_allowed(&gate);
 
     if should_trip {
         if access_trip && failing.is_empty() {
@@ -343,7 +400,7 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
         }
     } else if state.is_tripped() {
         if !failing.is_empty() || access_uncovered {
-            if cfg.kill_on_fail {
+            if cfg.kill_on_fail && !unconfigured {
                 let mut killed = crate::guard::kill_agents(&cfg);
                 if cfg.guarded_agents.iter().any(|id| id == "claude") {
                     killed += crate::guard::kill_claude_cli();
@@ -660,6 +717,65 @@ mod tests {
         }
         assert!(launch_permission(&RoundSummary::ok(), true).is_err());
         assert!(launch_permission(&RoundSummary::ok(), false).is_ok());
+    }
+
+    fn gate() -> TripGate {
+        TripGate {
+            unconfigured: false,
+            paused: false,
+            tripped: false,
+            access_uncovered: false,
+            access_streak: 0,
+            failing: 0,
+            max_streak: 0,
+            threshold: 3,
+            launch: false,
+        }
+    }
+
+    #[test]
+    fn unconfigured_never_trips_even_on_launch_with_failures() {
+        let mut g = gate();
+        g.unconfigured = true;
+        g.launch = true;
+        g.failing = 2;
+        g.max_streak = 9;
+        g.access_uncovered = true;
+        g.access_streak = 9;
+        assert!(!trip_allowed(&g), "首启未配置时不允许任何熔断");
+    }
+
+    #[test]
+    fn configured_trip_follows_launch_or_threshold() {
+        let mut g = gate();
+        g.failing = 1;
+        g.max_streak = 1;
+        assert!(!trip_allowed(&g), "后台轮次未达阈值不熔断");
+        g.max_streak = 3;
+        assert!(trip_allowed(&g), "后台轮次达阈值应熔断");
+        g.max_streak = 1;
+        g.launch = true;
+        assert!(trip_allowed(&g), "启动前检查失败应立即熔断");
+    }
+
+    #[test]
+    fn paused_or_tripped_or_uncovered_gate() {
+        let mut g = gate();
+        g.failing = 1;
+        g.launch = true;
+        g.paused = true;
+        assert!(!trip_allowed(&g));
+        g.paused = false;
+        g.tripped = true;
+        assert!(!trip_allowed(&g));
+        g.tripped = false;
+        g.failing = 0;
+        g.launch = false;
+        g.access_uncovered = true;
+        g.access_streak = 3;
+        assert!(trip_allowed(&g), "未接入达阈值同样熔断");
+        g.access_streak = 1;
+        assert!(!trip_allowed(&g));
     }
 
     #[test]

@@ -93,7 +93,7 @@ pub fn prepare() -> Result<tempfile::TempDir, String> {
         ..Config::default()
     };
     cfg.notify.enabled = false;
-    cfg.save();
+    let _ = cfg.save();
     if !crate::config::config_path().starts_with(dir.path())
         || !crate::config::config_path().is_file()
     {

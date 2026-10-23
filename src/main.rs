@@ -190,8 +190,10 @@ fn cli_check() -> i32 {
     let results = monitor::dry_round(&cfg);
     // v3.7：接入路径快照；enforce 且未接入 → 整体不通过。
     let (_proxy, access) = access::resolve(&cfg);
-    let uncovered = cfg!(target_os = "windows") && cfg.enforce_access_path && access.is_uncovered();
-    let passed = !results.is_empty() && results.iter().all(|result| result.pass) && !uncovered;
+    let enforced = cfg!(target_os = "windows") && cfg.enforce_access_path;
+    // v3.10 R03：未接入与无法确认都不算通过（前者熔断、后者禁止启动）。
+    let access_ok = !enforced || access.is_known();
+    let passed = !results.is_empty() && results.iter().all(|result| result.pass) && access_ok;
     print_json(&serde_json::json!({
         "version": crate::model::VERSION,
         "passed": passed,

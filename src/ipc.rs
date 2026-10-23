@@ -46,7 +46,15 @@ pub fn update_settings(
     state: State<'_, Arc<AppState>>,
     patch: serde_json::Value,
 ) -> Result<StateView, String> {
-    let next = state.config().apply_patch(&patch)?;
+    // apply_patch 先把改动原子落盘，失败时直接返回错误——内存配置保持原样。
+    let next = match state.config().apply_patch(&patch) {
+        Ok(next) => next,
+        Err(err) => {
+            state.set_error(err.clone());
+            return Err(err);
+        }
+    };
+    state.clear_error();
     state.set_config(next);
     state.reset_statuses_from_config();
     state.emit_state();
@@ -61,7 +69,11 @@ pub fn save_targets(
     let targets = crate::targets::validate(targets)?;
     let mut cfg = state.config();
     cfg.targets = targets;
-    cfg.save();
+    if let Err(err) = cfg.save() {
+        state.set_error(err.clone());
+        return Err(err);
+    }
+    state.clear_error();
     state.set_config(cfg);
     state.reset_statuses_from_config();
     state.log("监控目标已保存");
@@ -70,19 +82,23 @@ pub fn save_targets(
 }
 
 #[tauri::command]
-pub fn reset_targets(state: State<'_, Arc<AppState>>) -> StateView {
+pub fn reset_targets(state: State<'_, Arc<AppState>>) -> Result<StateView, String> {
     let mut cfg = state.config();
     let (ips, regions) = cfg
         .target("claude")
         .map(|t| (t.expect_ips.clone(), t.expect_regions.clone()))
         .unwrap_or_default();
     cfg.targets = crate::targets::default_targets(&ips, &regions);
-    cfg.save();
+    if let Err(err) = cfg.save() {
+        state.set_error(err.clone());
+        return Err(err);
+    }
+    state.clear_error();
     state.set_config(cfg);
     state.reset_statuses_from_config();
     state.log("监控目标已恢复默认锚点（白名单保留）");
     state.emit_state();
-    state.state_view()
+    Ok(state.state_view())
 }
 
 // ---------- 检查 / 熔断 ----------
@@ -106,8 +122,13 @@ pub fn recheck_target(state: State<'_, Arc<AppState>>, id: String) -> Result<Dry
         .ok_or_else(|| "目标不存在".to_string())?;
     let (route, access) = crate::access::resolve(&cfg);
     let enforced = cfg!(target_os = "windows") && cfg.enforce_access_path;
-    if enforced && access.is_uncovered() {
-        return Ok(crate::monitor::dry_skipped(&target));
+    if enforced && !access.is_known() {
+        let reason = if access.is_uncovered() {
+            "未接入代理链路，已跳过探测".to_string()
+        } else {
+            format!("接入路径无法确认，已跳过探测：{}", access.note)
+        };
+        return Ok(crate::monitor::dry_skipped_with(&target, &reason));
     }
     let proxy = match route {
         crate::access::ProbeRoute::Proxy(url) => Some(url),
@@ -231,7 +252,11 @@ pub fn set_autostart(state: State<'_, Arc<AppState>>, on: bool) -> Result<bool, 
     if ok {
         let mut cfg = state.config();
         cfg.auto_start_with_system = on;
-        cfg.save();
+        if let Err(err) = cfg.save() {
+            state.set_error(err.clone());
+            return Err(err);
+        }
+        state.clear_error();
         state.set_config(cfg);
         state.emit_state();
     }

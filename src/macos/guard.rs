@@ -427,6 +427,21 @@ pub fn firewall_dedupe() -> usize {
     0
 }
 
+// v3.10 R07：共享代码（state/main/monitor）会调用防火墙兜底与 lockdown 接口。
+// macOS 既不支持应用级防火墙隔离，也不支持兜底封锁，因此这里显式返回"未执行"，
+// 让共享代码可编译，并由上层按 `networkIsolationSupported=false` 在 UI/--check 明示。
+pub fn fw_ensure_on() -> bool {
+    false
+}
+
+pub fn lockdown_apply(_cfg: &crate::config::Config) -> usize {
+    0
+}
+
+pub fn lockdown_clear() -> bool {
+    false
+}
+
 pub fn trip(cfg: &crate::config::Config, reason: &str) -> TripResult {
     let mut report = TripResult {
         agents: cfg
