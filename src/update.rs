@@ -687,46 +687,51 @@ pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
         match result {
             Ok(mut staged) => {
                 // R09/D6：先按官方摘要校验（走句柄），再谈替换。摘要拿不到就不自动装。
-                let digest = match digest_for_asset(&state.config(), &url) {
-                    Ok(d) => d,
-                    Err(err) => {
-                        state.set_upd(UpdState::Failed {
-                            msg: format!("无法获取官方校验摘要：{err}"),
-                        });
-                        state.emit_state();
-                        state.log(format!("更新已取消：无法获取校验摘要（{err}）"));
-                        return;
-                    }
-                };
-                let expected = match digest.as_deref().and_then(parse_digest) {
-                    Some(hex) => hex,
-                    None => {
-                        let msg = "该版本未提供校验摘要，已取消自动更新；请手动下载安装包";
-                        state.set_upd(UpdState::Failed {
-                            msg: msg.to_string(),
-                        });
+                #[cfg(windows)]
+                {
+                    // R09/D6：先按官方摘要校验（走句柄），再谈替换。摘要拿不到就不自动装。
+                    let digest = match digest_for_asset(&state.config(), &url) {
+                        Ok(d) => d,
+                        Err(err) => {
+                            state.set_upd(UpdState::Failed {
+                                msg: format!("无法获取官方校验摘要：{err}"),
+                            });
+                            state.emit_state();
+                            state.log(format!("更新已取消：无法获取校验摘要（{err}）"));
+                            return;
+                        }
+                    };
+                    let expected = match digest.as_deref().and_then(parse_digest) {
+                        Some(hex) => hex,
+                        None => {
+                            let msg = "该版本未提供校验摘要，已取消自动更新；请手动下载安装包";
+                            state.set_upd(UpdState::Failed {
+                                msg: msg.to_string(),
+                            });
+                            state.emit_state();
+                            state.log(format!("更新已取消：{msg}"));
+                            return;
+                        }
+                    };
+                    let actual = match sha256_of_file(&mut staged.file) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            state.set_upd(UpdState::Failed { msg: err.clone() });
+                            state.emit_state();
+                            state.log(format!("更新已取消：{err}"));
+                            return;
+                        }
+                    };
+                    if actual != expected {
+                        let msg = format!("更新包校验不通过（期望 {expected}，实得 {actual}）");
+                        state.set_upd(UpdState::Failed { msg: msg.clone() });
                         state.emit_state();
                         state.log(format!("更新已取消：{msg}"));
                         return;
                     }
-                };
-                let actual = match sha256_of_file(&mut staged.file) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        state.set_upd(UpdState::Failed { msg: err.clone() });
-                        state.emit_state();
-                        state.log(format!("更新已取消：{err}"));
-                        return;
-                    }
-                };
-                if actual != expected {
-                    let msg = format!("更新包校验不通过（期望 {expected}，实得 {actual}）");
-                    state.set_upd(UpdState::Failed { msg: msg.clone() });
-                    state.emit_state();
-                    state.log(format!("更新已取消：{msg}"));
-                    return;
+                    state.log("更新包校验通过");
                 }
-                state.log("更新包校验通过");
+
                 state.set_upd(UpdState::Restarting);
                 state.emit_state();
                 state.log("更新已下载，正在替换并重启…");
@@ -737,6 +742,7 @@ pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
                     }
                     #[cfg(target_os = "macos")]
                     {
+                        // macOS 走带签名清单的 self_update，校验在下载阶段已完成。
                         apply_update(&staged, true)
                     }
                 };
