@@ -57,7 +57,7 @@ pub fn redact(text: &str, include_egress: bool) -> String {
         out.push(c);
         i += 1;
     }
-    out
+    scrub_region_names(&out)
 }
 
 /// 识别"独立的两位大写地区代码"（前后不是字母/数字），返回应跳过的字符数。
@@ -86,6 +86,48 @@ fn region_marker_at(chars: &[char], i: usize) -> Option<usize> {
         return None;
     }
     Some(2)
+}
+
+/// 中文地区名（与 `model::region_name` 同源）：脱敏时同样要打码。
+///
+/// 只靠"两位大写代码"挡不住 `policy::fail_reason` 产出的"出口 1.2.3.4（美国）"。
+const REGION_NAMES_ZH: [&str; 25] = [
+    "美国",
+    "日本",
+    "新加坡",
+    "香港",
+    "台湾",
+    "韩国",
+    "英国",
+    "德国",
+    "法国",
+    "加拿大",
+    "澳大利亚",
+    "荷兰",
+    "俄罗斯",
+    "印度",
+    "巴西",
+    "土耳其",
+    "阿联酋",
+    "瑞士",
+    "瑞典",
+    "意大利",
+    "西班牙",
+    "中国",
+    "澳门",
+    "越南",
+    "泰国",
+];
+
+/// 把文本里出现的中文地区名替换成占位符。
+fn scrub_region_names(text: &str) -> String {
+    let mut out = text.to_string();
+    for name in REGION_NAMES_ZH {
+        if out.contains(name) {
+            out = out.replace(name, REDACTED);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -128,6 +170,18 @@ mod tests {
         assert!(redact("OK", false).contains("OK"));
         assert!(redact("API 检查失败", false).contains("API"));
         assert!(redact("HTTP 500", false).contains("HTTP"));
+    }
+
+    #[test]
+    fn chinese_region_names_are_redacted_by_default() {
+        // policy::fail_reason 的产物形如「出口 204.1.100.98（美国）不在白名单」
+        let text = "出口 204.1.100.98（美国）不在白名单";
+        let out = redact(text, false);
+        assert!(!out.contains("204.1.100.98"), "默认不得出现出口 IP：{out}");
+        assert!(!out.contains("美国"), "默认不得出现地区名：{out}");
+        assert!(out.contains(REDACTED));
+        // 用户显式打开后原样保留
+        assert_eq!(redact(text, true), text);
     }
 
     #[test]
