@@ -22,6 +22,8 @@
     release: "release",
     pause: "pause",
     resume: "resume",
+    rearm: "rearm",
+    disarm: "disarm",
     sweep_claude: "sweep_claude",
     lockdown: "lockdown",
     recent_logs: "recent_logs",

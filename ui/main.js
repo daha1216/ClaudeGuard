@@ -339,6 +339,15 @@
     const st = S.state;
     if (!st) { host.innerHTML = ""; return; }
     const parts = [];
+    // v3.10 R06：已停止保护是最高优先级的状态——此时守护器不杀进程、不隔离、不断网，
+    // 用户必须一眼看到"现在没有保护"，而不是被其他提示淹没。
+    if (st.disarmed) {
+      parts.push(banner("warn", [
+        "保护已停止",
+        (st.disarmedReason ? st.disarmedReason + "。" : "") +
+          "当前只做出口检测，不会结束进程、隔离或断网，也不拦截从守护器启动。",
+      ], { id: "rearm", label: "重新布防" }));
+    }
     if (st.platform === "macos" && !st.networkIsolationSupported) {
       parts.push(banner("warn", ["macOS 移植预览 · 进程守护模式", "出口异常达到阈值后关闭勾选应用，检测未通过时禁止从守护器启动 Claude。请开启「结束守护对象进程」；此模式不阻断网络连接。"]));
     }
@@ -393,6 +402,7 @@
         const id = el.getAttribute("data-bact");
         if (id === "release") doRelease();
         else if (id === "resume") doResume();
+        else if (id === "rearm") doRearm();
         else if (id === "details") expand("details");
         else if (id === "launch-dismiss") {
           S.launchErrShown = st.launchError;
@@ -715,6 +725,12 @@
 
   async function doResume() {
     await call(CMD.resume);
+    await refreshState();
+  }
+
+  /* v3.10 R06：从"已停止保护"回到正常守护。call 内部已提示失败原因。 */
+  async function doRearm() {
+    await call(CMD.rearm);
     await refreshState();
   }
 

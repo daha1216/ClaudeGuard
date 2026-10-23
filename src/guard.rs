@@ -490,6 +490,28 @@ fn version_key(name: &str) -> Vec<u64> {
 mod tests {
     use super::*;
 
+    /// 行为锁：空数组必须解析成"没有规则"，不能变成一个全默认字段的幽灵规则。
+    /// 恢复核验依赖这条：`[]` 被当成 1 条残留会让 --restore 永远失败。
+    #[test]
+    fn empty_rule_list_is_zero_rules_not_a_phantom_rule() {
+        assert!(parse_rule_instances("[]").is_empty());
+        assert!(parse_rule_instances("null").is_empty());
+        assert!(parse_rule_instances("").is_empty());
+        assert!(parse_rule_instances("not json").is_empty());
+    }
+
+    /// 行为锁：单对象与数组两种输出形态都能解析，且不吞掉真实规则。
+    #[test]
+    fn rule_list_parses_both_shapes() {
+        let one = r#"{"name":"{A}","display":"ClaudeGuard Block Out (claude)","program":"C:\\x.exe","dir":"Outbound","action":"Block","enabled":"True"}"#;
+        let parsed = parse_rule_instances(one);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].display, "ClaudeGuard Block Out (claude)");
+
+        let two = format!("[{one},{one}]");
+        assert_eq!(parse_rule_instances(&two).len(), 2);
+    }
+
     /// 行为锁: 兜底封锁规则名按 agent 区分，与熔断隔离规则名互不冲突。
     #[test]
     fn lockdown_rule_names_are_scoped() {
@@ -1378,6 +1400,13 @@ pub fn firewall_release_agent(id: &str) -> bool {
     a || b
 }
 
+/// 本产品防火墙规则总条数（含隔离、兜底封锁、断网规则）。
+///
+/// 恢复核验用：返回 None 表示查询失败——此时不能宣称"已清理干净"。
+pub fn firewall_rule_count() -> Option<usize> {
+    query_rules().map(|rules| rules.len())
+}
+
 /// 解除全部 agent 的隔离规则（通过即恢复 / 托盘手动解除共用）
 pub fn firewall_release() -> bool {
     let mut any = false;
@@ -1407,24 +1436,27 @@ struct FwRuleInstance {
     enabled: String,
 }
 
-/// `Get-NetFirewallRule ... | ConvertTo-Json`：单条输出对象，多条输出数组。
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum RuleList {
-    One(FwRuleInstance),
-    Many(Vec<FwRuleInstance>),
-}
-
 /// 纯函数：解析规则实例 JSON（空/null/非法输入返回空）。
+///
+/// 必须先看 JSON 的形状再决定按数组还是单对象解析：`FwRuleInstance` 的字段
+/// 全都有 `#[serde(default)]`，若直接 `untagged` 尝试 `One(Struct)`，serde 会把
+/// `[]` 当成"空序列构造全默认结构体"而成功——于是"没有规则"被解析成"1 条空规则"，
+/// 恢复核验就会永远报告残留。真实踩过。
 fn parse_rule_instances(text: &str) -> Vec<FwRuleInstance> {
     let text = text.trim();
     if text.is_empty() || text.eq_ignore_ascii_case("null") {
         return Vec::new();
     }
-    match serde_json::from_str::<RuleList>(text) {
-        Ok(RuleList::One(rule)) => vec![rule],
-        Ok(RuleList::Many(rules)) => rules,
-        Err(_) => Vec::new(),
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Array(items)) => items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value(item).ok())
+            .collect(),
+        Ok(serde_json::Value::Object(_)) => match serde_json::from_str::<FwRuleInstance>(text) {
+            Ok(rule) => vec![rule],
+            Err(_) => Vec::new(),
+        },
+        _ => Vec::new(),
     }
 }
 

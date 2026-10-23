@@ -9,6 +9,7 @@ mod anchors;
 #[cfg_attr(target_os = "macos", path = "macos/claude_update.rs")]
 mod claude_update;
 mod config;
+mod disarm;
 mod feishu;
 #[cfg_attr(target_os = "macos", path = "macos/guard.rs")]
 mod guard;
@@ -25,6 +26,7 @@ mod netcut;
 #[cfg_attr(target_os = "macos", path = "macos/notify.rs")]
 mod notify;
 mod policy;
+mod recover;
 mod state;
 mod targets;
 mod update;
@@ -108,6 +110,14 @@ fn main() {
         std::process::exit(cli_install());
     }
     if has("--uninstall") {
+        // R06：卸载前必须先恢复成功；恢复失败禁止继续删（否则会留下无记录的
+        // 隔离规则/断网现场，而恢复执行器本身也一起被删掉了）。
+        let report = crate::recover::restore_all();
+        if !report.ok {
+            eprintln!("{}", report.summary());
+            eprintln!("恢复未完成，已中止卸载（可稍后重试 --restore）");
+            std::process::exit(1);
+        }
         #[cfg(target_os = "macos")]
         if let Err(error) = crate::install::uninstall() {
             eprintln!("{error}");
@@ -209,14 +219,32 @@ fn cli_check() -> i32 {
 }
 
 fn cli_restore() -> i32 {
-    let (ok, note) = crate::netcut::restore();
-    let released = crate::guard::firewall_release();
+    // 急救路径：不依赖 GUI、不依赖联网、不依赖探测成功（R06 流程 B）。
+    let report = crate::recover::restore_all();
+    // 恢复成功才写"停止保护"意图：否则存活实例会在下一轮把规则重新加回来，
+    // 用户看到的"已恢复"几秒后就会失效。恢复失败则保持原样，宁可继续保护。
+    let mut disarm_note = String::new();
+    if report.ok {
+        match crate::disarm::mark("--restore 急救恢复") {
+            Ok(()) => disarm_note = "已通知守护器停止重新施加规则".to_string(),
+            Err(err) => {
+                eprintln!("警告：{err}；存活实例可能重新施加规则，请手动停止守护器");
+                disarm_note = err;
+            }
+        }
+    }
     print_json(&serde_json::json!({
-        "networkOk": ok,
-        "network": note,
-        "firewallReleased": released,
+        "items": report.items,
+        "ok": report.ok,
+        "verified": report.verified,
+        "disarm": disarm_note,
     }));
-    0
+    if report.ok {
+        0
+    } else {
+        eprintln!("{}", report.summary());
+        1
+    }
 }
 
 fn cli_install() -> i32 {
@@ -398,13 +426,25 @@ fn run_gui(start_hidden: bool, want_settings: bool) {
                 });
             });
         }
-        if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
+        // R06 / 契约 D3：正常退出必须"核验成功才退出"，失败要保持运行并报错，
+        // 否则用户会在系统仍被改动的情况下失去守护器与恢复执行器。
+        if let RunEvent::ExitRequested { api, .. } = &event {
             let state = app_handle.state::<Arc<AppState>>();
             state.stop.store(true, Ordering::SeqCst);
-            let _ = crate::netcut::restore();
-            let _ = crate::guard::firewall_release();
-            // v3.9：退出时解除兜底封锁（只清规则，不动防火墙总开关）。
-            let _ = crate::guard::lockdown_clear();
+            let report = crate::recover::restore_all();
+            if !report.ok {
+                state.stop.store(false, Ordering::SeqCst);
+                state.set_error(format!("退出前恢复未完成：{}", report.summary()));
+                api.prevent_exit();
+            }
+        }
+        if matches!(event, RunEvent::Exit) {
+            let state = app_handle.state::<Arc<AppState>>();
+            state.stop.store(true, Ordering::SeqCst);
+            let report = crate::recover::restore_all();
+            if !report.ok {
+                crate::guard::log_line(&format!("退出恢复未完成：{}", report.summary()));
+            }
         }
     });
 }
@@ -417,6 +457,8 @@ fn with_ipc(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
         ipc::save_targets,
         ipc::reset_targets,
         ipc::recheck,
+        ipc::disarm,
+        ipc::rearm,
         ipc::launch,
         ipc::recheck_target,
         ipc::release,

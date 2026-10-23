@@ -36,11 +36,13 @@ pub struct TripGate {
     pub max_streak: u32,
     pub threshold: u32,
     pub launch: bool,
+    /// v3.10 R06：用户已要求停止保护时不得熔断（否则会立刻撤销急救结果）。
+    pub disarmed: bool,
 }
 
 /// 是否应当熔断。R08 的约束在这里集中体现：未配置时永不熔断。
 pub fn trip_allowed(g: &TripGate) -> bool {
-    if g.unconfigured || g.paused || g.tripped {
+    if g.unconfigured || g.paused || g.tripped || g.disarmed {
         return false;
     }
     let target_trip = g.failing > 0 && (g.launch || g.max_streak >= g.threshold);
@@ -202,8 +204,12 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     let unconfigured = is_unconfigured(&cfg);
     let skip_probes = unconfigured || access_uncovered || access_unknown;
 
+    // v3.10 R06：用户已要求停止保护（如 `--restore` 急救）时，本轮只做检测，
+    // 不再封锁/隔离/断网；否则急救刚清掉的规则会被守护器立刻加回去。
+    let disarmed = state.is_disarmed();
+
     // v3.9 防火墙兜底：未接入时维持守护对象出站封锁（回环代理不受影响），接入后自动解除。
-    if cfg!(target_os = "windows") {
+    if cfg!(target_os = "windows") && !disarmed {
         let want_lockdown = !unconfigured && access_uncovered && cfg.lockdown_on_uncovered;
         state.sync_lockdown(want_lockdown, &cfg);
     }
@@ -402,6 +408,7 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
         max_streak,
         threshold: cfg.trip_threshold,
         launch: purpose == Purpose::Launch,
+        disarmed,
     };
     let access_trip = access_uncovered
         && !unconfigured
@@ -418,7 +425,7 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
         }
     } else if state.is_tripped() {
         if !failing.is_empty() || access_uncovered {
-            if cfg.kill_on_fail && !unconfigured {
+            if cfg.kill_on_fail && !unconfigured && !disarmed {
                 let mut killed = crate::guard::kill_agents(&cfg);
                 if cfg.guarded_agents.iter().any(|id| id == "claude") {
                     killed += crate::guard::kill_claude_cli();
@@ -773,7 +780,26 @@ mod tests {
             max_streak: 0,
             threshold: 3,
             launch: false,
+            disarmed: false,
         }
+    }
+
+    /// 行为锁：用户已要求停止保护（如刚跑过 `--restore` 急救）时，
+    /// 即便各项都失败也不能熔断，否则守护器会把急救结果立刻撤销。
+    #[test]
+    fn disarmed_never_trips_even_when_everything_fails() {
+        let mut g = gate();
+        g.disarmed = true;
+        g.failing = 3;
+        g.max_streak = 99;
+        g.access_uncovered = true;
+        g.access_streak = 99;
+        g.launch = true;
+        assert!(!trip_allowed(&g), "停止保护期间不允许熔断");
+
+        // 反向对照：同样的失败，没有停止保护时应当熔断——否则上一条断言没有意义。
+        g.disarmed = false;
+        assert!(trip_allowed(&g));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-; ClaudeGuard Inno Setup script
+﻿; ClaudeGuard Inno Setup script
 ; Build: ISCC.exe installer\claude-guard.iss  (from repo root)
 ; All wizard text comes from ChineseSimplified.isl (official Inno translation),
 ; so this file is pure ASCII on purpose - do NOT add non-ASCII here without
@@ -61,6 +61,7 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 [Code]
 var
   TaskkillResultCode: Integer;
+  RestoreResultCode: Integer;
 
 // v2 UI runs on WebView2 (Edge Evergreen runtime). Most Windows 10/11 boxes
 // have it via Edge updates; we do NOT bundle or auto-download it -- just fail
@@ -97,10 +98,32 @@ begin
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ExePath: String;
+  RestoreOk: Boolean;
 begin
   if CurUninstallStep = usUninstall then
   begin
     Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM ClaudeGuard.exe >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, TaskkillResultCode);
+
+    // v3.10 R06: 卸载前必须先把网络改动与防火墙隔离恢复掉。此刻 exe 还在，
+    // 一旦文件被删，就再也没有能执行恢复的程序，残留规则会长期拦着 Claude。
+    ExePath := ExpandConstant('{app}\{#MyAppExeName}');
+    RestoreOk := False;
+    if FileExists(ExePath) then
+    begin
+      if Exec(ExePath, '--restore', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, RestoreResultCode) then
+        RestoreOk := (RestoreResultCode = 0);
+    end;
+    if not RestoreOk then
+    begin
+      if MsgBox('未能确认网络与防火墙隔离已恢复。' + #13#10 + #13#10 +
+                '继续卸载会留下无人清理的防火墙规则，可能让 Claude 等应用一直无法联网。' + #13#10 +
+                '建议先取消卸载，手动运行：' + #13#10 + '    ' + ExePath + ' --restore' + #13#10 + #13#10 +
+                '仍要继续卸载吗？',
+                mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDNO then
+        Abort;
+    end;
     // Remove autostart entry the app may have written (HKCU Run).
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'ClaudeGuard');
     // Remove legacy self-install registry key (pre-1.3.3 --install) to avoid

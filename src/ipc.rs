@@ -108,6 +108,19 @@ pub fn recheck(state: State<'_, Arc<AppState>>) {
     monitor::recheck(state.inner());
 }
 
+/// v3.10 R06：停止保护（只检测、不动作）。用于"我知道有风险，先别动我的进程"。
+#[tauri::command]
+pub fn disarm(state: State<'_, Arc<AppState>>, reason: Option<String>) -> Result<(), String> {
+    let reason = reason.unwrap_or_else(|| "用户手动停止保护".to_string());
+    state.inner().disarm(&reason)
+}
+
+/// v3.10 R06：重新布防，恢复守护动作。
+#[tauri::command]
+pub fn rearm(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.inner().rearm()
+}
+
 #[tauri::command]
 pub fn launch(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     monitor::launch(state.inner())

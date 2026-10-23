@@ -57,6 +57,9 @@ pub struct StateView {
     pub lockdown: bool,
     /// v3.10 R13：手动封锁是否由用户开启（独立生命周期）。
     pub lockdown_manual: bool,
+    /// v3.10 R06：用户已要求停止保护（只检测，不动作）。
+    pub disarmed: bool,
+    pub disarmed_reason: String,
 }
 
 /// 本进程的启动代次（启动时间 + PID）。账本用它区分"上一代留下的现场"。
@@ -93,6 +96,9 @@ pub struct AppState {
     pub lockdown_last: Mutex<Option<bool>>,
     /// v3.10 R13：用户手动封锁意图（独立生命周期，不被下一轮自动逻辑覆盖）。
     pub lockdown_manual: Mutex<bool>,
+    /// v3.10 R06：用户要求停止保护（`--restore` 急救或界面手动停止）。
+    /// 存在时守护器只做检测，不再 kill/隔离/断网/封锁，也不拦截启动。
+    pub disarmed: Mutex<Option<String>>,
     pub stop: Arc<AtomicBool>,
     pub is_admin: bool,
     pub smoke_settings: bool,
@@ -141,6 +147,7 @@ impl AppState {
             access_streak: std::sync::atomic::AtomicU32::new(0),
             lockdown_last: Mutex::new(None),
             lockdown_manual: Mutex::new(false),
+            disarmed: Mutex::new(crate::disarm::reason()),
             stop: Arc::new(AtomicBool::new(false)),
             is_admin,
             smoke_settings,
@@ -314,6 +321,36 @@ impl AppState {
     pub fn paused_until(&self) -> Option<u64> {
         let until = *lock(&self.paused_until);
         until.filter(|until| *until > crate::model::now())
+    }
+
+    /// 是否处于"用户要求停止保护"状态。
+    pub fn is_disarmed(&self) -> bool {
+        lock(&self.disarmed).is_some()
+    }
+
+    pub fn disarmed_reason(&self) -> String {
+        lock(&self.disarmed).clone().unwrap_or_default()
+    }
+
+    /// 停止保护：写意图文件（跨重启保留）+ 更新内存态。
+    /// 文件写失败必须返回错误——否则重启后守护器会重新施加规则，急救失效。
+    pub fn disarm(&self, reason: &str) -> Result<(), String> {
+        crate::disarm::mark(reason)?;
+        *lock(&self.disarmed) = Some(reason.to_string());
+        self.log(format!(
+            "已停止保护：{reason}（此后只检测，不再结束进程/隔离/断网）"
+        ));
+        self.emit_state();
+        Ok(())
+    }
+
+    /// 重新布防：删意图文件 + 清内存态。
+    pub fn rearm(&self) -> Result<(), String> {
+        crate::disarm::clear()?;
+        *lock(&self.disarmed) = None;
+        self.log("已重新布防：恢复守护动作");
+        self.emit_state();
+        Ok(())
     }
 
     pub fn is_paused(&self) -> bool {
@@ -493,6 +530,8 @@ impl AppState {
             enforce_access: cfg!(target_os = "windows") && cfg.enforce_access_path,
             lockdown: self.lockdown_on(),
             lockdown_manual: self.lockdown_manual_on(),
+            disarmed: self.is_disarmed(),
+            disarmed_reason: self.disarmed_reason(),
         }
     }
 
