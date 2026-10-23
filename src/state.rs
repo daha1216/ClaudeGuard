@@ -9,7 +9,7 @@ use crate::model::{
 use crate::notify;
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tauri::{AppHandle, Emitter};
 
@@ -64,6 +64,10 @@ pub struct AppState {
     pub cfg: Mutex<Config>,
     pub statuses: Mutex<Vec<TargetStatus>>,
     pub checking: AtomicBool,
+    /// R10：配置代次（每次 set_config +1），用于丢弃过期轮次的结果。
+    pub cfg_rev: AtomicU64,
+    /// R10：熔断执行权——同一时刻只允许一轮真正执行熔断（杀进程/断网/隔离）。
+    pub trip_guard: Mutex<()>,
     pub last_check: Mutex<Option<u64>>,
     pub tripped: Mutex<Option<TripInfo>>,
     pub paused_until: Mutex<Option<u64>>,
@@ -108,6 +112,8 @@ impl AppState {
             statuses: Mutex::new(statuses),
             cfg: Mutex::new(cfg),
             checking: AtomicBool::new(false),
+            cfg_rev: AtomicU64::new(0),
+            trip_guard: Mutex::new(()),
             last_check: Mutex::new(None),
             tripped: Mutex::new(None),
             paused_until: Mutex::new(None),
@@ -139,8 +145,21 @@ impl AppState {
         lock(&self.cfg).clone()
     }
 
+    /// 配置代次：每次配置变更 +1。轮次开始时记下代次，提交结果前比对，
+    /// 代次变了就说明"这一轮依据的配置已经过期"，结果不得提交（R10）。
+    pub fn cfg_rev(&self) -> u64 {
+        self.cfg_rev.load(Ordering::SeqCst)
+    }
+
     pub fn set_config(&self, cfg: Config) {
         *lock(&self.cfg) = cfg;
+        self.cfg_rev.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 一次拿到"配置 + 代次"，保证两者来自同一时刻。
+    pub fn config_rev(&self) -> (Config, u64) {
+        let cfg = lock(&self.cfg).clone();
+        (cfg, self.cfg_rev.load(Ordering::SeqCst))
     }
 
     // ---------- 目标状态 ----------

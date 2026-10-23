@@ -173,6 +173,14 @@ pub fn dry_round(cfg: &Config) -> Vec<DryResult> {
 }
 
 /// 跑一轮完整检查（会更新状态、按需熔断/恢复）。
+/// 纯函数：本轮依据的配置代次是否已经过期（R10）。
+///
+/// 过期 = 用户在本轮探测期间改了配置（白名单/目标/档位/阈值），此时本轮的
+/// 判定与熔断决定都建立在旧配置上，必须丢弃而不是提交。
+pub fn round_is_stale(start_rev: u64, current_rev: u64) -> bool {
+    start_rev != current_rev
+}
+
 pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     if state.is_checking() && purpose != Purpose::Launch {
         return RoundSummary::ok();
@@ -180,7 +188,8 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     state.set_checking(true);
     state.emit_state();
 
-    let cfg = state.config();
+    // R10：配置与代次取自同一时刻；提交结果前比对，过期轮次不提交。
+    let (cfg, rev) = state.config_rev();
     // v3.7 接入路径：探测跟随系统代理；v3.8 起未接入（且启用检查）时不直连探测——
     // 守护器自身流量绝不带着家宽 IP 出机器，判定与熔断靠注册表/TUN 的确定性检查。
     let (route, access) = crate::access::resolve(&cfg);
@@ -324,6 +333,15 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
         .count();
     let max_streak = statuses.iter().map(|s| s.fail_streak).max().unwrap_or(0);
 
+    // R10：这一轮依据的配置若已被改动（用户刚改了白名单/目标/档位），
+    // 结果与熔断决定都已过期——丢弃本轮，不写状态、不熔断。
+    if round_is_stale(rev, state.cfg_rev()) {
+        state.log("配置已变更，本轮检查结果作废（下一轮按新配置重新判定）");
+        state.set_checking(false);
+        state.emit_state();
+        return RoundSummary::ok();
+    }
+
     state.set_statuses(statuses.clone());
     state.set_last_check(now());
 
@@ -429,6 +447,15 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
 }
 
 fn do_trip(state: &Arc<AppState>, cfg: &Config, failing_ids: &[String], reason: &str) {
+    // R10：熔断是唯一的"高权限副作用"，同一时刻只允许一轮执行；抢不到说明
+    // 另一轮已经在做（手动检查与定时检查撞车），本轮直接放弃，不重复杀/重复加规则。
+    let Ok(_guard) = state.trip_guard.try_lock() else {
+        state.log("另一轮检查正在执行熔断，本轮跳过");
+        return;
+    };
+    if state.is_tripped() {
+        return;
+    }
     let mode = if cfg!(target_os = "macos") {
         CutMode::Off
     } else {
@@ -710,6 +737,14 @@ fn spawn_sweeper(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_rounds_are_discarded() {
+        // R10：代次没变 → 结果可提交；代次变了 → 本轮作废（不写状态、不熔断）。
+        assert!(!round_is_stale(3, 3));
+        assert!(round_is_stale(3, 4));
+        assert!(round_is_stale(4, 3), "任何不一致都按过期处理，宁可不提交");
+    }
 
     #[test]
     fn launch_denies_failed_unverified_empty_and_unreleased_trip() {
