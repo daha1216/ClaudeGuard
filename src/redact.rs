@@ -22,6 +22,12 @@ pub fn redact(text: &str, include_egress: bool) -> String {
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
+        // 地区/国家标记：独立的两位大写代码（"（US）"、"· US ·"、"loc=US"）
+        if let Some(skip) = region_marker_at(&bytes, i) {
+            out.push_str(REDACTED);
+            i += skip;
+            continue;
+        }
         // IPv4：形如 1.2.3.4 的数字点串
         if c.is_ascii_digit() {
             let start = i;
@@ -54,6 +60,34 @@ pub fn redact(text: &str, include_egress: bool) -> String {
     out
 }
 
+/// 识别"独立的两位大写地区代码"（前后不是字母/数字），返回应跳过的字符数。
+///
+/// 只认独立出现的形式，避免把正文里的普通英文缩写（如 `OK`）误打码；
+/// 出口地区在通知里总是单独成段出现。
+fn region_marker_at(chars: &[char], i: usize) -> Option<usize> {
+    let a = *chars.get(i)?;
+    let b = *chars.get(i + 1)?;
+    if !(a.is_ascii_uppercase() && b.is_ascii_uppercase()) {
+        return None;
+    }
+    // 后面不能再接字母/数字（否则只是单词的一部分，如 API / HTTP）
+    if chars.get(i + 2).is_some_and(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    // 地区代码在通知里总是紧跟分隔符出现（"出口 … · US"、"地区：US"、"（US）"）。
+    // 要求前面确实是分隔符，才不会把正文开头的普通大写单词当成地区。
+    let prev = i.checked_sub(1).and_then(|p| chars.get(p)).copied()?;
+    let is_sep = prev.is_whitespace()
+        || matches!(
+            prev,
+            '·' | '（' | '(' | '：' | ':' | '=' | ',' | '，' | '、' | '/' | '-' | '|'
+        );
+    if !is_sep {
+        return None;
+    }
+    Some(2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,6 +105,29 @@ mod tests {
     fn ipv4_kept_when_user_opts_in() {
         let text = "出口：204.1.100.98";
         assert_eq!(redact(text, true), text);
+    }
+
+    #[test]
+    fn region_codes_are_redacted_by_default() {
+        for text in ["出口 204.1.100.98 · US", "地区：US", "loc=US colo=LAX"] {
+            let out = redact(text, false);
+            assert!(!out.contains("US"), "默认不得出现地区代码：{text} -> {out}");
+            assert!(out.contains(REDACTED));
+        }
+    }
+
+    #[test]
+    fn region_codes_kept_when_user_opts_in() {
+        let text = "出口 204.1.100.98 · US";
+        assert_eq!(redact(text, true), text);
+    }
+
+    #[test]
+    fn ordinary_uppercase_words_are_not_treated_as_regions() {
+        // 单词内部的两位大写不算地区；纯大写单词也不该被打码成乱码。
+        assert!(redact("OK", false).contains("OK"));
+        assert!(redact("API 检查失败", false).contains("API"));
+        assert!(redact("HTTP 500", false).contains("HTTP"));
     }
 
     #[test]
