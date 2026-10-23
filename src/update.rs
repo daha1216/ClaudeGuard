@@ -522,6 +522,23 @@ fn digest_for_asset(cfg: &Config, url: &str) -> Result<Option<String>, String> {
         .and_then(|a| a.digest.clone()))
 }
 
+/// 保护进行中是否允许应用自身更新（计划 5.5 的近期阻断策略）。
+///
+/// 隔离/断网/lockdown 生效时替换主程序，会让"谁还在维持保护"变得不可确认；
+/// 装新版本也绝不能顺手解除保护，所以这里直接拒绝，等用户先恢复。
+pub fn update_blocked_reason(tripped: bool, lockdown: bool, disarmed: bool) -> Option<String> {
+    if tripped {
+        return Some("当前处于熔断隔离状态，请先解除隔离再更新".to_string());
+    }
+    if lockdown {
+        return Some("当前处于出站封锁状态，请先解除封锁再更新".to_string());
+    }
+    if disarmed {
+        return Some("当前已停止保护，请先重新布防再更新".to_string());
+    }
+    None
+}
+
 pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
     #[cfg(target_os = "macos")]
     if MACOS_DOWNLOAD_BUSY
@@ -540,6 +557,16 @@ pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
     std::thread::spawn(move || {
         #[cfg(target_os = "macos")]
         let _download_guard = MacDownloadGuard;
+        if let Some(reason) =
+            update_blocked_reason(state.is_tripped(), state.lockdown_on(), state.is_disarmed())
+        {
+            state.set_upd(UpdState::Failed {
+                msg: reason.clone(),
+            });
+            state.emit_state();
+            state.log(format!("更新已拒绝：{reason}"));
+            return;
+        }
         state.set_upd(UpdState::Downloading {
             done: 0,
             total: size,
@@ -754,5 +781,24 @@ mod tests {
         assert!(err.contains("未提供校验摘要"), "实际：{err}");
         assert!(verify_download(&file, Some("sha256:abc")).is_err());
         assert!(verify_download(&file, Some(&format!("sha256:{}", sha256_hex(b"hello")))).is_ok());
+    }
+
+    /// 计划 5.5：保护生效期间不应用自身更新，且拒绝时必须说明原因。
+    #[test]
+    fn update_is_blocked_while_protection_is_active() {
+        assert!(update_blocked_reason(false, false, false).is_none());
+        assert!(update_blocked_reason(true, false, false)
+            .unwrap()
+            .contains("熔断"));
+        assert!(update_blocked_reason(false, true, false)
+            .unwrap()
+            .contains("封锁"));
+        assert!(update_blocked_reason(false, false, true)
+            .unwrap()
+            .contains("停止保护"));
+        // 多重状态同时成立时，按"最需要用户先处理"的顺序报
+        assert!(update_blocked_reason(true, true, true)
+            .unwrap()
+            .contains("熔断"));
     }
 }

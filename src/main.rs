@@ -541,6 +541,17 @@ fn build_window(app: &tauri::App, height: f64, visible: bool) -> tauri::Result<(
             .resizable(true)
             .decorations(cfg!(target_os = "macos"))
             .visible(visible)
+            // R15：窗口只允许停留在应用自己的页面上。任何把主窗口导航到外部
+            // 站点的尝试都拒绝——外部页面会继承这个窗口的 IPC 能力。
+            .on_navigation(|url| {
+                let allowed = url.scheme() == "tauri"
+                    || url.host_str() == Some("tauri.localhost")
+                    || url.host_str() == Some("ipc.localhost");
+                if !allowed {
+                    crate::guard::log_line(&format!("navigation: 已拒绝导航到 {url}"));
+                }
+                allowed
+            })
             .center();
     #[cfg(target_os = "macos")]
     let builder = builder.theme(Some(tauri::Theme::Dark));
