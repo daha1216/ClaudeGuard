@@ -121,7 +121,7 @@ impl From<&AccessPath> for AccessInfo {
             },
             AccessPath::Tun { adapter } => AccessInfo {
                 path: "tun".into(),
-                note: format!("TUN 直连（{adapter}）"),
+                note: format!("TUN 直连（{}）", adapter.trim()),
             },
             AccessPath::Uncovered => AccessInfo {
                 path: "uncovered".into(),
@@ -131,27 +131,42 @@ impl From<&AccessPath> for AccessInfo {
     }
 }
 
-/// 每轮探测前调用：返回（探测要拨的代理地址；`None` = 直连，接入快照）。
-pub fn resolve(cfg: &Config) -> (Option<String>, AccessInfo) {
+/// 每轮探测的路由决定。
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProbeRoute {
+    /// 经该代理地址探测（"http://host:port"）。
+    Proxy(String),
+    /// 直连探测（TUN 接管，与应用同路）。
+    Direct,
+    /// 未接入：不探测——守护器自身流量绝不带着家宽 IP 出机器，
+    /// 判定与熔断完全靠注册表/TUN 的确定性检查。
+    Skip,
+}
+
+/// 每轮探测前调用：返回（探测路由，接入快照）。
+pub fn resolve(cfg: &Config) -> (ProbeRoute, AccessInfo) {
     #[cfg(target_os = "windows")]
     {
         let (enabled, server) = read_system_proxy();
         let tun = if enabled { None } else { detect_tun_adapter() };
         let path = verdict(enabled, parse_sys_proxyserver(server.as_deref()), tun);
         let info = AccessInfo::from(&path);
-        let proxy = match &path {
-            AccessPath::SystemProxy { addr: Some(addr) } => Some(format!("http://{addr}")),
+        let route = match &path {
+            AccessPath::SystemProxy { addr: Some(addr) } => {
+                ProbeRoute::Proxy(format!("http://{addr}"))
+            }
             // 系统代理开着但地址读不到：按已接入，探测回退配置端口。
-            AccessPath::SystemProxy { addr: None } => Some(cfg.proxy_url()),
-            _ => None,
+            AccessPath::SystemProxy { addr: None } => ProbeRoute::Proxy(cfg.proxy_url()),
+            AccessPath::Tun { .. } => ProbeRoute::Direct,
+            AccessPath::Uncovered => ProbeRoute::Skip,
         };
-        (proxy, info)
+        (route, info)
     }
     #[cfg(not(target_os = "windows"))]
     {
         // macOS 移植为进程守护模式，保持按配置端口探测、不检查接入路径。
         (
-            Some(cfg.proxy_url()),
+            ProbeRoute::Proxy(cfg.proxy_url()),
             AccessInfo {
                 path: "skipped".into(),
                 note: "非 Windows：按配置端口探测".into(),

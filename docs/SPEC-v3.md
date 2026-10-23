@@ -34,7 +34,7 @@
 
 ## 2. 锚点与解析（`src/anchors.rs`，纯解析函数必须可单测）
 
-请求：ureq Agent，代理地址按 §3.5 接入判定解析（系统代理开→其实际地址；关→TUN/未接入均直连；读不到地址时回退 `http://{proxy_host}:{proxy_port}`），超时 `timeout_secs`，跟随重定向，UA `ClaudeGuard/3.0`。任何 HTTP 响应（含 4xx/5xx）都算"有响应"；网络错误/超时算不可达。国内直连 claude.ai 可达（Cloudflare 前端，未被封），所以未接入时直连探测能拿到家宽真实出口 IP、按白名单判 Fail——注册表/TUN 检查是这条之外的确定性第一道防线。
+请求：ureq Agent，代理地址按 §3.5 接入判定解析（系统代理开→其实际地址；关+TUN→直连被 TUN 接管；未接入→**不探测**；读不到地址时回退 `http://{proxy_host}:{proxy_port}`），超时 `timeout_secs`，跟随重定向，UA `ClaudeGuard/3.0`。任何 HTTP 响应（含 4xx/5xx）都算"有响应"；网络错误/超时算不可达。国内直连 claude.ai 可达（Cloudflare 前端，未被封）——但守护器刻意不在未接入时直连探测（隐私语义见 §3.5），改用注册表/TUN 确定性判定。
 
 `auto` 解析顺序（命中即停）：
 1. **trace**：按行匹配 `ip=`、`loc=`、`colo=`；要求至少 `ip` 或 `loc` 之一。
@@ -74,10 +74,11 @@ Claude 等桌面应用只认系统代理——系统代理没开时它们直连�
 | 开 | 读到任意地址 | 任意 | **SystemProxy**（已接入） | 该地址（不管是否等于配置端口） |
 | 开 | 读不到 | 任意 | SystemProxy（地址未知，按已接入） | 回退配置端口 |
 | 关 | — | 检测到 | **Tun**（已接入，界面标注"TUN 直连"） | 直连（被 TUN 接管，与应用同路） |
-| 关 | — | 无 | **Uncovered**（应用直连真实出口） | 直连；计入熔断阈值 |
+| 关 | — | 无 | **Uncovered**（应用直连真实出口） | **不探测**（守护器自身不直连；判定与熔断完全靠注册表/TUN 确定性检查） |
 
 - 检测方式：`winreg` 读 `HKCU\...\Internet Settings` 的 `ProxyEnable`/`ProxyServer`（支持 `http=..;https=..` 分号形式，取 https 优先）；`GetAdaptersAddresses` 枚举 Up 状态适配器按描述/友好名匹配 TUN 关键词（mihomo/clash/meta/sing-box/singbox/wintun/wireguard/openvpn/tap-windows/tun2socks/bettbox/hysteria/juicity/v2ray/xray/utun 前缀；不含 tailscale——非默认全隧道）。`verdict()`/`parse_sys_proxyserver()`/`is_tun_name()` 为纯函数（单测覆盖），`read_system_proxy()`/`detect_tun_adapter()` 只做系统读取。
-- 语义：Uncovered 按独立 `access_streak` 计数走同一 `trip_threshold` 防抖（阈值-1 时预警一次）；熔断动作与目标 Fail 完全一致（杀进程/隔离/断网档位），Launch 用途立即熔断；恢复条件额外要求 access 已重新覆盖（SystemProxy/Tun）。暂停同样压制 access 熔断。`enforce_access_path=false`（设置可关）或非 Windows 时整段跳过。
+- 语义：Uncovered 按独立 `access_streak` 计数走同一 `trip_threshold` 防抖（阈值-1 时预警一次）；熔断动作与目标 Fail 完全一致（杀进程/隔离/断网档位），Launch 用途立即熔断；被跳过探测的目标标 Unverified（reason"未接入代理链路，已跳过探测"）；恢复条件额外要求 access 已重新覆盖（SystemProxy/Tun）。暂停同样压制 access 熔断。`enforce_access_path=false`（设置可关，此时未接入仍会直连探测）或非 Windows 时整段跳过。
+- **隐私语义（v3.8）**：启用检查时，守护器自身流量在任何状态下都不带家宽 IP 出机器（探测只走代理或 TUN 接管的直连）；国内直连 claude.ai 本可测出家宽 IP，但守护器刻意不测，改用注册表/TUN 判定。
 - `--check` JSON 增加 `access: {path, note}`；enforce 且 Uncovered → 整体不通过（exit 2）。设置页「检测」组有"接入路径检查"开关；未接入时主界面横幅+副标题提示。
 
 ## 4. 监控循环与防抖（`src/monitor.rs`）

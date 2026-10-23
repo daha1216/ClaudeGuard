@@ -82,10 +82,35 @@ fn probe_all(cfg: &Config, proxy: Option<String>) -> Vec<(Target, ProbeResult)> 
     })
 }
 
-/// 只读检查（--check 与设置页"测试目标"共用）。探测同样跟随系统代理。
+/// 单目标"未接入，跳过探测"的结果（run_round / dry_round / recheck 共用文案）。
+pub fn dry_skipped(target: &crate::model::Target) -> DryResult {
+    DryResult {
+        id: target.id.clone(),
+        name: target.name.clone(),
+        pass: false,
+        verdict: Verdict::Unverified,
+        reason: "未接入代理链路，已跳过探测".into(),
+        ip: None,
+        country: None,
+        latency_ms: 0,
+    }
+}
+
+/// 只读检查（--check 与设置页"测试目标"共用）。探测同样跟随系统代理；
+/// 未接入（且启用检查）时不直连，直接标"无法确认"。
 pub fn dry_round(cfg: &Config) -> Vec<DryResult> {
-    let (proxy, _access) = crate::access::resolve(cfg);
-    probe_all(cfg, proxy)
+    let (route, access) = crate::access::resolve(cfg);
+    let enforced = cfg!(target_os = "windows") && cfg.enforce_access_path;
+    let skipped = enforced && access.is_uncovered();
+    let results = if skipped {
+        Vec::new()
+    } else {
+        match &route {
+            crate::access::ProbeRoute::Proxy(url) => probe_all(cfg, Some(url.clone())),
+            _ => probe_all(cfg, None),
+        }
+    };
+    results
         .into_iter()
         .map(|(target, probe)| {
             let eval = crate::policy::evaluate(&target, &probe);
@@ -100,6 +125,15 @@ pub fn dry_round(cfg: &Config) -> Vec<DryResult> {
                 latency_ms: probe.latency_ms,
             }
         })
+        .chain(if skipped {
+            cfg.targets
+                .iter()
+                .filter(|t| t.enabled)
+                .map(dry_skipped)
+                .collect()
+        } else {
+            Vec::new()
+        })
         .collect()
 }
 
@@ -112,13 +146,23 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     state.emit_state();
 
     let cfg = state.config();
-    // v3.7 接入路径：探测跟随系统代理（关→TUN→直连），并判定应用是否真正接入。
-    let (probe_proxy, access) = crate::access::resolve(&cfg);
+    // v3.7 接入路径：探测跟随系统代理；v3.8 起未接入（且启用检查）时不直连探测——
+    // 守护器自身流量绝不带着家宽 IP 出机器，判定与熔断靠注册表/TUN 的确定性检查。
+    let (route, access) = crate::access::resolve(&cfg);
     state.set_access(access.clone());
     let access_enforced = cfg!(target_os = "windows") && cfg.enforce_access_path;
     let access_uncovered = access_enforced && access.is_uncovered();
+    let skip_probes = access_uncovered;
 
-    let probes = probe_all(&cfg, probe_proxy);
+    let probes = if skip_probes {
+        Vec::new()
+    } else {
+        match &route {
+            crate::access::ProbeRoute::Proxy(url) => probe_all(&cfg, Some(url.clone())),
+            // Direct（TUN 接管）；未启用检查时的未接入也按用户选择直连。
+            _ => probe_all(&cfg, None),
+        }
+    };
     let mut statuses: Vec<TargetStatus> = cfg
         .targets
         .iter()
@@ -156,6 +200,17 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
             _ => streak = 0,
         }
         slot.apply(&probe, &eval, streak);
+    }
+
+    // v3.8：未接入被跳过探测的目标标"无法确认"，界面与 --check 可见原因。
+    if skip_probes {
+        for slot in statuses.iter_mut() {
+            if slot.state == TargetState::Pending {
+                slot.state = TargetState::Unverified;
+                slot.reason = "未接入代理链路，已跳过探测".into();
+                slot.checked_at = Some(crate::model::now());
+            }
+        }
     }
 
     // 状态变化日志 + 预警通知（只在跨越阈值-1 时提醒一次）。

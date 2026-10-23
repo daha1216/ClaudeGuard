@@ -104,7 +104,15 @@ pub fn recheck_target(state: State<'_, Arc<AppState>>, id: String) -> Result<Dry
         .target(&id)
         .cloned()
         .ok_or_else(|| "目标不存在".to_string())?;
-    let (proxy, _access) = crate::access::resolve(&cfg);
+    let (route, access) = crate::access::resolve(&cfg);
+    let enforced = cfg!(target_os = "windows") && cfg.enforce_access_path;
+    if enforced && access.is_uncovered() {
+        return Ok(crate::monitor::dry_skipped(&target));
+    }
+    let proxy = match route {
+        crate::access::ProbeRoute::Proxy(url) => Some(url),
+        _ => None,
+    };
     let probe = crate::anchors::probe(proxy.as_deref(), &target);
     let eval = crate::policy::evaluate(&target, &probe);
     Ok(DryResult {
