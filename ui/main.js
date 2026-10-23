@@ -274,7 +274,8 @@
     if (st.access && st.access.path === "uncovered" && st.enforceAccess && overall !== "tripped") {
       s = "未接入代理链路：" + (st.access.note || "系统代理未开启且未检测到 TUN 网卡");
       // v3.9：兜底封锁生效时说明现状。
-      if (st.lockdown) s += "；已启用防火墙兜底封锁";
+      if (st.lockdownManual) s += "；已手动封锁出站";
+      else if (st.lockdown) s += "；已启用防火墙兜底封锁";
     } else if (st.access && st.access.path === "unknown" && st.enforceAccess && overall !== "tripped") {
       s = "接入路径无法确认：" + (st.access.note || "PAC 或代理配置无法等价复用");
     }
@@ -362,9 +363,11 @@
       st.access && st.access.path === "uncovered" && st.enforceAccess &&
       overall !== "tripped" && overall !== "paused"
     ) {
-      const note = st.lockdown
-        ? "系统代理未开启且未检测到 TUN 网卡，Claude 会直连真实出口；已启用防火墙兜底封锁，走系统代理不受影响，接入后自动解除。"
-        : "系统代理未开启且未检测到 TUN 网卡，Claude 会直连真实出口；开启系统代理或 TUN 模式即可解除。";
+      const note = st.lockdownManual
+        ? "系统代理未开启且未检测到 TUN 网卡，Claude 会直连真实出口；已按你的手动封锁阻断出站，走系统代理不受影响，需在设置里手动解除。"
+        : st.lockdown
+          ? "系统代理未开启且未检测到 TUN 网卡，Claude 会直连真实出口；已启用防火墙兜底封锁，走系统代理不受影响，接入后自动解除。"
+          : "系统代理未开启且未检测到 TUN 网卡，Claude 会直连真实出口；开启系统代理或 TUN 模式即可解除。";
       parts.push(banner("warn", ["未接入代理链路", note]));
     }
     // v3.10 R03：接入路径无法确认——不熔断，但不允许通过守护器启动。

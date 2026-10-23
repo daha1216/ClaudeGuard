@@ -55,6 +55,8 @@ pub struct StateView {
     pub access: crate::access::AccessInfo,
     pub enforce_access: bool,
     pub lockdown: bool,
+    /// v3.10 R13：手动封锁是否由用户开启（独立生命周期）。
+    pub lockdown_manual: bool,
 }
 
 pub struct AppState {
@@ -77,6 +79,8 @@ pub struct AppState {
     pub access_streak: std::sync::atomic::AtomicU32,
     /// v3.9 兜底封锁：上次同步到防火墙的意图（None=启动后未同步过，首轮会强制对齐）。
     pub lockdown_last: Mutex<Option<bool>>,
+    /// v3.10 R13：用户手动封锁意图（独立生命周期，不被下一轮自动逻辑覆盖）。
+    pub lockdown_manual: Mutex<bool>,
     pub stop: Arc<AtomicBool>,
     pub is_admin: bool,
     pub smoke_settings: bool,
@@ -122,6 +126,7 @@ impl AppState {
             }),
             access_streak: std::sync::atomic::AtomicU32::new(0),
             lockdown_last: Mutex::new(None),
+            lockdown_manual: Mutex::new(false),
             stop: Arc::new(AtomicBool::new(false)),
             is_admin,
             smoke_settings,
@@ -195,11 +200,41 @@ impl AppState {
         *lock(&self.lockdown_last) == Some(true)
     }
 
+    /// UI 用：手动封锁是否处于用户开启状态。
+    pub fn lockdown_manual_on(&self) -> bool {
+        self.lockdown_manual()
+    }
+
+    /// 用户是否手动要求封锁（R13：手动意图独立于接入状态）。
+    pub fn lockdown_manual(&self) -> bool {
+        *lock(&self.lockdown_manual)
+    }
+
+    /// R13：本轮应同步到的封锁意图 = 自动策略 ∨ 用户手动封锁。
+    ///
+    /// 手动意图独立于接入状态，因此不会被"接入恢复"的下一轮自动逻辑清除。
+    pub fn desired_lockdown(auto_want: bool, manual: bool) -> bool {
+        auto_want || manual
+    }
+
+    /// R13 + D3：暂停期间只允许"减少副作用"的同步（解除），不允许新增封锁；
+    /// 已经处于封锁时保持原样（幂等）。
+    pub fn lockdown_sync_allowed(paused: bool, current: Option<bool>, want: bool) -> bool {
+        !(paused && want && current != Some(true))
+    }
+
     /// 把"想要的状态"同步到防火墙：只在意图变化时增删规则（避免每轮重复 add 堆积）。
     /// 启动后首轮 `last=None` 必然不同步状态——顺带清理崩溃残留或补上未接入封锁。
+    ///
+    /// 暂停期间不新增副作用（CONTRACT D3）：暂停时不施加封锁，但**也不解除**既有封锁。
     pub fn sync_lockdown(&self, want: bool, cfg: &Config) {
+        // R13：手动封锁优先，且不被自动逻辑（接入状态变化）清除。
+        let want = Self::desired_lockdown(want, self.lockdown_manual());
         let mut last = lock(&self.lockdown_last);
         if *last == Some(want) {
+            return;
+        }
+        if !Self::lockdown_sync_allowed(self.is_paused(), *last, want) {
             return;
         }
         if want {
@@ -214,15 +249,23 @@ impl AppState {
         *last = Some(want);
     }
 
-    /// 手动一键：立即封锁（无视接入状态；自动逻辑之后按接入状态接管）。
+    /// 手动一键：立即封锁 / 解除封锁。
+    ///
+    /// R13：手动封锁意图有独立生命周期——开启后一直保持，直到用户手动解除；
+    /// 自动逻辑（未接入时维持封锁）只在没有手动意图时生效。解除手动封锁后
+    /// 由下一轮自动逻辑按接入状态接管。
     pub fn lockdown_now(&self, on: bool, cfg: &Config) {
         if on {
             let n = crate::guard::lockdown_apply(cfg);
-            self.log(format!("手动封锁：已添加 {n} 条出站封锁规则"));
+            *lock(&self.lockdown_manual) = true;
+            self.log(format!(
+                "手动封锁：已添加 {n} 条出站封锁规则；将持续生效，直到你手动解除"
+            ));
             *lock(&self.lockdown_last) = Some(true);
         } else {
             crate::guard::lockdown_clear();
-            self.log("手动解除：已删除全部出站封锁规则");
+            *lock(&self.lockdown_manual) = false;
+            self.log("手动解除：已删除出站封锁规则；之后按接入状态自动接管");
             *lock(&self.lockdown_last) = Some(false);
         }
     }
@@ -422,6 +465,7 @@ impl AppState {
             access: self.access(),
             enforce_access: cfg!(target_os = "windows") && cfg.enforce_access_path,
             lockdown: self.lockdown_on(),
+            lockdown_manual: self.lockdown_manual_on(),
         }
     }
 
@@ -454,6 +498,7 @@ fn agent_usage() -> (Vec<AgentCount>, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    use super::AppState;
     use crate::model::{Overall, TargetState};
 
     /// overall 的纯逻辑（不依赖 AppState/AppHandle）：与 AppState::overall 保持一致。
@@ -512,6 +557,28 @@ mod tests {
             overall_of(false, false, false, &[TargetState::Pass, TargetState::Fail]),
             Overall::Fail
         );
+    }
+
+    #[test]
+    fn manual_lockdown_survives_auto_clear() {
+        // 手动封锁开启后，即使自动策略本轮判定"不需要封锁"，意图仍为封锁。
+        assert!(AppState::desired_lockdown(false, true));
+        assert!(AppState::desired_lockdown(true, false));
+        assert!(AppState::desired_lockdown(true, true));
+        assert!(!AppState::desired_lockdown(false, false));
+    }
+
+    #[test]
+    fn paused_blocks_new_lockdown_but_allows_release() {
+        // 暂停中不允许新增封锁（D3：暂停不新增副作用）。
+        assert!(!AppState::lockdown_sync_allowed(true, None, true));
+        assert!(!AppState::lockdown_sync_allowed(true, Some(false), true));
+        // 已封锁时保持幂等。
+        assert!(AppState::lockdown_sync_allowed(true, Some(true), true));
+        // 解除（减少副作用）始终允许。
+        assert!(AppState::lockdown_sync_allowed(true, Some(true), false));
+        // 非暂停时正常同步。
+        assert!(AppState::lockdown_sync_allowed(false, None, true));
     }
 
     #[test]

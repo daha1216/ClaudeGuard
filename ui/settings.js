@@ -202,6 +202,16 @@
     chk("st-enforce-access", cfg.enforce_access_path !== false);
     chk("st-sweep", cfg.sweep_on_exit !== false);
     chk("st-lockdown-auto", cfg.lockdown_on_uncovered !== false);
+    const lockState0 = $("st-lockdown-state");
+    if (lockState0 && S.state) {
+      if (S.state.lockdownManual) {
+        lockState0.textContent = "当前为手动封锁：会一直保持到你点「解除封锁」";
+        lockState0.style.display = "";
+      } else if (S.state.lockdown) {
+        lockState0.textContent = "当前为自动封锁：未接入代理时生效，接入后自动解除";
+        lockState0.style.display = "";
+      }
+    }
     const agents = Array.isArray(cfg.guarded_agents) ? cfg.guarded_agents : [];
     chk("st-ag-claude", agents.includes("claude"));
     chk("st-ag-chatgpt", agents.includes("chatgpt"));
@@ -482,7 +492,9 @@
         try {
           await invoke(CMD.lockdown, { on });
           if (lockState) {
-            lockState.textContent = on ? "已封锁：守护对象直连出站被阻断（走系统代理不受影响）" : "已解除：出站封锁规则全部删除";
+            lockState.textContent = on
+              ? "已封锁（手动）：守护对象直连出站被阻断，走系统代理不受影响；会一直保持到你点「解除封锁」"
+              : "已解除手动封锁：规则已删除；若当前仍未接入代理，下一轮检查会按自动策略重新封锁";
             lockState.style.display = "";
           }
           notifyToast(on ? "已启用防火墙兜底封锁" : "已解除防火墙封锁");

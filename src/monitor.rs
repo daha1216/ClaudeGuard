@@ -580,13 +580,21 @@ pub fn launch(state: &Arc<AppState>) -> Result<(), String> {
 pub fn pause(state: &Arc<AppState>, minutes: u64) {
     let until = now().saturating_add(minutes.saturating_mul(60));
     state.set_paused_until(Some(until));
-    state.log(format!("暂停守护 {minutes} 分钟"));
+    // CONTRACT D3：暂停只停"新的"副作用，既有隔离原样保留。
+    state.log(format!(
+        "暂停守护 {minutes} 分钟：期间不再熔断/结束进程/断网，既有隔离保持不变"
+    ));
     state.emit_state();
 }
 
 pub fn resume(state: &Arc<AppState>) {
     state.set_paused_until(None);
-    state.log("恢复守护");
+    // 恢复只恢复检查；若仍处于熔断，需用户显式"解除隔离"（D3：不自动解除）。
+    if state.is_tripped() {
+        state.log("恢复守护：检查已恢复；当前仍处于熔断状态，解除隔离需手动操作");
+    } else {
+        state.log("恢复守护：检查已恢复");
+    }
     state.emit_state();
 }
 
