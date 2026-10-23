@@ -22,8 +22,17 @@ const MAX_REDIRECTS: u32 = 5;
 /// 探测 `target`。`proxy_url = Some(...)` 时经该代理，`None` 直连（TUN 接管或真实直连）。
 /// 任何 HTTP 响应（含 4xx/5xx）都算可达，网络错误/超时返回 [`ProbeResult::failed`]。
 pub fn probe(proxy_url: Option<&str>, target: &Target) -> ProbeResult {
-    let started = Instant::now();
-    let timeout = Duration::from_secs(target.timeout_secs.max(1));
+    match build_agent(proxy_url, Duration::from_secs(target.timeout_secs.max(1))) {
+        Ok(agent) => probe_with(&agent, target),
+        Err(err) => ProbeResult::failed(err),
+    }
+}
+
+/// 构造可复用的 Agent。
+///
+/// `AgentBuilder::build()` 会加载系统根证书（实测约 60ms），一轮检查里每个目标
+/// 各建一个 Agent 会把这份开销乘以目标数；一轮共用一个即可。
+pub fn build_agent(proxy_url: Option<&str>, timeout: Duration) -> Result<ureq::Agent, String> {
     let mut builder = ureq::AgentBuilder::new()
         .timeout(timeout)
         .redirects(MAX_REDIRECTS)
@@ -31,13 +40,18 @@ pub fn probe(proxy_url: Option<&str>, target: &Target) -> ProbeResult {
     if let Some(url) = proxy_url {
         match ureq::Proxy::new(url) {
             Ok(proxy) => builder = builder.proxy(proxy),
-            Err(err) => return ProbeResult::failed(format!("代理地址无效：{err}")),
+            Err(err) => return Err(format!("代理地址无效：{err}")),
         }
     }
-    let agent = builder.build();
+    Ok(builder.build())
+}
 
+/// 用已有 Agent 探测单个目标；每个请求单独设超时，互不影响。
+pub fn probe_with(agent: &ureq::Agent, target: &Target) -> ProbeResult {
+    let started = Instant::now();
+    let timeout = Duration::from_secs(target.timeout_secs.max(1));
     // ureq 把 4xx/5xx 归到 Err(Status)；这里把两种"有响应"的分支合并成同一个 Response。
-    let response = match agent.get(&target.anchor_url).call() {
+    let response = match agent.get(&target.anchor_url).timeout(timeout).call() {
         Ok(response) => response,
         Err(ureq::Error::Status(_, response)) => response,
         Err(err) => return ProbeResult::failed(transport_detail(&err)),

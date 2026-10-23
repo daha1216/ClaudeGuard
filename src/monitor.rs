@@ -95,14 +95,34 @@ fn probe_all(cfg: &Config, proxy: Option<String>) -> Vec<(Target, ProbeResult)> 
     if targets.is_empty() {
         return Vec::new();
     }
+    // 一轮共用一个 Agent：建 Agent 要加载根证书，按目标各建一次太贵。
+    let max_timeout = Duration::from_secs(
+        targets
+            .iter()
+            .map(|t| t.timeout_secs.max(1))
+            .max()
+            .unwrap_or(10),
+    );
+    let agent = match crate::anchors::build_agent(proxy.as_deref(), max_timeout) {
+        Ok(agent) => agent,
+        Err(err) => {
+            return targets
+                .into_iter()
+                .map(|t| {
+                    let probe = crate::model::ProbeResult::failed(err.clone());
+                    (t, probe)
+                })
+                .collect()
+        }
+    };
     std::thread::scope(|scope| {
         let handles: Vec<_> = targets
             .iter()
             .map(|target| {
-                let proxy = proxy.clone();
+                let agent = agent.clone();
                 let target = target.clone();
                 scope.spawn(move || {
-                    let probe = crate::anchors::probe(proxy.as_deref(), &target);
+                    let probe = crate::anchors::probe_with(&agent, &target);
                     (target, probe)
                 })
             })
@@ -183,6 +203,40 @@ pub fn round_is_stale(start_rev: u64, current_rev: u64) -> bool {
     start_rev != current_rev
 }
 
+/// 自身进程累计 CPU 毫秒（仅用于 CG_ROUND_TRACE 计时，不参与任何判定）。
+#[cfg(windows)]
+pub fn self_cpu_ms() -> f64 {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    unsafe {
+        let mut create = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        if GetProcessTimes(
+            GetCurrentProcess(),
+            &mut create,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+        .is_err()
+        {
+            return 0.0;
+        }
+        let to_ms = |ft: FILETIME| {
+            ((ft.dwHighDateTime as u64) << 32 | ft.dwLowDateTime as u64) as f64 / 10_000.0
+        };
+        let _ = CloseHandle(GetCurrentProcess());
+        to_ms(kernel) + to_ms(user)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn self_cpu_ms() -> f64 {
+    0.0
+}
+
 pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     if state.is_checking() && purpose != Purpose::Launch {
         return RoundSummary::ok();
@@ -197,7 +251,20 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     let (cfg, rev) = state.config_rev();
     // v3.7 接入路径：探测跟随系统代理；v3.8 起未接入（且启用检查）时不直连探测——
     // 守护器自身流量绝不带着家宽 IP 出机器，判定与熔断靠注册表/TUN 的确定性检查。
+    let trace = std::env::var_os("CG_ROUND_TRACE").is_some();
+    let cpu0 = if trace {
+        Some(crate::monitor::self_cpu_ms())
+    } else {
+        None
+    };
+    let t_access = std::time::Instant::now();
     let (route, access) = crate::access::resolve(&cfg);
+    if trace {
+        eprintln!(
+            "[trace] access {:.1}ms",
+            t_access.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     state.set_access(access.clone());
     let access_enforced = cfg!(target_os = "windows") && cfg.enforce_access_path;
     let access_uncovered = access_enforced && access.is_uncovered();
@@ -217,6 +284,7 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
         state.sync_lockdown(want_lockdown, &cfg);
     }
 
+    let t_probe = std::time::Instant::now();
     let probes = if skip_probes {
         Vec::new()
     } else {
@@ -226,6 +294,13 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
             _ => probe_all(&cfg, None),
         }
     };
+    if trace {
+        eprintln!(
+            "[trace] probes {:.1}ms",
+            t_probe.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    let t_rest = std::time::Instant::now();
     let mut statuses: Vec<TargetStatus> = cfg
         .targets
         .iter()
@@ -351,9 +426,21 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
         return RoundSummary::ok();
     }
 
+    if trace {
+        eprintln!(
+            "[trace] set_statuses {:.1}ms",
+            t_rest.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     state.set_statuses(statuses.clone());
     state.set_last_check(now());
     // R09/D6：能跑完一轮检查就说明新版本可用，这时才允许清理上一版备份。
+    if trace {
+        eprintln!(
+            "[trace] confirm_healthy {:.1}ms",
+            t_rest.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     crate::update::confirm_healthy();
 
     let all_pass = enabled_count > 0 && passed_count == enabled_count;
@@ -382,6 +469,12 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
         failing: failing.clone(),
     };
 
+    if trace {
+        eprintln!(
+            "[trace] pre_trip {:.1}ms",
+            t_rest.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     let paused = state.is_paused();
 
     // v3.7 接入路径防抖：未接入与目标 Fail 走同一套阈值语义。
@@ -422,6 +515,12 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
         && (purpose == Purpose::Launch || access_streak >= cfg.trip_threshold);
     let should_trip = trip_allowed(&gate);
 
+    if trace {
+        eprintln!(
+            "[trace] should_trip {:.1}ms",
+            t_rest.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     if should_trip {
         if access_trip && failing.is_empty() {
             do_trip(state, &cfg, &[], access_reason);
@@ -454,6 +553,13 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     state.set_checking(false);
     state.emit_state();
 
+    if let Some(cpu0) = cpu0 {
+        eprintln!(
+            "[trace] round cpu {:.1}ms (wall {:.0}ms)",
+            self_cpu_ms() - cpu0,
+            t_rest.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     summary.passed = all_pass && !state.is_tripped();
     summary
 }
@@ -710,15 +816,23 @@ pub fn spawn(state: Arc<AppState>) {
 /// （桌面家族 + 孤儿 CLI）。暂停守护 / 未守护 claude / 配置关闭时不动作。
 fn spawn_sweeper(state: Arc<AppState>) {
     std::thread::spawn(move || {
-        const TICK_MS: u64 = 2000;
+        // 自适应节奏：没有 claude 进程时没必要 3 秒问一次；桌面端在跑时勤一点。
+        const TICK_ACTIVE_MS: u64 = 3000;
+        const TICK_IDLE_MS: u64 = 10000;
         const GRACE_SECS: u64 = 4;
         let mut desktop_seen = false;
         let mut gone_at: Option<u64> = None;
+        let mut dir_cache: Option<(u64, Option<String>)> = None;
+        let mut active_tick = true;
         loop {
             if state.stop.load(Ordering::SeqCst) {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(TICK_MS));
+            std::thread::sleep(Duration::from_millis(if active_tick {
+                TICK_ACTIVE_MS
+            } else {
+                TICK_IDLE_MS
+            }));
             let cfg = state.config();
             let active = cfg.sweep_on_exit
                 && cfg.guarded_agents.iter().any(|a| a == "claude")
@@ -729,13 +843,24 @@ fn spawn_sweeper(state: Arc<AppState>) {
                 gone_at = None;
                 continue;
             }
-            let claude_dir_l =
-                crate::guard::find_claude_dir().map(|d| d.to_string_lossy().to_lowercase());
-            let procs = crate::guard::snapshot_processes();
-            let desktop_now = procs.iter().any(|p| {
-                crate::guard::classify_claude(p, claude_dir_l.as_deref())
-                    == Some(crate::guard::ClaudeKind::Desktop)
-            });
+            // 一次扫描同时回答"有没有 claude"和"是不是桌面端"。
+            let presence = {
+                let ts_now = now();
+                let fresh = match &dir_cache {
+                    Some((at, _)) => ts_now.saturating_sub(*at) < 60,
+                    None => false,
+                };
+                if !fresh {
+                    dir_cache = Some((
+                        ts_now,
+                        crate::guard::find_claude_dir().map(|d| d.to_string_lossy().to_lowercase()),
+                    ));
+                }
+                let dir = dir_cache.as_ref().and_then(|(_, d)| d.clone());
+                crate::guard::claude_presence(dir.as_deref())
+            };
+            active_tick = presence != crate::guard::ClaudePresence::None;
+            let desktop_now = presence == crate::guard::ClaudePresence::Desktop;
             if desktop_now {
                 desktop_seen = true;
                 gone_at = None;

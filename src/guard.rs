@@ -128,6 +128,10 @@ pub fn scan_agents() -> AgentScan {
     let mut cli: Vec<(&'static str, usize)> = CLI_AGENTS.iter().map(|a| (a.0, 0)).collect();
     for p in sys.processes().values() {
         let name_l = p.name().to_string().to_lowercase();
+        // 读 PEB 取路径/命令行很贵，只对可能命中的进程做。
+        if !name_of_interest(&name_l) {
+            continue;
+        }
         let path_l = p
             .exe()
             .map(|e| e.to_string_lossy().to_lowercase())
@@ -268,11 +272,134 @@ fn recheck_identity(sys: &mut sysinfo::System, snap: &ProcInfo) -> bool {
     }
 }
 
-pub fn snapshot_processes() -> Vec<ProcInfo> {
-    use sysinfo::System;
+/// Claude 进程的存在情况（一次 Toolhelp32 扫描得出，退出清理每拍只问一次）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudePresence {
+    /// 没有名为 claude 的进程。
+    None,
+    /// 只有 Claude Code CLI。
+    CliOnly,
+    /// 桌面端在跑。
+    Desktop,
+}
+
+/// 一次扫描判断 claude 进程的存在情况。
+///
+/// 退出清理每 3~4 秒问一次，两件事（有没有 / 是不是桌面端）合并成一次枚举，
+/// 避免每拍做两遍全进程遍历。
+#[cfg(windows)]
+pub fn claude_presence(claude_dir_l: Option<&str>) -> ClaudePresence {
+    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let mut seen = ClaudePresence::None;
+    unsafe {
+        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(h) if h != INVALID_HANDLE_VALUE => h,
+            // 拿不到快照时保守当作"桌面端在跑"，避免误判成退出而清理
+            _ => return ClaudePresence::Desktop,
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if Process32FirstW(snap, &mut entry).is_ok() {
+            loop {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name_l = String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase();
+                if name_l.contains("claude") {
+                    let mut path_l = String::new();
+                    if let Ok(handle) = OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION,
+                        false,
+                        entry.th32ProcessID,
+                    ) {
+                        let mut buf = [0u16; 1024];
+                        let mut size = buf.len() as u32;
+                        if QueryFullProcessImageNameW(
+                            handle,
+                            PROCESS_NAME_WIN32,
+                            windows::core::PWSTR(buf.as_mut_ptr()),
+                            &mut size,
+                        )
+                        .is_ok()
+                        {
+                            path_l = String::from_utf16_lossy(&buf[..size as usize]).to_lowercase();
+                        }
+                        let _ = CloseHandle(handle);
+                    }
+                    let cli = path_l.contains(r"\claude\claude-code\")
+                        || path_l.contains(r"\.local\bin\claude")
+                        || path_l.contains("@anthropic-ai");
+                    let in_dir = claude_dir_l.map(|d| path_l.starts_with(d)).unwrap_or(false);
+                    if !cli && (in_dir || path_l.contains("windowsapps")) {
+                        seen = ClaudePresence::Desktop;
+                        break;
+                    }
+                    if seen == ClaudePresence::None {
+                        seen = ClaudePresence::CliOnly;
+                    }
+                }
+                if Process32NextW(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    seen
+}
+
+#[cfg(not(windows))]
+pub fn claude_presence(claude_dir_l: Option<&str>) -> ClaudePresence {
+    let mut seen = ClaudePresence::None;
+    for p in snapshot_named("claude") {
+        match classify_claude(&p, claude_dir_l) {
+            Some(ClaudeKind::Desktop) => return ClaudePresence::Desktop,
+            Some(ClaudeKind::Cli) => seen = ClaudePresence::CliOnly,
+            None => {}
+        }
+    }
+    seen
+}
+
+/// 极轻量的进程名探测：只读进程名，不取可执行路径与命令行。
+///
+/// 退出清理每 2 秒轮询一次，用 [`snapshot_processes`] 全量扫描要读每个进程的
+/// PEB（实测占单核约 2.7%），这里先用名字过滤，命中才做全量扫描。
+
+#[cfg(not(windows))]
+pub fn any_process_named(needle: &str) -> bool {
+    use sysinfo::{ProcessRefreshKind, System};
     let mut sys = System::new();
-    sys.refresh_processes();
-    sys.processes().values().map(proc_info_of).collect()
+    sys.refresh_processes_specifics(ProcessRefreshKind::new());
+    sys.processes()
+        .values()
+        .any(|p| p.name().to_lowercase().contains(needle))
+}
+
+/// 进程名是否可能属于受管对象。`scan_agents` 只对命中的进程读取 PEB
+/// （可执行路径与命令行），把每轮扫描从"全部进程"降到"几个进程"。
+fn name_of_interest(name_l: &str) -> bool {
+    name_l.contains("claude")
+        || name_l.contains("chatgpt")
+        || name_l.contains("antigravity")
+        || name_l.starts_with("codex")
+        || matches!(
+            name_l,
+            "node.exe" | "node" | "bun.exe" | "bun" | "deno.exe" | "deno"
+        )
 }
 
 /// Claude 进程分类：桌面端 / Claude Code CLI。
