@@ -162,7 +162,9 @@ pub fn kill_agent(id: &str) -> usize {
     let claude_dir_l = find_claude_dir().map(|d| d.to_string_lossy().to_lowercase());
     let mut sys = System::new();
     sys.refresh_processes();
-    let mut killed = 0usize;
+    // 先收集候选（含启动时间），再逐个重新核对后终止：扫描与终止之间进程可能已退出，
+    // 或者 PID 已被别的程序复用。
+    let mut targets: Vec<(u32, u64, String)> = Vec::new();
     for (pid, proc) in sys.processes() {
         let name_l = proc.name().to_string().to_lowercase();
         let path_l = proc
@@ -170,15 +172,37 @@ pub fn kill_agent(id: &str) -> usize {
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
         if gui_agent_matches(id, &name_l, &path_l, claude_dir_l.as_deref()) {
-            let pidv: u32 = pid.as_u32();
-            if proc.kill() {
-                killed += 1;
-                log_line(&format!("killed {id} process pid={pidv}"));
-            }
+            targets.push((pid.as_u32(), proc.start_time(), path_l));
         }
     }
-    if killed > 0 {
-        log_line(&format!("kill_agent({id}): {killed} processes terminated"));
+    let mut killed = 0usize;
+    let mut skipped = 0usize;
+    for (pidv, start, path_l) in targets {
+        let pid = sysinfo::Pid::from_u32(pidv);
+        sys.refresh_process(pid);
+        let Some(now) = sys.process(pid) else {
+            continue;
+        };
+        let now_path = now
+            .exe()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if !same_identity(start, now.start_time(), &path_l, &now_path) {
+            skipped += 1;
+            log_line(&format!(
+                "kill_agent({id}): 跳过 pid={pidv}（身份已变化，不确认归属）"
+            ));
+            continue;
+        }
+        if now.kill() {
+            killed += 1;
+            log_line(&format!("killed {id} process pid={pidv}"));
+        }
+    }
+    if killed > 0 || skipped > 0 {
+        log_line(&format!(
+            "kill_agent({id}): {killed} processes terminated, {skipped} skipped"
+        ));
     }
     killed
 }
@@ -198,10 +222,13 @@ pub struct ProcInfo {
     pub name_l: String,
     pub path_l: String,
     pub cmd_l: String,
+    /// 进程启动时间（秒）。PID 会被系统复用，只有它能证明"还是同一个进程"。
+    pub start_time: u64,
 }
 
 fn proc_info_of(p: &sysinfo::Process) -> ProcInfo {
     ProcInfo {
+        start_time: p.start_time(),
         pid: p.pid().as_u32(),
         ppid: p.parent().map(|x| x.as_u32()).unwrap_or(0),
         name_l: p.name().to_string().to_lowercase(),
@@ -216,6 +243,28 @@ fn proc_info_of(p: &sysinfo::Process) -> ProcInfo {
             .collect::<Vec<_>>()
             .join(" ")
             .to_lowercase(),
+    }
+}
+
+/// 纯函数：快照与当前是否仍是同一个进程（PID 复用后路径/启动时间会变）。
+pub fn same_identity(snap_start: u64, now_start: u64, snap_path: &str, now_path: &str) -> bool {
+    snap_start == now_start && snap_path.eq_ignore_ascii_case(now_path)
+}
+
+/// 动手前重新核对身份：进程可能已退出、PID 可能被别的程序复用。
+fn recheck_identity(sys: &mut sysinfo::System, snap: &ProcInfo) -> bool {
+    let pid = sysinfo::Pid::from_u32(snap.pid);
+    sys.refresh_process(pid);
+    match sys.process(pid) {
+        Some(p) => same_identity(
+            snap.start_time,
+            p.start_time(),
+            &snap.path_l,
+            &p.exe()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default(),
+        ),
+        None => false,
     }
 }
 
@@ -304,6 +353,8 @@ pub struct SweepReport {
     pub killed: usize,
     pub desktop_killed: usize,
     pub cli_killed: usize,
+    /// 快照里有、但动手前核对身份失败而跳过的数量（不确认归属就不杀）
+    pub unconfirmed: usize,
     /// 每条 "pid 名称（类型）"
     pub detail: Vec<String>,
     /// 特殊情况说明（桌面端仍在运行等），空串表示正常执行
@@ -340,6 +391,15 @@ pub fn sweep_claude(mode: SweepMode) -> SweepReport {
     };
     for (i, kind) in picks {
         let info = &procs[i];
+        // R04：先核对身份再动手，避免把复用了同一 PID 的无关进程杀掉。
+        if !recheck_identity(&mut sys, info) {
+            report.unconfirmed += 1;
+            log_line(&format!(
+                "sweep: 跳过 pid={}（身份已变化或进程已退出，不确认归属）",
+                info.pid
+            ));
+            continue;
+        }
         let Some(proc) = sys.process(sysinfo::Pid::from_u32(info.pid)) else {
             continue;
         };
@@ -611,6 +671,31 @@ mod tests {
     }
 
     #[test]
+    fn same_identity_rejects_pid_reuse() {
+        // 同一个进程：启动时间与映像路径都一致（大小写不敏感）。
+        assert!(same_identity(
+            1000,
+            1000,
+            r"c:\apps\claude.exe",
+            r"C:\Apps\Claude.exe"
+        ));
+        // PID 被复用：启动时间变了。
+        assert!(!same_identity(
+            1000,
+            2000,
+            r"c:\apps\claude.exe",
+            r"C:\Apps\Claude.exe"
+        ));
+        // 路径变了（升级换目录/换了程序）。
+        assert!(!same_identity(
+            1000,
+            1000,
+            r"c:\apps\claude.exe",
+            r"c:\other\claude.exe"
+        ));
+    }
+
+    #[test]
     fn covered_dirs_prefers_registered_packages_and_keeps_all_versions() {
         // R05：升级过渡期新旧版本都要覆盖，新版本排在前（先纳入新、最后撤旧）。
         let pkgs = vec![
@@ -819,6 +904,7 @@ mod tests {
             name_l: name.to_string(),
             path_l: path.to_string(),
             cmd_l: String::new(),
+            start_time: pid as u64,
         };
         let wa_dir = r"c:\program files\windowsapps\claude_2.42304.0.0_x64__pzs8sxrjxfjjc";
         let wa = format!(r"{wa_dir}\claude.exe");

@@ -901,7 +901,8 @@
           const rep = await invoke(CMD.sweep_claude);
           const n = rep && rep.killed != null ? rep.killed : 0;
           toast(n > 0
-            ? "已结束 " + n + " 个 Claude 进程（桌面 " + (rep.desktopKilled || 0) + " / CLI " + (rep.cliKilled || 0) + "）"
+            ? "已结束 " + n + " 个 Claude 进程（桌面 " + (rep.desktopKilled || 0) + " / CLI " + (rep.cliKilled || 0) + "）" +
+              (rep.unconfirmed ? "，另有 " + rep.unconfirmed + " 个身份未确认已跳过" : "")
             : "未发现 Claude 进程", true);
         } catch (e) {
           toast((e && e.message) || "清理失败");
