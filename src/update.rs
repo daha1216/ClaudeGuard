@@ -45,6 +45,9 @@ pub struct Asset {
     pub name: String,
     pub size: u64,
     pub browser_download_url: String,
+    /// GitHub 为每个资产提供的 `sha256:<hex>` 摘要；旧版本 API 可能没有。
+    #[serde(default)]
+    pub digest: Option<String>,
 }
 
 impl Release {
@@ -186,6 +189,48 @@ pub fn download(
     Ok(tmp)
 }
 
+// ------------------------------------------------------------------ 校验摘要
+
+/// 从 `sha256:<hex>` 取出 64 位十六进制摘要（大小写不敏感）。
+/// 形态不对一律返回 None——调用方据此拒绝自动替换，而不是"没摘要就当没问题"。
+pub fn parse_digest(raw: &str) -> Option<String> {
+    let hex = raw.trim().strip_prefix("sha256:").unwrap_or(raw.trim());
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(hex.to_ascii_lowercase())
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let out = hasher.finalize();
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 校验下载到的文件与官方摘要一致。不一致必须报错并让调用方丢弃文件。
+pub fn verify_file(path: &std::path::Path, expected_hex: &str) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("读取待校验文件失败：{e}"))?;
+    let actual = sha256_hex(&bytes);
+    if actual == expected_hex {
+        Ok(())
+    } else {
+        Err(format!(
+            "更新包校验不通过（期望 {expected_hex}，实得 {actual}）"
+        ))
+    }
+}
+
+/// 下载完成后按官方摘要校验；拿不到摘要就不允许自动替换。
+pub fn verify_download(path: &std::path::Path, digest: Option<&str>) -> Result<(), String> {
+    let Some(raw) = digest else {
+        return Err("该版本未提供校验摘要，已取消自动更新；请手动下载安装包".to_string());
+    };
+    let hex = parse_digest(raw).ok_or_else(|| format!("校验摘要格式无法识别：{raw}"))?;
+    verify_file(path, &hex)
+}
+
 // ------------------------------------------------------------------ 自替换
 
 /// 用新 exe 替换当前进程的 exe 并重启。
@@ -244,16 +289,52 @@ pub fn download(
     self_update::download(cfg, url, size, progress)
 }
 
-/// 启动时清理上次更新残留的 .old 文件。
+/// 启动时的更新收尾：**不**立刻删旧版本备份。
+///
+/// 备份要留到新实例真正跑起来（完成一轮检查）之后才清理，否则新版本一启动就崩
+/// 时用户既没有可用程序、也没有可回滚的文件。
 pub fn cleanup_old() {
     #[cfg(target_os = "macos")]
     if let Err(error) = self_update::recover_current() {
         eprintln!("macOS 自更新恢复未完成：{error}");
     }
     #[cfg(windows)]
-    if let Ok(cur) = std::env::current_exe() {
-        let old = cur.with_extension("exe.old");
-        let _ = std::fs::remove_file(&old);
+    if let Some(old) = pending_backup() {
+        crate::guard::log_line(&format!(
+            "update: 保留上次更新备份 {}，本次启动核验通过后清理",
+            old.display()
+        ));
+    }
+}
+
+/// 上次更新留下的旧版本备份（存在即说明需要"启动健康核验"）。
+#[cfg(windows)]
+pub fn pending_backup() -> Option<PathBuf> {
+    let cur = std::env::current_exe().ok()?;
+    let old = cur.with_extension("exe.old");
+    old.exists().then_some(old)
+}
+
+#[cfg(target_os = "macos")]
+pub fn pending_backup() -> Option<PathBuf> {
+    None
+}
+
+/// 新实例已跑通一轮检查 → 更新算成功接管，这时才删备份。
+pub fn confirm_healthy() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(old) = pending_backup() {
+        match std::fs::remove_file(&old) {
+            Ok(()) => crate::guard::log_line("update: 新版本启动核验通过，已清理旧版本备份"),
+            Err(err) => crate::guard::log_line(&format!(
+                "update: 旧版本备份清理失败（{err}），可手动删除 {}",
+                old.display()
+            )),
+        }
     }
 }
 
@@ -430,6 +511,17 @@ impl Drop for MacDownloadGuard {
         MACOS_DOWNLOAD_BUSY.store(false, std::sync::atomic::Ordering::Release);
     }
 }
+/// 取某个下载地址对应的官方摘要：以更新检查时的 API 响应为准，
+/// 而不是信任 UI 传下来的字符串。
+fn digest_for_asset(cfg: &Config, url: &str) -> Result<Option<String>, String> {
+    let release = check_latest(cfg)?;
+    Ok(release
+        .assets
+        .iter()
+        .find(|a| a.browser_download_url == url)
+        .and_then(|a| a.digest.clone()))
+}
+
 pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
     #[cfg(target_os = "macos")]
     if MACOS_DOWNLOAD_BUSY
@@ -470,6 +562,27 @@ pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
         });
         match result {
             Ok(path) => {
+                // R09/D6：先按官方摘要校验，再谈替换。摘要拿不到就不自动装。
+                let digest = match digest_for_asset(&state.config(), &url) {
+                    Ok(d) => d,
+                    Err(err) => {
+                        let _ = std::fs::remove_file(&path);
+                        state.set_upd(UpdState::Failed {
+                            msg: format!("无法获取官方校验摘要：{err}"),
+                        });
+                        state.emit_state();
+                        state.log(format!("更新已取消：无法获取校验摘要（{err}）"));
+                        return;
+                    }
+                };
+                if let Err(err) = verify_download(&path, digest.as_deref()) {
+                    let _ = std::fs::remove_file(&path);
+                    state.set_upd(UpdState::Failed { msg: err.clone() });
+                    state.emit_state();
+                    state.log(format!("更新已取消：{err}"));
+                    return;
+                }
+                state.log("更新包校验通过");
                 state.set_upd(UpdState::Restarting);
                 state.emit_state();
                 state.log("更新已下载，正在替换并重启…");
@@ -567,6 +680,7 @@ mod tests {
                     name: (*n).into(),
                     size: 1,
                     browser_download_url: String::new(),
+                    digest: None,
                 })
                 .collect(),
         };
@@ -592,5 +706,53 @@ mod tests {
         // 只有安装包: 宁可不更新也不能拿它替换主程序
         let r = mk(&["ClaudeGuard-v9.9.9-setup.exe"]);
         assert!(r.exe_asset().is_none());
+    }
+
+    /// 摘要只认 `sha256:` + 64 位十六进制；其它形态一律视为"没有摘要"。
+    #[test]
+    fn digest_parsing_is_strict() {
+        let hex = "a".repeat(64);
+        assert_eq!(parse_digest(&format!("sha256:{hex}")), Some(hex.clone()));
+        assert_eq!(
+            parse_digest(&format!("sha256:{}", hex.to_uppercase())),
+            Some(hex.clone())
+        );
+        // 缺前缀也接受（GitHub 偶尔只给裸值），但长度/字符必须对
+        assert_eq!(parse_digest(&hex), Some(hex.clone()));
+        assert_eq!(parse_digest(&format!("sha512:{hex}")), None);
+        assert_eq!(parse_digest("sha256:abc"), None);
+        assert_eq!(parse_digest(&format!("sha256:{}", "z".repeat(64))), None);
+        assert_eq!(parse_digest(""), None);
+    }
+
+    /// 内容不一致必须报错，且报错里带两侧摘要（便于用户核对）。
+    #[test]
+    fn verify_file_rejects_tampered_bytes() {
+        let dir = std::env::temp_dir().join("cg-update-verify-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pkg.exe");
+        std::fs::write(&file, b"hello").unwrap();
+
+        let good = sha256_hex(b"hello");
+        assert!(verify_file(&file, &good).is_ok());
+
+        let err = verify_file(&file, &sha256_hex(b"hell0")).unwrap_err();
+        assert!(err.contains("校验不通过"), "实际：{err}");
+    }
+
+    /// D6：拿不到官方摘要时不允许自动替换（不能"没校验就当没问题"）。
+    #[test]
+    fn missing_digest_blocks_auto_update() {
+        let dir = std::env::temp_dir().join("cg-update-nodigest-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pkg.exe");
+        std::fs::write(&file, b"hello").unwrap();
+
+        let err = verify_download(&file, None).unwrap_err();
+        assert!(err.contains("未提供校验摘要"), "实际：{err}");
+        assert!(verify_download(&file, Some("sha256:abc")).is_err());
+        assert!(verify_download(&file, Some(&format!("sha256:{}", sha256_hex(b"hello")))).is_ok());
     }
 }

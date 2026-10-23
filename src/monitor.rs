@@ -353,6 +353,8 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
 
     state.set_statuses(statuses.clone());
     state.set_last_check(now());
+    // R09/D6：能跑完一轮检查就说明新版本可用，这时才允许清理上一版备份。
+    crate::update::confirm_healthy();
 
     let all_pass = enabled_count > 0 && passed_count == enabled_count;
     let primary_ip = statuses.iter().find_map(|s| s.ip.clone());
