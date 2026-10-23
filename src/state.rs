@@ -50,6 +50,8 @@ pub struct StateView {
     pub notify_enabled: bool,
     pub cut_mode: CutMode,
     pub guarded_agents: Vec<String>,
+    pub access: crate::access::AccessInfo,
+    pub enforce_access: bool,
 }
 
 pub struct AppState {
@@ -66,6 +68,8 @@ pub struct AppState {
     pub claude_update: crate::claude_update::Updater,
     pub codex_update: crate::claude_update::Updater,
     pub launch_error: Mutex<String>,
+    pub access: Mutex<crate::access::AccessInfo>,
+    pub access_streak: std::sync::atomic::AtomicU32,
     pub stop: Arc<AtomicBool>,
     pub is_admin: bool,
     pub smoke_settings: bool,
@@ -104,6 +108,11 @@ impl AppState {
             ),
             codex_update: crate::claude_update::Updater::load(crate::claude_update::Product::Codex),
             launch_error: Mutex::new(String::new()),
+            access: Mutex::new(crate::access::AccessInfo {
+                path: "skipped".into(),
+                note: "尚未检测".into(),
+            }),
+            access_streak: std::sync::atomic::AtomicU32::new(0),
             stop: Arc::new(AtomicBool::new(false)),
             is_admin,
             smoke_settings,
@@ -148,6 +157,26 @@ impl AppState {
         for status in lock(&self.statuses).iter_mut() {
             status.fail_streak = 0;
         }
+        self.access_streak.store(0, Ordering::SeqCst);
+    }
+
+    // ---------- 接入路径（v3.7） ----------
+
+    pub fn set_access(&self, access: crate::access::AccessInfo) {
+        *lock(&self.access) = access;
+    }
+
+    pub fn access(&self) -> crate::access::AccessInfo {
+        lock(&self.access).clone()
+    }
+
+    /// 未接入计数 +1，返回当前值。
+    pub fn bump_access_streak(&self) -> u32 {
+        self.access_streak.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub fn reset_access_streak(&self) {
+        self.access_streak.store(0, Ordering::SeqCst);
     }
 
     // ---------- 熔断 / 暂停 / 检查 ----------
@@ -313,6 +342,8 @@ impl AppState {
                 cfg.cut_mode()
             },
             guarded_agents: cfg.guarded_agents.clone(),
+            access: self.access(),
+            enforce_access: cfg!(target_os = "windows") && cfg.enforce_access_path,
         }
     }
 

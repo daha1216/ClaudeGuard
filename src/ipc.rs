@@ -104,7 +104,8 @@ pub fn recheck_target(state: State<'_, Arc<AppState>>, id: String) -> Result<Dry
         .target(&id)
         .cloned()
         .ok_or_else(|| "目标不存在".to_string())?;
-    let probe = crate::anchors::probe(&cfg.proxy_url(), &target);
+    let (proxy, _access) = crate::access::resolve(&cfg);
+    let probe = crate::anchors::probe(proxy.as_deref(), &target);
     let eval = crate::policy::evaluate(&target, &probe);
     Ok(DryResult {
         id: target.id.clone(),

@@ -4,6 +4,7 @@
 //! 判定与调度在 `monitor`；这里只负责把各模块接起来并保持程序生命周期干净：
 //! 退出前必须恢复网络、解除隔离（网络绝不能因为程序退出而保持断开）。
 
+mod access;
 mod anchors;
 #[cfg_attr(target_os = "macos", path = "macos/claude_update.rs")]
 mod claude_update;
@@ -187,10 +188,14 @@ fn print_json(value: &impl serde::Serialize) {
 fn cli_check() -> i32 {
     let cfg = config::Config::load();
     let results = monitor::dry_round(&cfg);
-    let passed = !results.is_empty() && results.iter().all(|result| result.pass);
+    // v3.7：接入路径快照；enforce 且未接入 → 整体不通过。
+    let (_proxy, access) = access::resolve(&cfg);
+    let uncovered = cfg!(target_os = "windows") && cfg.enforce_access_path && access.is_uncovered();
+    let passed = !results.is_empty() && results.iter().all(|result| result.pass) && !uncovered;
     print_json(&serde_json::json!({
         "version": crate::model::VERSION,
         "passed": passed,
+        "access": access,
         "targets": results,
     }));
     if passed {

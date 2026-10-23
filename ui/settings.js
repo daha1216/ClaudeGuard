@@ -85,7 +85,8 @@
       group("detect", "检测",
         '<div class="srow"><div class="slabel">代理端口<span class="shint">本机代理软件的端口</span></div><div class="sval"><input class="in num" id="st-port" type="number" min="1" max="65535" step="1"></div></div>' +
         '<div class="srow"><div class="slabel">检查间隔<span class="shint">自动复查的周期</span></div><div class="sval"><input class="in num" id="st-interval" type="number" min="5" max="3600" step="1"><span class="unit">秒</span></div></div>' +
-        '<div class="srow"><div class="slabel">立即重新检查<span class="shint">不改配置，马上校验一轮</span></div><div class="sval"><button class="btn" id="st-recheck" type="button">' + ic("refresh", 12) + "重新检查</button></div></div>") +
+        '<div class="srow"><div class="slabel">立即重新检查<span class="shint">不改配置，马上校验一轮</span></div><div class="sval"><button class="btn" id="st-recheck" type="button">' + ic("refresh", 12) + "重新检查</button></div></div>" +
+        rowSwitch("st-enforce-access", "接入路径检查", "探测跟随系统代理；系统代理关且无 TUN 网卡时视为未接入并熔断（防止应用直连真实出口）", !CFG || CFG.enforce_access_path !== false, false)) +
 
       group("guard", "熔断与清理",
         '<div class="srow col"><div class="slabel">断网档位<span class="shint">判定失败时切断出口的方式</span></div>' +
@@ -194,6 +195,7 @@
     set("st-interval", cfg.check_interval_secs || "");
     chk("st-kill", cfg.kill_on_fail);
     chk("st-quarantine", cfg.quarantine_on_fail);
+    chk("st-enforce-access", cfg.enforce_access_path !== false);
     chk("st-sweep", cfg.sweep_on_exit !== false);
     const agents = Array.isArray(cfg.guarded_agents) ? cfg.guarded_agents : [];
     chk("st-ag-claude", agents.includes("claude"));
@@ -459,6 +461,8 @@
     // 进程清理：退出后残留开关（一键清理已移到主界面 CTA 旁，见 main.js）
     const sweep = $("st-sweep");
     if (sweep) sweep.addEventListener("change", () => patch({ sweep_on_exit: !!sweep.checked }, "已保存"));
+    const enforceAccess = $("st-enforce-access");
+    if (enforceAccess) enforceAccess.addEventListener("change", () => patch({ enforce_access_path: !!enforceAccess.checked }, "已保存"));
 
     ["st-ag-claude:claude", "st-ag-chatgpt:chatgpt", "st-ag-antigravity:antigravity"].forEach((pair) => {
       const [id, agent] = pair.split(":");

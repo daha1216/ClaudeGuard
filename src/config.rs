@@ -106,6 +106,9 @@ pub struct Config {
     pub check_interval_secs: u64,
     #[serde(default = "default_threshold")]
     pub trip_threshold: u32,
+    /// v3.7：接入路径检查（系统代理关 + 无 TUN 视为未接入，计入熔断）。
+    #[serde(default = "default_true")]
+    pub enforce_access_path: bool,
     #[serde(default = "default_true")]
     pub cut_network: bool,
     #[serde(default)]
@@ -157,6 +160,7 @@ impl Default for Config {
             targets: targets::default_targets(&[], &[]),
             check_interval_secs: default_interval(),
             trip_threshold: default_threshold(),
+            enforce_access_path: true,
             cut_network: true,
             disable_network_adapters: false,
             kill_on_fail: true,

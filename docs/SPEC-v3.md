@@ -20,7 +20,7 @@
 - **整体状态**：`idle|checking|pass|fail|tripped|paused`。
 - **熔断 TripInfo**：`since,reason,failing_ids,killed,firewall_rules,network_cut(off|firewall|nics),quarantined_agents,agents`。
 - **配置 Config**（`config.json`，snake_case）：
-  `version=3, proxy_host, proxy_port, targets[], check_interval_secs(默认15,5..3600), trip_threshold(默认2,1..5), cut_network(默认true), disable_network_adapters(默认false), kill_on_fail(默认true), quarantine_on_fail(默认true), guarded_agents(默认["claude"]), cli_warn(默认true), sweep_on_exit(默认true), close_to_tray(默认true), auto_start_with_system(默认false), notify{enabled,trip,recover,launch_blocked,warning,client_update,self_update}(默认全true), auto_upd_check(默认true), first_run(默认true)`。
+  `version=3, proxy_host, proxy_port, targets[], check_interval_secs(默认15,5..3600), trip_threshold(默认2,1..5), enforce_access_path(默认true,详见§3.5), cut_network(默认true), disable_network_adapters(默认false), kill_on_fail(默认true), quarantine_on_fail(默认true), guarded_agents(默认["claude"]), cli_warn(默认true), sweep_on_exit(默认true), close_to_tray(默认true), auto_start_with_system(默认false), notify{enabled,trip,recover,launch_blocked,warning,client_update,self_update}(默认全true), auto_upd_check(默认true), first_run(默认true)`。
 - **Target**：`id, name, builtin, enabled, anchor_url, anchor_kind, expect_ips[], expect_regions[], timeout_secs(默认12,3..60), bind_agent: Option<String>`。
 
 **内置目标（4 个，`builtin=true`，可禁用不可删除）**：
@@ -64,6 +64,21 @@
 | 网络错误/超时（无响应） | Unverified（不熔断） |
 
 **整体判定**：任一启用目标 Fail → 整体失败（触发防抖计数）；全部 Pass → 通过；有 Unverified 其余非 Fail → "部分无法确认"（不算失败，也不能解除已熔断状态）。
+
+### 3.5 接入路径检查（`src/access.rs`，v3.7 起，仅 Windows）
+
+Claude 等桌面应用只认系统代理——系统代理没开时它们直连真实出口，守护器测代理出口测得再准也管不到应用本体。v3.7 做了两件事：**探测流量跟随系统代理**（测到的就是应用真实出口，换了端口/换了代理软件也成立），并额外判定**应用接入方式**：
+
+| 系统代理开关 | ProxyServer | TUN 网卡 | 判定 | 探测走哪 |
+|---|---|---|---|---|
+| 开 | 读到任意地址 | 任意 | **SystemProxy**（已接入） | 该地址（不管是否等于配置端口） |
+| 开 | 读不到 | 任意 | SystemProxy（地址未知，按已接入） | 回退配置端口 |
+| 关 | — | 检测到 | **Tun**（已接入，界面标注"TUN 直连"） | 直连（被 TUN 接管，与应用同路） |
+| 关 | — | 无 | **Uncovered**（应用直连真实出口） | 直连；计入熔断阈值 |
+
+- 检测方式：`winreg` 读 `HKCU\...\Internet Settings` 的 `ProxyEnable`/`ProxyServer`（支持 `http=..;https=..` 分号形式，取 https 优先）；`GetAdaptersAddresses` 枚举 Up 状态适配器按描述/友好名匹配 TUN 关键词（mihomo/clash/meta/sing-box/singbox/wintun/wireguard/openvpn/tap-windows/tun2socks/bettbox/hysteria/juicity/v2ray/xray/utun 前缀；不含 tailscale——非默认全隧道）。`verdict()`/`parse_sys_proxyserver()`/`is_tun_name()` 为纯函数（单测覆盖），`read_system_proxy()`/`detect_tun_adapter()` 只做系统读取。
+- 语义：Uncovered 按独立 `access_streak` 计数走同一 `trip_threshold` 防抖（阈值-1 时预警一次）；熔断动作与目标 Fail 完全一致（杀进程/隔离/断网档位），Launch 用途立即熔断；恢复条件额外要求 access 已重新覆盖（SystemProxy/Tun）。暂停同样压制 access 熔断。`enforce_access_path=false`（设置可关）或非 Windows 时整段跳过。
+- `--check` JSON 增加 `access: {path, note}`；enforce 且 Uncovered → 整体不通过（exit 2）。设置页「检测」组有"接入路径检查"开关；未接入时主界面横幅+副标题提示。
 
 ## 4. 监控循环与防抖（`src/monitor.rs`）
 

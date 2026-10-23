@@ -1,6 +1,6 @@
 [package]
 name = "claude-guard"
-version = "3.6.0"
+version = "3.7.0"
 edition = "2021"
 description = "ClaudeGuard：Windows AI 桌面应用网络出口门禁（多目标锚点 + 熔断断网）"
 
@@ -19,6 +19,8 @@ tauri-plugin-single-instance = "2"
 winreg = "0.52"
 windows = { version = "0.58", features = [
     "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_HiDpi",

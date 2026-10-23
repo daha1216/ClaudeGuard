@@ -270,6 +270,10 @@
       const passed = targets.some((x) => x.state === "pass");
       s = passed ? "等待下一次自动检测" : "等待首次检测";
     }
+    // v3.7：未接入提示（系统代理关 + 无 TUN，应用直连真实出口）。
+    if (st.access && st.access.path === "uncovered" && st.enforceAccess && overall !== "tripped") {
+      s = "未接入代理链路：" + (st.access.note || "系统代理未开启且未检测到 TUN 网卡");
+    }
     title.textContent = t;
     sub.textContent = s;
   }
@@ -279,7 +283,10 @@
     const primary = ok.find((x) => /claude/i.test(x.name)) || ok[0];
     const head = primary ? primary.name.replace(/\s*出口$/, "") + " 出口校验通过" : "出口校验通过";
     const n = (st.guardedAgents || []).length;
-    return n > 0 ? head + " · " + n + " 个应用受守护" : head;
+    const tail = n > 0 ? " · " + n + " 个应用受守护" : "";
+    // v3.7：TUN 直连模式（系统代理关、靠虚拟网卡接管）在主标题下标注。
+    const tun = st.access && st.access.path === "tun" ? " · TUN 直连" : "";
+    return head + tail + tun;
   }
 
   /* ---------- 目标列表 ---------- */
@@ -345,6 +352,13 @@
     } else if (overall === "fail") {
       const bad = (st.targets || []).filter((x) => x.state === "fail").map((x) => x.name);
       parts.push(banner("warn", ["出口校验未通过", (bad.length ? bad.join("、") + " " : "") + "不符合白名单，熔断前可修正"], { id: "details", label: "查看详情" }));
+    }
+    // v3.7：未接入横幅（系统代理关 + 无 TUN，应用直连真实出口；未熔断时提示）。
+    if (
+      st.access && st.access.path === "uncovered" && st.enforceAccess &&
+      overall !== "tripped" && overall !== "paused"
+    ) {
+      parts.push(banner("warn", ["未接入代理链路", "系统代理未开启且未检测到 TUN 网卡，Claude 会直连真实出口；开启系统代理或 TUN 模式即可解除。"]));
     }
     if (st.launchError && st.launchError !== S.launchErrShown) {
       S.launchErrShown = st.launchError;

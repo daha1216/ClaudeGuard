@@ -19,21 +19,22 @@ pub const USER_AGENT: &str = "ClaudeGuard/3.0";
 /// 跟随重定向的次数（SPEC §2；与 ureq 默认值一致，显式写出便于对照）。
 const MAX_REDIRECTS: u32 = 5;
 
-/// 走 `proxy_url` 探测 `target`。任何 HTTP 响应（含 4xx/5xx）都算可达，
-/// 网络错误/超时返回 [`ProbeResult::failed`]。
-pub fn probe(proxy_url: &str, target: &Target) -> ProbeResult {
+/// 探测 `target`。`proxy_url = Some(...)` 时经该代理，`None` 直连（TUN 接管或真实直连）。
+/// 任何 HTTP 响应（含 4xx/5xx）都算可达，网络错误/超时返回 [`ProbeResult::failed`]。
+pub fn probe(proxy_url: Option<&str>, target: &Target) -> ProbeResult {
     let started = Instant::now();
     let timeout = Duration::from_secs(target.timeout_secs.max(1));
-    let proxy = match ureq::Proxy::new(proxy_url) {
-        Ok(proxy) => proxy,
-        Err(err) => return ProbeResult::failed(format!("代理地址无效：{err}")),
-    };
-    let agent = ureq::AgentBuilder::new()
-        .proxy(proxy)
+    let mut builder = ureq::AgentBuilder::new()
         .timeout(timeout)
         .redirects(MAX_REDIRECTS)
-        .user_agent(USER_AGENT)
-        .build();
+        .user_agent(USER_AGENT);
+    if let Some(url) = proxy_url {
+        match ureq::Proxy::new(url) {
+            Ok(proxy) => builder = builder.proxy(proxy),
+            Err(err) => return ProbeResult::failed(format!("代理地址无效：{err}")),
+        }
+    }
+    let agent = builder.build();
 
     // ureq 把 4xx/5xx 归到 Err(Status)；这里把两种"有响应"的分支合并成同一个 Response。
     let response = match agent.get(&target.anchor_url).call() {

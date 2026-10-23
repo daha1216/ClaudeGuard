@@ -57,17 +57,12 @@ pub struct DryResult {
     pub latency_ms: u64,
 }
 
-fn proxy_url(cfg: &Config) -> String {
-    cfg.proxy_url()
-}
-
-/// 并行探测全部启用目标，返回与输入同序的结果。
-fn probe_all(cfg: &Config) -> Vec<(Target, ProbeResult)> {
+/// 并行探测全部启用目标，返回与输入同序的结果。`proxy=None` 直连（TUN/未接入）。
+fn probe_all(cfg: &Config, proxy: Option<String>) -> Vec<(Target, ProbeResult)> {
     let targets: Vec<Target> = cfg.enabled_targets().cloned().collect();
     if targets.is_empty() {
         return Vec::new();
     }
-    let proxy = proxy_url(cfg);
     std::thread::scope(|scope| {
         let handles: Vec<_> = targets
             .iter()
@@ -75,7 +70,7 @@ fn probe_all(cfg: &Config) -> Vec<(Target, ProbeResult)> {
                 let proxy = proxy.clone();
                 let target = target.clone();
                 scope.spawn(move || {
-                    let probe = crate::anchors::probe(&proxy, &target);
+                    let probe = crate::anchors::probe(proxy.as_deref(), &target);
                     (target, probe)
                 })
             })
@@ -87,9 +82,10 @@ fn probe_all(cfg: &Config) -> Vec<(Target, ProbeResult)> {
     })
 }
 
-/// 只读检查（--check 与设置页"测试目标"共用）。
+/// 只读检查（--check 与设置页"测试目标"共用）。探测同样跟随系统代理。
 pub fn dry_round(cfg: &Config) -> Vec<DryResult> {
-    probe_all(cfg)
+    let (proxy, _access) = crate::access::resolve(cfg);
+    probe_all(cfg, proxy)
         .into_iter()
         .map(|(target, probe)| {
             let eval = crate::policy::evaluate(&target, &probe);
@@ -116,7 +112,13 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     state.emit_state();
 
     let cfg = state.config();
-    let probes = probe_all(&cfg);
+    // v3.7 接入路径：探测跟随系统代理（关→TUN→直连），并判定应用是否真正接入。
+    let (probe_proxy, access) = crate::access::resolve(&cfg);
+    state.set_access(access.clone());
+    let access_enforced = cfg!(target_os = "windows") && cfg.enforce_access_path;
+    let access_uncovered = access_enforced && access.is_uncovered();
+
+    let probes = probe_all(&cfg, probe_proxy);
     let mut statuses: Vec<TargetStatus> = cfg
         .targets
         .iter()
@@ -225,30 +227,61 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     } else {
         format!("{} 出口不在白名单", failing.join("、"))
     };
+    let access_reason = "系统代理未开启且未检测到 TUN 网卡，应用会直连真实出口";
     let mut summary = RoundSummary {
         passed: all_pass,
-        block_reason: if failing.is_empty() {
-            if all_pass {
-                String::new()
-            } else {
-                "部分目标无法确认，暂不允许启动".to_string()
-            }
-        } else {
+        block_reason: if !failing.is_empty() {
             reason.clone()
+        } else if access_uncovered {
+            access_reason.to_string()
+        } else if all_pass {
+            String::new()
+        } else {
+            "部分目标无法确认，暂不允许启动".to_string()
         },
         failing: failing.clone(),
     };
 
     let paused = state.is_paused();
-    let should_trip = !failing.is_empty()
+
+    // v3.7 接入路径防抖：未接入与目标 Fail 走同一套阈值语义。
+    let access_streak = if access_uncovered {
+        state.bump_access_streak()
+    } else {
+        state.reset_access_streak();
+        0
+    };
+    if access_uncovered
+        && !state.is_tripped()
+        && cfg.trip_threshold > 1
+        && access_streak == cfg.trip_threshold - 1
+    {
+        state.log("接入路径连续未接入，下一轮将熔断");
+        state.notify(
+            "warning",
+            "ClaudeGuard 检查未通过",
+            "系统代理未开启且无 TUN 网卡，应用正直连真实出口；下一轮将熔断。",
+        );
+    }
+    let access_trip = access_uncovered
         && !state.is_tripped()
         && !paused
-        && (purpose == Purpose::Launch || max_streak >= cfg.trip_threshold);
+        && (purpose == Purpose::Launch || access_streak >= cfg.trip_threshold);
+
+    let should_trip = (!failing.is_empty()
+        && !state.is_tripped()
+        && !paused
+        && (purpose == Purpose::Launch || max_streak >= cfg.trip_threshold))
+        || access_trip;
 
     if should_trip {
-        do_trip(state, &cfg, &failing_ids, &reason);
+        if access_trip && failing.is_empty() {
+            do_trip(state, &cfg, &[], access_reason);
+        } else {
+            do_trip(state, &cfg, &failing_ids, &reason);
+        }
     } else if state.is_tripped() {
-        if !failing.is_empty() {
+        if !failing.is_empty() || access_uncovered {
             if cfg.kill_on_fail {
                 let mut killed = crate::guard::kill_agents(&cfg);
                 if cfg.guarded_agents.iter().any(|id| id == "claude") {
@@ -258,7 +291,12 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
                     state.log(format!("持续异常：再次结束 {killed} 个进程"));
                 }
             }
-        } else if passed_count > 0 && enabled_count > 0 && passed_count == enabled_count {
+        } else if passed_count > 0
+            && enabled_count > 0
+            && passed_count == enabled_count
+            && !access_uncovered
+        {
+            // v3.7：恢复额外要求接入路径已重新覆盖（系统代理或 TUN）。
             do_recover(state, &cfg, primary_ip.as_deref());
         }
     } else if all_pass && !failing.is_empty() {
