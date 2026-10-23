@@ -345,6 +345,11 @@ UI 文档：ui/、tests/、docs/、AGENTS.md
 | M4 审计返工 | 独立只读审计判 M4「部分达标」，逐项修复：①受控暂存句柄补 `.read(true)`（只开 write 时 sha256/copy 必然 `ERROR_ACCESS_DENIED`，自更新在 Windows 上从未跑通，属 M4 回归；测试改为直接走 `create_staged` 并断言句柄可读）②脱敏覆盖整段正文 + 中文地区名（`policy::fail_reason` 产出「出口 <ip>（美国）…」，只挡 IPv4 会漏）③`netpol` 代理地址非法时返回错误而不是静默直连，并 `redirects(0)` ④摘要与官方资产校验前移到下载之前，下载加 128 MB 硬上限且超限即中止 ⑤`Downloading`/`Restarting` 期间检查结果一律不写（`set_upd_if_idle`），后台与手动检查都跳过 ⑥暂存目录不再回退 `%APPDATA%` 可写位置 ⑦替换前复核熔断/封锁/停止保护 ⑧版本提醒改走 `state.notify` 唯一出口 | `8bca875`…`6440941` | 169→174 测试；每项都有对应回归用例 |
 **外发例外（显式，不是静默回退）**：飞书 Webhook 直连 `open.feishu.cn`，不继承被监控的代理（`src/feishu.rs` 注释与 `redirects(0)`）。理由：凭据与消息内容不经过代理链路，且飞书是国内服务、经 AI 节点出海通常不可用。该例外只影响通知投递，不参与出口判定；正文仍按 `include_egress` 脱敏。
 
+| M5 配置语义对齐（D1） | `CONFIG_VERSION=4` 与 `Default`/`migrate` 统一；新装 `cut_network=false`（应用级隔离为主，全局断网改成显式选择），旧配置显式 true 原样保留；首次 GUI 启动把旧版配置原样备份成 `config.v{旧版本}.bak.json`（只备一次、绝不覆盖、`--check` 不碰盘） | `9facd9e` | 172→178 测试；隔离 APPDATA 迁移演练：v3 配置含 `cut_network=true` → 生成 `config.v3.bak.json` 且内容一致，线上文件仍是 version 3（读不写盘），首次保存才写 4 且保留 true |
+| M5 性能（R16） | 两处热点：①退出清理线程每 2 秒枚举 WindowsApps + sysinfo 全量刷新（每进程读 PEB）②每轮检查每个目标各建一个 `ureq::Agent`（加载根证书）。修法：`anchors::build_agent`/`probe_with` 一轮共用一个 Agent；新增 `guard::claude_presence`（Toolhelp 快照 + `QueryFullProcessImageNameW` 单次扫描，命中即停，拿不到快照保守返回 Desktop）；清理线程目录解析缓存 60s、节奏自适应 3s（有 Claude）/10s（无）；删除被取代的死代码 | `c4da552` | 空闲 CPU **1.719%→0.755%**（40s 窗口 218ms，约 0.5% 单核）、RSS 50.4→34.1MB、窗口可见 0.52s、首条日志 0.75s、单轮检查 CPU 15.6ms（小于一个 Windows 计时量子）；`CG_ROUND_TRACE` 埋点默认零开销 |
+| M5 原生验收 | `--version`/`--check`（白名单外 exit 2、`verdict:fail`、`access.path:unknown`）/`--restore`（exit 0 + 分项结果）/单实例（第二进程自动退出）/主窗口句柄非 0/托盘六项字面核对 | 本次提交 | 全部符合 CONTRACT；`--restore` 在真实熔断后执行成功 |
+| M5 一致性（R17） | GUIDE 断网档位默认值改为「不断网（默认）」并注明升级保留原选择；数据目录补 `ledger.json`/`disarmed`/`upd-notify.json`；三向核对（设置项↔GUIDE↔SPEC）确认 8 组设置项、6 类通知 + 2 个开关、托盘六项字面一致 | 本次提交 | 逐项 grep 比对，唯一不符项已修 |
+
 ### 尚未开始
 
 - **M4 剩余（已明确移到 M5 收口）**：R09 的签名清单/发布序号防重放与"受信交接者 Ready 回执/回滚"（需要维护者密钥与发布流水线改造，属实施依赖）；R15 的普通权限 UI + 窄接口高权限执行器拆分（D7 决定过渡期保持 `requireAdministrator`，拆分需单独立项）；重解析点/父目录 ACL 检查；`RecoveryPending` 状态阻断。
