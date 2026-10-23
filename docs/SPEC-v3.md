@@ -34,7 +34,7 @@
 
 ## 2. 锚点与解析（`src/anchors.rs`，纯解析函数必须可单测）
 
-请求：ureq Agent + 系统代理 `http://{proxy_host}:{proxy_port}`，超时 `timeout_secs`，跟随重定向，UA `ClaudeGuard/3.0`。任何 HTTP 响应（含 4xx/5xx）都算"有响应"；网络错误/超时算不可达。
+请求：ureq Agent，代理地址按 §3.5 接入判定解析（系统代理开→其实际地址；关→TUN/未接入均直连；读不到地址时回退 `http://{proxy_host}:{proxy_port}`），超时 `timeout_secs`，跟随重定向，UA `ClaudeGuard/3.0`。任何 HTTP 响应（含 4xx/5xx）都算"有响应"；网络错误/超时算不可达。国内直连 claude.ai 可达（Cloudflare 前端，未被封），所以未接入时直连探测能拿到家宽真实出口 IP、按白名单判 Fail——注册表/TUN 检查是这条之外的确定性第一道防线。
 
 `auto` 解析顺序（命中即停）：
 1. **trace**：按行匹配 `ip=`、`loc=`、`colo=`；要求至少 `ip` 或 `loc` 之一。
