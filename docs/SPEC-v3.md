@@ -2,12 +2,13 @@
 
 > 2026-10-20 需求定稿。本文件是 v3 的唯一实现依据；与 `PARITY-v2.md` / `v2-spec.md` 冲突时以本文件为准。
 > 仓库 `D:\ClaudeGuard`，分支 `v3`（master 保持 v2.11.0 到发版）。Tauri 2 + 纯静态前端（零 node 构建），Inno AppId 不变。
+> **2026-10-24 起：v3.10 修复主线以 `docs/CONTRACT-v3.10.md` 为准**（D1–D7 决策 + 覆盖矩阵）；本文件与契约冲突时以契约为准。§7 IPC/§8 UI 列表在对应里程碑落地时随代码同步更新。
 
 ## 0. 范围与不变项
 
 **保留（功能不缩水）**：出口门禁、托盘常驻、首启向导、开机自启、熔断（杀进程 + 分 agent 防火墙）、多 agent 守护、CLI 仅提醒、飞书通知、Claude/Codex 客户端更新、自身更新、`--check` JSON、单实例、Inno 安装器（AppId `{F5110E67-B6E3-4B59-B8BE-7F12B33EF85E}`，数据目录 `%APPDATA%\ClaudeGuard`）。
 
-**v3 新增**：①监控目标模型（每目标独立锚点与期望值，可增删改）；②三类锚点（Cloudflare trace / 页面地区标记 / 仅可达性）；③断网两档（默认防火墙全局出站阻断，可选禁用物理网卡）；④桌面通知五类；⑤"解除隔离并恢复网络"与启动自愈；⑥`--restore` 急救。
+**v3 新增**：①监控目标模型（每目标独立锚点与期望值，可增删改）；②三类锚点（Cloudflare trace / 页面地区标记 / 仅可达性）；③断网两档（v3.10 起默认应用级隔离，全局断网/禁网卡为高级可选，须有恢复执行器）；④桌面通知六类；⑤"解除隔离并恢复网络"与启动自愈；⑥`--restore` 急救。
 
 **移除**：`launch_on_pass`（v1 起即死配置）、`connect_target`/`app_id` 落盘字段、`tcp_table.rs` 兜底探测（由锚点模型取代）。**移植**：`feishu.rs`、`update.rs`、`claude_update.rs`、`claude_package.ps1`、`install.rs` 基本原样（只改接口适配）。
 
@@ -20,7 +21,7 @@
 - **整体状态**：`idle|checking|pass|fail|tripped|paused`。
 - **熔断 TripInfo**：`since,reason,failing_ids,killed,firewall_rules,network_cut(off|firewall|nics),quarantined_agents,agents`。
 - **配置 Config**（`config.json`，snake_case）：
-  `version=3, proxy_host, proxy_port, targets[], check_interval_secs(默认15,5..3600), trip_threshold(默认2,1..5), enforce_access_path(默认true,详见§3.5), lockdown_on_uncovered(默认true,详见§3.6), cut_network(默认true), disable_network_adapters(默认false), kill_on_fail(默认true), quarantine_on_fail(默认true), guarded_agents(默认["claude"]), cli_warn(默认true), sweep_on_exit(默认true), close_to_tray(默认true), auto_start_with_system(默认false), notify{enabled,trip,recover,launch_blocked,warning,client_update,self_update}(默认全true), auto_upd_check(默认true), first_run(默认true)`。
+  `version=4, proxy_host, proxy_port, targets[], check_interval_secs(默认15,5..3600), trip_threshold(默认2,1..5), enforce_access_path(默认true,详见§3.5), lockdown_on_uncovered(默认true,详见§3.6), cut_network(默认false；v3.9 及以前迁移保留原值), disable_network_adapters(默认false), kill_on_fail(默认true), quarantine_on_fail(默认true), guarded_agents(默认["claude"]), cli_warn(默认true), sweep_on_exit(默认true), close_to_tray(默认true), auto_start_with_system(默认false), notify{enabled,trip,recover,launch_blocked,warning,client_update,self_update,include_egress}(默认全true，include_egress 默认false), auto_upd_check(默认true), first_run(默认true)`。
 - **Target**：`id, name, builtin, enabled, anchor_url, anchor_kind, expect_ips[], expect_regions[], timeout_secs(默认12,3..60), bind_agent: Option<String>`。
 
 **内置目标（4 个，`builtin=true`，可禁用不可删除）**：
@@ -95,10 +96,10 @@ Claude 等桌面应用只认系统代理——系统代理没开时它们直连�
 - 一轮 = 并行探测所有启用目标（`std::thread::scope`），逐一判定，更新 TargetStatus；记录 `checked_at`。
 - **防抖**：每个目标维护 `fail_streak`；Fail → +1，非 Fail → 清零。`max(fail_streak) >= trip_threshold` 且未 tripped 且未暂停 → 执行熔断；`fail_streak == trip_threshold - 1` 且通知开启 → 预警通知一次（每个目标每轮触发状态变化时最多一次）。
 - **熔断执行**（`monitor` 调 `guard::trip` + `netcut::cut`）：失败目标名并入 reason；结束 `guarded_agents` 全部 GUI 进程；按开关加隔离防火墙；按档位断网；桌面通知 + 飞书；写 TripInfo；`trip()` 成功则 state=tripped。
-- **已熔断期间**：每轮仍探测；仍有 Fail → 再次 kill（日志"持续异常：再次结束 N 个进程"）；**恢复条件**：无 Fail 且至少 1 个 Pass → `netcut::restore` + 解除隔离 + 清零 streaks + 通知恢复；若全部 Unverified → 保持 tripped（横幅"等待确认出口"）。
-- **暂停**：`paused_until` 期间照常检查与更新状态，但不 engage/kill/断网；到点自动恢复；托盘可提前恢复。
+- **已熔断期间**：每轮仍探测；仍有 Fail → 再次 kill（日志"持续异常：再次结束 N 个进程"）；**恢复条件（v3.10 流程 A）**：核验隔离完整 → 恢复业务网络 → 当前代次复核通过后解除应用隔离、清零 streaks、通知恢复；若全部 Unverified → 保持 tripped（横幅"等待确认出口"），不自动解除。
+- **暂停**：`paused_until` 期间照常检查与更新状态，但不 engage/kill/断网；到点自动恢复；托盘可提前恢复；暂停期间不自动解除既有隔离（fail-closed）。
 - **启动门禁**：`launch()` 走 `run_check(Purpose::Launch)`，要求所有启用目标 Pass；否则阻止启动 + 桌面通知（launch_blocked）+ 记录 `launch_error`；Fail 时同样执行熔断（与 v2 一致）。启动成功后 `close_to_tray` 则收托盘。
-- **手动解除**：`release()` = `netcut::restore` + 解除隔离 + 清 tripped + 清 streaks + 日志；不清用户配置。
+- **手动解除（v3.10 流程 B）**：`release()` = 恢复网络 + 解除隔离 + 清 tripped + 清 streaks + 日志；仍保持布防（下一轮失败会再次隔离）；不清用户配置。
 
 ## 5. 熔断执行与断网（`src/guard.rs`、`src/netcut.rs`）
 
@@ -111,13 +112,13 @@ Claude 进程清理引擎（v3.2）：`ProcInfo` 快照 + 纯函数判定（`cla
 `log_line` 写 `%APPDATA%\ClaudeGuard\guard.log`（>1MB 原子裁剪保留约 400KB，行边界）；`version_key`、`find_windowsapps_dir`、`find_claude_dir`、`find_chatgpt_dir`、`resolve_app_id`、`launch_claude`、`is_admin`、`firewall_dedupe`。
 
 `netcut.rs`（新增）：
-- 档位：`off`（cut_network=false）/`firewall`（默认）/`nics`（disable_network_adapters=true 时，额外禁用物理网卡）。
+- 档位：`off`（默认，应用级隔离）/`firewall`/`nics`（需 cut_network=true；nics 还需 disable_network_adapters=true；两者都要求恢复执行器就绪）。
 - firewall 档：`netsh advfirewall firewall add rule name="ClaudeGuard Cut All" dir=out action=block profile=any enable=yes`；恢复删除同名规则。
 - nics 档：`powershell.exe -NoProfile -Command "Get-NetAdapter -Physical | Where-Object {$_.Status -eq 'Up'} | Select-Object -ExpandProperty Name | ConvertTo-Json"` 枚举启用中的物理网卡 → 逐个 `Disable-NetAdapter -Name ... -Confirm:$false`；恢复 `Enable-NetAdapter`。用 cmdlet 名避免本地化文本解析。
 - 断网状态持久化 `%APPDATA%\ClaudeGuard\netcut.json`（`{mode,firewall,nics,since}`）。
 - 恢复：删规则 + 重新启用记录在案的网卡 + 删持久化文件。
 - 自愈：启动时若存在 `netcut.json` → 恢复并日志"检测到上次熔断残留，已恢复网络"；若存在 `ClaudeGuard Cut All` 规则而无状态文件 → 删除；清理旧版重复规则（同名多份只留一份，或全部删除由 v3 重加）。
-- 退出：真退出前必须 `netcut::restore`（网络绝不能因程序退出保持断开）；隔离规则是否保留：v3 一并解除（比 v2 更干净，AGENTS 记录）。
+- 退出：正常退出走恢复协议（先写账本、核验成功才退出）；强退/断电由账本与恢复执行器下次启动处理（fail-closed）；隔离规则按流程 B 一并解除。
 - `--restore` CLI：执行恢复并输出 JSON，退出码 0。
 
 ## 6. 桌面通知（`src/notify.rs`，powershell.exe + WinRT Toast，无第三方 crate）
@@ -128,7 +129,7 @@ Claude 进程清理引擎（v3.2）：`ProcInfo` 快照 + 纯函数判定（`cla
 `HKCU\Software\Classes\AppUserModelId\ClaudeGuard` 登记（DisplayName / IconUri = 当前 exe）。
 未登记时 `Show()` 既不抛错也不投递——即“通知不生效”。`notify::ensure_identity()` 在启动时与每次发送前幂等补登记，安装版与便携版同样生效。
 
-1. `trip`："ClaudeGuard 已熔断" / "{失败目标名} 出口不符合白名单，已结束相关应用并切断网络。修正后自动恢复。"
+1. `trip`："ClaudeGuard 已熔断" / "{失败目标名} 出口不符合白名单，已结束相关应用并施加隔离。确认出口正常后可恢复。"
 2. `recover`："ClaudeGuard 已恢复" / "出口检查通过，已解除隔离并恢复网络。"
 3. `launch_blocked`："ClaudeGuard 已阻止启动" / reason。
 4. `warning`："ClaudeGuard 检查未通过" / "第 {n} 次连续失败，再失败一次将熔断。"
@@ -152,7 +153,7 @@ src/policy.rs      判定矩阵（纯函数可测）
 src/monitor.rs     调度、fail_streak、trip/recover 编排、launch 门禁、暂停
 src/guard.rs       进程扫描/结束、防火墙、日志、路径与版本工具（移植 v2）
 src/netcut.rs      断网两档 + 恢复 + 自愈 + 规则去重
-src/notify.rs      桌面通知五类
+src/notify.rs      桌面通知六类
 src/feishu.rs      飞书通知（移植）
 src/update.rs      自身更新（移植）
 src/claude_update.rs Claude/Codex 客户端更新（移植，含 src/claude_package.ps1）
