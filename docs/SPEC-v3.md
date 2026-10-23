@@ -20,7 +20,7 @@
 - **整体状态**：`idle|checking|pass|fail|tripped|paused`。
 - **熔断 TripInfo**：`since,reason,failing_ids,killed,firewall_rules,network_cut(off|firewall|nics),quarantined_agents,agents`。
 - **配置 Config**（`config.json`，snake_case）：
-  `version=3, proxy_host, proxy_port, targets[], check_interval_secs(默认15,5..3600), trip_threshold(默认2,1..5), enforce_access_path(默认true,详见§3.5), cut_network(默认true), disable_network_adapters(默认false), kill_on_fail(默认true), quarantine_on_fail(默认true), guarded_agents(默认["claude"]), cli_warn(默认true), sweep_on_exit(默认true), close_to_tray(默认true), auto_start_with_system(默认false), notify{enabled,trip,recover,launch_blocked,warning,client_update,self_update}(默认全true), auto_upd_check(默认true), first_run(默认true)`。
+  `version=3, proxy_host, proxy_port, targets[], check_interval_secs(默认15,5..3600), trip_threshold(默认2,1..5), enforce_access_path(默认true,详见§3.5), lockdown_on_uncovered(默认true,详见§3.6), cut_network(默认true), disable_network_adapters(默认false), kill_on_fail(默认true), quarantine_on_fail(默认true), guarded_agents(默认["claude"]), cli_warn(默认true), sweep_on_exit(默认true), close_to_tray(默认true), auto_start_with_system(默认false), notify{enabled,trip,recover,launch_blocked,warning,client_update,self_update}(默认全true), auto_upd_check(默认true), first_run(默认true)`。
 - **Target**：`id, name, builtin, enabled, anchor_url, anchor_kind, expect_ips[], expect_regions[], timeout_secs(默认12,3..60), bind_agent: Option<String>`。
 
 **内置目标（4 个，`builtin=true`，可禁用不可删除）**：
@@ -81,6 +81,14 @@ Claude 等桌面应用只认系统代理——系统代理没开时它们直连�
 - **隐私语义（v3.8）**：启用检查时，守护器自身流量在任何状态下都不带家宽 IP 出机器（探测只走代理或 TUN 接管的直连）；国内直连 claude.ai 本可测出家宽 IP，但守护器刻意不测，改用注册表/TUN 判定。
 - `--check` JSON 增加 `access: {path, note}`；enforce 且 Uncovered → 整体不通过（exit 2）。设置页「检测」组有"接入路径检查"开关；未接入时主界面横幅+副标题提示。
 
+### 3.6 防火墙兜底封锁（v3.9，Windows）
+
+- 动机：未接入态（系统代理关+无 TUN）下应用直连真实出口；TUN 模式又不能拦（覆盖一切流量）。防火墙 Block 规则按 exe 生效且回环（127.0.0.1 系统代理）不受 Windows 防火墙过滤——正好实现"没连代理就出不去、连了照常走"。
+- 语义：每轮监控按接入状态同步封锁意图——`未接入 && lockdown_on_uncovered` → 维持"每守护对象一组出站 Block 规则"（`ClaudeGuard Lockdown ({id})`，按 `agent_exes` 全 exe）；已接入（SystemProxy/Tun）或该开关关 → 全部解除。意图不变不重复增删（`state.sync_lockdown` 按上次意图差分；启动首轮强制对齐，顺带清理崩溃残留）。手动 `lockdown(on)` IPC 立即生效，下一轮自动逻辑按接入状态接管。
+- 前置：`fw_ensure_on()`——防火墙整体关着时 Block 规则不生效（实测踩过：用户机器三 profile 全 Off，隔离规则从未真正执行）；因此 trip() 隔离前与 lockdown 前都会确保开启（只开不关，默认出站=允许，不影响正常流量）。
+- 边界：按 exe 封锁=应用全部域名（Windows 防火墙无域名字段）；CLI 跑在 node 宿主不能拦（与熔断隔离同边界）；退出程序时 `lockdown_clear()` 只删规则不动防火墙总开关。
+- UI：未接入横幅/副标题在封锁生效时注明"已启用防火墙兜底封锁"；设置「熔断与清理」组新增"防火墙兜底封锁"子节（自动开关+一键封锁/解除按钮）；`StateView.lockdown` 暴露当前意图。
+
 ## 4. 监控循环与防抖（`src/monitor.rs`）
 
 - 启动 1s 后首轮；300ms tick；每 `check_interval_secs` 且非 busy 跑一轮；间隔实时读配置。
@@ -97,6 +105,8 @@ Claude 等桌面应用只认系统代理——系统代理没开时它们直连�
 `guard.rs`（移植 v2 语义）：GUI agents = claude / chatgpt / antigravity（fingerprint 不变；claude 指纹排除 CLI 原生二进制路径 `\claude\claude-code\` 与 `\.local\bin\claude`）；CLI agents = claude-code（指纹含 npm js、`\.local\bin\claude`、新安装布局 `%APPDATA%\Claude\claude-code\<ver>\<hash>\claude.exe`）/ codex / gemini。v3.2 起 Claude 是守护对象时熔断连 Claude Code CLI 一并结束（codex/gemini 仍只提醒）；`trip()` 结束进程 + 按 agent 加防火墙（claude 沿用旧规则名 `ClaudeGuard Block Out/In`，其他带 agent 后缀）。
 
 Claude 进程清理引擎（v3.2）：`ProcInfo` 快照 + 纯函数判定（`classify_claude` 桌面/CLI 二分、`pick_manual` 全量、`pick_residual` 残留=桌面家族全部 + 孤儿 CLI【父进程已死】，桌面端仍在运行时返回 None 不清理）；`sweep_claude(mode)` 三态 Manual（一键全清）/ CliOnly（熔断路径）/ Residual（退出后清理）返回 `SweepReport{scanned,killed,desktopKilled,cliKilled,detail[],note}`。残留监视线程（`monitor.rs::spawn_sweeper`）：2 秒一拍盯桌面端在否，消失后宽限 4 秒复查（自动更新/快速重启自救）再清残留；`sweep_on_exit=false`、未守护 claude、暂停守护时不动作。
+
+防火墙兜底封锁（v3.9，详见 §3.6）：`fw_ensure_on()`/`lockdown_apply(cfg)`/`lockdown_clear()`；trip() 隔离前确保防火墙开启；退出时清兜底规则。
 
 `log_line` 写 `%APPDATA%\ClaudeGuard\guard.log`（>1MB 原子裁剪保留约 400KB，行边界）；`version_key`、`find_windowsapps_dir`、`find_claude_dir`、`find_chatgpt_dir`、`resolve_app_id`、`launch_claude`、`is_admin`、`firewall_dedupe`。
 
@@ -153,7 +163,7 @@ ui/index.html|app.css|main.js|ipc.js|icons.js|settings.js|updates.js|feishu.js
 ```
 
 **IPC 命令**（`invoke('cmd', {args})`，Tauri 2 snake_case↔camelCase 自动映射）：
-`get_state`、`get_config`、`update_settings(patch)`、`save_targets(targets)`、`reset_targets`、`recheck`、`launch`、`recheck_target(id)`、`release`、`pause`、`resume`、`sweep_claude`（一键清理，返回 SweepReport）、`recent_logs(limit)`、`open_data_folder`、`install_app`、`set_autostart(on)`、`upd_state`、`upd_check`、`upd_download`、`feishu_status`、`feishu_save(cfgJson)`、`feishu_test`、`feishu_retry_failed`、`claude_update_status`、`claude_update_configure(json)`、`claude_update_check`、`codex_update_status`、`codex_update_configure(json)`、`codex_update_check`、`js_log(level,msg)`、`notify_test(kind)`。
+`get_state`、`get_config`、`update_settings(patch)`、`save_targets(targets)`、`reset_targets`、`recheck`、`launch`、`recheck_target(id)`、`release`、`pause`、`resume`、`sweep_claude`（一键清理，返回 SweepReport）、`lockdown(on)`（v3.9 一键防火墙兜底封锁/解除，返回 bool）、`recent_logs(limit)`、`open_data_folder`、`install_app`、`set_autostart(on)`、`upd_state`、`upd_check`、`upd_download`、`feishu_status`、`feishu_save(cfgJson)`、`feishu_test`、`feishu_retry_failed`、`claude_update_status`、`claude_update_configure(json)`、`claude_update_check`、`codex_update_status`、`codex_update_configure(json)`、`codex_update_check`、`js_log(level,msg)`、`notify_test(kind)`。
 **事件**：`guard://state`（StateView）、`guard://log`（单行）。
 
 **StateView（camelCase）**：`checking,checkedAt,intervalSecs,tripThreshold,overall,targets[TargetStatus],tripped, pausedUntil,admin,installed,version,upd,feishu,claudeUpdate,codexUpdate,agentsRunning[{id,name,count}],cliRunning[],guardedAgents[],launchError,smokeSettings,notifyEnabled,cutMode`。
@@ -161,7 +171,7 @@ ui/index.html|app.css|main.js|ipc.js|icons.js|settings.js|updates.js|feishu.js
 ## 8. UI 规格（初版方向 A·极简仪表盘；设计稿为唯一视觉基准）
 
 - 窗口 420 × clamp(工作区逻辑高−8, 420, 620)，min 400×420；`decorations:false`，`data-tauri-drag-region`；标题栏 44px 毛玻璃、左侧纯文字 `ClaudeGuard`（13px/600，无图标）、右侧仅最小化/关闭；边缘八向缩放（tao 自带）。
-- 结构（自上而下，主区可滚动，footer sticky）：hero（128px 环、stroke 5.6、平色 #03AA49/#E4002B/灰，中心勾/叉/暂停/spinner；h1 22px/600；sub 12px #86868B；不再有 meta 行）→ 目标列表卡（圆角 14、白 88% + blur 20px、行高 54px（熔断/暂停压缩为 50px）、分隔 hairline；每行：状态点 + 左列（名称 13px/600 + 地区/组说明 11px） + 右列（IP 12.5px 等宽 tabular + 延迟 10.5px））→ 横幅区（仅熔断红/暂停灰/未通过橙/启动失败橙；CLI 运行提醒只在详情卡与日志，不占首屏）→ CTA（全宽 46px 渐变蓝主按钮：启动 Claude / 重新检查 / 启动已禁止；下方一行文字链接：立即检测（熔断态变红色「解除隔离并恢复网络」）+ 清理 Claude 进程（v3.4 起常驻，两段确认：首击 3.2s 内变红「确认结束全部 Claude 进程？」，再击执行 sweep_claude，防误触））→ 详情卡（默认收起：每目标一行的判定步骤、锚点 host、延迟、原因、运行中进程）→ 设置卡（默认收起；展开后为**折叠手风琴，同一时间只展开一组**，组头含动态摘要（端口/间隔、断网档位、守护对象名、目标启用数、通知开关）与旋转箭头，默认展开「检测」；组=检测（端口/间隔/立即检查）、熔断与清理（断网档位/停进程/隔离 + 进程清理子节=退出清扫开关；一键清理在主界面 CTA 旁）、守护对象、监控目标（列表编辑+添加+恢复默认）、通知（六开关+测试）、飞书通知、通用（关窗驻留/开机自启/数据文件夹/用户指南）、更新（自身+Claude 客户端+Codex 客户端三子节））→ 日志卡（默认收起，11px mono）→ footer（左：详情/设置/日志 链接；右：`vX.Y.Z`）。
+- 结构（自上而下，主区可滚动，footer sticky）：hero（128px 环、stroke 5.6、平色 #03AA49/#E4002B/灰，中心勾/叉/暂停/spinner；h1 22px/600；sub 12px #86868B；不再有 meta 行）→ 目标列表卡（圆角 14、白 88% + blur 20px、行高 54px（熔断/暂停压缩为 50px）、分隔 hairline；每行：状态点 + 左列（名称 13px/600 + 地区/组说明 11px） + 右列（IP 12.5px 等宽 tabular + 延迟 10.5px））→ 横幅区（仅熔断红/暂停灰/未通过橙/启动失败橙；CLI 运行提醒只在详情卡与日志，不占首屏）→ CTA（全宽 46px 渐变蓝主按钮：启动 Claude / 重新检查 / 启动已禁止；下方一行文字链接：立即检测（熔断态变红色「解除隔离并恢复网络」）+ 清理 Claude 进程（v3.4 起常驻，两段确认：首击 3.2s 内变红「确认结束全部 Claude 进程？」，再击执行 sweep_claude，防误触））→ 详情卡（默认收起：每目标一行的判定步骤、锚点 host、延迟、原因、运行中进程）→ 设置卡（默认收起；展开后为**折叠手风琴，同一时间只展开一组**，组头含动态摘要（端口/间隔、断网档位、守护对象名、目标启用数、通知开关）与旋转箭头，默认展开「检测」；组=检测（端口/间隔/立即检查）、熔断与清理（断网档位/停进程/隔离 + 进程清理子节=退出清扫开关；一键清理在主界面 CTA 旁 + **防火墙兜底封锁子节**=未接入自动封锁开关+一键封锁/解除按钮）、守护对象、监控目标（列表编辑+添加+恢复默认）、通知（六开关+测试）、飞书通知、通用（关窗驻留/开机自启/数据文件夹/用户指南）、更新（自身+Claude 客户端+Codex 客户端三子节））→ 日志卡（默认收起，11px mono）→ footer（左：详情/设置/日志 链接；右：`vX.Y.Z`）。
 - 状态语义：环/标题跟随 overall；busy 只在手动检查/首查转圈（后台刷新不动环）；目标行四态点：绿/红/橙（unverified）/灰（disabled）；熔断态红色横幅 + 置灰 CTA + 解除隔离按钮。
 - 动效红线（沿用 v2 标准）：只动 transform/opacity；无 transition:all/ease-in/scale(0)；按压 :active scale(0.97)；入场 scale(0.95)+opacity；≤300ms；stagger 30–80ms；reduced-motion → 交叉淡入；reduced-transparency → 实底；hover 包 `@media(hover:hover) and (pointer:fine)`。所有 JS 文件 IIFE 包裹（跨文件只经 `window.CG_IPC`/`window.ICONS`/`window.CG_UI`）。
 - 首启向导 3 页（沿用 v2 文案结构）：页 0 欢迎；页 1 代理端口 + 白名单 IP（逗号分隔）+ 出口地区（写入 local/claude/codex 三个目标的 expect）；页 2 安装 vs 便携。向导期间监测照跑。

@@ -154,6 +154,12 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     let access_uncovered = access_enforced && access.is_uncovered();
     let skip_probes = access_uncovered;
 
+    // v3.9 防火墙兜底：未接入时维持守护对象出站封锁（回环代理不受影响），接入后自动解除。
+    if cfg!(target_os = "windows") {
+        let want_lockdown = access_uncovered && cfg.lockdown_on_uncovered;
+        state.sync_lockdown(want_lockdown, &cfg);
+    }
+
     let probes = if skip_probes {
         Vec::new()
     } else {

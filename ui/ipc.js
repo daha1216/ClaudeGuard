@@ -23,6 +23,7 @@
     pause: "pause",
     resume: "resume",
     sweep_claude: "sweep_claude",
+    lockdown: "lockdown",
     recent_logs: "recent_logs",
     open_data_folder: "open_data_folder",
     open_guide: "open_guide",

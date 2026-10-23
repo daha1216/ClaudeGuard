@@ -400,6 +400,8 @@ fn run_gui(start_hidden: bool, want_settings: bool) {
             state.stop.store(true, Ordering::SeqCst);
             let _ = crate::netcut::restore();
             let _ = crate::guard::firewall_release();
+            // v3.9：退出时解除兜底封锁（只清规则，不动防火墙总开关）。
+            let _ = crate::guard::lockdown_clear();
         }
     });
 }
@@ -418,6 +420,7 @@ fn with_ipc(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
         ipc::pause,
         ipc::resume,
         ipc::sweep_claude,
+        ipc::lockdown,
         ipc::recent_logs,
         ipc::open_data_folder,
         ipc::open_guide,

@@ -273,6 +273,8 @@
     // v3.7：未接入提示（系统代理关 + 无 TUN，应用直连真实出口）。
     if (st.access && st.access.path === "uncovered" && st.enforceAccess && overall !== "tripped") {
       s = "未接入代理链路：" + (st.access.note || "系统代理未开启且未检测到 TUN 网卡");
+      // v3.9：兜底封锁生效时说明现状。
+      if (st.lockdown) s += "；已启用防火墙兜底封锁";
     }
     title.textContent = t;
     sub.textContent = s;
@@ -358,7 +360,10 @@
       st.access && st.access.path === "uncovered" && st.enforceAccess &&
       overall !== "tripped" && overall !== "paused"
     ) {
-      parts.push(banner("warn", ["未接入代理链路", "系统代理未开启且未检测到 TUN 网卡，Claude 会直连真实出口；开启系统代理或 TUN 模式即可解除。"]));
+      const note = st.lockdown
+        ? "系统代理未开启且未检测到 TUN 网卡，Claude 会直连真实出口；已启用防火墙兜底封锁，走系统代理不受影响，接入后自动解除。"
+        : "系统代理未开启且未检测到 TUN 网卡，Claude 会直连真实出口；开启系统代理或 TUN 模式即可解除。";
+      parts.push(banner("warn", ["未接入代理链路", note]));
     }
     if (st.launchError && st.launchError !== S.launchErrShown) {
       S.launchErrShown = st.launchError;

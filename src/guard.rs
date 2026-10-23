@@ -430,6 +430,20 @@ fn version_key(name: &str) -> Vec<u64> {
 mod tests {
     use super::*;
 
+    /// 行为锁: 兜底封锁规则名按 agent 区分，与熔断隔离规则名互不冲突。
+    #[test]
+    fn lockdown_rule_names_are_scoped() {
+        assert_eq!(
+            lockdown_rule_name("claude"),
+            "ClaudeGuard Lockdown (claude)"
+        );
+        assert_ne!(lockdown_rule_name("chatgpt"), lockdown_rule_name("claude"));
+        // 熔断隔离规则沿用旧名（不带后缀），兜底封锁必须错开。
+        let (q_out, q_in) = fw_names("claude");
+        assert_ne!(lockdown_rule_name("claude"), q_out);
+        assert_ne!(lockdown_rule_name("claude"), q_in);
+    }
+
     /// 行为锁: 日志裁剪只在上限触发, 保留尾部完整行, 原子替换。
     #[test]
     fn trim_log_respects_cap_and_line_boundary() {
@@ -1161,12 +1175,91 @@ pub fn trip(cfg: &crate::config::Config, reason: &str) -> TripResult {
         }
     }
     if cfg.quarantine_on_fail {
+        // v3.9：防火墙整体关着时 Block 规则不生效（实测踩过），隔离前先确保开启。
+        fw_ensure_on();
         for id in &cfg.guarded_agents {
             res.firewall_rules += firewall_quarantine_agent(id);
         }
         res.quarantined = res.firewall_rules > 0 || firewall_active();
     }
     res
+}
+
+// ---------- v3.9 防火墙兜底封锁 ----------
+
+/// 兜底封锁规则名前缀（与熔断隔离规则分开管理：隔离随熔断加/解除，兜底随接入状态维持）。
+pub const LOCKDOWN_RULE: &str = "ClaudeGuard Lockdown";
+
+fn lockdown_rule_name(id: &str) -> String {
+    format!("{LOCKDOWN_RULE} ({id})")
+}
+
+/// 确保 Windows 防火墙处于开启。默认出站策略是"允许"，开启不影响正常流量；
+/// 但防火墙整体关着时一切 Block 规则都是摆设（2026-10 实测用户机器三档全关）。
+/// 只开不关——不逆向改用户的防火墙状态。
+pub fn fw_ensure_on() -> bool {
+    let out = Command::new(sys32("netsh.exe"))
+        .args(["advfirewall", "show", "allprofiles", "state"])
+        .output();
+    let text = out
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase())
+        .unwrap_or_default();
+    if text.split_whitespace().any(|w| w == "off") {
+        let ok = netsh(&["advfirewall", "set", "allprofiles", "state", "on"]);
+        log_line(if ok {
+            "firewall: 检测到 Windows 防火墙未开启，已自动开启（默认出站=允许，不影响正常流量）"
+        } else {
+            "firewall: 尝试开启 Windows 防火墙失败，Block 规则可能不生效"
+        });
+        return ok;
+    }
+    true
+}
+
+/// 一键兜底封锁：为全部守护对象的 exe 添加出站 Block 规则。
+/// 回环（127.0.0.1 系统代理）不受 Windows 防火墙过滤，代理模式照常可用；
+/// 直连/TUN 流量被拦。返回添加的规则数。
+pub fn lockdown_apply(cfg: &crate::config::Config) -> usize {
+    fw_ensure_on();
+    let mut added = 0usize;
+    for id in &cfg.guarded_agents {
+        let name = lockdown_rule_name(id);
+        for exe in agent_exes(id) {
+            if netsh(&[
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={name}"),
+                "dir=out",
+                "action=block",
+                "enable=yes",
+                &format!("program={}", exe.to_string_lossy()),
+            ]) {
+                added += 1;
+            }
+        }
+    }
+    log_line(&format!("lockdown: {added} outbound block rules added"));
+    added
+}
+
+/// 解除全部兜底封锁规则（防火墙本身保持开启）。返回是否删到规则。
+pub fn lockdown_clear() -> bool {
+    let mut any = false;
+    for a in GUI_AGENTS {
+        if netsh(&[
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={}", lockdown_rule_name(a.id)),
+        ]) {
+            any = true;
+        }
+    }
+    log_line(&format!("lockdown: cleared={any}"));
+    any
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize)]

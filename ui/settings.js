@@ -98,7 +98,11 @@
         rowSwitch("st-kill", "结束守护对象进程", "熔断时结束勾选应用的所有进程", !!(CFG && CFG.kill_on_fail), false) +
         rowSwitch("st-quarantine", "防火墙隔离", "阻断这些应用联网，解除后自动恢复", !!(CFG && CFG.quarantine_on_fail), false) +
         '<div class="sgroup-title">进程清理</div>' +
-        rowSwitch("st-sweep", "退出后清理残留", "Claude 桌面端退出后，自动结束残留进程与孤儿 CLI；一键清理在主界面「立即检测」旁", !CFG || CFG.sweep_on_exit !== false, false)) +
+        rowSwitch("st-sweep", "退出后清理残留", "Claude 桌面端退出后，自动结束残留进程与孤儿 CLI；一键清理在主界面「立即检测」旁", !CFG || CFG.sweep_on_exit !== false, false) +
+        '<div class="sgroup-title">防火墙兜底封锁</div>' +
+        rowSwitch("st-lockdown-auto", "未接入时自动封锁", "系统代理与 TUN 都不在时，自动用防火墙阻断守护对象直连出站；走系统代理不受影响，接入后自动解除", !CFG || CFG.lockdown_on_uncovered !== false, false) +
+        '<div class="srow"><div class="slabel">一键封锁 / 解除<span class="shint">按应用 exe 添加出站 Block 规则，立即生效</span></div><div class="sval"><button class="btn" id="st-lockdown-on" type="button">封锁出站</button><button class="btn" id="st-lockdown-off" type="button" style="margin-left:6px">解除封锁</button></div></div>' +
+        '<div class="formhint" id="st-lockdown-state" style="display:none"></div>') +
 
       group("agents", "守护对象",
         rowSwitch("st-ag-claude", "Claude 桌面版", "Anthropic Claude 桌面端", false, false) +
@@ -197,6 +201,7 @@
     chk("st-quarantine", cfg.quarantine_on_fail);
     chk("st-enforce-access", cfg.enforce_access_path !== false);
     chk("st-sweep", cfg.sweep_on_exit !== false);
+    chk("st-lockdown-auto", cfg.lockdown_on_uncovered !== false);
     const agents = Array.isArray(cfg.guarded_agents) ? cfg.guarded_agents : [];
     chk("st-ag-claude", agents.includes("claude"));
     chk("st-ag-chatgpt", agents.includes("chatgpt"));
@@ -463,6 +468,31 @@
     if (sweep) sweep.addEventListener("change", () => patch({ sweep_on_exit: !!sweep.checked }, "已保存"));
     const enforceAccess = $("st-enforce-access");
     if (enforceAccess) enforceAccess.addEventListener("change", () => patch({ enforce_access_path: !!enforceAccess.checked }, "已保存"));
+
+    // v3.9 防火墙兜底封锁：自动开关 + 一键封锁/解除
+    const lockAuto = $("st-lockdown-auto");
+    if (lockAuto) lockAuto.addEventListener("change", () => patch({ lockdown_on_uncovered: !!lockAuto.checked }, "已保存"));
+    const lockState = $("st-lockdown-state");
+    const lockBtns = [["st-lockdown-on", true], ["st-lockdown-off", false]];
+    lockBtns.forEach(([id, on]) => {
+      const b = $(id);
+      if (!b) return;
+      b.addEventListener("click", async () => {
+        b.disabled = true;
+        try {
+          await invoke(CMD.lockdown, { on });
+          if (lockState) {
+            lockState.textContent = on ? "已封锁：守护对象直连出站被阻断（走系统代理不受影响）" : "已解除：出站封锁规则全部删除";
+            lockState.style.display = "";
+          }
+          notifyToast(on ? "已启用防火墙兜底封锁" : "已解除防火墙封锁");
+        } catch (e) {
+          notifyToast("操作失败：" + e);
+        } finally {
+          b.disabled = false;
+        }
+      });
+    });
 
     ["st-ag-claude:claude", "st-ag-chatgpt:chatgpt", "st-ag-antigravity:antigravity"].forEach((pair) => {
       const [id, agent] = pair.split(":");

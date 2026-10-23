@@ -142,6 +142,16 @@ pub fn resume(state: State<'_, Arc<AppState>>) {
     monitor::resume(state.inner());
 }
 
+/// v3.9 一键防火墙兜底封锁：on=立即封锁守护对象出站，off=立即解除。
+/// 自动逻辑（未接入时维持）在下一轮检查继续接管。
+#[tauri::command]
+pub fn lockdown(state: State<'_, Arc<AppState>>, on: bool) -> bool {
+    let cfg = state.config();
+    state.lockdown_now(on, &cfg);
+    state.emit_state();
+    on
+}
+
 /// 一键扫描并结束全部 Claude 进程（桌面端 + Claude Code CLI）。
 #[tauri::command]
 pub fn sweep_claude(state: State<'_, Arc<AppState>>) -> crate::guard::SweepReport {

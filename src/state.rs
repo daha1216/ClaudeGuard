@@ -52,6 +52,7 @@ pub struct StateView {
     pub guarded_agents: Vec<String>,
     pub access: crate::access::AccessInfo,
     pub enforce_access: bool,
+    pub lockdown: bool,
 }
 
 pub struct AppState {
@@ -70,6 +71,8 @@ pub struct AppState {
     pub launch_error: Mutex<String>,
     pub access: Mutex<crate::access::AccessInfo>,
     pub access_streak: std::sync::atomic::AtomicU32,
+    /// v3.9 兜底封锁：上次同步到防火墙的意图（None=启动后未同步过，首轮会强制对齐）。
+    pub lockdown_last: Mutex<Option<bool>>,
     pub stop: Arc<AtomicBool>,
     pub is_admin: bool,
     pub smoke_settings: bool,
@@ -113,6 +116,7 @@ impl AppState {
                 note: "尚未检测".into(),
             }),
             access_streak: std::sync::atomic::AtomicU32::new(0),
+            lockdown_last: Mutex::new(None),
             stop: Arc::new(AtomicBool::new(false)),
             is_admin,
             smoke_settings,
@@ -177,6 +181,45 @@ impl AppState {
 
     pub fn reset_access_streak(&self) {
         self.access_streak.store(0, Ordering::SeqCst);
+    }
+
+    // ---------- 防火墙兜底封锁（v3.9） ----------
+
+    /// 兜底封锁当前是否生效（按已同步到防火墙的意图）。
+    pub fn lockdown_on(&self) -> bool {
+        *lock(&self.lockdown_last) == Some(true)
+    }
+
+    /// 把"想要的状态"同步到防火墙：只在意图变化时增删规则（避免每轮重复 add 堆积）。
+    /// 启动后首轮 `last=None` 必然不同步状态——顺带清理崩溃残留或补上未接入封锁。
+    pub fn sync_lockdown(&self, want: bool, cfg: &Config) {
+        let mut last = lock(&self.lockdown_last);
+        if *last == Some(want) {
+            return;
+        }
+        if want {
+            let n = crate::guard::lockdown_apply(cfg);
+            self.log(format!(
+                "防火墙兜底：已封锁守护对象出站（{n} 条规则）；走系统代理不受影响，接入后自动解除"
+            ));
+        } else {
+            crate::guard::lockdown_clear();
+            self.log("防火墙兜底：已解除出站封锁");
+        }
+        *last = Some(want);
+    }
+
+    /// 手动一键：立即封锁（无视接入状态；自动逻辑之后按接入状态接管）。
+    pub fn lockdown_now(&self, on: bool, cfg: &Config) {
+        if on {
+            let n = crate::guard::lockdown_apply(cfg);
+            self.log(format!("手动封锁：已添加 {n} 条出站封锁规则"));
+            *lock(&self.lockdown_last) = Some(true);
+        } else {
+            crate::guard::lockdown_clear();
+            self.log("手动解除：已删除全部出站封锁规则");
+            *lock(&self.lockdown_last) = Some(false);
+        }
     }
 
     // ---------- 熔断 / 暂停 / 检查 ----------
@@ -344,6 +387,7 @@ impl AppState {
             guarded_agents: cfg.guarded_agents.clone(),
             access: self.access(),
             enforce_access: cfg!(target_os = "windows") && cfg.enforce_access_path,
+            lockdown: self.lockdown_on(),
         }
     }
 

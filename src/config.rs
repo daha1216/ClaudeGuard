@@ -109,6 +109,9 @@ pub struct Config {
     /// v3.7：接入路径检查（系统代理关 + 无 TUN 视为未接入，计入熔断）。
     #[serde(default = "default_true")]
     pub enforce_access_path: bool,
+    /// v3.9：未接入时自动维持守护对象的出站防火墙封锁（兜底，接入后自动解除）。
+    #[serde(default = "default_true")]
+    pub lockdown_on_uncovered: bool,
     #[serde(default = "default_true")]
     pub cut_network: bool,
     #[serde(default)]
@@ -161,6 +164,7 @@ impl Default for Config {
             check_interval_secs: default_interval(),
             trip_threshold: default_threshold(),
             enforce_access_path: true,
+            lockdown_on_uncovered: true,
             cut_network: true,
             disable_network_adapters: false,
             kill_on_fail: true,
@@ -400,6 +404,17 @@ mod tests {
         assert!(cfg.allowed_ips.is_empty());
         assert_eq!(cfg.guarded_agents, vec!["claude", "chatgpt"]);
         assert!(!cfg.first_run);
+        // v3.9 新字段对旧配置缺省=true（未接入即封锁是安全默认）。
+        assert!(cfg.lockdown_on_uncovered);
+    }
+
+    #[test]
+    fn lockdown_default_true_for_older_v3_json() {
+        let text = r#"{"proxy_host":"127.0.0.1","proxy_port":7890,"targets":[]}"#;
+        let cfg: Config = serde_json::from_str(text).unwrap();
+        assert!(cfg.lockdown_on_uncovered);
+        let def = Config::default();
+        assert!(def.lockdown_on_uncovered);
     }
 
     #[test]
