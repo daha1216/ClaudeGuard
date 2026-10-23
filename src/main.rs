@@ -628,10 +628,10 @@ fn build_tray(state: &Arc<AppState>) -> tauri::Result<()> {
                 ipc::open_data_folder();
             }
             "cg_quit" => {
+                // 恢复统一交给 ExitRequested 闸门：那里核验不过会拦住退出。
+                // 这里先自己动一遍系统再退出，等于在协议之外开了第二个入口。
                 let state = app.state::<Arc<AppState>>();
                 state.stop.store(true, Ordering::SeqCst);
-                let _ = crate::netcut::restore();
-                let _ = crate::guard::firewall_release();
                 app.exit(0);
             }
             _ => {}

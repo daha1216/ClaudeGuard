@@ -355,7 +355,84 @@ fn cut_locked(mode: CutMode) -> (bool, String) {
         msg.push_str(&notes.join("；"));
     }
     log_line(&format!("netcut: cut({}) -> {msg}", mode.label()));
-    (verified || engaged, msg)
+    (verified, msg)
+}
+
+/// 恢复计划的一条：账本里有 GUID 就按 GUID 恢复，只有旧现场的名称时才退化为按名称。
+pub struct NicRestore {
+    pub guid: Option<String>,
+    pub name: String,
+}
+
+/// 恢复计划 = 账本记过的网卡 ∪ 状态文件里记的网卡。
+///
+/// 账本是"我改过什么"的权威记录：禁用网卡成功、`netcut.json` 还没写就崩溃时，
+/// 只有账本知道那张网卡被关掉了，所以这里不能拿状态文件当驱动源。
+pub fn restore_plan(ledger: &[(String, String)], state_nics: &[String]) -> Vec<NicRestore> {
+    let mut out: Vec<NicRestore> = Vec::new();
+    for (guid, name) in ledger {
+        let guid = guid.trim();
+        if guid.is_empty() {
+            continue;
+        }
+        let label = if name.trim().is_empty() {
+            guid.to_string()
+        } else {
+            name.trim().to_string()
+        };
+        out.push(NicRestore {
+            guid: Some(guid.to_string()),
+            name: label,
+        });
+    }
+    for name in state_nics {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if out.iter().any(|n| n.name.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        out.push(NicRestore {
+            guid: None,
+            name: name.to_string(),
+        });
+    }
+    out
+}
+
+/// 从账本里取出 (GUID, 名称) 对：GUID 来自 scope，名称来自 original 里的原始枚举。
+fn ledger_nic_pairs(txn: &crate::ledger::Txn, managed: &[String]) -> Vec<(String, String)> {
+    let recorded: Vec<(String, String)> = txn
+        .original
+        .get("nics")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|n| {
+                    let guid = n.get("guid").and_then(|x| x.as_str())?.to_string();
+                    let name = n
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some((guid, name))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    managed
+        .iter()
+        .filter_map(|s| s.strip_prefix(crate::ledger::SCOPE_NIC))
+        .map(|g| {
+            let name = recorded
+                .iter()
+                .find(|(gg, _)| gg.eq_ignore_ascii_case(g))
+                .map(|(_, n)| n.clone())
+                .unwrap_or_default();
+            (g.to_string(), name)
+        })
+        .collect()
 }
 
 fn restore_locked() -> (bool, String) {
@@ -366,7 +443,10 @@ fn restore_locked() -> (bool, String) {
     let mut nics_ok = true;
     // R02：账本是"我改过什么"的权威记录。损坏/读不出时不能当成没有残留，
     // 也不能凭 netcut.json 里的名字乱动，先按可恢复的部分做并如实报告。
-    let txn = match crate::ledger::load() {
+    let loaded = crate::ledger::load();
+    // 账本损坏时不知道还有哪些改动没撤，这一轮不能宣称恢复完成，也不能删账本。
+    let ledger_ok = !matches!(loaded, crate::ledger::Loaded::Corrupt(_));
+    let txn = match loaded {
         crate::ledger::Loaded::Pending(t) | crate::ledger::Loaded::Done(t) => Some(t),
         crate::ledger::Loaded::Corrupt(err) => {
             log_line(&format!("netcut: 恢复账本损坏（{err}），保留证据"));
@@ -401,44 +481,23 @@ fn restore_locked() -> (bool, String) {
         ));
         actions.push(format!("已忽略 {} 项无法识别的账本条目", rejected.len()));
     }
-    let ledger_nics: Vec<String> = managed
-        .iter()
-        .filter_map(|s| s.strip_prefix(crate::ledger::SCOPE_NIC))
-        .map(|g| g.to_string())
-        .collect();
-    if let Some(state) = state.as_ref() {
-        // 先恢复网卡、最后删规则：恢复过程中网络仍受规则管着。
-        for name in &state.nics {
-            let guid = ledger_nics
-                .iter()
-                .find(|g| {
-                    txn.as_ref()
-                        .and_then(|t| t.original.get("nics"))
-                        .and_then(|v| v.as_array())
-                        .and_then(|arr| {
-                            arr.iter().find(|n| {
-                                n.get("name")
-                                    .and_then(|x| x.as_str())
-                                    .map(|x| x.eq_ignore_ascii_case(name))
-                                    .unwrap_or(false)
-                            })
-                        })
-                        .and_then(|n| n.get("guid"))
-                        .and_then(|x| x.as_str())
-                        .map(|x| x.eq_ignore_ascii_case(g))
-                        .unwrap_or(false)
-                })
-                .cloned();
-            let ok = match guid {
-                Some(g) => set_nic_enabled_by_guid(&g, true),
-                None => enable_nic(name),
-            };
-            if ok {
-                actions.push(format!("已启用网卡 {name}"));
-            } else {
-                nics_ok = false;
-                actions.push(format!("启用网卡失败：{name}"));
-            }
+    let ledger_pairs = txn
+        .as_ref()
+        .map(|t| ledger_nic_pairs(t, &managed))
+        .unwrap_or_default();
+    let state_nics: Vec<String> = state.as_ref().map(|s| s.nics.clone()).unwrap_or_default();
+    let plan = restore_plan(&ledger_pairs, &state_nics);
+    // 先恢复网卡、最后删规则：恢复过程中网络仍受规则管着。
+    for nic in &plan {
+        let ok = match nic.guid.as_deref() {
+            Some(guid) => set_nic_enabled_by_guid(guid, true),
+            None => enable_nic(&nic.name),
+        };
+        if ok {
+            actions.push(format!("已启用网卡 {}", nic.name));
+        } else {
+            nics_ok = false;
+            actions.push(format!("启用网卡失败：{}", nic.name));
         }
     }
     let (rule_ok, detail) = delete_cut_rule();
@@ -449,12 +508,14 @@ fn restore_locked() -> (bool, String) {
             actions.push(format!("删除断网防火墙规则失败：{detail}"));
         }
     }
-    let ok = nics_ok && rule_ok;
+    let ok = nics_ok && rule_ok && ledger_ok;
     if ok {
         // 核验通过才清账本；否则保留，下次自愈重试（账本是唯一可信的现场记录）。
         if let Err(err) = crate::ledger::clear() {
             actions.push(format!("清理恢复账本失败：{err}"));
         }
+    } else if !ledger_ok {
+        actions.push("恢复账本损坏，未清理账本（需人工确认后再删）".to_string());
     }
     if state_exists {
         // 有失败就保留现场，下次启动自愈重试；否则删干净。
@@ -903,5 +964,64 @@ mod tests {
         assert_eq!(shorten("  abc  ", 10), "abc");
         assert_eq!(shorten("abcdef", 3), "abc…");
         assert_eq!(shorten("中文网卡名", 2), "中文…");
+    }
+
+    /// T03-02：禁用网卡成功、状态文件还没写就崩溃时，只有账本知道那张网卡。
+    #[test]
+    fn restore_plan_recovers_ledger_nics_without_state_file() {
+        let ledger = vec![(
+            "6f1c2f9a-1b2c-4d5e-8f90-1234567890ab".to_string(),
+            "以太网".to_string(),
+        )];
+        let plan = restore_plan(&ledger, &[]);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            plan[0].guid.as_deref(),
+            Some("6f1c2f9a-1b2c-4d5e-8f90-1234567890ab")
+        );
+        assert_eq!(plan[0].name, "以太网");
+    }
+
+    /// 旧现场（账本没有、状态文件有）仍要按名称恢复，不能因为没账本就跳过。
+    #[test]
+    fn restore_plan_falls_back_to_state_names() {
+        let plan = restore_plan(&[], &["WLAN".to_string()]);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].guid, None);
+        assert_eq!(plan[0].name, "WLAN");
+    }
+
+    /// 同一张网卡两边都记着时只恢复一次，且优先按 GUID（名称可能被用户改过）。
+    #[test]
+    fn restore_plan_dedupes_and_prefers_guid() {
+        let ledger = vec![(
+            "6f1c2f9a-1b2c-4d5e-8f90-1234567890ab".to_string(),
+            "以太网".to_string(),
+        )];
+        let plan = restore_plan(&ledger, &["以太网".to_string(), "WLAN".to_string()]);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(
+            plan[0].guid.as_deref(),
+            Some("6f1c2f9a-1b2c-4d5e-8f90-1234567890ab")
+        );
+        assert_eq!(plan[1].name, "WLAN");
+    }
+
+    /// 账本里没有名称时用 GUID 兜底展示，空条目直接丢弃。
+    #[test]
+    fn restore_plan_skips_blank_entries() {
+        let ledger = vec![
+            (
+                "6f1c2f9a-1b2c-4d5e-8f90-1234567890ab".to_string(),
+                String::new(),
+            ),
+            (String::new(), "垃圾".to_string()),
+        ];
+        let plan = restore_plan(&ledger, &[String::new(), "  ".to_string()]);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            plan[0].name, "6f1c2f9a-1b2c-4d5e-8f90-1234567890ab",
+            "没有名称时应回落到 GUID"
+        );
     }
 }

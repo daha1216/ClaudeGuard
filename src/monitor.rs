@@ -187,6 +187,9 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     if state.is_checking() && purpose != Purpose::Launch {
         return RoundSummary::ok();
     }
+    // R06/D3：外部 `--restore`/`--rearm` 只改意图文件，常驻实例必须每轮对齐，
+    // 否则用户以为停手了，这里下一轮照样杀进程、加规则。
+    state.sync_disarm();
     state.set_checking(true);
     state.emit_state();
 

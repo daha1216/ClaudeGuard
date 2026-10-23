@@ -353,6 +353,36 @@ impl AppState {
         Ok(())
     }
 
+    /// 与磁盘上的停止保护意图对齐（存活实例感知外部 `--restore` / `--rearm`）。
+    ///
+    /// 启动时读一次不够：外部入口改的是文件，不重读的话常驻进程会继续按旧意图
+    /// 杀进程、加规则。返回是否发生了变化，便于调用方决定要不要额外动作。
+    pub fn sync_disarm(&self) -> bool {
+        let disk = crate::disarm::reason();
+        let changed = {
+            let mut cur = lock(&self.disarmed);
+            match crate::disarm::reconcile(cur.as_deref(), disk.as_deref()) {
+                Some(next) => {
+                    *cur = next;
+                    true
+                }
+                None => false,
+            }
+        };
+        if changed {
+            let reason = self.disarmed_reason();
+            if reason.is_empty() {
+                self.log("检测到外部重新布防，已恢复守护动作");
+            } else {
+                self.log(format!(
+                    "检测到外部停止保护请求（{reason}），此后只检测，不再结束进程/隔离/断网"
+                ));
+            }
+            self.emit_state();
+        }
+        changed
+    }
+
     pub fn is_paused(&self) -> bool {
         self.paused_until().is_some()
     }
