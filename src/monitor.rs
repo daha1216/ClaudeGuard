@@ -578,7 +578,24 @@ fn launch_permission(summary: &RoundSummary, tripped: bool) -> Result<(), String
 }
 
 /// 启动门禁：必须所有启用目标通过才放行 Claude。
+/// 契约 D3：已停止保护时守护器不再校验出口，因此也不能代用户启动。
+pub fn disarmed_launch_reason(disarmed: bool) -> Option<String> {
+    if disarmed {
+        Some("已停止保护，无法通过守护器启动；请先重新布防".to_string())
+    } else {
+        None
+    }
+}
+
 pub fn launch(state: &Arc<AppState>) -> Result<(), String> {
+    // 契约 D3：已停止保护时守护器不再承担"通过检查才放行"的责任，
+    // 因此也不能代替用户启动——否则等于用一条不再校验的通道冒充门禁。
+    if let Some(reason) = disarmed_launch_reason(state.is_disarmed()) {
+        state.set_launch_error(reason.clone());
+        state.log(format!("阻止启动：{reason}"));
+        state.emit_state();
+        return Err(reason);
+    }
     let cfg = state.config();
     let summary = run_round(state, Purpose::Launch);
     if let Err(reason) = launch_permission(&summary, state.is_tripped()) {
@@ -700,7 +717,8 @@ fn spawn_sweeper(state: Arc<AppState>) {
             let cfg = state.config();
             let active = cfg.sweep_on_exit
                 && cfg.guarded_agents.iter().any(|a| a == "claude")
-                && !state.is_paused();
+                && !state.is_paused()
+                && !state.is_disarmed();
             if !active {
                 desktop_seen = false;
                 gone_at = None;
@@ -751,6 +769,13 @@ mod tests {
         assert!(!round_is_stale(3, 3));
         assert!(round_is_stale(3, 4));
         assert!(round_is_stale(4, 3), "任何不一致都按过期处理，宁可不提交");
+    }
+
+    /// 行为锁：停止保护期间不得代用户启动（否则等于用不校验的通道冒充门禁）。
+    #[test]
+    fn launch_is_refused_while_disarmed() {
+        assert!(disarmed_launch_reason(true).is_some());
+        assert!(disarmed_launch_reason(false).is_none());
     }
 
     #[test]
