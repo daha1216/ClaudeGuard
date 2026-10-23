@@ -8,8 +8,8 @@ use crate::model::UpdState;
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
 #[cfg(windows)]
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -140,16 +140,87 @@ pub fn check_latest(cfg: &Config) -> Result<Release, String> {
 // ------------------------------------------------------------------ 下载
 
 /// 下载到临时文件, 返回路径。progress(已下载字节, 总字节)。
+/// 下载到受控暂存目录，返回**仍打开的句柄**。
+///
+/// 计划 5.5 要求：管理员专用目录、随机名字、独占创建、句柄贯穿验证与复制。
+/// 用临时目录里的固定文件名（旧实现 `%TEMP%\ClaudeGuard-update.exe`）时，任何
+/// 同权限进程都能在校验和复制之间把文件换掉。
+#[cfg(windows)]
+pub struct Staged {
+    pub file: std::fs::File,
+    pub path: PathBuf,
+}
+
+#[cfg(windows)]
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// 暂存目录：优先 ProgramData（管理员创建后普通用户不可写），失败则退到本地应用数据。
+#[cfg(windows)]
+fn staging_dir() -> PathBuf {
+    let program_data = std::env::var("ProgramData")
+        .map(|p| PathBuf::from(p).join("ClaudeGuard").join("staging"))
+        .unwrap_or_default();
+    if !program_data.as_os_str().is_empty() && std::fs::create_dir_all(&program_data).is_ok() {
+        return program_data;
+    }
+    let fallback = crate::config::config_dir().join("staging");
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
+}
+
+/// 随机文件名：不依赖 rand crate，用时间+进程+计数器混合，够避免碰撞即可；
+/// 真正的防替换靠 `create_new` 独占创建与句柄贯穿。
+#[cfg(windows)]
+fn staging_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{:016x}-{:08x}-{:04x}.exe",
+        nanos,
+        std::process::id(),
+        seq & 0xffff
+    )
+}
+
+#[cfg(windows)]
+fn create_staged() -> Result<Staged, String> {
+    use std::io::ErrorKind;
+    let dir = staging_dir();
+    for _ in 0..8 {
+        let path = dir.join(staging_name());
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok(Staged { file, path }),
+            // 名字撞了：换一个；其它错误如实上报（权限问题不该被重试掩盖）
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(format!("创建暂存文件失败：{err}")),
+        }
+    }
+    Err("创建暂存文件失败：连续多次重名".to_string())
+}
+
 #[cfg(windows)]
 pub fn download(
     cfg: &Config,
     url: &str,
     expected_size: u64,
     mut progress: impl FnMut(u64, u64),
-) -> Result<PathBuf, String> {
-    let tmp = std::env::temp_dir().join("ClaudeGuard-update.exe");
+) -> Result<Staged, String> {
+    let mut staged = create_staged()?;
 
-    let do_download =
+    let mut do_download =
         |agent: &ureq::Agent, progress: &mut dyn FnMut(u64, u64)| -> Result<(), String> {
             let resp = agent
                 .get(url)
@@ -158,23 +229,28 @@ pub fn download(
                 .call()
                 .map_err(|e| format!("下载失败: {e}"))?;
             let mut reader = resp.into_reader();
-            let mut buf = Vec::with_capacity(expected_size as usize + 4096);
+            let mut written: u64 = 0;
             let mut chunk = [0u8; 65536];
             loop {
                 let n = reader.read(&mut chunk).map_err(|e| format!("读取: {e}"))?;
                 if n == 0 {
                     break;
                 }
-                buf.extend_from_slice(&chunk[..n]);
-                progress(buf.len() as u64, expected_size);
+                // 流式落盘，不把整包读进内存（计划要求下载内存与制品大小解耦）。
+                staged
+                    .file
+                    .write_all(&chunk[..n])
+                    .map_err(|e| format!("写暂存文件: {e}"))?;
+                written += n as u64;
+                progress(written, expected_size);
             }
-            if expected_size > 0 && buf.len() as u64 != expected_size {
-                return Err(format!(
-                    "大小不符: 期望 {expected_size}, 实得 {}",
-                    buf.len()
-                ));
+            if expected_size > 0 && written != expected_size {
+                return Err(format!("大小不符: 期望 {expected_size}, 实得 {written}"));
             }
-            std::fs::write(&tmp, &buf).map_err(|e| format!("写临时文件: {e}"))?;
+            staged
+                .file
+                .sync_all()
+                .map_err(|e| format!("落盘暂存文件: {e}"))?;
             Ok(())
         };
 
@@ -186,7 +262,7 @@ pub fn download(
             crate::netpol::proxy_required_error(&e)
         }
     })?;
-    Ok(tmp)
+    Ok(staged)
 }
 
 // ------------------------------------------------------------------ 校验摘要
@@ -201,6 +277,7 @@ pub fn parse_digest(raw: &str) -> Option<String> {
     Some(hex.to_ascii_lowercase())
 }
 
+#[cfg(test)]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -209,26 +286,31 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     out.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 校验下载到的文件与官方摘要一致。不一致必须报错并让调用方丢弃文件。
-pub fn verify_file(path: &std::path::Path, expected_hex: &str) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("读取待校验文件失败：{e}"))?;
-    let actual = sha256_hex(&bytes);
-    if actual == expected_hex {
-        Ok(())
-    } else {
-        Err(format!(
-            "更新包校验不通过（期望 {expected_hex}，实得 {actual}）"
-        ))
+/// 从已打开的句柄算摘要：校验与复制用的是同一个句柄，路径在中途被换掉也不影响
+/// 我们装的就是刚才校验过的那份字节。
+pub fn sha256_of_file(file: &mut std::fs::File) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("定位待校验文件失败：{e}"))?;
+    let mut hasher = Sha256::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = file
+            .read(&mut chunk)
+            .map_err(|e| format!("读取待校验文件失败：{e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&chunk[..n]);
     }
-}
-
-/// 下载完成后按官方摘要校验；拿不到摘要就不允许自动替换。
-pub fn verify_download(path: &std::path::Path, digest: Option<&str>) -> Result<(), String> {
-    let Some(raw) = digest else {
-        return Err("该版本未提供校验摘要，已取消自动更新；请手动下载安装包".to_string());
-    };
-    let hex = parse_digest(raw).ok_or_else(|| format!("校验摘要格式无法识别：{raw}"))?;
-    verify_file(path, &hex)
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("回卷待校验文件失败：{e}"))?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 // ------------------------------------------------------------------ 自替换
@@ -238,8 +320,13 @@ pub fn verify_download(path: &std::path::Path, digest: Option<&str>) -> Result<(
 /// 流程: 当前 exe 改名为 .old → 新文件复制到原路径(失败则回滚) → 启动新实例。
 /// 安装版以管理员运行, 重命名/复制/启动均无权限问题; 便携版在可写目录同样适用。
 /// `spawn_new=false` 供自测使用: 只做替换不启动。
+/// 从**已经校验过的句柄**复制到主程序位置并重启。
+///
+/// 复制走句柄而不是路径：校验和安装之间即使有人替换了暂存文件，装上去的仍是
+/// 刚才校验过的那份字节。
 #[cfg(windows)]
-pub fn apply_update(new_exe: &Path, spawn_new: bool) -> Result<(), String> {
+pub fn apply_update_from(staged: &mut std::fs::File, spawn_new: bool) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom};
     let cur = std::env::current_exe().map_err(|e| format!("定位自身: {e}"))?;
     let old = cur.with_extension("exe.old");
 
@@ -248,10 +335,20 @@ pub fn apply_update(new_exe: &Path, spawn_new: bool) -> Result<(), String> {
 
     std::fs::rename(&cur, &old).map_err(|e| format!("重命名旧版本: {e}"))?;
 
-    if let Err(e) = std::fs::copy(new_exe, &cur) {
+    let copy_result = (|| -> Result<(), String> {
+        staged
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| format!("回卷更新包: {e}"))?;
+        let mut out = std::fs::File::create(&cur).map_err(|e| format!("创建新版本文件: {e}"))?;
+        std::io::copy(staged, &mut out).map_err(|e| format!("复制新版本: {e}"))?;
+        out.sync_all().map_err(|e| format!("落盘新版本: {e}"))?;
+        Ok(())
+    })();
+
+    if let Err(e) = copy_result {
         // 回滚: 把 .old 改回原名, 让程序继续可用
         let _ = std::fs::rename(&old, &cur);
-        return Err(format!("复制新版本: {e}"));
+        return Err(e);
     }
 
     if !spawn_new {
@@ -588,12 +685,11 @@ pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
             }
         });
         match result {
-            Ok(path) => {
-                // R09/D6：先按官方摘要校验，再谈替换。摘要拿不到就不自动装。
+            Ok(mut staged) => {
+                // R09/D6：先按官方摘要校验（走句柄），再谈替换。摘要拿不到就不自动装。
                 let digest = match digest_for_asset(&state.config(), &url) {
                     Ok(d) => d,
                     Err(err) => {
-                        let _ = std::fs::remove_file(&path);
                         state.set_upd(UpdState::Failed {
                             msg: format!("无法获取官方校验摘要：{err}"),
                         });
@@ -602,18 +698,49 @@ pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
                         return;
                     }
                 };
-                if let Err(err) = verify_download(&path, digest.as_deref()) {
-                    let _ = std::fs::remove_file(&path);
-                    state.set_upd(UpdState::Failed { msg: err.clone() });
+                let expected = match digest.as_deref().and_then(parse_digest) {
+                    Some(hex) => hex,
+                    None => {
+                        let msg = "该版本未提供校验摘要，已取消自动更新；请手动下载安装包";
+                        state.set_upd(UpdState::Failed {
+                            msg: msg.to_string(),
+                        });
+                        state.emit_state();
+                        state.log(format!("更新已取消：{msg}"));
+                        return;
+                    }
+                };
+                let actual = match sha256_of_file(&mut staged.file) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        state.set_upd(UpdState::Failed { msg: err.clone() });
+                        state.emit_state();
+                        state.log(format!("更新已取消：{err}"));
+                        return;
+                    }
+                };
+                if actual != expected {
+                    let msg = format!("更新包校验不通过（期望 {expected}，实得 {actual}）");
+                    state.set_upd(UpdState::Failed { msg: msg.clone() });
                     state.emit_state();
-                    state.log(format!("更新已取消：{err}"));
+                    state.log(format!("更新已取消：{msg}"));
                     return;
                 }
                 state.log("更新包校验通过");
                 state.set_upd(UpdState::Restarting);
                 state.emit_state();
                 state.log("更新已下载，正在替换并重启…");
-                match apply_update(&path, true) {
+                let applied = {
+                    #[cfg(windows)]
+                    {
+                        apply_update_from(&mut staged.file, true)
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        apply_update(&staged, true)
+                    }
+                };
+                match applied {
                     Ok(()) => {
                         #[cfg(windows)]
                         std::process::exit(0);
@@ -752,35 +879,66 @@ mod tests {
         assert_eq!(parse_digest(""), None);
     }
 
-    /// 内容不一致必须报错，且报错里带两侧摘要（便于用户核对）。
+    /// 句柄摘要与内存摘要必须一致（校验和复制共用同一份字节的前提）。
     #[test]
-    fn verify_file_rejects_tampered_bytes() {
-        let dir = std::env::temp_dir().join("cg-update-verify-test");
+    fn handle_digest_matches_in_memory_digest() {
+        let dir = std::env::temp_dir().join("cg-update-handle-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("pkg.exe");
-        std::fs::write(&file, b"hello").unwrap();
+        let file_path = dir.join("pkg.exe");
+        std::fs::write(&file_path, b"hello").unwrap();
 
-        let good = sha256_hex(b"hello");
-        assert!(verify_file(&file, &good).is_ok());
+        let mut file = std::fs::File::open(&file_path).unwrap();
+        let from_handle = sha256_of_file(&mut file).unwrap();
+        assert_eq!(from_handle, sha256_hex(b"hello"));
+        // 读完后句柄要回卷到开头，调用方才能继续复制
+        assert_eq!(std::io::read_to_string(&mut file).unwrap(), "hello");
 
-        let err = verify_file(&file, &sha256_hex(b"hell0")).unwrap_err();
-        assert!(err.contains("校验不通过"), "实际：{err}");
+        std::fs::write(&file_path, b"hell0").unwrap();
+        let mut file = std::fs::File::open(&file_path).unwrap();
+        assert_ne!(sha256_of_file(&mut file).unwrap(), from_handle);
     }
 
-    /// D6：拿不到官方摘要时不允许自动替换（不能"没校验就当没问题"）。
+    /// 受控暂存：目录在 ProgramData 下、名字随机、独占创建、Drop 时自删。
+    #[test]
+    #[cfg(windows)]
+    fn staging_uses_controlled_dir_and_cleans_up() {
+        let staged = create_staged().unwrap();
+        let path = staged.path.clone();
+        assert!(path.exists(), "暂存文件应已创建");
+        let text = path.to_string_lossy().to_lowercase();
+        assert!(
+            text.contains("programdata") || text.contains("claudeguard"),
+            "暂存目录应在受控位置，实际：{text}"
+        );
+        assert!(
+            path.file_name()
+                .map(|n| n.to_string_lossy().len() > 12)
+                .unwrap_or(false),
+            "文件名应是随机长名，实际：{text}"
+        );
+        drop(staged);
+        assert!(!path.exists(), "Staged 离开作用域后应删除暂存文件");
+    }
+
+    /// 独占创建：同名文件已存在时不会复用（防预置文件替换）。
+    #[test]
+    #[cfg(windows)]
+    fn staging_names_do_not_collide() {
+        let a = create_staged().unwrap();
+        let b = create_staged().unwrap();
+        assert_ne!(a.path, b.path);
+    }
+
+    /// D6：拿不到可用摘要时不允许自动替换（不能"没校验就当没问题"）。
     #[test]
     fn missing_digest_blocks_auto_update() {
-        let dir = std::env::temp_dir().join("cg-update-nodigest-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("pkg.exe");
-        std::fs::write(&file, b"hello").unwrap();
-
-        let err = verify_download(&file, None).unwrap_err();
-        assert!(err.contains("未提供校验摘要"), "实际：{err}");
-        assert!(verify_download(&file, Some("sha256:abc")).is_err());
-        assert!(verify_download(&file, Some(&format!("sha256:{}", sha256_hex(b"hello")))).is_ok());
+        let gate = |d: Option<&str>| d.and_then(parse_digest);
+        assert!(gate(None).is_none());
+        assert!(gate(Some("sha256:abc")).is_none());
+        assert!(gate(Some("sha512:deadbeef")).is_none());
+        let hex = sha256_hex(b"hello");
+        assert_eq!(gate(Some(&format!("sha256:{hex}"))), Some(hex));
     }
 
     /// 计划 5.5：保护生效期间不应用自身更新，且拒绝时必须说明原因。
