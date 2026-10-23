@@ -35,8 +35,17 @@ const TUN_KEYWORDS: [&str; 15] = [
 ];
 /// 排除项：默认不是全隧道的虚拟网卡，命中不算 TUN 接入。
 const TUN_EXCLUDES: [&str; 1] = ["tailscale"];
-/// 代理绕过列表里不代表"直连"的条目。
-const BYPASS_NEUTRAL: [&str; 2] = ["<local>", ""];
+/// 被监控应用实际会连的服务域名后缀：绕过列表命中这些才算"可能直连"。
+const SENSITIVE_SUFFIXES: [&str; 8] = [
+    "anthropic.com",
+    "claude.ai",
+    "openai.com",
+    "chatgpt.com",
+    "oaistatic.com",
+    "oaiusercontent.com",
+    "googleapis.com",
+    "google.com",
+];
 
 /// 适配器描述/友好名是否像 TUN 虚拟网卡。
 pub fn is_tun_name(name: &str) -> bool {
@@ -189,11 +198,93 @@ pub fn bypass_all(raw: Option<&str>) -> bool {
     bypass_entries(raw).iter().any(|v| v == "*")
 }
 
-/// 绕过列表含非 `<local>` 条目：部分域名可能直连，无法确认应用实际出口。
-pub fn bypass_nonlocal(raw: Option<&str>) -> bool {
-    bypass_entries(raw)
-        .iter()
-        .any(|v| !BYPASS_NEUTRAL.contains(&v.as_str()))
+/// 去掉通配前缀，取出条目里的域名部分（`*.claude.ai`、`*claude.ai` → `claude.ai`）。
+fn entry_domain(entry: &str) -> String {
+    entry
+        .trim()
+        .trim_start_matches('*')
+        .trim_start_matches('.')
+        .to_string()
+}
+
+/// 条目是否只覆盖本机 / 私网 / 链路本地——这类地址不可能让公网流量直连。
+pub fn bypass_local_entry(entry: &str) -> bool {
+    let e = entry.trim().to_ascii_lowercase();
+    match e.as_str() {
+        "<local>" | "localhost" | "localhost.*" | "*.localhost" | "*.local" | "[::1]" | "::1" => {
+            return true
+        }
+        _ => {}
+    }
+    let Some(prefix) = e.strip_suffix(".*") else {
+        return false;
+    };
+    let octets: Vec<u8> = prefix
+        .split('.')
+        .map(|v| v.parse::<u8>().ok())
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+    match octets.as_slice() {
+        [10] | [127] => true,
+        [192, 168] | [169, 254] => true,
+        [172, second] => (16..=31).contains(second),
+        _ => false,
+    }
+}
+
+/// 绕过条目是否会命中给定主机名（`*` 由 `bypass_all` 单独处理）。
+pub fn bypass_hits_host(entry: &str, host: &str) -> bool {
+    let domain = entry_domain(entry);
+    if domain.is_empty() {
+        return true;
+    }
+    let host = host.trim().to_ascii_lowercase();
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+/// 绕过列表里是否存在会让被监控流量直连的条目；返回该条目。
+pub fn bypass_risk(raw: Option<&str>, hosts: &[String]) -> Option<String> {
+    for entry in bypass_entries(raw) {
+        if entry == "*" || bypass_local_entry(&entry) {
+            continue;
+        }
+        if hosts.iter().any(|h| bypass_hits_host(&entry, h)) {
+            return Some(entry);
+        }
+        if SENSITIVE_SUFFIXES
+            .iter()
+            .any(|suffix| bypass_hits_host(&entry, suffix))
+        {
+            return Some(entry);
+        }
+    }
+    None
+}
+
+/// 从探测地址里取主机名（小写）。
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.trim().strip_prefix("https://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+/// 当前启用目标实际会访问的主机名，用于判断绕过列表是否真的会造成直连。
+pub fn monitored_hosts(cfg: &Config) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for target in cfg.targets.iter().filter(|t| t.enabled) {
+        if let Some(host) = host_of(&target.anchor_url) {
+            if !out.contains(&host) {
+                out.push(host);
+            }
+        }
+    }
+    out
 }
 
 /// 应用当前的接入方式判定（纯函数，供单测）。
@@ -236,7 +327,16 @@ impl AccessInfo {
 }
 
 /// 由注册表证据 + TUN 探测结果判定接入方式。
-pub fn verdict(evidence: &ProxyEvidence, tun_adapter: Option<String>) -> AccessPath {
+///
+/// `hosts` 是被监控目标实际会访问的主机名：只有绕过列表命中它们（或命中 AI 服务后缀）
+/// 才算"可能直连"。仅含本机/私网/无关域名（如购物站）的绕过列表不影响判定——
+/// Windows 上几乎每台机器都有 `127.*;10.*;192.168.*;<local>` 之类的条目，
+/// 把它们一律当作"无法确认"会让守护器永远拒绝启动。
+pub fn verdict(
+    evidence: &ProxyEvidence,
+    tun_adapter: Option<String>,
+    hosts: &[String],
+) -> AccessPath {
     if let Some(pac) = evidence
         .autoconfig
         .as_deref()
@@ -258,9 +358,9 @@ pub fn verdict(evidence: &ProxyEvidence, tun_adapter: Option<String>) -> AccessP
             if bypass_all(evidence.overrides.as_deref()) {
                 // 全部绕过代理 = 应用直连，与未接入同义。
                 AccessPath::Uncovered
-            } else if bypass_nonlocal(evidence.overrides.as_deref()) {
+            } else if let Some(entry) = bypass_risk(evidence.overrides.as_deref(), hosts) {
                 AccessPath::Unknown {
-                    reason: "代理绕过列表包含非本地条目，部分流量可能直连".into(),
+                    reason: format!("代理绕过列表含 {entry}，被监控流量可能直连"),
                 }
             } else {
                 AccessPath::SystemProxy { addr }
@@ -332,7 +432,7 @@ pub fn resolve(cfg: &Config) -> (ProbeRoute, AccessInfo) {
         } else {
             detect_tun_adapter()
         };
-        let path = verdict(&evidence, tun);
+        let path = verdict(&evidence, tun, &monitored_hosts(cfg));
         (plan_route(&path, cfg), AccessInfo::from(&path))
     }
     #[cfg(not(target_os = "windows"))]
@@ -445,6 +545,11 @@ pub fn detect_tun_adapter() -> Option<String> {
 mod tests {
     use super::*;
 
+    /// 被监控目标的代表主机名（真实默认目标的锚点）。
+    fn hosts() -> Vec<String> {
+        vec!["claude.ai".to_string(), "chatgpt.com".to_string()]
+    }
+
     fn evidence(enable: bool, server: Option<&str>) -> ProxyEvidence {
         ProxyEvidence {
             enable,
@@ -500,7 +605,7 @@ mod tests {
             ProxyParse::Unsupported(_)
         ));
         assert_eq!(
-            verdict(&evidence(true, Some("socks=127.0.0.1:1080")), None),
+            verdict(&evidence(true, Some("socks=127.0.0.1:1080")), None, &[]),
             AccessPath::Unknown {
                 reason: "系统代理配置无法等价复用：仅配置了 SOCKS 代理".into()
             }
@@ -511,7 +616,7 @@ mod tests {
     fn missing_address_is_unknown() {
         // T01-02：ProxyEnable=1 但 ProxyServer 缺失 → Unknown，不得判已接入。
         assert_eq!(
-            verdict(&evidence(true, None), None),
+            verdict(&evidence(true, None), None, &[]),
             AccessPath::Unknown {
                 reason: "系统代理已开启但未读到代理地址".into()
             }
@@ -523,11 +628,14 @@ mod tests {
         // T01-05：PAC 存在时无论 ProxyEnable 取值都不猜测。
         let mut ev = evidence(true, Some("127.0.0.1:7890"));
         ev.autoconfig = Some("http://127.0.0.1:7890/pac".into());
-        assert!(matches!(verdict(&ev, None), AccessPath::Unknown { .. }));
+        assert!(matches!(
+            verdict(&ev, None, &hosts()),
+            AccessPath::Unknown { .. }
+        ));
         let mut off = evidence(false, None);
         off.autoconfig = Some("http://127.0.0.1:7890/pac".into());
         assert!(matches!(
-            verdict(&off, Some("Mihomo".into())),
+            verdict(&off, Some("Mihomo".into()), &hosts()),
             AccessPath::Unknown { .. }
         ));
     }
@@ -535,17 +643,64 @@ mod tests {
     #[test]
     fn bypass_list_semantics() {
         let mut ev = evidence(true, Some("127.0.0.1:7890"));
+        let proxy = AccessPath::SystemProxy {
+            addr: "127.0.0.1:7890".into(),
+        };
         ev.overrides = Some("<local>".into());
-        assert_eq!(
-            verdict(&ev, None),
-            AccessPath::SystemProxy {
-                addr: "127.0.0.1:7890".into()
-            }
-        );
-        ev.overrides = Some("<local>;*.corp.example".into());
-        assert!(matches!(verdict(&ev, None), AccessPath::Unknown { .. }));
+        assert_eq!(verdict(&ev, None, &hosts()), proxy);
+
+        // Windows 上常见的本机/私网条目不影响判定（否则等于永远拒绝启动）。
+        ev.overrides = Some("localhost;*.local;127.*;10.*;192.168.*;172.16.*;172.31.*".into());
+        assert_eq!(verdict(&ev, None, &hosts()), proxy);
+
+        // 与被监控域名无关的公网绕过项同样不影响。
+        ev.overrides = Some("<local>;*jd.com;*zhihu.com".into());
+        assert_eq!(verdict(&ev, None, &hosts()), proxy);
+
+        // 命中被监控主机、或命中 AI 服务后缀，才判"无法确认"。
+        ev.overrides = Some("<local>;*.corp.example;*claude.ai".into());
+        assert!(matches!(
+            verdict(&ev, None, &hosts()),
+            AccessPath::Unknown { .. }
+        ));
+        ev.overrides = Some("*.anthropic.com".into());
+        assert!(matches!(
+            verdict(&ev, None, &hosts()),
+            AccessPath::Unknown { .. }
+        ));
+
         ev.overrides = Some("*".into());
-        assert_eq!(verdict(&ev, None), AccessPath::Uncovered);
+        assert_eq!(verdict(&ev, None, &hosts()), AccessPath::Uncovered);
+    }
+
+    #[test]
+    fn bypass_local_and_host_matching() {
+        for entry in [
+            "<local>",
+            "localhost",
+            "localhost.*",
+            "*.local",
+            "127.*",
+            "10.*",
+            "192.168.*",
+            "169.254.*",
+            "172.16.*",
+            "172.31.*",
+            "[::1]",
+        ] {
+            assert!(bypass_local_entry(entry), "{entry} 应视为本地");
+        }
+        for entry in ["172.15.*", "172.32.*", "8.8.8.*", "*.claude.ai", "jd.com"] {
+            assert!(!bypass_local_entry(entry), "{entry} 不应视为本地");
+        }
+        assert!(bypass_hits_host("*.claude.ai", "claude.ai"));
+        assert!(bypass_hits_host("*claude.ai", "api.claude.ai"));
+        assert!(!bypass_hits_host("*.claude.ai", "claude.ai.evil.test"));
+        assert_eq!(bypass_risk(Some("<local>;127.*;*jd.com"), &hosts()), None);
+        assert_eq!(
+            bypass_risk(Some("<local>;*.openai.com"), &hosts()),
+            Some("*.openai.com".to_string())
+        );
     }
 
     #[test]
@@ -589,21 +744,24 @@ mod tests {
     #[test]
     fn verdict_matrix() {
         assert_eq!(
-            verdict(&evidence(true, Some("127.0.0.1:7890")), None),
+            verdict(&evidence(true, Some("127.0.0.1:7890")), None, &hosts()),
             AccessPath::SystemProxy {
                 addr: "127.0.0.1:7890".into()
             }
         );
         assert_eq!(
-            verdict(&evidence(false, None), Some("Mihomo".into())),
+            verdict(&evidence(false, None), Some("Mihomo".into()), &[]),
             AccessPath::Tun {
                 adapter: "Mihomo".into()
             }
         );
-        assert_eq!(verdict(&evidence(false, None), None), AccessPath::Uncovered);
+        assert_eq!(
+            verdict(&evidence(false, None), None, &[]),
+            AccessPath::Uncovered
+        );
         // 系统代理开优先于 TUN。
         assert_eq!(
-            verdict(&evidence(true, Some("a:1")), Some("Mihomo".into())),
+            verdict(&evidence(true, Some("a:1")), Some("Mihomo".into()), &[]),
             AccessPath::SystemProxy { addr: "a:1".into() }
         );
     }

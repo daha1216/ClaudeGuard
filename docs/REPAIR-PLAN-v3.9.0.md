@@ -348,6 +348,7 @@ UI 文档：ui/、tests/、docs/、AGENTS.md
 | M5 配置语义对齐（D1） | `CONFIG_VERSION=4` 与 `Default`/`migrate` 统一；新装 `cut_network=false`（应用级隔离为主，全局断网改成显式选择），旧配置显式 true 原样保留；首次 GUI 启动把旧版配置原样备份成 `config.v{旧版本}.bak.json`（只备一次、绝不覆盖、`--check` 不碰盘） | `9facd9e` | 172→178 测试；隔离 APPDATA 迁移演练：v3 配置含 `cut_network=true` → 生成 `config.v3.bak.json` 且内容一致，线上文件仍是 version 3（读不写盘），首次保存才写 4 且保留 true |
 | M5 性能（R16） | 两处热点：①退出清理线程每 2 秒枚举 WindowsApps + sysinfo 全量刷新（每进程读 PEB）②每轮检查每个目标各建一个 `ureq::Agent`（加载根证书）。修法：`anchors::build_agent`/`probe_with` 一轮共用一个 Agent；新增 `guard::claude_presence`（Toolhelp 快照 + `QueryFullProcessImageNameW` 单次扫描，命中即停，拿不到快照保守返回 Desktop）；清理线程目录解析缓存 60s、节奏自适应 3s（有 Claude）/10s（无）；删除被取代的死代码 | `c4da552` | 空闲 CPU **1.719%→0.755%**（40s 窗口 218ms，约 0.5% 单核）、RSS 50.4→34.1MB、窗口可见 0.52s、首条日志 0.75s、单轮检查 CPU 15.6ms（小于一个 Windows 计时量子）；`CG_ROUND_TRACE` 埋点默认零开销 |
 | M5 原生验收 | `--version`/`--check`（白名单外 exit 2、`verdict:fail`、`access.path:unknown`）/`--restore`（exit 0 + 分项结果）/单实例（第二进程自动退出）/主窗口句柄非 0/托盘六项字面核对 | 本次提交 | 全部符合 CONTRACT；`--restore` 在真实熔断后执行成功 |
+| M5 自校验返工（R03） | 自查发现 R03 的绕过列表判定过严：Windows 机器普遍带 `127.*;10.*;192.168.*;<local>` 一类条目，原实现把它们一律判成 Unknown → 启动被永久拒绝（本机实测 `--check` exit 2）。改为按主机名判定：只在本机/私网/无关域名之外，命中被监控主机名或 AI 服务后缀时才判 Unknown | 本次提交 | 178→179 测试（新增 `bypass_local_and_host_matching` 与重写的 `bypass_list_semantics`）；本机 `--check` 由 `path:unknown, exit 2` 变为 `path:system_proxy, exit 0` |
 | M5 一致性（R17） | GUIDE 断网档位默认值改为「不断网（默认）」并注明升级保留原选择；数据目录补 `ledger.json`/`disarmed`/`upd-notify.json`；三向核对（设置项↔GUIDE↔SPEC）确认 8 组设置项、6 类通知 + 2 个开关、托盘六项字面一致 | 本次提交 | 逐项 grep 比对，唯一不符项已修 |
 
 ### 尚未开始

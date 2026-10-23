@@ -73,10 +73,12 @@ Claude 等桌面应用只认系统代理——系统代理没开时它们直连�
 | 系统代理开关 | ProxyServer | TUN 网卡 | 判定 | 探测走哪 |
 |---|---|---|---|---|
 | 开 | 读到任意地址 | 任意 | **SystemProxy**（已接入） | 该地址（不管是否等于配置端口） |
+| 开 | 读到地址，但绕过列表命中被监控域名 | 任意 | **Unknown**（不熔断、禁止启动） | 回退配置端口 |
 | 开 | 读不到 | 任意 | SystemProxy（地址未知，按已接入） | 回退配置端口 |
 | 关 | — | 检测到 | **Tun**（已接入，界面标注"TUN 直连"） | 直连（被 TUN 接管，与应用同路） |
 | 关 | — | 无 | **Uncovered**（应用直连真实出口） | **不探测**（守护器自身不直连；判定与熔断完全靠注册表/TUN 确定性检查） |
 
+- 绕过列表（`ProxyOverride`）判定：只把**命中被监控主机名或 AI 服务后缀**（anthropic.com/claude.ai/openai.com/chatgpt.com/oaistatic.com/oaiusercontent.com/googleapis.com/google.com）的条目当作风险；`<local>`、`localhost`、`*.local`、`127.*`、`10.*`、`192.168.*`、`169.254.*`、`172.16.*`–`172.31.*`、`[::1]` 这类本机/私网条目，以及与 AI 无关的公网域名（如购物站）一律不影响判定——Windows 上几乎每台机器都有这类条目，若一律判 Unknown，守护器会永远拒绝启动（v3.10 修正）。`*` 仍等价于未接入。
 - 检测方式：`winreg` 读 `HKCU\...\Internet Settings` 的 `ProxyEnable`/`ProxyServer`（支持 `http=..;https=..` 分号形式，取 https 优先）；`GetAdaptersAddresses` 枚举 Up 状态适配器按描述/友好名匹配 TUN 关键词（mihomo/clash/meta/sing-box/singbox/wintun/wireguard/openvpn/tap-windows/tun2socks/bettbox/hysteria/juicity/v2ray/xray/utun 前缀；不含 tailscale——非默认全隧道）。`verdict()`/`parse_sys_proxyserver()`/`is_tun_name()` 为纯函数（单测覆盖），`read_system_proxy()`/`detect_tun_adapter()` 只做系统读取。
 - 语义：Uncovered 按独立 `access_streak` 计数走同一 `trip_threshold` 防抖（阈值-1 时预警一次）；熔断动作与目标 Fail 完全一致（杀进程/隔离/断网档位），Launch 用途立即熔断；被跳过探测的目标标 Unverified（reason"未接入代理链路，已跳过探测"）；恢复条件额外要求 access 已重新覆盖（SystemProxy/Tun）。暂停同样压制 access 熔断。`enforce_access_path=false`（设置可关，此时未接入仍会直连探测）或非 Windows 时整段跳过。
 - **隐私语义（v3.8）**：启用检查时，守护器自身流量在任何状态下都不带家宽 IP 出机器（探测只走代理或 TUN 接管的直连）；国内直连 claude.ai 本可测出家宽 IP，但守护器刻意不测，改用注册表/TUN 判定。
