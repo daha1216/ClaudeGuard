@@ -162,18 +162,18 @@ impl Drop for Staged {
     }
 }
 
-/// 暂存目录：优先 ProgramData（管理员创建后普通用户不可写），失败则退到本地应用数据。
+/// 暂存目录：只认 ProgramData（管理员创建后普通用户不可写）。
+///
+/// 旧实现在这里回退到 `%APPDATA%\ClaudeGuard\staging`——那是普通用户可写的位置，
+/// 把"受控暂存"变成了"用户可预置文件"，与 R09 的前提相反。拿不到受控目录就
+/// 直接失败，让用户看到原因，而不是悄悄降级。
 #[cfg(windows)]
-fn staging_dir() -> PathBuf {
-    let program_data = std::env::var("ProgramData")
-        .map(|p| PathBuf::from(p).join("ClaudeGuard").join("staging"))
-        .unwrap_or_default();
-    if !program_data.as_os_str().is_empty() && std::fs::create_dir_all(&program_data).is_ok() {
-        return program_data;
-    }
-    let fallback = crate::config::config_dir().join("staging");
-    let _ = std::fs::create_dir_all(&fallback);
-    fallback
+fn staging_dir() -> Result<PathBuf, String> {
+    let base = std::env::var("ProgramData")
+        .map_err(|_| "拿不到 ProgramData 目录，无法使用受控暂存目录".to_string())?;
+    let dir = PathBuf::from(base).join("ClaudeGuard").join("staging");
+    std::fs::create_dir_all(&dir).map_err(|err| format!("创建受控暂存目录失败：{err}"))?;
+    Ok(dir)
 }
 
 /// 随机文件名：不依赖 rand crate，用时间+进程+计数器混合，够避免碰撞即可；
@@ -198,7 +198,7 @@ fn staging_name() -> String {
 #[cfg(windows)]
 fn create_staged() -> Result<Staged, String> {
     use std::io::ErrorKind;
-    let dir = staging_dir();
+    let dir = staging_dir()?;
     for _ in 0..8 {
         let path = dir.join(staging_name());
         // 必须同时要读权限：后面要用同一个句柄算摘要（sha256_of_file）并复制，
@@ -767,6 +767,20 @@ pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
                         return;
                     }
                     state.log("更新包校验通过");
+                }
+
+                // 保护状态可能在下载期间变化（例如刚好熔断）：替换前再确认一次。
+                if let Some(reason) = update_blocked_reason(
+                    state.is_tripped(),
+                    state.lockdown_on(),
+                    state.is_disarmed(),
+                ) {
+                    state.set_upd(UpdState::Failed {
+                        msg: reason.clone(),
+                    });
+                    state.emit_state();
+                    state.log(format!("更新已中止：{reason}"));
+                    return;
                 }
 
                 state.set_upd(UpdState::Restarting);
