@@ -202,6 +202,59 @@ pub fn sweep_claude(state: State<'_, Arc<AppState>>) -> crate::guard::SweepRepor
     report
 }
 
+// ---------- v3.12：直连观察 / 环境对齐 ----------
+
+/// 立即做一次直连泄露观察（不等 10 秒节奏）。
+#[tauri::command]
+pub fn leak_scan(state: State<'_, Arc<AppState>>) -> crate::netwatch::LeakReport {
+    let cfg = state.config();
+    let report = crate::netwatch::scan(&cfg, &state.access());
+    if report.leaked() {
+        state.log(format!(
+            "直连观察：{} 条连接绕过本地代理",
+            report.direct_total
+        ));
+    } else {
+        state.log(format!("直连观察：{}", report.note));
+    }
+    state.set_leak(report.clone());
+    state.emit_state();
+    report
+}
+
+/// 立即把系统时区/默认位置对齐到当前出口。
+#[tauri::command]
+pub fn env_align(state: State<'_, Arc<AppState>>) -> Result<crate::envfix::AppliedEnv, String> {
+    let cfg = state.config();
+    let statuses = state.statuses();
+    let Some((country, colo)) = crate::envcheck::pick_egress(&statuses) else {
+        return Err("还没有可用的出口信息，请先完成一次检查".to_string());
+    };
+    let Some(place) = crate::geo::resolve(colo.as_deref(), country.as_deref()) else {
+        return Err("出口地区不在内置地点表内，无法对齐".to_string());
+    };
+    let rec = crate::envfix::apply(&cfg, place)?;
+    state.log(format!("环境对齐：{}（退出时自动还原）", rec.summary()));
+    state.set_env_applied(Some(rec.clone()));
+    let check = crate::envcheck::check(&cfg, &state.statuses());
+    state.set_env(check);
+    state.emit_state();
+    Ok(rec)
+}
+
+/// 把系统时区/默认位置还原成对齐前的样子。
+#[tauri::command]
+pub fn env_restore(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let msg = crate::envfix::restore()?;
+    state.log(format!("环境还原：{msg}"));
+    state.set_env_applied(None);
+    let cfg = state.config();
+    let check = crate::envcheck::check(&cfg, &state.statuses());
+    state.set_env(check);
+    state.emit_state();
+    Ok(msg)
+}
+
 // ---------- 日志 / 数据 ----------
 
 #[tauri::command]

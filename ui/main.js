@@ -377,6 +377,8 @@
       ["防火墙隔离", fw, tripped ? " fail" : ""],
       ["断网档位", CUT_LABEL[st.cutMode] || "不断网", ""],
       ["进程清理", (st.guardedAgents || []).length ? "已开启" : "已关闭", ""],
+      ["直连观察", leakLabel(st.leak), st.leak && st.leak.directTotal > 0 ? " fail" : ""],
+      ["环境", envLabel(st.env), st.env && st.env.tzMatch === false ? " fail" : ""],
     ];
     host.innerHTML = rows
       .map(
@@ -384,6 +386,22 @@
           '<div class="row"><span class="nm">' + esc(r[0]) + '</span><span class="val' + r[2] + '">' + esc(r[1]) + "</span></div>"
       )
       .join("");
+  }
+
+  // v3.12：直连观察与环境的单行摘要（详情卡用，后端结构体是 camelCase）
+  function leakLabel(leak) {
+    if (!leak || !leak.checkedAt) return "未观察";
+    if (!leak.applicable) return leak.note || "当前接入方式不判定";
+    if (leak.directTotal > 0) return "发现 " + leak.directTotal + " 条直连";
+    if (leak.agentConns > 0) return "正常 · " + leak.proxied + " 条经代理";
+    return "正常 · 无出站连接";
+  }
+
+  function envLabel(env) {
+    if (!env || !env.note) return "未检查";
+    if (env.tzMatch === false || env.localeMatch === false) return "不一致";
+    if (env.tzMatch === true) return "一致";
+    return "未判定";
   }
 
   /* ---------- 横幅 ---------- */

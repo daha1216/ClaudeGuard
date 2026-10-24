@@ -794,6 +794,7 @@ pub fn release(state: &Arc<AppState>) {
 /// 后台监控线程：启动 1 秒后首轮，之后按配置间隔轮询。
 pub fn spawn(state: Arc<AppState>) {
     spawn_sweeper(Arc::clone(&state));
+    spawn_watcher(Arc::clone(&state));
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(1));
         let mut last_run = 0u64;
@@ -810,6 +811,162 @@ pub fn spawn(state: Arc<AppState>) {
             std::thread::sleep(Duration::from_millis(300));
         }
     });
+}
+
+/// 直连泄露触发熔断（v3.12）。只在 `cfg.leak_trip` 开启时由观察线程调用。
+pub fn trip_leak(state: &Arc<AppState>, cfg: &Config, report: &crate::netwatch::LeakReport) {
+    if !report.leaked() || state.is_tripped() {
+        return;
+    }
+    let reason = format!(
+        "检测到 {} 条绕过代理的直连（{}）",
+        report.direct_total,
+        report
+            .direct
+            .iter()
+            .map(|c| c.agent.as_str())
+            .collect::<Vec<_>>()
+            .join("、")
+    );
+    do_trip(state, cfg, &[], &reason);
+}
+
+/// 环境与泄露观察线程（v3.12）。
+///
+/// 与检查轮次解耦：轮次负责出口判定，这里负责两件"配置对但实际可能不对"的事——
+/// 应用是不是真的走了代理、系统环境是不是和出口自相矛盾。两者都不改判定结果
+/// （除非用户显式打开 `leak_trip`），因此可以独立按 10 秒节奏跑。
+///
+/// 只在**状态发生变化**时写日志/发通知：每轮都喊一次会把通知中心刷成瀑布。
+fn spawn_watcher(state: Arc<AppState>) {
+    std::thread::spawn(move || {
+        const TICK_MS: u64 = 10_000;
+        let mut last_leak_sig = String::new();
+        let mut last_env_sig = String::new();
+        let mut pending_city: Option<String> = None;
+        loop {
+            if state.stop.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(TICK_MS));
+            if state.is_paused() || state.is_disarmed() {
+                continue;
+            }
+            let cfg = state.config();
+            let mut changed = false;
+
+            // ---- 直连泄露观察 ----
+            if cfg.leak_watch {
+                let report = crate::netwatch::scan(&cfg, &state.access());
+                let sig = format!(
+                    "{}|{}|{}",
+                    report.applicable, report.direct_total, report.mode
+                );
+                if sig != last_leak_sig {
+                    last_leak_sig = sig;
+                    if report.leaked() {
+                        let who: Vec<String> = report
+                            .direct
+                            .iter()
+                            .map(|c| format!("{}（{}）", c.agent, c.remote))
+                            .collect();
+                        state.log(format!(
+                            "直连泄露：{} 条连接未经本地代理端口 {}：{}",
+                            report.direct_total,
+                            cfg.proxy_port,
+                            who.join("、")
+                        ));
+                        state.notify(
+                            "warning",
+                            "ClaudeGuard 发现直连",
+                            &format!(
+                                "{} 条连接绕过了本地代理，出口可能已暴露。详见「详情」。",
+                                report.direct_total
+                            ),
+                        );
+                        if cfg.leak_trip {
+                            trip_leak(&state, &cfg, &report);
+                        }
+                    } else if report.applicable && report.agent_conns > 0 {
+                        state.log(format!("直连观察：{} 条连接全部经本地代理", report.proxied));
+                    }
+                    changed = true;
+                }
+                state.set_leak(report);
+            }
+
+            // ---- 环境一致性 ----
+            if cfg.env_check {
+                let check = crate::envcheck::check(&cfg, &state.statuses());
+                let sig = format!(
+                    "{:?}|{:?}|{:?}",
+                    check.tz_match, check.locale_match, check.expect_city
+                );
+                if sig != last_env_sig {
+                    last_env_sig = sig;
+                    if check.mismatched() {
+                        state.log(format!("环境不一致：{}", check.note));
+                        state.notify(
+                            "warning",
+                            "ClaudeGuard 环境与出口不一致",
+                            &format!("{}。可在设置里一键对齐。", check.note),
+                        );
+                    } else if check.expect_city.is_some() {
+                        state.log(format!("环境检查：{}", check.note));
+                    }
+                    changed = true;
+                }
+                state.set_env(check);
+            }
+
+            // ---- 环境自动对齐（v3.12）：出口城市要连续两拍一致才动系统 ----
+            if cfg.env_align_tz || cfg.env_align_location {
+                let city = crate::envcheck::pick_egress(&state.statuses())
+                    .and_then(|(country, colo)| {
+                        crate::geo::resolve(colo.as_deref(), country.as_deref())
+                    })
+                    .map(|place| place.city.to_string());
+                // 切节点瞬间可能探到真实出口（kill-switch 窗口），只看一次会把系统时区
+                // 改成真实地区；要求同一城市连续两次观测到才认。
+                if city.is_some() && city == pending_city {
+                    auto_align_env(&state, &cfg);
+                }
+                pending_city = city;
+            } else {
+                pending_city = None;
+            }
+
+            if changed {
+                state.emit_state();
+            }
+        }
+    });
+}
+
+/// 环境自动对齐（v3.12）：出口城市变了才动一次系统设置，避免每拍反复改时区/位置。
+/// 只在用户勾选了「对齐时区 / 对齐位置」时生效；失败只记日志，不影响判定。
+fn auto_align_env(state: &Arc<AppState>, cfg: &Config) {
+    let Some((country, colo)) = crate::envcheck::pick_egress(&state.statuses()) else {
+        return;
+    };
+    let Some(place) = crate::geo::resolve(colo.as_deref(), country.as_deref()) else {
+        return;
+    };
+    // 账本里已经是这个城市 → 说明已经对齐过，不重复改系统
+    if let Some(rec) = crate::envfix::load() {
+        if rec.city == place.city {
+            return;
+        }
+    }
+    match crate::envfix::apply(cfg, place) {
+        Ok(rec) => {
+            state.log(format!("环境对齐：{}", rec.summary()));
+            state.set_env_applied(Some(rec));
+            state.set_env(crate::envcheck::check(cfg, &state.statuses()));
+            state.emit_state();
+        }
+        Err(err) => state.log(format!("环境对齐失败：{err}")),
+    }
 }
 
 /// 残留清理线程（v3.2）：盯 Claude 桌面端是否退出；退出并度过宽限期后清掉残留进程

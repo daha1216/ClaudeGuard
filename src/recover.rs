@@ -106,7 +106,13 @@ pub fn restore_all() -> Report {
         },
     );
 
-    // 4. 核验：必须查得到"本产品规则已为 0 条"才算完成
+    // 4. 环境对齐（v3.12）：改过时区/默认位置就还原
+    match crate::envfix::restore() {
+        Ok(msg) => report.push("还原环境设置", true, &msg),
+        Err(err) => report.push("还原环境设置", false, &err),
+    }
+
+    // 5. 核验：必须查得到"本产品规则已为 0 条"才算完成
     let (verified, detail) = verify_cleanup(guard::firewall_rule_count());
     report.verified = verified;
     report.push("核验规则清空", verified, &detail);

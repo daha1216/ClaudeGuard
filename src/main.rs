@@ -10,7 +10,10 @@ mod anchors;
 mod claude_update;
 mod config;
 mod disarm;
+mod envcheck;
+mod envfix;
 mod feishu;
+mod geo;
 #[cfg_attr(target_os = "macos", path = "macos/guard.rs")]
 mod guard;
 #[cfg_attr(target_os = "macos", path = "macos/install.rs")]
@@ -24,6 +27,7 @@ mod monitor;
 #[cfg_attr(target_os = "macos", path = "macos/netcut.rs")]
 mod netcut;
 mod netpol;
+mod netwatch;
 #[cfg_attr(target_os = "macos", path = "macos/notify.rs")]
 mod notify;
 mod policy;
@@ -469,6 +473,9 @@ fn with_ipc(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
         ipc::pause,
         ipc::resume,
         ipc::sweep_claude,
+        ipc::leak_scan,
+        ipc::env_align,
+        ipc::env_restore,
         ipc::lockdown,
         ipc::recent_logs,
         ipc::open_data_folder,
@@ -688,7 +695,7 @@ fn apply_smoke_state(state: &Arc<AppState>, kind: &str) {
         for status in statuses.iter_mut().filter(|s| s.id != "antigravity") {
             status.state = crate::model::TargetState::Fail;
             status.fail_streak = 2;
-            status.reason = "出口 103.62.49.170 不在白名单".into();
+            status.reason = "出口 198.51.100.24 不在白名单".into();
         }
     }
     let failing_ids: Vec<String> = statuses
@@ -720,6 +727,34 @@ fn apply_smoke_state(state: &Arc<AppState>, kind: &str) {
     }
     if kind == "checking" {
         state.set_checking(true);
+    }
+    // v3.12：截图用的直连观察与环境结果（仅冒烟钩子，不影响真实判定）
+    if matches!(kind, "pass" | "paused" | "checking") {
+        state.set_leak(crate::netwatch::LeakReport {
+            applicable: true,
+            mode: "system_proxy".into(),
+            checked_at: now,
+            agent_conns: 3,
+            proxied: 3,
+            local: 0,
+            direct: Vec::new(),
+            direct_total: 0,
+            note: "3 条连接全部经本地代理".into(),
+        });
+    }
+    if matches!(kind, "pass" | "paused" | "checking") {
+        let mut env = crate::envcheck::EnvCheck {
+            info: crate::envcheck::read_env(),
+            egress_country: Some("US".into()),
+            egress_colo: Some("LAX".into()),
+            expect_city: Some("洛杉矶".into()),
+            expect_tz: Some("Pacific Standard Time".into()),
+            tz_match: Some(true),
+            locale_match: Some(true),
+            note: String::new(),
+        };
+        env.note = crate::envcheck::describe(&env);
+        state.set_env(env);
     }
     state.emit_state();
 }

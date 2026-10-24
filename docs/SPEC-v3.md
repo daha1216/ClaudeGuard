@@ -92,6 +92,25 @@ Claude 等桌面应用只认系统代理——系统代理没开时它们直连�
 - 边界：按 exe 封锁=应用全部域名（Windows 防火墙无域名字段）；CLI 跑在 node 宿主不能拦（与熔断隔离同边界）；退出程序时 `lockdown_clear()` 只删规则不动防火墙总开关。
 - UI：未接入横幅/副标题在封锁生效时注明"已启用防火墙兜底封锁"；设置「熔断与清理」组新增"防火墙兜底封锁"子节（自动开关+一键封锁/解除按钮）；`StateView.lockdown` 暴露当前意图。
 
+### 3.7 直连泄露观察（`src/netwatch.rs`，v3.12，仅 Windows）
+
+- 动机：`access.rs` 只按配置推断"该走代理"，从不看应用实际连到哪。配置看着正常、某个子进程或应用自身的代理设置绕过系统代理直连出去时，守护器毫无察觉。
+- 语义：用 `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL, AF_INET)` 取全机 ESTABLISHED 连接，按 `agent_pids()`（复用 `guard` 的 GUI/CLI 指纹）筛出属于守护对象的连接，再用 `classify()` 判三类：目的端口 == 代理端口 → `Proxy`；目的地址是回环/私有/链路本地/100.64-10/0.0.0.0-8 → `Local`；其余 → `Public`（即直连）。
+- **只在 `AccessInfo.path == system_proxy` 时判定**：TUN 模式下应用的对端本来就是公网 IP，判了会全线误报；`uncovered`/`unknown`/`skipped` 一律 `applicable=false` 并给出原因。
+- 只看 agent 本体不看子进程（WebView2 子进程连微软域名=噪声）；只看 TCP（UDP/QUIC 无可靠连接态）。
+- 默认**只告警**：`leak_watch` 默认 true、`leak_trip` 默认 false。打开 `leak_trip` 才走 `trip_leak()` → 熔断（reason="检测到 N 条绕过代理的直连"）。
+- 节奏：`monitor.rs::spawn_watcher` 10 秒一拍，按签名（applicable|directTotal|mode）变化才写日志/通知/emit；`leak_scan` IPC 可立即触发一次。
+- 输出 `LeakReport{applicable,mode,checkedAt,agentConns,proxied,local,direct[],directTotal,note}`，列表最多列 8 条但计数全量。
+
+### 3.8 环境一致性检查与对齐（`src/envcheck.rs`、`src/envfix.rs`、`src/geo.rs`，v3.12）
+
+- 动机：出口 IP 换了国家，系统时区/区域还是原样——这种自相矛盾本身就是可识别信号。检查只提示，不熔断（用户可能就想保持中文系统）。
+- 检查：读 `HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation`（`TimeZoneKeyName` + `ActiveTimeBias`）与 `HKCU\Control Panel\International`（`LocaleName`，退回 `sLanguage`+`sCountry`），与出口地区比对：`tz_match` = 系统时区键 == 出口城市的 Windows 时区键；`locale_match` = 系统区域代码 == 出口国家代码。任一为 `false` 即 `mismatched()`。
+- 地点表 `geo.rs` **完全离线**：`PLACES` 50 个常用机场代码（LAX/NRT/HKG/FRA…）→ 城市/国家/Windows 时区键/经纬度；`COUNTRY_FALLBACK` 只含单时区国家（**故意不含 US/CA/RU/BR/AU/MX/ID**——多时区国家拿首都猜会改错）。查不到就返回 None，宁可不做也不猜。
+- 对齐（`envfix.rs`）是唯一会改系统设置的功能，走账本：`env-align.json` 记改前时区与经纬度；`apply()` 先 `restore()` 再改（避免账本原值被覆盖）；时区用 `tzutil /s`，默认位置写注册表 `Sensor\Overrides\{BFA794E4-…}` 的 `Latitude`/`Longitude`（**不动 `SensorPermissionState`**，开定位权限是另一回事）。
+- 自动对齐（`monitor.rs::spawn_watcher`）只在用户开了 `env_align_tz`/`env_align_location` 时生效，且要求**同一出口城市连续两拍一致**才动系统——切节点瞬间可能探到真实出口（kill-switch 窗口），只看一次会把时区改成真实地区。账本已是该城市则不重复改。
+- 还原：`restore()` 从账本恢复并删除账本；已接入 `recover::restore_all()` 第 4 步，因此 `--restore`、退出、UI 按钮走同一条协议。
+
 ## 4. 监控循环与防抖（`src/monitor.rs`）
 
 - 启动 1s 后首轮；300ms tick；每 `check_interval_secs` 且非 busy 跑一轮；间隔实时读配置。

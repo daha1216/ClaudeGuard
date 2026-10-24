@@ -345,9 +345,9 @@ mod tests {
 
     #[test]
     fn json_reads_nested_data_and_aliases() {
-        let text = r#"{"data":{"ip_address":"103.62.49.170","country_code":"jp"}}"#;
+        let text = r#"{"data":{"ip_address":"198.51.100.24","country_code":"jp"}}"#;
         let probe = parse_json_ip(text).expect("data 子对象应能解析");
-        assert_eq!(probe.ip.as_deref(), Some("103.62.49.170"));
+        assert_eq!(probe.ip.as_deref(), Some("198.51.100.24"));
         assert_eq!(probe.country.as_deref(), Some("JP"));
         assert!(probe.city.is_none());
     }

@@ -143,6 +143,21 @@ pub struct Config {
     /// 后台每 6 小时静默检查 ClaudeGuard 自身新版本
     #[serde(default = "default_true")]
     pub auto_upd_check: bool,
+    /// v3.12：观察被守护应用的直连泄露（系统代理模式下比对真实连接）。
+    #[serde(default = "default_true")]
+    pub leak_watch: bool,
+    /// v3.12：发现直连即熔断。默认关闭——先告警，确认无误报再让用户自己开。
+    #[serde(default)]
+    pub leak_trip: bool,
+    /// v3.12：环境一致性检查（系统时区/区域 vs 出口，只提示不熔断）。
+    #[serde(default = "default_true")]
+    pub env_check: bool,
+    /// v3.12：把系统时区对齐到出口（退出/恢复时还原）。
+    #[serde(default)]
+    pub env_align_tz: bool,
+    /// v3.12：把 Windows 默认位置对齐到出口（退出/恢复时还原）。
+    #[serde(default)]
+    pub env_align_location: bool,
     #[serde(default = "default_true")]
     pub first_run: bool,
 
@@ -183,6 +198,11 @@ impl Default for Config {
             auto_start_with_system: false,
             notify: NotifyPrefs::default(),
             auto_upd_check: true,
+            leak_watch: true,
+            leak_trip: false,
+            env_check: true,
+            env_align_tz: false,
+            env_align_location: false,
             first_run: true,
             allowed_ips: Vec::new(),
             egress_region: String::new(),

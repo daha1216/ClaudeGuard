@@ -524,7 +524,7 @@ mod tests {
         assert_eq!(normalize_ip("::1").as_deref(), Some("::1"));
         let expect = vec!["204.1.100.98".to_string()];
         assert!(ip_hit(&expect, "204.1.100.98"));
-        assert!(!ip_hit(&expect, "103.62.49.170"));
+        assert!(!ip_hit(&expect, "198.51.100.24"));
         assert!(!ip_hit(&expect, "not-an-ip"));
     }
 

@@ -104,6 +104,18 @@
         '<div class="srow"><div class="slabel">一键封锁 / 解除<span class="shint">按应用 exe 添加出站 Block 规则，立即生效</span></div><div class="sval"><button class="btn" id="st-lockdown-on" type="button">封锁出站</button><button class="btn" id="st-lockdown-off" type="button" style="margin-left:6px">解除封锁</button></div></div>' +
         '<div class="formhint" id="st-lockdown-state" style="display:none"></div>') +
 
+      group("env", "环境与泄露",
+        rowSwitch("st-leak-watch", "直连观察", "观察守护对象的 TCP 连接，系统代理模式下出现绕过代理的外连即告警", !CFG || CFG.leak_watch !== false, false) +
+        rowSwitch("st-leak-trip", "发现直连就熔断", "确认无误报后再打开；默认只告警", !!(CFG && CFG.leak_trip), false) +
+        '<div class="srow"><div class="slabel">立即观察一次<span class="shint">不等自动节奏，马上扫一遍连接表</span></div><div class="sval"><button class="btn" id="st-leak-scan" type="button">' + ic("refresh", 12) + '观察</button></div></div>' +
+        '<div class="formhint" id="st-leak-state" style="display:none"></div>' +
+        '<div class="sgroup-title">环境一致性</div>' +
+        rowSwitch("st-env-check", "检查时区与区域", "把系统时区、区域设置与出口地区比对，不一致时提示", !CFG || CFG.env_check !== false, false) +
+        rowSwitch("st-env-tz", "自动对齐时区", "出口城市连续两次一致后，把 Windows 时区改成当地时区；退出时还原", !!(CFG && CFG.env_align_tz), false) +
+        rowSwitch("st-env-loc", "自动对齐位置", "同上，把 Windows 默认位置改成出口城市；退出时还原", !!(CFG && CFG.env_align_location), false) +
+        '<div class="srow"><div class="slabel">立即对齐 / 还原<span class="shint">按当前出口改系统时区与默认位置，可随时还原</span></div><div class="sval"><button class="btn" id="st-env-apply" type="button">对齐</button><button class="btn" id="st-env-restore" type="button" style="margin-left:6px">还原</button></div></div>' +
+        '<div class="formhint" id="st-env-state" style="display:none"></div>') +
+
       group("agents", "守护对象",
         rowSwitch("st-ag-claude", "Claude 桌面版", "Anthropic Claude 桌面端", false, false) +
         rowSwitch("st-ag-chatgpt", "ChatGPT 桌面版", "OpenAI ChatGPT / Codex 桌面端", false, false) +
@@ -174,11 +186,47 @@
     const names = (Array.isArray(cfg.guarded_agents) ? cfg.guarded_agents : [])
       .map((a) => (a === "claude" ? "Claude" : a === "chatgpt" ? "ChatGPT" : a === "antigravity" ? "反重力" : a))
       .join("、");
+    sum("env",
+      (cfg.leak_watch !== false ? "直连观察开" : "直连观察关") +
+      " · " + (cfg.env_check !== false ? "环境检查开" : "环境检查关") +
+      (cfg.env_align_tz || cfg.env_align_location ? " · 自动对齐" : ""));
     sum("agents", names || "未选择");
     const list = Array.isArray(cfg.targets) ? cfg.targets : [];
     sum("targets", list.length ? list.filter((t) => t && t.enabled !== false).length + " / " + list.length + " 启用" : "未配置");
     sum("notify", ((cfg.notify || {}).enabled !== false ? "桌面通知开" : "桌面通知关"));
     sum("generic", cfg.auto_start_with_system ? "开机自启开" : "开机自启关");
+  }
+
+  /* ---------- 环境与泄露的渲染 ---------- */
+
+  function showEnvState(text) {
+    const el = $("st-env-state");
+    if (!el) return;
+    el.textContent = text;
+    el.style.display = "";
+  }
+
+  function renderLeak(r) {
+    const el = $("st-leak-state");
+    if (!el || !r) return;
+    // 后端结构体带 serde(rename_all = "camelCase")：字段名是 checkedAt / directTotal / agentConns
+    let text;
+    if (!r.checkedAt) {
+      text = "尚未观察";
+    } else if (!r.applicable) {
+      text = r.note || "当前接入方式不判定直连";
+    } else if (r.directTotal > 0) {
+      const who = (r.direct || [])
+        .map((c) => (c.agent || "?") + " → " + c.remote)
+        .join("、");
+      text = "发现 " + r.directTotal + " 条直连：" + who;
+    } else if (r.agentConns > 0) {
+      text = "正常：" + r.proxied + " 条连接全部经过本地代理";
+    } else {
+      text = "正常：守护对象当前没有出站连接";
+    }
+    el.textContent = text;
+    el.style.display = "";
   }
 
   /* ---------- 填值 ---------- */
@@ -203,8 +251,17 @@
     chk("st-enforce-access", cfg.enforce_access_path !== false);
     chk("st-sweep", cfg.sweep_on_exit !== false);
     chk("st-lockdown-auto", cfg.lockdown_on_uncovered !== false);
+    chk("st-leak-watch", cfg.leak_watch !== false);
+    chk("st-leak-trip", !!cfg.leak_trip);
+    chk("st-env-check", cfg.env_check !== false);
+    chk("st-env-tz", !!cfg.env_align_tz);
+    chk("st-env-loc", !!cfg.env_align_location);
     const lockState0 = $("st-lockdown-state");
     const view = OPTS.getState ? OPTS.getState() : null;
+    if (view) {
+      if (view.leak) renderLeak(view.leak);
+      if (view.env && view.env.note && view.env.note !== "尚未检查") showEnvState(view.env.note);
+    }
     if (lockState0 && view) {
       if (view.lockdownManual) {
         lockState0.textContent = "当前为手动封锁：会一直保持到你点「解除封锁」";
@@ -508,6 +565,65 @@
         }
       });
     });
+
+    ["st-leak-watch:leak_watch", "st-leak-trip:leak_trip", "st-env-check:env_check",
+      "st-env-tz:env_align_tz", "st-env-loc:env_align_location"].forEach((pair) => {
+      const [id, key] = pair.split(":");
+      const el = $(id);
+      if (!el) return;
+      el.addEventListener("change", () => {
+        const p = {};
+        p[key] = el.checked;
+        patch(p, "已保存");
+      });
+    });
+
+    const leakScan = $("st-leak-scan");
+    if (leakScan) {
+      leakScan.addEventListener("click", async () => {
+        leakScan.disabled = true;
+        try {
+          const r = await invoke(CMD.leak_scan);
+          renderLeak(r);
+        } catch (e) {
+          notifyToast("观察失败：" + e);
+        } finally {
+          leakScan.disabled = false;
+        }
+      });
+    }
+
+    const envApply = $("st-env-apply");
+    if (envApply) {
+      envApply.addEventListener("click", async () => {
+        envApply.disabled = true;
+        try {
+          const rec = await invoke(CMD.env_align);
+          showEnvState("已对齐：" + (rec && rec.summary ? rec.summary : ""));
+          notifyToast("已对齐到出口地区");
+        } catch (e) {
+          showEnvState("对齐失败：" + e);
+        } finally {
+          envApply.disabled = false;
+        }
+      });
+    }
+
+    const envRestore = $("st-env-restore");
+    if (envRestore) {
+      envRestore.addEventListener("click", async () => {
+        envRestore.disabled = true;
+        try {
+          const msg = await invoke(CMD.env_restore);
+          showEnvState("已还原：" + msg);
+          notifyToast("已还原系统时区与位置");
+        } catch (e) {
+          showEnvState("还原失败：" + e);
+        } finally {
+          envRestore.disabled = false;
+        }
+      });
+    }
 
     ["st-ag-claude:claude", "st-ag-chatgpt:chatgpt", "st-ag-antigravity:antigravity"].forEach((pair) => {
       const [id, agent] = pair.split(":");

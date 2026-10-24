@@ -166,3 +166,19 @@ node --check ui/*.js           # 逐个检查，跨文件词法冲突查不出�
     不要把 `.cta` 挪回 `#content`（挪回去必然在 620px 窗口里被裁）。熔断与暂停**不再有横幅**，
     状态由主卡标题 + 主钮表达；新增横幅前先算高度预算（可用内容高 = 窗高 − 标题栏 44 −
     CTA 54 − footer 36，v3.11 实测 486px，三行目标刚好占满）。
+24. **新增设置/状态字段一律先看 serde 大小写**（v3.12 踩过）：`LeakReport`/`EnvCheck`/
+    `AppliedEnv`/`StateView` 全部是 `#[serde(rename_all = "camelCase")]`，前端读到的是
+    `checkedAt`/`directTotal`/`agentConns`/`tzMatch`；写成 `checked_at` 不报错、只是永远取到
+    `undefined`（表现：观察完仍显示"尚未观察"）。新增字段后先在 CDP 里 `JSON.stringify(await
+    window.CG_IPC.invoke(...))` 看一眼真实键名。
+25. **v3.12 直连观察只在 `system_proxy` 模式判定**：TUN 模式下应用对端本来就是公网 IP，判了
+    全线误报；`uncovered`/`unknown`/`skipped` 一律 `applicable=false`。只看 agent 本体不看子进程、
+    只看 TCP。默认 `leak_trip=false` 只告警，别在验证时打开——冒烟环境里一次真实熔断会往系统
+    加防火墙规则（本次踩过：`ClaudeGuard Lockdown (claude)` 7 条，需 `--restore` 清）。
+26. **改系统设置的功能必须"账本先行 + 两拍确认"**（v3.12 环境对齐）：`envfix::apply()` 先
+    `restore()` 再改，账本 `env-align.json` 记改前值；自动对齐要求出口城市连续两拍一致才动
+    系统（切节点瞬间会探到真实出口，只看一次会把时区改成真实地区）；`restore()` 已接入
+    `recover::restore_all()` 第 4 步，所以 `--restore`/退出/UI 按钮同一条协议。
+27. **仓库里不许出现真实出口 IP**（v3.12 修）：`src/anchors.rs`/`src/main.rs`/`src/model.rs`
+    的测试与冒烟数据曾硬编码真实家宽出口，已统一换成文档保留地址 `198.51.100.24`。新增测试
+    夹具一律用 `198.51.100.0/24`（TEST-NET-2）或 `203.0.113.0/24`（TEST-NET-3），别用真实值。

@@ -60,6 +60,12 @@ pub struct StateView {
     /// v3.10 R06：用户已要求停止保护（只检测，不动作）。
     pub disarmed: bool,
     pub disarmed_reason: String,
+    /// v3.12：直连泄露观察结果。
+    pub leak: crate::netwatch::LeakReport,
+    /// v3.12：环境一致性检查结果。
+    pub env: crate::envcheck::EnvCheck,
+    /// v3.12：当前生效的环境对齐记录（None = 未改动系统设置）。
+    pub env_applied: Option<crate::envfix::AppliedEnv>,
 }
 
 /// 本进程的启动代次（启动时间 + PID）。账本用它区分"上一代留下的现场"。
@@ -99,6 +105,12 @@ pub struct AppState {
     /// v3.10 R06：用户要求停止保护（`--restore` 急救或界面手动停止）。
     /// 存在时守护器只做检测，不再 kill/隔离/断网/封锁，也不拦截启动。
     pub disarmed: Mutex<Option<String>>,
+    /// v3.12：直连泄露观察结果（系统代理模式下比对真实 TCP 连接）。
+    pub leak: Mutex<crate::netwatch::LeakReport>,
+    /// v3.12：环境一致性检查结果（时区/区域 vs 出口）。
+    pub env: Mutex<crate::envcheck::EnvCheck>,
+    /// v3.12：当前生效的环境对齐账本（None = 未改动系统设置）。
+    pub env_applied: Mutex<Option<crate::envfix::AppliedEnv>>,
     pub stop: Arc<AtomicBool>,
     pub is_admin: bool,
     pub smoke_settings: bool,
@@ -151,6 +163,21 @@ impl AppState {
             stop: Arc::new(AtomicBool::new(false)),
             is_admin,
             smoke_settings,
+            leak: Mutex::new(crate::netwatch::LeakReport::not_applicable(
+                "skipped",
+                "尚未观察",
+            )),
+            env: Mutex::new(crate::envcheck::EnvCheck {
+                info: crate::envcheck::EnvInfo::default(),
+                egress_country: None,
+                egress_colo: None,
+                expect_city: None,
+                expect_tz: None,
+                tz_match: None,
+                locale_match: None,
+                note: "尚未检查".to_string(),
+            }),
+            env_applied: Mutex::new(crate::envfix::load()),
         })
     }
 
@@ -312,6 +339,20 @@ impl AppState {
 
     pub fn set_tripped(&self, trip: Option<TripInfo>) {
         *lock(&self.tripped) = trip;
+    }
+
+    // ---------- v3.12：直连观察 / 环境一致性 ----------
+
+    pub fn set_leak(&self, report: crate::netwatch::LeakReport) {
+        *lock(&self.leak) = report;
+    }
+
+    pub fn set_env(&self, check: crate::envcheck::EnvCheck) {
+        *lock(&self.env) = check;
+    }
+
+    pub fn set_env_applied(&self, rec: Option<crate::envfix::AppliedEnv>) {
+        *lock(&self.env_applied) = rec;
     }
 
     pub fn is_tripped(&self) -> bool {
@@ -582,6 +623,9 @@ impl AppState {
             lockdown_manual: self.lockdown_manual_on(),
             disarmed: self.is_disarmed(),
             disarmed_reason: self.disarmed_reason(),
+            leak: lock(&self.leak).clone(),
+            env: lock(&self.env).clone(),
+            env_applied: lock(&self.env_applied).clone(),
         }
     }
 
