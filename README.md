@@ -32,18 +32,18 @@ Claude、ChatGPT、反重力这些客户端对出口环境很敏感，而代理�
 
 <table>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshot-main.png" alt="主界面：守护正常" width="400" /><br><sub>主界面 · 各目标出口逐一校验通过</sub></td>
-    <td align="center" width="50%"><img src="assets/screenshot-trip.png" alt="熔断态" width="400" /><br><sub>熔断 · 结束进程 + 断网隔离，一键解除</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshot-main.png" alt="主界面：守护正常" width="400" /><br><sub>主界面 · 各目标出口校验通过，一键启动</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshot-trip.png" alt="熔断态" width="400" /><br><sub>熔断 · 结束进程 + 隔离，一键解除并恢复网络</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshot-settings.png" alt="设置卡" width="400" /><br><sub>设置 · 端口 / 白名单 / 断网档位 / 守护对象</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshot-settings.png" alt="设置卡" width="400" /><br><sub>设置 · 八个折叠组，组头直接显示当前值</sub></td>
     <td align="center" width="50%"><img src="assets/screenshot-wizard.png" alt="首次向导" width="400" /><br><sub>首次向导 · 三步完成配置</sub></td>
   </tr>
 </table>
 
 <p align="center">
-  <img src="assets/screenshot-checking.png" alt="检测中" width="400" /><br>
-  <sub>检测中 · 目标逐个回填出口 IP、地区与耗时</sub>
+  <img src="assets/screenshot-details.png" alt="详情卡" width="400" /><br>
+  <sub>详情 · 每个目标的锚点、期望值、耗时与运行参数</sub>
 </p>
 
 ---
