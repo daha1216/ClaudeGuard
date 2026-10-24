@@ -217,34 +217,21 @@
     paused: "#B0B0B6",
   };
 
-  function renderRing(overall) {
-    const fg = $("ring-fg");
-    const spinner = $("ring-spinner");
-    const core = $("hero-core");
-    if (!fg || !spinner || !core) return;
-    const checking = overall === "checking" || S.manualBusy;
-    fg.style.opacity = checking ? "0" : "1";
-    fg.setAttribute("stroke", RING_STROKE[overall] || RING_STROKE.idle);
-    if (checking) spinner.removeAttribute("hidden");
-    else spinner.setAttribute("hidden", "");
-    let name = "";
-    let size = 44;
-    if (checking) name = "";
-    else if (overall === "pass") name = "check";
-    else if (overall === "tripped") { name = "x"; size = 40; }
-    else if (overall === "fail") name = "alert";
-    else if (overall === "paused") name = "pause";
-    else name = "dash";
-    core.innerHTML = name ? icon(name, size) : "";
-  }
-
   function renderHero() {
     const st = S.state;
     const title = $("hero-title");
     const sub = $("hero-sub");
     if (!st || !title || !sub) return;
     const overall = st.overall || "idle";
-    renderRing(overall);
+    const dot = $("hero-dot");
+    if (dot) {
+      dot.className =
+        overall === "tripped" ? "dot fail"
+        : overall === "paused" ? "dot unverified"
+        : dotClass(overall);
+    }
+    const ver = $("hero-ver");
+    if (ver) ver.textContent = st.version ? "v" + st.version : "";
     const targets = st.targets || [];
     let t = "守护待命";
     let s = "等待首次检测";
@@ -281,6 +268,7 @@
     }
     title.textContent = t;
     sub.textContent = s;
+    renderTiles(st);
   }
 
   function heroPassText(st, targets) {
@@ -294,32 +282,107 @@
     return head + tail + tun;
   }
 
-  /* ---------- 目标列表 ---------- */
+  /* ---------- 出口瓦片（主卡内） ---------- */
+
+  function tileTargets(targets) {
+    const pick = [];
+    [/claude/i, /codex/i].forEach((re) => {
+      const hit = targets.find((x) => re.test(x.name) && x.state !== "disabled");
+      if (hit) pick.push(hit);
+    });
+    targets.forEach((x) => {
+      if (pick.length < 2 && x.state !== "disabled" && pick.indexOf(x) < 0) pick.push(x);
+    });
+    return pick.slice(0, 2);
+  }
+
+  function tileMeta(t) {
+    if (t.state === "disabled") return "未启用";
+    if (t.state === "checking") return "检测中…";
+    if (t.state === "fail") return "不在白名单";
+    if (t.anchorKind === "reachability") {
+      return t.state === "pass" ? "可达 · " + (t.latencyMs || 0) + "ms" : "待检测";
+    }
+    const parts = [];
+    if (t.country) parts.push(regionText(t.country));
+    const city = cityText(t.city);
+    if (city) parts.push(city);
+    if (t.latencyMs) parts.push(t.latencyMs + "ms");
+    if (parts.length) return parts.join(" · ");
+    return t.reason || "待检测";
+  }
+
+  function renderTiles(st) {
+    const host = $("hero-tiles");
+    if (!host) return;
+    const list = tileTargets(st.targets || []);
+    if (!list.length) {
+      host.hidden = true;
+      host.innerHTML = "";
+      return;
+    }
+    host.hidden = false;
+    host.innerHTML = list
+      .map((t) => {
+        const bad = t.state === "fail";
+        const idle = !t.ip && !bad;
+        const vcls = "tile-n" + (bad ? " fail" : idle ? " idle" : "");
+        const mcls = "tile-m" + (bad ? " fail" : "");
+        const val = t.ip || (t.state === "disabled" ? "未启用" : bad ? "不符合" : "—");
+        return (
+          '<div class="tile"><div class="tile-t">' + esc(t.name) + '</div>' +
+          '<div class="' + vcls + '">' + esc(val) + '</div>' +
+          '<div class="' + mcls + '">' + esc(tileMeta(t)) + "</div></div>"
+        );
+      })
+      .join("");
+  }
+
+  /* ---------- 分组卡：监控目标 / 保护 ---------- */
 
   function renderTargets() {
     const host = $("targets");
-    if (!host) return;
     const st = S.state;
     const targets = (st && st.targets) || [];
-    if (!targets.length) {
-      host.innerHTML = '<div class="egress-empty">还没有监控目标，可在设置里添加</div>';
-      return;
+    if (host) {
+      if (!targets.length) {
+        host.innerHTML = '<div class="grp-empty">还没有监控目标，可在设置里添加</div>';
+      } else {
+        host.innerHTML = targets
+          .map((t) => {
+            const val =
+              t.ip ||
+              (t.state === "fail" ? "不符合" : t.state === "checking" ? "…" : t.state === "disabled" ? "未启用" : "—");
+            const cls = "val ip" + (t.state === "fail" ? " fail" : !t.ip ? " idle" : "");
+            return (
+              '<div class="row" data-target="' + esc(t.id) + '">' +
+              '<span class="' + dotClass(t.state) + '" aria-hidden="true"></span>' +
+              '<span class="nm">' + esc(t.name) + '</span>' +
+              '<span class="' + cls + '">' + esc(val) + "</span></div>"
+            );
+          })
+          .join("");
+      }
     }
-    host.innerHTML = targets
-      .map((t) => {
-        const ipText = t.ip || "—";
-        const ipCls = "ip" + (t.state === "fail" ? " fail" : !t.ip ? " idle" : "");
-        const latCls = "lat" + (t.state === "fail" ? " fail" : !t.ip ? " idle" : "");
-        return (
-          '<div class="row" data-target="' +
-          esc(t.id) +
-          '">' +
-          '<span class="' + dotClass(t.state) + '" aria-hidden="true"></span>' +
-          '<div class="body"><div class="name">' + esc(t.name) + '</div><div class="geo">' + esc(targetGeo(t)) + "</div></div>" +
-          '<div class="right"><div class="' + ipCls + '">' + esc(ipText) + '</div><div class="' + latCls + '">' + esc(targetLat(t)) + "</div></div>" +
-          "</div>"
-        );
-      })
+    renderProtect(st);
+  }
+
+  function renderProtect(st) {
+    const host = $("protect");
+    if (!host || !st) return;
+    const tripped = !!st.tripped;
+    const agents = tripped && st.tripped.agents ? st.tripped.agents.length : 0;
+    const fw = tripped ? "已隔离" + (agents ? " " + agents + " 个应用" : "") : st.lockdown ? "兜底封锁中" : "待命";
+    const rows = [
+      ["防火墙隔离", fw, tripped ? " fail" : ""],
+      ["断网档位", CUT_LABEL[st.cutMode] || "不断网", ""],
+      ["进程清理", (st.guardedAgents || []).length ? "已开启" : "已关闭", ""],
+    ];
+    host.innerHTML = rows
+      .map(
+        (r) =>
+          '<div class="row"><span class="nm">' + esc(r[0]) + '</span><span class="val' + r[2] + '">' + esc(r[1]) + "</span></div>"
+      )
       .join("");
   }
 
@@ -353,17 +416,8 @@
     }
     const overall = st.overall || "idle";
     const trip = st.tripped;
-    if (overall === "tripped" && trip) {
-      const fails = (st.targets || []).filter((t) => t.state === "fail");
-      const failIp = fails.map((t) => t.ip).find(Boolean);
-      const line1 = failIp ? "出口 " + failIp + " 不在允许列表" : trip.reason || "出口不符合允许列表";
-      const line2 = trip.networkNote || (st.platform === "macos" ? "进程守护模式：出口检测通过后才允许从守护器启动" : "网络已阻断，修正配置后可解除");
-      parts.push(banner("trip", [line1, line2], { id: "release", label: st.platform === "macos" ? "清除熔断" : "解除隔离" }));
-    } else if (overall === "paused") {
-      const left = minutesLeft(st.pausedUntil);
-      const text = left > 0 ? "已暂停 " + left + " 分钟，期间不会熔断" : "守护已暂停，可随时恢复";
-      parts.push(banner("info", [text], { id: "resume", label: "恢复守护" }));
-    } else if (overall === "fail") {
+    // 熔断与暂停不占横幅位：主卡标题已表达状态，解除/恢复动作落在主钮上（设计 A）。
+    if (overall === "fail") {
       const bad = (st.targets || []).filter((x) => x.state === "fail").map((x) => x.name);
       parts.push(banner("warn", ["出口校验未通过", (bad.length ? bad.join("、") + " " : "") + "不符合白名单，熔断前可修正"], { id: "details", label: "查看详情" }));
     }
@@ -417,51 +471,51 @@
   function renderCta() {
     const st = S.state;
     const btn = $("btn-primary");
-    const act = $("btn-recheck");
-    if (!btn || !act) return;
+    const ghost = $("btn-recheck");
+    if (!btn) return;
     const overall = (st && st.overall) || "idle";
     const checking = S.manualBusy || (st && st.checking);
-    let label;
-    let icons = "";
-    let blocked = false;
-    let busy = false;
-    let actLabel = "";
-    let actIcon = "refresh";
-    let actRole = "recheck";
-    let actDanger = false;
-    let actDisabled = false;
+    let label = "重新检查";
+    let icons = icon("refresh", 16);
+    let cls = "btn-primary";
+    let role = "recheck";
+    let disabled = false;
+    let ghostLabel = "";
     if (overall === "tripped") {
-      label = "启动已禁止";
-      icons = icon("ban", 16);
-      blocked = true;
-      actLabel = st.platform === "macos" ? "清除熔断状态（启动仍需检测）" : "解除隔离并恢复网络";
-      actRole = "release";
-      actDanger = true;
-      actDisabled = S.releaseBusy;
+      label = st.platform === "macos" ? "清除熔断状态" : "解除隔离并恢复网络";
+      icons = icon("unlock", 16);
+      cls = "btn-primary is-blocked";
+      role = "release";
+      disabled = !!S.releaseBusy;
+    } else if (overall === "paused") {
+      label = "恢复守护";
+      icons = icon("play", 16);
+      role = "resume";
+      ghostLabel = "立即检测";
     } else if (checking) {
       label = "正在检查…";
-      busy = true;
-      actLabel = "立即检测";
-      actDisabled = true;
+      icons = "";
+      cls = "btn-primary is-busy";
+      disabled = true;
+      ghostLabel = "立即检测";
     } else if (overall === "pass") {
       label = S.launchBusy ? "正在启动…" : "启动 Claude";
       icons = icon("play", 16);
-      busy = S.launchBusy;
-      actLabel = "立即检测";
-    } else {
-      label = "重新检查";
-      icons = icon("refresh", 16);
+      if (S.launchBusy) {
+        cls = "btn-primary is-busy";
+        disabled = true;
+      }
+      ghostLabel = "立即检测";
     }
     btn.innerHTML = icons + "<span>" + esc(label) + "</span>";
-    btn.disabled = blocked || busy;
-    btn.className = "btn-primary" + (blocked ? " is-blocked" : "") + (busy ? " is-busy" : "");
-    act.hidden = !actLabel;
-    act.innerHTML = actLabel
-      ? (S.releaseBusy && actDanger ? icon("rotate", 13) : icon(actIcon, 13)) + "<span>" + esc(actLabel) + "</span>"
-      : "";
-    act.className = "link-action" + (actDanger ? " is-danger" : "");
-    act.disabled = !!actDisabled;
-    act.dataset.role = actRole;
+    btn.className = cls;
+    btn.disabled = disabled;
+    btn.dataset.role = role;
+    if (ghost) {
+      ghost.hidden = !ghostLabel;
+      ghost.innerHTML = ghostLabel ? icon("refresh", 14) + "<span>" + esc(ghostLabel) + "</span>" : "";
+      ghost.disabled = !!checking;
+    }
   }
 
   /* ---------- 详情 ---------- */
@@ -635,9 +689,6 @@
     root.CG_UI.platform = st.platform;
     document.body.dataset.platform = st.platform || "";
     if (st.platform === "macos") {
-      const cta = document.querySelector(".cta");
-      const footer = document.querySelector(".footer");
-      if (cta && footer && cta.parentElement !== footer) footer.insertBefore(cta, footer.querySelector(".foot-right"));
       const intro = document.querySelector('.wiz-page[data-step="0"] .wiz-p');
       if (intro) intro.textContent = "它在后台按目标校验出口 IP 与地区，异常时按配置结束进程。此移植预览尚不能阻断应用网络连接。";
     }
@@ -658,8 +709,6 @@
     renderBanners();
     renderCta();
     renderDetails();
-    const ver = $("foot-version");
-    if (ver && view.version) ver.textContent = "v" + view.version;
     const comp = root.CG_UI && root.CG_UI.settings;
     if (S.settingsMounted && comp && comp.setState) comp.setState(view);
     if (view.smokeSettings && !S.smokeOpened) {
@@ -878,41 +927,39 @@
     if (primary) {
       primary.addEventListener("click", () => {
         const st = S.state;
-        if (!st || st.overall === "tripped") return;
-        if (st.overall === "pass") doLaunch();
+        if (!st) return;
+        if (primary.dataset.role === "release") doRelease();
+        else if (primary.dataset.role === "resume") doResume();
+        else if (st.overall === "pass") doLaunch();
         else doRecheck();
       });
     }
     const act = $("btn-recheck");
-    if (act) {
-      act.addEventListener("click", () => {
-        if (act.dataset.role === "release") doRelease();
-        else doRecheck();
-      });
-    }
-    // 一键清理 Claude 进程（CTA 下方，与「立即检测」并排）：两段确认，防误触
-    const sweep = $("btn-sweep");
+    if (act) act.addEventListener("click", () => doRecheck());
+    // 一键清理 Claude 进程（页脚链，与「日志」相邻）：两段确认，防误触
+    const sweep = $("link-sweep");
     if (sweep) {
       let armed = false;
       let armTimer = 0;
-      const sweepLabel = (txt, danger) => {
-        sweep.innerHTML = icon(danger ? "stop" : "trash", 13) + "<span>" + esc(txt) + "</span>";
-        sweep.classList.toggle("is-danger", !!danger);
+      const resetSweep = () => {
+        armed = false;
+        sweep.textContent = "清理 Claude 进程";
+        sweep.classList.remove("is-danger");
       };
-      sweepLabel("清理 Claude 进程", false);
       sweep.addEventListener("click", async () => {
         if (sweep.disabled) return;
         if (!armed) {
           armed = true;
-          sweepLabel("确认结束全部 Claude 进程？", true);
+          sweep.textContent = "确认结束？";
+          sweep.classList.add("is-danger");
           clearTimeout(armTimer);
-          armTimer = setTimeout(() => { armed = false; sweepLabel("清理 Claude 进程", false); }, 3200);
+          armTimer = setTimeout(resetSweep, 3200);
           return;
         }
         clearTimeout(armTimer);
         armed = false;
         sweep.disabled = true;
-        sweepLabel("正在清理…", true);
+        sweep.textContent = "正在清理…";
         try {
           const rep = await invoke(CMD.sweep_claude);
           const n = rep && rep.killed != null ? rep.killed : 0;
@@ -924,7 +971,7 @@
           toast((e && e.message) || "清理失败");
         } finally {
           sweep.disabled = false;
-          sweepLabel("清理 Claude 进程", false);
+          resetSweep();
         }
       });
     }

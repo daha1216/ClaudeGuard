@@ -26,39 +26,27 @@
 <main class="scroll" id="scroll">
   <div class="content" id="content">
 
-    <section class="hero" id="hero" aria-label="守护状态">
-      <div class="ring" id="ring">
-        <svg class="ring-svg" viewBox="0 0 118 118" aria-hidden="true">
-          <defs>
-            <linearGradient id="ring-green" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#34C759"/><stop offset="1" stop-color="#03AA49"/></linearGradient>
-            <linearGradient id="ring-red" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FF3B47"/><stop offset="1" stop-color="#E4002B"/></linearGradient>
-            <linearGradient id="ring-orange" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FF9F0A"/><stop offset="1" stop-color="#ED6300"/></linearGradient>
-            <linearGradient id="ring-blue" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0A84FF"/><stop offset="1" stop-color="#0071E3"/></linearGradient>
-            <linearGradient id="ring-gray" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#D2D2D7"/><stop offset="1" stop-color="#AEAEB2"/></linearGradient>
-          </defs>
-          <g transform="rotate(-90 59 59)">
-            <circle class="ring-track" cx="59" cy="59" r="54" fill="none" stroke="#E9E9EE" stroke-width="5.6"/>
-            <circle class="ring-fg" id="ring-fg" cx="59" cy="59" r="54" fill="none" stroke="#03AA49" stroke-width="5.6" stroke-linecap="round" stroke-dasharray="339.3" stroke-dashoffset="0"/>
-          </g>
-          <circle class="ring-spinner" id="ring-spinner" cx="59" cy="59" r="54" fill="none" stroke="url(#ring-blue)" stroke-width="5.6" stroke-linecap="round" stroke-dasharray="72 267.3" hidden/>
-        </svg>
-        <div class="core" id="hero-core" aria-hidden="true"></div>
+    <section class="card hero" id="hero" aria-label="守护状态">
+      <div class="hero-head">
+        <span class="dot" id="hero-dot" aria-hidden="true"></span>
+        <h1 class="hero-title" id="hero-title">守护待命</h1>
+        <span class="hero-ver" id="hero-ver"></span>
       </div>
-      <h1 class="hero-title" id="hero-title">守护待命</h1>
       <div class="hero-sub" id="hero-sub">等待首次检测</div>
+      <div class="tiles" id="hero-tiles" hidden></div>
     </section>
 
     <div class="banners" id="banners" aria-live="polite"></div>
 
-    <section class="egress" id="targets" aria-label="出口校验"></section>
+    <section class="card grp" id="card-targets" aria-label="监控目标">
+      <div class="grp-title">监控目标</div>
+      <div class="grp-rows" id="targets"></div>
+    </section>
 
-    <div class="cta">
-      <button class="btn-primary" id="btn-primary" type="button"></button>
-      <div class="cta-links">
-        <button class="link-action" id="btn-recheck" type="button"></button>
-        <button class="link-action" id="btn-sweep" type="button"></button>
-      </div>
-    </div>
+    <section class="card grp" id="card-protect" aria-label="保护">
+      <div class="grp-title">保护</div>
+      <div class="grp-rows" id="protect"></div>
+    </section>
 
     <section class="card fold" id="card-details" data-card="details">
       <button class="fold-head" id="head-details" type="button" aria-expanded="false" aria-controls="body-details">
@@ -92,14 +80,17 @@
   </div>
 </main>
 
+<div class="cta">
+  <button class="btn-primary" id="btn-primary" type="button"></button>
+  <button class="btn-ghost" id="btn-recheck" type="button"></button>
+</div>
+
 <footer class="footer">
   <div class="links">
     <button class="link" id="link-details" type="button">详情</button>
     <button class="link" id="link-settings" type="button">设置</button>
+    <button class="link" id="link-sweep" type="button">清理 Claude 进程</button>
     <button class="link" id="link-logs" type="button">日志</button>
-  </div>
-  <div class="foot-right">
-    <span class="foot-version" id="foot-version">v3.1.0</span>
   </div>
 </footer>
 

@@ -160,3 +160,9 @@ node --check ui/*.js           # 逐个检查，跨文件词法冲突查不出�
 22. **single-instance 行为（PR #2 后）**：二次启动带 `--tray` 参数不再强制弹主窗（登录自启场景）；
     `--settings` 仍会唤起。CDP 页面 URL 现在是 `http://tauri.localhost/`（不再含 "index.html"），
     匹配页面时用 `tauri.localhost` 过滤。
+
+23. **主界面布局是「主卡 + 分组卡」，CTA 条在滚动区之外**（v3.11 起）：`ui/index.html` 里 `.cta`
+    是 `main.scroll` 的兄弟节点、`footer` 之上，因此主区再长主钮也不会被挤出窗口；改布局时
+    不要把 `.cta` 挪回 `#content`（挪回去必然在 620px 窗口里被裁）。熔断与暂停**不再有横幅**，
+    状态由主卡标题 + 主钮表达；新增横幅前先算高度预算（可用内容高 = 窗高 − 标题栏 44 −
+    CTA 54 − footer 36，v3.11 实测 486px，三行目标刚好占满）。

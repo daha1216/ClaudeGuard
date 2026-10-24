@@ -30,3 +30,4 @@ diag-v29*.mjs
 /dist/
 .DS_Store
 ._*
+design-demos/

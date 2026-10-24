@@ -174,8 +174,15 @@ ui/index.html|app.css|main.js|ipc.js|icons.js|settings.js|updates.js|feishu.js
 ## 8. UI 规格（初版方向 A·极简仪表盘；设计稿为唯一视觉基准）
 
 - 窗口 420 × clamp(工作区逻辑高−8, 420, 620)，min 400×420；`decorations:false`，`data-tauri-drag-region`；标题栏 44px 毛玻璃、左侧纯文字 `ClaudeGuard`（13px/600，无图标）、右侧仅最小化/关闭；边缘八向缩放（tao 自带）。
-- 结构（自上而下，主区可滚动，footer sticky）：hero（128px 环、stroke 5.6、平色 #03AA49/#E4002B/灰，中心勾/叉/暂停/spinner；h1 22px/600；sub 12px #86868B；不再有 meta 行）→ 目标列表卡（圆角 14、白 88% + blur 20px、行高 54px（熔断/暂停压缩为 50px）、分隔 hairline；每行：状态点 + 左列（名称 13px/600 + 地区/组说明 11px） + 右列（IP 12.5px 等宽 tabular + 延迟 10.5px））→ 横幅区（仅熔断红/暂停灰/未通过橙/启动失败橙；CLI 运行提醒只在详情卡与日志，不占首屏）→ CTA（全宽 46px 渐变蓝主按钮：启动 Claude / 重新检查 / 启动已禁止；下方一行文字链接：立即检测（熔断态变红色「解除隔离并恢复网络」）+ 清理 Claude 进程（v3.4 起常驻，两段确认：首击 3.2s 内变红「确认结束全部 Claude 进程？」，再击执行 sweep_claude，防误触））→ 详情卡（默认收起：每目标一行的判定步骤、锚点 host、延迟、原因、运行中进程）→ 设置卡（默认收起；展开后为**折叠手风琴，同一时间只展开一组**，组头含动态摘要（端口/间隔、断网档位、守护对象名、目标启用数、通知开关）与旋转箭头，默认展开「检测」；组=检测（端口/间隔/立即检查）、熔断与清理（断网档位/停进程/隔离 + 进程清理子节=退出清扫开关；一键清理在主界面 CTA 旁 + **防火墙兜底封锁子节**=未接入自动封锁开关+一键封锁/解除按钮）、守护对象、监控目标（列表编辑+添加+恢复默认）、通知（六开关+测试）、飞书通知、通用（关窗驻留/开机自启/数据文件夹/用户指南）、更新（自身+Claude 客户端+Codex 客户端三子节））→ 日志卡（默认收起，11px mono）→ footer（左：详情/设置/日志 链接；右：`vX.Y.Z`）。
-- 状态语义：环/标题跟随 overall；busy 只在手动检查/首查转圈（后台刷新不动环）；目标行四态点：绿/红/橙（unverified）/灰（disabled）；熔断态红色横幅 + 置灰 CTA + 解除隔离按钮。
+- 结构（v3.11 起＝方向 A「主卡 + 分组卡」，设计稿 `design-demos/dir-2-light.html`）：主区滚动，**CTA 条与 footer 固定在滚动区之外**（`.cta` 是 `main.scroll` 的兄弟节点，永远可见）。
+  1. **主卡 hero**（白卡、圆角 14、`--shadow-card`）：左状态点 11px（绿/红/橙/灰）+ 标题 15px/600 + 右侧版本号 10.5px；副标题 12px、左缩进 20px（对齐标题）；下方两枚出口瓦片（`--card-sunken` 底、圆角 10）：目标名 10.5px / IP 12.5px 等宽 / 地区·延迟 10.5px，失败时 IP 与备注转红。瓦片按名称优先取 Claude、Codex，不足两个时取前两个启用目标。
+  2. **横幅区**：只保留「保护已停止 / 未接入代理链路 / 接入路径无法确认 / 校验未通过 / 操作未生效 / 启动失败」。**熔断与暂停不再占横幅位**——状态由主卡标题与主钮表达。
+  3. **监控目标卡**：组标题 11px；每行 40px：状态点 + 名称 12.5px + 右侧值（IP 11.5px 等宽；未启用/不符合/— 转灰或红）。
+  4. **保护卡**：三行 key/value（值用正文字体）：防火墙隔离（待命 / 兜底封锁中 / 已隔离 N 个应用）、断网档位（不断网 / 防火墙全局阻断 / 禁用物理网卡）、进程清理（已开启 / 已关闭）。
+  5. **CTA 条**（`flex:none`，`padding:8px 14px 0`，底色 `--page-bg`）：主钮 `flex:1` 46px 圆角 11 + ghost 118px。pass＝「启动 Claude」+「立即检测」；checking＝「正在检查…」；tripped＝整条红色「解除隔离并恢复网络」（unlock 图标）；paused＝「恢复守护」+「立即检测」；fail/idle＝「重新检查」。
+  6. 三张折叠卡（详情 / 设置 / 日志），设置仍为单开手风琴（8 组，组头带动态摘要）。
+  7. **footer 四链**：详情 / 设置 / 清理 Claude 进程（两段确认：首击 3.2s 内变红「确认结束？」，再击执行 `sweep_claude`）/ 日志。版本号已移入主卡右上角。
+- 状态语义：状态点与标题跟随 overall（pass 绿 / fail 红 / unverified 橙 / idle 灰；tripped 红点 + 标题转深红 `#A3121A`；paused 橙点）；busy 只在手动检查/首查时出现（后台刷新不动主钮）；目标行四态点同上；熔断态不再有横幅，红色主钮即解除动作。
 - 动效红线（沿用 v2 标准）：只动 transform/opacity；无 transition:all/ease-in/scale(0)；按压 :active scale(0.97)；入场 scale(0.95)+opacity；≤300ms；stagger 30–80ms；reduced-motion → 交叉淡入；reduced-transparency → 实底；hover 包 `@media(hover:hover) and (pointer:fine)`。所有 JS 文件 IIFE 包裹（跨文件只经 `window.CG_IPC`/`window.ICONS`/`window.CG_UI`）。
 - 首启向导 3 页（沿用 v2 文案结构）：页 0 欢迎；页 1 代理端口 + 白名单 IP（逗号分隔）+ 出口地区（写入 local/claude/codex 三个目标的 expect）；页 2 安装 vs 便携。向导期间监测照跑。
 - 测试钩子：`CG_SMOKE_STATE=pass|fail|trip|paused` 造界面状态且不启动探测线程；`CG_WIN_H` 覆盖窗高；`--settings` 启动即展开设置卡（截图用；`CG_SMOKE_SETTINGS=1` 仅置 StateView 标记）。
