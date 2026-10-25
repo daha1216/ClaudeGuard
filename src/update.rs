@@ -124,7 +124,16 @@ pub fn check_latest(cfg: &Config) -> Result<Release, String> {
             .set("Accept", "application/vnd.github+json")
             .timeout(T_CHECK)
             .call()
-            .map_err(|e| format!("GitHub API: {e}"))?;
+            .map_err(|e| {
+                // 403/429 多半是匿名 API 限流（每小时 60 次），不是配置错误。
+                // 说清楚，免得用户以为代理坏了；下一轮（6 小时）自然重试。
+                let text = e.to_string();
+                if text.contains("403") || text.contains("429") {
+                    format!("GitHub API 限流（{text}），稍后自动重试")
+                } else {
+                    format!("GitHub API: {text}")
+                }
+            })?;
         let text = resp.into_string().map_err(|e| format!("读取响应: {e}"))?;
         serde_json::from_str::<Release>(&text).map_err(|e| format!("解析 release: {e}"))
     };

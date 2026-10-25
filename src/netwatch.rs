@@ -95,6 +95,16 @@ pub enum Remote {
     Public,
 }
 
+/// TUN 代理的 fake-ip 地址段：`198.18.0.0/15`（RFC 2544 基准测试段）。
+///
+/// mihomo/Clash/sing-box 在 TUN + fake-ip 模式下把应用的目标地址换成本段里的地址，
+/// 由虚拟网卡接管后再按域名转发。所以这些连接**不是直连**，而是被代理接管了——
+/// v3.12.0 没排除这一段，实测在用户机器上把 3 条 fake-ip 连接报成了"直连泄露"。
+pub fn is_fake_ip_v4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 198 && (o[1] == 18 || o[1] == 19)
+}
+
 /// 私网/本地地址判断（IPv4）。
 pub fn is_local_v4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
@@ -112,7 +122,7 @@ pub fn is_local_v4(ip: Ipv4Addr) -> bool {
 pub fn classify(remote: Ipv4Addr, port: u16, proxy_port: u16) -> Remote {
     if remote.is_loopback() && port == proxy_port {
         Remote::Proxy
-    } else if is_local_v4(remote) {
+    } else if is_local_v4(remote) || is_fake_ip_v4(remote) {
         Remote::Local
     } else {
         Remote::Public
@@ -287,11 +297,15 @@ pub fn fold(
         };
         return report;
     }
+    let mut fake_ip = 0usize;
     for c in conns {
         let Some(agent) = agents.get(&c.pid) else {
             continue;
         };
         report.agent_conns += 1;
+        if is_fake_ip_v4(c.remote) {
+            fake_ip += 1;
+        }
         match classify(c.remote, c.port, proxy_port) {
             Remote::Proxy => report.proxied += 1,
             Remote::Local => report.local += 1,
@@ -307,6 +321,13 @@ pub fn fold(
                 }
             }
         }
+    }
+    // 观察到 fake-ip 说明 TUN 正在接管应用流量：此时"公网对端"可能是被接管后的真实目标，
+    // 也可能是硬编码 IP，按地址判直连已不可靠——放弃判定，只如实说明。
+    if fake_ip > 0 {
+        report.applicable = false;
+        report.note = format!("检测到 TUN 接管（{fake_ip} 条 fake-ip 连接），不判定直连");
+        return report;
     }
     report.note = if report.direct_total > 0 {
         format!(
@@ -407,6 +428,34 @@ mod tests {
             classify(Ipv4Addr::new(100, 128, 0, 1), 443, 7890),
             Remote::Public
         );
+    }
+
+    #[test]
+    fn fake_ip_is_not_direct() {
+        // 198.18.0.0/15 是 TUN fake-ip 段：被接管，不是直连
+        assert!(is_fake_ip_v4(Ipv4Addr::new(198, 18, 0, 34)));
+        assert!(is_fake_ip_v4(Ipv4Addr::new(198, 19, 255, 1)));
+        assert!(!is_fake_ip_v4(Ipv4Addr::new(198, 20, 0, 1)));
+        assert_eq!(
+            classify(Ipv4Addr::new(198, 18, 0, 34), 443, 7890),
+            Remote::Local
+        );
+    }
+
+    #[test]
+    fn fold_gives_up_when_tun_fake_ip_seen() {
+        // 实测踩过：TUN fake-ip 下 3 条连接被报成"直连泄露"
+        let mut agents = HashMap::new();
+        agents.insert(100u32, "Claude".to_string());
+        let conns = vec![
+            conn(100, [198, 18, 0, 4], 443),
+            conn(100, [198, 18, 0, 5], 443),
+            conn(100, [198, 18, 0, 6], 443),
+        ];
+        let r = fold(&conns, &agents, 7890, &access("system_proxy"));
+        assert!(!r.applicable, "看到 fake-ip 就不能再判直连");
+        assert_eq!(r.direct_total, 0);
+        assert!(r.note.contains("TUN 接管"), "note={}", r.note);
     }
 
     #[test]
