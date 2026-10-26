@@ -190,3 +190,10 @@ node --check ui/*.js           # 逐个检查，跨文件词法冲突查不出�
 29. **GitHub 匿名 API 有 60 次/小时限流**：静默检查更新撞到 403/429 属正常，不是配置错误，
     也不是代理坏了。`check_latest` 已把这两种状态翻译成"GitHub API 限流（…），稍后自动重试"，
     下一轮（6 小时）自然重试；**不要**为此加直连回退。
+30. **下载制品必须跟 GitHub 的 302，但不能乱跟**（v3.12.2 修，用户实测报障）：`netpol::agent`
+    是 `redirects(0)`（防 API 响应把请求引到别处），而 Release 资产地址必然 302 到
+    `release-assets.githubusercontent.com`——不跟这一跳，拿到的就是 302 的空响应体，
+    报"大小不符：期望 4581888，实得 0"，外层再包一层"代理不可用"，看起来像代理坏了。
+    现在下载走 `netpol::download_agent` + 手动逐跳，每跳用 `redirect_allowed()` 校验主机白名单
+    （只放行 GitHub 三个资产域名）。验证：`cargo test --offline download_real_asset -- --ignored`
+    会真下载一次（约 1 分钟，需要代理）。

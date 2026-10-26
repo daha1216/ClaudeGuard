@@ -238,12 +238,37 @@ pub fn download(
 
     let mut do_download =
         |agent: &ureq::Agent, progress: &mut dyn FnMut(u64, u64)| -> Result<(), String> {
-            let resp = agent
-                .get(url)
-                .set("User-Agent", USER_AGENT)
-                .timeout(T_DOWNLOAD)
-                .call()
-                .map_err(|e| format!("下载失败: {e}"))?;
+            // GitHub 资产地址必然 302 到 release-assets.githubusercontent.com。
+            // 手动跟这一跳，并且每一跳都校验主机在 netpol 的白名单里——
+            // 既拿到字节，又不会跟着被篡改的 Location 跑到任意主机。
+            let mut target = url.to_string();
+            let resp = loop {
+                let resp = agent
+                    .get(&target)
+                    .set("User-Agent", USER_AGENT)
+                    .timeout(T_DOWNLOAD)
+                    .call()
+                    .map_err(|e| format!("下载失败: {e}"))?;
+                let code = resp.status();
+                if (300..400).contains(&code) {
+                    let location = resp.header("location").unwrap_or("").to_string();
+                    if location.is_empty() {
+                        return Err(format!("下载失败：{code} 重定向但缺少 Location"));
+                    }
+                    if !crate::netpol::redirect_allowed(&location) {
+                        return Err(format!(
+                            "下载失败：重定向到非官方主机（{}），已拒绝",
+                            location.split('?').next().unwrap_or(&location)
+                        ));
+                    }
+                    target = location;
+                    continue;
+                }
+                if !(200..300).contains(&code) {
+                    return Err(format!("下载失败：HTTP {code}"));
+                }
+                break resp;
+            };
             // 制品硬上限：超了立刻中止，不先写满磁盘再比大小。
             let limit = if expected_size > 0 {
                 expected_size.min(MAX_ARTIFACT)
@@ -283,7 +308,7 @@ pub fn download(
         };
 
     let prog = &mut progress;
-    let agent = agent(cfg)?;
+    let agent = crate::netpol::download_agent(cfg, T_DOWNLOAD)?;
     do_download(&agent, prog).map_err(|e| {
         if crate::netpol::route(cfg) == crate::netpol::Route::Direct {
             e
@@ -848,6 +873,19 @@ fn missing_asset_message(ver: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 手动跑的真实下载验证（默认 ignore，门禁不联网）：
+    /// `cargo test --offline download_real_asset -- --ignored --nocapture`
+    /// 依赖本机代理可用；验证的是"GitHub 302 能被正确跟随"这条链路。
+    #[test]
+    #[ignore = "需要代理与网络，手动执行"]
+    fn download_real_asset_follows_github_redirect() {
+        let cfg = crate::config::Config::load();
+        let url = "https://github.com/daha1216/ClaudeGuard/releases/download/v3.12.1/ClaudeGuard-v3.12.1.exe";
+        let staged = download(&cfg, url, 4_581_888, |_, _| {}).expect("下载应成功");
+        let len = std::fs::metadata(&staged.path).expect("读元数据").len();
+        assert_eq!(len, 4_581_888, "落盘大小应与发布资产一致");
+    }
 
     #[test]
     fn upd_notify_roundtrip() {

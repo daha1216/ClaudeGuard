@@ -54,6 +54,58 @@ pub fn agent(cfg: &Config, timeout: std::time::Duration) -> Result<ureq::Agent, 
     }
 }
 
+/// 下载制品时允许跟随的重定向目标（主机名白名单）。
+///
+/// GitHub Release 资产的下载地址必然 302 到这些域名：`github.com` →
+/// `release-assets.githubusercontent.com`（旧版本是 `objects.githubusercontent.com`）。
+/// 检查更新用的 Agent 是 `redirects(0)`——那是刻意的，防止 API 响应把请求引到别处；
+/// 但下载制品必须跟这一跳，否则拿到的永远是 302 的空响应体（v3.12.2 修的就是这个：
+/// 用户点检查更新报"大小不符：期望 4581888，实得 0"）。
+///
+/// 只放行资产域名，不放行任意主机：即使响应头被篡改，也只能跳到 GitHub 自己的存储。
+pub const DOWNLOAD_REDIRECT_HOSTS: [&str; 3] = [
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+];
+
+/// 主机名是否在下载重定向白名单里。
+pub fn redirect_allowed(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    let Some(rest) = lower.split("://").nth(1) else {
+        return false;
+    };
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    DOWNLOAD_REDIRECT_HOSTS.contains(&host)
+}
+
+/// 下载专用 Agent：允许有限重定向（由 [`redirect_allowed`] 逐跳校验）。
+pub fn download_agent(cfg: &Config, timeout: std::time::Duration) -> Result<ureq::Agent, String> {
+    let base = || {
+        ureq::AgentBuilder::new()
+            .timeout_connect(timeout)
+            .try_proxy_from_env(false)
+            // 手动逐跳校验，所以这里放开 ureq 的自动跟随
+            .redirects(0)
+    };
+    match route(cfg) {
+        Route::Proxy(url) => match ureq::Proxy::new(&url) {
+            Ok(proxy) => Ok(base().proxy(proxy).build()),
+            Err(err) => Err(proxy_required_error(&format!("代理地址无效：{err}"))),
+        },
+        Route::Direct => Ok(base().build()),
+    }
+}
+
 /// 代理不可用时的统一错误文案（含"没有偷偷直连"这一事实）。
 pub fn proxy_required_error(detail: &str) -> String {
     format!("代理不可用（{detail}）；已按外发策略放弃直连，避免暴露真实出口")
@@ -92,5 +144,26 @@ mod tests {
         let msg = proxy_required_error("连接被拒绝");
         assert!(msg.contains("代理不可用"));
         assert!(msg.contains("放弃直连"), "必须明确告知没有偷偷直连");
+    }
+
+    #[test]
+    fn download_redirect_only_allows_github_asset_hosts() {
+        // GitHub Release 资产的真实落点
+        assert!(redirect_allowed(
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1/2?sp=r&sig=x"
+        ));
+        assert!(redirect_allowed(
+            "https://objects.githubusercontent.com/foo"
+        ));
+        assert!(redirect_allowed(
+            "https://GITHUB-RELEASES.githubusercontent.com/x"
+        ));
+        // 其它主机一律拒绝：重定向被篡改时不能跟着跑
+        assert!(!redirect_allowed("https://evil.example.com/x"));
+        assert!(!redirect_allowed("https://github.com.evil.example.com/x"));
+        assert!(!redirect_allowed("https://raw.githubusercontent.com/x"));
+        assert!(!redirect_allowed("http://127.0.0.1:8080/x"));
+        assert!(!redirect_allowed("not a url"));
+        assert!(!redirect_allowed(""));
     }
 }
