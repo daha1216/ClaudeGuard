@@ -267,6 +267,20 @@ pub fn open_data_folder() {
     open_folder();
 }
 
+/// 项目仓库地址。写死在后端：前端只说"打开仓库"，不接受任意 URL，
+/// 免得哪天多出一个能开任意网页的通道。
+pub const REPO_URL: &str = "https://github.com/daha1216/ClaudeGuard";
+
+#[tauri::command]
+pub fn open_repo() {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("/usr/bin/open")
+        .arg(REPO_URL)
+        .spawn();
+    #[cfg(not(target_os = "macos"))]
+    open_url(REPO_URL);
+}
+
 #[tauri::command]
 pub fn open_guide(app: tauri::AppHandle) {
     #[cfg(target_os = "macos")]

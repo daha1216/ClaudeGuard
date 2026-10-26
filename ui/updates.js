@@ -85,11 +85,20 @@
       '<span class="switch-track"><span class="switch-knob"></span></span></label></div></div>' +
       '<div class="srow"><div class="slabel">当前版本<span class="shint" id="upd-cur"></span></div>' +
       '<div class="sval"><button class="btn" type="button" id="upd-btn">检查更新</button></div></div>' +
+      '<div class="srow"><div class="slabel">GitHub 仓库' +
+      '<span class="shint">github.com/daha1216/ClaudeGuard · 更新说明与历史版本</span></div>' +
+      '<div class="sval"><button class="btn" type="button" id="upd-repo">打开</button></div></div>' +
       '<div class="srow col"><div class="slabel">更新状态</div>' +
       '<div class="upd-status" id="upd-text">尚未检查更新</div>' +
       '<div class="progress" id="upd-progress" hidden><i id="upd-bar"></i></div></div>';
     const btn = $("upd-btn");
     if (btn) btn.addEventListener("click", onUpdAction);
+    const repo = $("upd-repo");
+    if (repo) {
+      repo.addEventListener("click", () => {
+        invoke(CMD.open_repo).catch((e) => toast((e && e.message) || "打开失败"));
+      });
+    }
     const sw = $("st-auto-upd");
     if (sw) {
       invoke(CMD.get_config)

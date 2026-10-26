@@ -479,6 +479,7 @@ fn with_ipc(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
         ipc::lockdown,
         ipc::recent_logs,
         ipc::open_data_folder,
+        ipc::open_repo,
         ipc::open_guide,
         ipc::js_log,
         ipc::install_app,

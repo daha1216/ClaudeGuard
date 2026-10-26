@@ -31,6 +31,7 @@
     lockdown: "lockdown",
     recent_logs: "recent_logs",
     open_data_folder: "open_data_folder",
+    open_repo: "open_repo",
     open_guide: "open_guide",
     install_app: "install_app",
     set_autostart: "set_autostart",
