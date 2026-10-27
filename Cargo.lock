@@ -546,7 +546,7 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "plist",
- "quick-xml 0.38.4",
+ "quick-xml",
  "security-framework",
  "serde",
  "serde_json",
@@ -2741,7 +2741,7 @@ checksum = "2896bade328c13f7042a297ea5ac5b0951f6cf989dea5f32c2fd98da398195cb"
 dependencies = [
  "base64 0.23.1",
  "indexmap 2.14.2",
- "quick-xml 0.42.0",
+ "quick-xml",
  "serde",
  "time",
 ]
@@ -2904,21 +2904,12 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "quick-xml"
-version = "0.38.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
-dependencies = [
- "memchr",
- "serde",
-]
-
-[[package]]
-name = "quick-xml"
 version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
 dependencies = [
  "memchr",
+ "serde",
 ]
 
 [[package]]

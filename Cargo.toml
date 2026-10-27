@@ -43,7 +43,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # 三倍堆分配），但 0.42 把 local_name() 的返回从裸字节改成了 &str，
 # src/macos/claude_update.rs 的字节比较会直接编译失败；那段代码只有 macOS 才编译。
 # 等 macOS CI 先跑绿，再连代码一起改——不要在 Windows 上盲改没人验证过的路径。
-quick-xml = { version = "0.38", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 url = "2"
 minisign-verify = "0.3"
 
