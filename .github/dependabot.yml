@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3
+    groups:
+      patch-and-minor:
+        applies-to: version-updates
+        update-types: ["patch", "minor"]
+    ignore:
+      # 这三个只在 Tauri 的 Linux 后端进依赖图（zbus / zvariant），Windows 与 macOS
+      # 构建里根本不出现，留着只会给 unmaintained 告警制造噪音。
+      - dependency-name: "zvariant"
+      - dependency-name: "zvariant_derive"
+      - dependency-name: "zbus_names"
+      - dependency-name: "proc-macro-error"

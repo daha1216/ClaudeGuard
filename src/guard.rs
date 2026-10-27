@@ -1164,6 +1164,23 @@ mod tests {
         assert!(decode_b64_text("   \n").is_none());
         assert!(decode_b64_text("不是 base64").is_none());
     }
+
+    /// 行为锁：防火墙"是否有关闭的配置文件"只认 PowerShell 数出来的数字。
+    /// 2026-10 中文 Win11 实测 netsh 的状态列是「启用 / 关闭」，非英文系统不会出现
+    /// ASCII `off`，所以这条判据不能回退到解析 netsh 文本。
+    #[test]
+    fn any_profile_disabled_reads_only_powershell_count() {
+        assert!(!any_profile_disabled("0"));
+        assert!(!any_profile_disabled("0\r\n"));
+        assert!(any_profile_disabled("1\r\n"));
+        assert!(any_profile_disabled("3"));
+        // 查询失败或输出无法识别 → 一律当"未关闭"，不去改用户系统设置
+        assert!(!any_profile_disabled(""));
+        assert!(!any_profile_disabled("   \n"));
+        assert!(!any_profile_disabled("状态 关闭"));
+        assert!(!any_profile_disabled("garbage"));
+        assert!(!any_profile_disabled("-1"));
+    }
 }
 
 /// 定位 WindowsApps 下指定前缀的安装目录（版本数值最大者）。
@@ -1780,22 +1797,38 @@ fn lockdown_rule_name(id: &str) -> String {
 /// 但防火墙整体关着时一切 Block 规则都是摆设（2026-10 实测用户机器三档全关）。
 /// 只开不关——不逆向改用户的防火墙状态。
 pub fn fw_ensure_on() -> bool {
-    let out = Command::new(sys32("netsh.exe"))
-        .args(["advfirewall", "show", "allprofiles", "state"])
-        .output();
-    let text = out
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase())
-        .unwrap_or_default();
-    if text.split_whitespace().any(|w| w == "off") {
-        let ok = netsh(&["advfirewall", "set", "allprofiles", "state", "on"]);
-        log_line(if ok {
-            "firewall: 检测到 Windows 防火墙未开启，已自动开启（默认出站=允许，不影响正常流量）"
-        } else {
-            "firewall: 尝试开启 Windows 防火墙失败，Block 规则可能不生效"
-        });
-        return ok;
+    // 不能解析 `netsh advfirewall show allprofiles state` 的状态列：那是本地化文案
+    // （中文系统是「启用 / 关闭」），任何非英文系统都找不到 ASCII `off`——2026-10
+    // 中文 Win11 实测确认。改问 Get-NetFirewallProfile，拿结构化布尔值数一遍。
+    // 回传只有一个 ASCII 数字，不涉及中文输出，无需 decode_b64_text。
+    const COUNT_DISABLED: &str = "@(Get-NetFirewallProfile -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq $false }).Count";
+    let disabled = match run_hidden(
+        &sys32(POWERSHELL),
+        &["-NoProfile", "-NonInteractive", "-Command", COUNT_DISABLED],
+    ) {
+        Ok(out) if out.status.success() => {
+            any_profile_disabled(&String::from_utf8_lossy(&out.stdout))
+        }
+        // 查询失败不去动系统设置：拿不到确定答案时保持现状（旧行为是"没看见 off 就当开着"）。
+        _ => false,
+    };
+    if !disabled {
+        return true;
     }
-    true
+    let ok = netsh(&["advfirewall", "set", "allprofiles", "state", "on"]);
+    log_line(if ok {
+        "firewall: 检测到 Windows 防火墙未开启，已自动开启（默认出站=允许，不影响正常流量）"
+    } else {
+        "firewall: 尝试开启 Windows 防火墙失败，Block 规则可能不生效"
+    });
+    ok
+}
+
+/// 纯函数：PowerShell 数出的「已关闭配置文件个数」→ 是否存在关闭的配置文件。
+/// 只认纯数字；空输出、错误文本、本地化文案（例如「状态 关闭」）一律按"未关闭"处理，
+/// 免得把识别不了的输出当成"该去改系统设置"。
+fn any_profile_disabled(text: &str) -> bool {
+    text.trim().parse::<u32>().is_ok_and(|n| n > 0)
 }
 
 /// 一键兜底封锁：为全部守护对象的 exe 添加出站 Block 规则。

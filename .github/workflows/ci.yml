@@ -11,6 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: 单元测试
+        run: cargo test --locked
       - name: 构建 release
         run: cargo build --release --locked
       - name: 上传 exe
@@ -18,3 +20,13 @@ jobs:
         with:
           name: ClaudeGuard-windows
           path: target/release/claude-guard.exe
+
+  macos:
+    # src/macos 下的 12 个文件和它们的 32 个单元测试只在 macOS 上参与编译，
+    # 没有这个 job 时它们永远不进任何 CI——改坏了也只在真机上才发现。
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 单元测试
+        run: cargo test --locked

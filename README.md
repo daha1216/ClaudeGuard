@@ -16,6 +16,7 @@
   <img src="https://img.shields.io/badge/Platform-macOS%20(移植预览)-9aa0a6" alt="macOS preview" />
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Rust" />
   <img src="https://img.shields.io/badge/GUI-Tauri%202-brightgreen" alt="Tauri 2" />
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT" />
 </p>
 
 ---
@@ -205,3 +206,10 @@ macOS：`cargo build --release && python3 scripts/package-macos.py`（详见上�
 - **v3.10.0**：修复主线——断网自愈与恢复协议（恢复分「安全恢复」与「停止保护」两条流程）、手动封锁、已停止保护状态、配置 `version=4`（新装默认不断网，升级前备份旧配置）、守护器空闲开销降到约 0.5% 单核。
 - **v3.11.0**：主界面按「主卡 + 分组卡」重构，CTA 移出滚动区，熔断与暂停改用标题与主钮表达。
 - **v3.12.0**：新增直连泄露观察（系统代理模式下发现绕过代理的外连即告警）、环境一致性检查，以及时区/默认位置的自动对齐与一键还原（全部走账本，可随时恢复）。
+- **v3.12.4**：修复防火墙自愈在非英文系统上从不触发（改按 `Get-NetFirewallProfile` 的结构化状态判断，不再解析本地化的 netsh 文本）；修正 netsh「找不到规则」提示的匹配串；TLS 栈补丁升级（rustls / rustls-webpki / webpki-roots / tokio）；CI 接入单元测试并新增 macOS job；补 MIT 许可。
+
+---
+
+## 许可协议
+
+[MIT](LICENSE) © 2026 daha1216

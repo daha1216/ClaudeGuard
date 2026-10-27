@@ -685,11 +685,14 @@ fn cut_rule_count() -> usize {
     count_rule_in_listing(&detail, CUT_RULE)
 }
 
-/// netsh 找不到规则时的提示。中文 Windows 的提示是 GBK 编码，按 UTF-8 lossy 读出来是乱码，
-/// 所以中文串只在纯函数单测里有效；实际幂等主要靠删前先用 `show` 计数。
+/// netsh 找不到规则时的提示。2026-10 中文 Win11 实测输出是合法 UTF-8：
+/// `"\r\n没有与指定标准相匹配的规则。\r\n\r\n"`（exit 1，48 字节）——不是 GBK，
+/// 而当前版本的措辞是「指定标准」，旧版本才是「指定条件」，两种都收。
+/// 实际幂等仍靠删前先用 `show` 计数（`count_rule_in_listing` 按 ASCII 规则名数行，
+/// 与界面语言无关）；这里只是竞态下"规则已被别处删掉"的兜底。
 fn is_no_match(detail: &str) -> bool {
     let detail = detail.to_ascii_lowercase();
-    detail.contains("no rules match") || detail.contains("没有与指定条件")
+    detail.contains("no rules match") || detail.contains("没有与指定")
 }
 
 /// 执行 PowerShell 命令（输出走 log_line），返回 (成功, 输出)。
@@ -937,12 +940,16 @@ mod tests {
     }
 
     /// 行为锁: 找不到规则提示的识别（英文为准，中文串兜底）。
+    /// 中文串取的是 2026-10 实测抓到的原文，而不是"看起来像"的写法——喂给它的
+    /// 必须是真实 netsh 输出，否则这条测试只会锁住一个错字面量。
     #[test]
     fn detects_netsh_no_match_text() {
         assert!(is_no_match("No rules match the specified criteria."));
-        assert!(is_no_match("没有与指定条件匹配的规则。"));
+        assert!(is_no_match("\r\n没有与指定标准相匹配的规则。\r\n\r\n"));
+        assert!(is_no_match("没有与指定条件匹配的规则。")); // 旧版本措辞
         assert!(!is_no_match("Ok."));
         assert!(!is_no_match(""));
+        assert!(!is_no_match("已更新 1 条规则。"));
     }
 
     /// 行为锁: 状态文件里的 mode 字面量与 CutMode 的映射（monitor 读 CutMode 用）。
