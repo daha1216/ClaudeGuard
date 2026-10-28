@@ -159,7 +159,7 @@ fn verify_archive(path: &Path, manifest: &Manifest) -> Result<(), String> {
         }
         hash.update(&buffer[..size]);
     }
-    if format!("{:x}", hash.finalize()) != manifest.sha256.to_ascii_lowercase() {
+    if crate::update::hex_lower(&hash.finalize()) != manifest.sha256.to_ascii_lowercase() {
         return Err("更新包 SHA256 校验失败".into());
     }
     Ok(())
@@ -577,7 +577,7 @@ mod tests {
         let data = std::fs::read(&archive).unwrap();
         let mut manifest = manifest();
         manifest.size = data.len() as u64;
-        manifest.sha256 = format!("{:x}", Sha256::digest(&data));
+        manifest.sha256 = crate::update::hex_lower(&Sha256::digest(&data));
         let (bytes, sig) = signed_manifest(&manifest, pair);
         std::fs::write(directory.join("manifest.json"), bytes).unwrap();
         std::fs::write(directory.join("manifest.minisig"), sig).unwrap();
@@ -616,7 +616,7 @@ mod tests {
         let mut data = manifest();
         data.version = "998.0.0".into();
         data.size = original.len() as u64;
-        data.sha256 = format!("{:x}", Sha256::digest(&original));
+        data.sha256 = crate::update::hex_lower(&Sha256::digest(&original));
         let (bytes, sig) = signed_manifest(&data, &pair);
         std::fs::write(directory.path().join("manifest.json"), bytes).unwrap();
         std::fs::write(directory.path().join("manifest.minisig"), sig).unwrap();
@@ -675,7 +675,7 @@ mod delivery_tests {
             url: "https://github.com/daha1216/ClaudeGuard/releases/download/v999.0.0/test.zip"
                 .into(),
             size: body.len() as u64,
-            sha256: format!("{:x}", Sha256::digest(body)),
+            sha256: crate::update::hex_lower(&Sha256::digest(body)),
         };
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
