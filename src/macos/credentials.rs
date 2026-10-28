@@ -22,10 +22,9 @@ fn key() -> Result<[u8; 32], String> {
     // Serialize first-use creation. Distinct isolated profiles never share keys.
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _lock = LOCK.lock().map_err(|_| "凭据锁不可用")?;
-    let account = format!(
-        "{:x}",
-        Sha256::digest(crate::macos::data_dir().to_string_lossy().as_bytes())
-    );
+    let account = crate::update::hex_lower(&Sha256::digest(
+        crate::macos::data_dir().to_string_lossy().as_bytes(),
+    ));
     match get_generic_password(SERVICE, &account) {
         Ok(bytes) => bytes.try_into().map_err(|_| "钥匙串密钥格式无效".into()),
         Err(e) if e.code() == -25300 => {

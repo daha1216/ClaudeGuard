@@ -333,13 +333,18 @@ pub fn parse_digest(raw: &str) -> Option<String> {
     Some(hex.to_ascii_lowercase())
 }
 
+/// 摘要字节转小写十六进制。sha2 0.11 的 `Array` 不再实现 `LowerHex`，
+/// 所以 `format!("{:x}", digest)` 会编译失败，统一走这里。
+pub fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    let out = hasher.finalize();
-    out.iter().map(|b| format!("{b:02x}")).collect()
+    hex_lower(&hasher.finalize())
 }
 
 /// 从已打开的句柄算摘要：校验与复制用的是同一个句柄，路径在中途被换掉也不影响
@@ -362,11 +367,7 @@ pub fn sha256_of_file(file: &mut std::fs::File) -> Result<String, String> {
     }
     file.seek(SeekFrom::Start(0))
         .map_err(|e| format!("回卷待校验文件失败：{e}"))?;
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    Ok(hex_lower(&hasher.finalize()))
 }
 
 // ------------------------------------------------------------------ 自替换
