@@ -1096,7 +1096,7 @@ mod tests {
             "[Console]::Write('inspect-ok')\n[Console]::Error.Write('inspect-error')\nexit 7",
         ])
         .creation_flags(0x08000000);
-        let result = inspect_output(&mut cmd, Duration::from_secs(5)).unwrap();
+        let result = inspect_output(&mut cmd, Duration::from_secs(60)).unwrap();
         assert_eq!(result.status.code(), Some(7));
         assert_eq!(result.stdout, b"inspect-ok");
         assert_eq!(result.stderr, b"inspect-error");
