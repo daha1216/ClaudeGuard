@@ -9,6 +9,8 @@ use crate::state::AppState;
 use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use std::io::{Read, Write};
+#[cfg(target_os = "macos")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -877,6 +879,8 @@ mod tests {
     /// 手动跑的真实下载验证（默认 ignore，门禁不联网）：
     /// `cargo test --offline download_real_asset -- --ignored --nocapture`
     /// 依赖本机代理可用；验证的是"GitHub 302 能被正确跟随"这条链路。
+    /// 只针对 Windows 发布资产与 `Staged` 句柄模型，macOS 自更新走归档，不适用。
+    #[cfg(windows)]
     #[test]
     #[ignore = "需要代理与网络，手动执行"]
     fn download_real_asset_follows_github_redirect() {
