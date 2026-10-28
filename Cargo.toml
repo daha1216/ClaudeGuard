@@ -38,12 +38,12 @@ plist = "1"
 libc = "0.2"
 libloading = "0.8"
 tempfile = "3"
-zip = { version = "2", default-features = false, features = ["deflate"] }
-# 0.41+ 修掉 RUSTSEC-2026-0194/0195（重复属性名检查的二次方时间、命名空间声明的
-# 三倍堆分配），但 0.42 把 local_name() 的返回从裸字节改成了 &str，
-# src/macos/claude_update.rs 的字节比较会直接编译失败；那段代码只有 macOS 才编译。
-# 等 macOS CI 先跑绿，再连代码一起改——不要在 Windows 上盲改没人验证过的路径。
-quick-xml = { version = "0.38", features = ["serialize"] }
+# RUSTSEC-2026-0367/0369 的修补版本是 9.0.0，2.x 没有修补版；本项目只用 zip 读条目
+# 元数据（解压走系统 ditto），升级面因此只在元数据 API 上。
+zip = { version = "9", default-features = false, features = ["deflate"] }
+# RUSTSEC-2026-0194/0195 修补于 0.41；这里取 0.42 是为了和 plist 的解析版本对齐，
+# 代价是 local_name() 返回 &str 而非裸字节（src/macos/claude_update.rs 已跟着改）。
+quick-xml = { version = "0.42", features = ["serialize"] }
 url = "2"
 minisign-verify = "0.3"
 

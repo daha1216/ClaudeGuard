@@ -251,52 +251,53 @@ fn release_from_codex(
     let mut deltas = false;
     loop {
         match reader.read_event().map_err(|_| "Codex 更新清单 XML 无效")? {
-            Event::Start(e) if e.local_name().as_ref() == b"item" => {
+            Event::Start(e) if e.local_name().as_ref() == "item" => {
                 current = Some(FeedItem::default())
             }
-            Event::Start(e) if e.local_name().as_ref() == b"deltas" => deltas = true,
-            Event::End(e) if e.local_name().as_ref() == b"deltas" => deltas = false,
+            Event::Start(e) if e.local_name().as_ref() == "deltas" => deltas = true,
+            Event::End(e) if e.local_name().as_ref() == "deltas" => deltas = false,
             Event::Start(e) if current.is_some() => {
                 let field = e.local_name();
                 let name = field.as_ref();
                 if [
-                    b"shortVersionString".as_slice(),
-                    b"hardwareRequirements",
-                    b"minimumSystemVersion",
+                    "shortVersionString",
+                    "hardwareRequirements",
+                    "minimumSystemVersion",
                 ]
                 .contains(&name)
                 {
                     let text = reader
                         .read_text(e.name())
                         .map_err(|_| "Codex 更新字段无效")?
+                        .xml10_content()
                         .into_owned();
                     let item = current.as_mut().unwrap();
                     match name {
-                        b"shortVersionString" => item.version = text,
-                        b"hardwareRequirements" => item.architecture = text,
-                        b"minimumSystemVersion" => item.minimum = text,
+                        "shortVersionString" => item.version = text,
+                        "hardwareRequirements" => item.architecture = text,
+                        "minimumSystemVersion" => item.minimum = text,
                         _ => {}
                     }
                 }
             }
             Event::Empty(e)
-                if e.local_name().as_ref() == b"enclosure" && current.is_some() && !deltas =>
+                if e.local_name().as_ref() == "enclosure" && current.is_some() && !deltas =>
             {
                 let item = current.as_mut().unwrap();
                 for attribute in e.attributes() {
                     let a = attribute.map_err(|_| "Codex 更新属性无效")?;
                     let value = a
-                        .decode_and_unescape_value(reader.decoder())
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map_err(|_| "Codex 更新属性编码无效")?
                         .into_owned();
                     match a.key.local_name().as_ref() {
-                        b"url" => item.url = value,
-                        b"length" => item.size = value.parse().map_err(|_| "Codex 包大小无效")?,
+                        "url" => item.url = value,
+                        "length" => item.size = value.parse().map_err(|_| "Codex 包大小无效")?,
                         _ => {}
                     }
                 }
             }
-            Event::End(e) if e.local_name().as_ref() == b"item" => {
+            Event::End(e) if e.local_name().as_ref() == "item" => {
                 if let Some(item) = current.take() {
                     items.push(item);
                 }

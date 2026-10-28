@@ -175,9 +175,8 @@ fn relative_inside(path: &Path) -> bool {
 /// 这里刻意不走 `ZipArchive::extract()` / `ZipStreamReader::extract()`——那两个 API
 /// 正是 2026 年三条 zip 公告（RUSTSEC-2026-0367 / -0368 / -0369）的攻击面，而本项目的
 /// 解压走系统 `/usr/bin/ditto -x -k`（见 [`extract`]），zip 只用来读条目元数据。
-/// 同理 zip 停在 2.x：三条公告的修复版本都是 9.0.0，不存在 2.x 修补版，而升大版本要
-/// 重验这段只有 macOS 才编译的代码，收益为零。一旦改成调用 `extract()`，
-/// 就必须同时升到已修补版本并重新评估这三条公告。
+/// 依赖已随公告对齐到 9.x（修补版本线），但「不调用 extract()」这条仍然成立：
+/// 一旦改成调用 `extract()`，解压侧的路径与权限校验就得整段重做。
 pub fn validate_archive(path: &Path) -> Result<(), String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|_| "不是有效的 ZIP 更新包")?;
@@ -190,7 +189,11 @@ pub fn validate_archive(path: &Path) -> Result<(), String> {
     for index in 0..archive.len() {
         let mut item = archive.by_index(index).map_err(|_| "无法读取更新包目录")?;
         let enclosed = item.enclosed_name().ok_or("更新包包含越界路径")?;
-        if !relative_inside(&enclosed) || item.name().contains('\\') {
+        let has_backslash = item
+            .name()
+            .map_err(|_| "无法读取更新包目录")?
+            .contains('\\');
+        if !relative_inside(&enclosed) || has_backslash {
             return Err("更新包路径不安全".into());
         }
         // Normalise before duplicate/ancestor checks; extraction tools may follow
