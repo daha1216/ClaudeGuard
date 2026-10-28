@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "claude-guard"
-version = "3.12.4"
+version = "3.12.5"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",

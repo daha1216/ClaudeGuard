@@ -207,6 +207,7 @@ macOS：`cargo build --release && python3 scripts/package-macos.py`（详见上�
 - **v3.11.0**：主界面按「主卡 + 分组卡」重构，CTA 移出滚动区，熔断与暂停改用标题与主钮表达。
 - **v3.12.0**：新增直连泄露观察（系统代理模式下发现绕过代理的外连即告警）、环境一致性检查，以及时区/默认位置的自动对齐与一键还原（全部走账本，可随时恢复）。
 - **v3.12.4**：修复防火墙自愈在非英文系统上从不触发（改按 `Get-NetFirewallProfile` 的结构化状态判断，不再解析本地化的 netsh 文本）；修正 netsh「找不到规则」提示的匹配串；TLS 栈补丁升级（rustls / rustls-webpki / webpki-roots / tokio）；CI 接入单元测试并新增 macOS job；补 MIT 许可。
+- **v3.12.5**：依赖安全对齐——`zip` 升到 9.x（RUSTSEC-2026-0367/0369 的修补版本线，2.x 无修补版）、`quick-xml` 升到 0.42（RUSTSEC-2026-0194/0195 修补于 0.41，同时消掉锁文件里的重复版本）；补齐 macOS 移植缺的符号，macOS job 首次真正编译通过；放宽一个依赖 PowerShell 冷启动的用例时限，消除 CI 偶发失败。
 
 ---
 

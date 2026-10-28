@@ -1,6 +1,6 @@
 [package]
 name = "claude-guard"
-version = "3.12.4"
+version = "3.12.5"
 edition = "2021"
 license = "MIT"
 description = "ClaudeGuard：Windows AI 桌面应用网络出口门禁（多目标锚点 + 熔断断网）"
