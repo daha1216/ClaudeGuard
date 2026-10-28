@@ -228,6 +228,33 @@ pub fn pick_manual(procs: &[ProcInfo], claude_dir_l: Option<&str>) -> Vec<(usize
         .collect()
 }
 
+/// Claude 进程的存在情况（一次全进程扫描得出）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudePresence {
+    /// 没有名为 claude 的进程。
+    None,
+    /// 只有 Claude Code CLI。
+    CliOnly,
+    /// 桌面端在跑。
+    Desktop,
+}
+
+/// 一次扫描判断 claude 进程的存在情况：有没有、是不是桌面端。
+///
+/// 与 Windows 侧同名函数语义一致，供共享的 monitor 退出清理每拍只问一次。
+pub fn claude_presence(claude_dir_l: Option<&str>) -> ClaudePresence {
+    let procs = snapshot_processes();
+    let mut seen = ClaudePresence::None;
+    for p in &procs {
+        match classify_claude(p, claude_dir_l) {
+            Some(ClaudeKind::Desktop) => return ClaudePresence::Desktop,
+            Some(ClaudeKind::Cli) => seen = ClaudePresence::CliOnly,
+            None => {}
+        }
+    }
+    seen
+}
+
 /// 残留判定（纯函数）：桌面端全部消失后，哪些 Claude 进程算"残留"。
 /// - 桌面家族进程：主进程不在了，剩下的 crashpad/gpu/renderer 全算残留；
 /// - CLI：父进程已死（孤儿）才算残留——挂在活终端下的会话不清，避免误杀正在用的终端。
@@ -425,6 +452,15 @@ pub fn firewall_release() -> bool {
 } // No rules are created by this build.
 pub fn firewall_dedupe() -> usize {
     0
+}
+
+/// 本产品防火墙规则总条数。
+///
+/// 这个构建不创建任何防火墙规则（见 [`firewall_release`] 与 [`firewall_dedupe`]），
+/// 恒为 0 条。返回 `Some(0)` 而非 `None`：恢复核验把 `None` 当作"查不到即不干净"，
+/// 而这里的 0 是确知的，不该被降级成未核验。
+pub fn firewall_rule_count() -> Option<usize> {
+    Some(0)
 }
 
 // v3.10 R07：共享代码（state/main/monitor）会调用防火墙兜底与 lockdown 接口。

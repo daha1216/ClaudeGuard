@@ -1,5 +1,10 @@
 //! No pretend firewall success. Full macOS isolation requires a signed Network Extension.
 use crate::model::CutMode;
+
+/// 断网防火墙规则名。这个构建不创建任何规则，但共享代码（账本）要用同一个常量
+/// 记账，因此与 Windows 侧保持同名同值。
+pub const CUT_RULE: &str = "ClaudeGuard Cut All";
+
 pub fn cut(mode: CutMode) -> (bool, String) {
     if mode == CutMode::Off {
         (true, "未请求断网".into())
