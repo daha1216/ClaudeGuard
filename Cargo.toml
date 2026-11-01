@@ -36,7 +36,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["std", 
 aes-gcm = "0.10"
 plist = "1"
 libc = "0.2"
-libloading = "0.8"
+libloading = "0.9"
 tempfile = "3"
 # RUSTSEC-2026-0367/0369 的修补版本是 9.0.0，2.x 没有修补版；本项目只用 zip 读条目
 # 元数据（解压走系统 ditto），升级面因此只在元数据 API 上。
