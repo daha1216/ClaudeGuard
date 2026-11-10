@@ -227,11 +227,16 @@
     // P0：内置目标期望全空（一个白名单 IP / 出口地区都没填）→ 后端按“未配置白名单，
     // 宁可错杀”持续失败，保护启动约 30 秒后熔断隔离。给专属提示与配置入口，
     // 不套用 fail 的“校验未通过”红色熔断样式（tripped 时不覆盖，尊重真实熔断态）。
-    const unconf = whitelistEmpty(st) && overall !== "tripped";
+    const unconf = !st.disarmed && whitelistEmpty(st) && overall !== "tripped";
+    // P1-1：已停止保护是前端要优先表达的状态（后端 overall() 无 disarmed 分支，
+    // 不能沿用它的结果），主卡给橙色“保护已停止”，不显示绿色“守护正常”。
+    const off = !!st.disarmed;
+    document.body.dataset.disarmed = off ? "1" : "0";
     const dot = $("hero-dot");
     if (dot) {
       dot.className =
-        overall === "tripped" ? "dot fail"
+        off ? "dot unverified"
+        : overall === "tripped" ? "dot fail"
         : overall === "paused" ? "dot unverified"
         : unconf ? "dot unverified"
         : dotClass(overall);
@@ -240,7 +245,10 @@
     if (ver) ver.textContent = st.version ? "v" + st.version : "";
     let t = "守护待命";
     let s = "等待首次检测";
-    if (unconf) {
+    if (off) {
+      t = "保护已停止";
+      s = (st.disarmedReason ? st.disarmedReason + "。" : "") + "当前只做出口检测，不结束进程、不隔离、不断网。";
+    } else if (unconf) {
       t = "";
       s = "留空 = 不放行任何出口；守护启动约 30 秒后熔断并隔离网络，建议现在填上白名单。";
     } else if (overall === "pass") {
@@ -266,12 +274,12 @@
       s = passed ? "等待下一次自动检测" : "等待首次检测";
     }
     // v3.7：未接入提示（系统代理关 + 无 TUN，应用直连真实出口）。
-    if (!unconf && st.access && st.access.path === "uncovered" && st.enforceAccess && overall !== "tripped") {
+    if (!off && !unconf && st.access && st.access.path === "uncovered" && st.enforceAccess && overall !== "tripped") {
       s = "未接入代理链路：" + (st.access.note || "系统代理未开启且未检测到 TUN 网卡");
       // v3.9：兜底封锁生效时说明现状。
       if (st.lockdownManual) s += "；已手动封锁出站";
       else if (st.lockdown) s += "；已启用防火墙兜底封锁";
-    } else if (!unconf && st.access && st.access.path === "unknown" && st.enforceAccess && overall !== "tripped") {
+    } else if (!off && !unconf && st.access && st.access.path === "unknown" && st.enforceAccess && overall !== "tripped") {
       s = "接入路径无法确认：" + (st.access.note || "PAC 或代理配置无法等价复用");
     }
     title.textContent = t;
@@ -516,7 +524,13 @@
     let role = "recheck";
     let disabled = false;
     let ghostLabel = "";
-    if (overall === "tripped") {
+    if (st && st.disarmed) {
+      // P1-1：停止保护时主钮不能再是「启动 Claude」（会被后端拦截），改为重新布防。
+      label = "重新布防";
+      icons = icon("shield", 16);
+      role = "rearm";
+      ghostLabel = "立即检测";
+    } else if (overall === "tripped") {
       label = st.platform === "macos" ? "清除熔断状态" : "解除隔离并恢复网络";
       icons = icon("unlock", 16);
       cls = "btn-primary is-blocked";
@@ -1029,6 +1043,7 @@
         if (!st) return;
         if (primary.dataset.role === "release") doRelease();
         else if (primary.dataset.role === "resume") doResume();
+        else if (primary.dataset.role === "rearm") doRearm();
         else if (st.overall === "pass") doLaunch();
         else doRecheck();
       });

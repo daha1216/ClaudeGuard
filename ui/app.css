@@ -52,6 +52,8 @@ body[data-overall="fail"] { --page-bg: #F8F4EF; }
 body[data-overall="tripped"] { --page-bg: #F8F1F2; }
 body[data-overall="tripped"] .hero-title { color: #A3121A; }
 body[data-overall="paused"] { --page-bg: #F2F2F4; }
+/* P1-1：保护已停止时主卡标题转橙（deep 变体，15px 小字对比度达标）。 */
+body[data-disarmed="1"] .hero-title { color: var(--orange-deep); }
 
 button, input, select { font-family: inherit; }
 button { cursor: pointer; }
