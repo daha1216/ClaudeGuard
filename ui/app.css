@@ -105,6 +105,20 @@ svg { display: block; }
 .hero-title { font-size: 15px; font-weight: 600; letter-spacing: .01em; color: var(--txt); }
 .hero-ver { margin-left: auto; font-size: 10.5px; color: var(--muted2); font-variant-numeric: tabular-nums; }
 .hero-sub { font-size: 12px; color: var(--txt2); margin: 6px 0 0 20px; line-height: 1.4; }
+/* P0：「未配置白名单 — 点此配置」专属入口；继承 .hero-title 排版，橙色深字保证小字对比度。 */
+.hero-unconf {
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: .01em;
+  color: var(--orange-deep);
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+}
+.hero-unconf:hover { text-decoration: underline; }
 
 .dot { width: 11px; height: 11px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(52, 199, 89, .16); flex: none; }
 .dot.fail { background: var(--red); box-shadow: 0 0 0 4px rgba(255, 59, 48, .16); }

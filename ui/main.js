@@ -223,19 +223,27 @@
     const sub = $("hero-sub");
     if (!st || !title || !sub) return;
     const overall = st.overall || "idle";
+    const targets = st.targets || [];
+    // P0：内置目标期望全空（一个白名单 IP / 出口地区都没填）→ 后端按“未配置白名单，
+    // 宁可错杀”持续失败，保护启动约 30 秒后熔断隔离。给专属提示与配置入口，
+    // 不套用 fail 的“校验未通过”红色熔断样式（tripped 时不覆盖，尊重真实熔断态）。
+    const unconf = whitelistEmpty(st) && overall !== "tripped";
     const dot = $("hero-dot");
     if (dot) {
       dot.className =
         overall === "tripped" ? "dot fail"
         : overall === "paused" ? "dot unverified"
+        : unconf ? "dot unverified"
         : dotClass(overall);
     }
     const ver = $("hero-ver");
     if (ver) ver.textContent = st.version ? "v" + st.version : "";
-    const targets = st.targets || [];
     let t = "守护待命";
     let s = "等待首次检测";
-    if (overall === "pass") {
+    if (unconf) {
+      t = "";
+      s = "留空 = 不放行任何出口；守护启动约 30 秒后熔断并隔离网络，建议现在填上白名单。";
+    } else if (overall === "pass") {
       t = "守护正常";
       s = heroPassText(st, targets);
       if (S.manualBusy) s = "正在重新校验出口 IP…";
@@ -258,15 +266,24 @@
       s = passed ? "等待下一次自动检测" : "等待首次检测";
     }
     // v3.7：未接入提示（系统代理关 + 无 TUN，应用直连真实出口）。
-    if (st.access && st.access.path === "uncovered" && st.enforceAccess && overall !== "tripped") {
+    if (!unconf && st.access && st.access.path === "uncovered" && st.enforceAccess && overall !== "tripped") {
       s = "未接入代理链路：" + (st.access.note || "系统代理未开启且未检测到 TUN 网卡");
       // v3.9：兜底封锁生效时说明现状。
       if (st.lockdownManual) s += "；已手动封锁出站";
       else if (st.lockdown) s += "；已启用防火墙兜底封锁";
-    } else if (st.access && st.access.path === "unknown" && st.enforceAccess && overall !== "tripped") {
+    } else if (!unconf && st.access && st.access.path === "unknown" && st.enforceAccess && overall !== "tripped") {
       s = "接入路径无法确认：" + (st.access.note || "PAC 或代理配置无法等价复用");
     }
     title.textContent = t;
+    if (unconf) {
+      // 专属配置入口：首装打开向导，否则展开设置的「监控目标」组。
+      const go = document.createElement("button");
+      go.type = "button";
+      go.className = "hero-unconf";
+      go.textContent = "未配置白名单 — 点此配置";
+      go.addEventListener("click", configWhitelist);
+      title.appendChild(go);
+    }
     sub.textContent = s;
     renderTiles(st);
   }
@@ -826,6 +843,31 @@
     el.textContent = msg || "";
     el.hidden = !msg;
   }
+  // P0：首装跳过（“以后再说”/ Esc）的两段确认——留空跳过会让守护约 30 秒后熔断。
+  let wizSkipArmed = false;
+  let wizSkipTimer = 0;
+  function armWizardSkip() {
+    const skip = $("wiz-skip");
+    wizSkipArmed = true;
+    if (skip) {
+      skip.textContent = "再点一次确认跳过";
+      skip.classList.add("is-danger");
+    }
+    wizErr("跳过将导致守护约 30 秒后熔断并隔离网络：两个框都留空，不会放行任何出口。");
+    clearTimeout(wizSkipTimer);
+    wizSkipTimer = setTimeout(resetWizardSkip, 4000);
+  }
+  function resetWizardSkip() {
+    const skip = $("wiz-skip");
+    wizSkipArmed = false;
+    clearTimeout(wizSkipTimer);
+    if (skip) {
+      skip.textContent = "以后再说";
+      skip.classList.remove("is-danger");
+    }
+    const err = $("wiz-err");
+    if (err && !err.hidden && String(err.textContent || "").indexOf("跳过将导致") === 0) wizErr("");
+  }
   function openWizard() {
     const wiz = $("wizard");
     if (!wiz) return;
@@ -846,6 +888,7 @@
   function closeWizard() {
     const wiz = $("wizard");
     if (!wiz) return;
+    resetWizardSkip();
     S.wizard.open = false;
     wiz.hidden = true;
     document.body.classList.remove("wiz-open");
@@ -869,6 +912,33 @@
     if (!Number.isInteger(n) || n < 1 || n > 65535) return NaN;
     return n;
   }
+
+  /* ---------- P0：白名单留空检测与配置入口（不改后端，由 StateView.targets 推导） ---------- */
+
+  // 所有需要校验出口的目标（排除未启用与纯可达性目标）期望全部为空 → 后端会
+  // 按“未配置白名单”持续熔断。Config 侧的 expect_ips/expect_regions 是 snake_case。
+  function whitelistEmpty(st) {
+    const list = (st && st.targets) || [];
+    const active = list.filter((t) => t.state !== "disabled" && t.anchorKind !== "reachability");
+    if (!active.length) return false;
+    return active.every((t) => !(t.expectIps || []).length && !(t.expectRegions || []).length);
+  }
+  // 向导两个输入框 + 已保存配置的白名单，三者全空才算“留空”。
+  function wizardWhitelistBlank() {
+    if (parseIpList(($("wiz-ips") || {}).value || "").length) return false;
+    if (String(($("wiz-region") || {}).value || "").trim()) return false;
+    const list = (S.cfg && S.cfg.targets) || [];
+    return !list.some((t) => (t.expect_ips || []).length || (t.expect_regions || []).length);
+  }
+  function configWhitelist() {
+    if (S.cfg && S.cfg.first_run && !S.wizard.open) {
+      openWizard();
+      return;
+    }
+    expand("settings");
+    const comp = root.CG_UI && root.CG_UI.settings;
+    if (comp && comp.openGroup) comp.openGroup("targets");
+  }
   async function finishWizard(install) {
     if (S.wizard.busy) return;
     const portRaw = ($("wiz-port") || {}).value || "";
@@ -876,6 +946,17 @@
     if (Number.isNaN(port)) { wizErr("代理端口要填 1-65535 之间的数字"); return; }
     const ips = parseIpList(($("wiz-ips") || {}).value || "");
     const region = (($("wiz-region") || {}).value || "").trim().toUpperCase();
+    // P0：首装且两个框都留空 → 这里不写 first_run:false（写了就会让守护在
+    // 约 30 秒后熔断并隔离网络），停留在第 1 步给内联错误；文案与后端
+    // src/targets.rs 的“至少要填一个白名单 IP 或出口地区（都不填会一直熔断）”一致。
+    if (!S.cfg) await refreshConfig();
+    if ((S.cfg || {}).first_run && !ips.length && !region) {
+      wizStep(1);
+      wizErr("两个框都留空会一直熔断：留空 = 不放行任何出口，守护启动约 30 秒后将熔断并隔离网络。请至少填 1 个白名单 IP 或选择出口地区。");
+      const ipsEl = $("wiz-ips");
+      if (ipsEl && ipsEl.focus) ipsEl.focus();
+      return;
+    }
     S.wizard.busy = true;
     const buttons = ["wiz-install", "wiz-portable"].map((id) => $(id)).filter(Boolean);
     buttons.forEach((b) => (b.disabled = true));
@@ -1002,6 +1083,11 @@
     if (wizNext) wizNext.addEventListener("click", () => wizStep(S.wizard.step + 1));
     if (wizPrev) wizPrev.addEventListener("click", () => wizStep(S.wizard.step - 1));
     if (wizSkip) wizSkip.addEventListener("click", async () => {
+      // P0：首装且白名单留空 → 先两段确认（“再点一次确认跳过”），不直接放行。
+      if ((S.cfg || {}).first_run && wizardWhitelistBlank() && !wizSkipArmed) {
+        armWizardSkip();
+        return;
+      }
       closeWizard();
       if (S.cfg && S.cfg.first_run) await call(CMD.update_settings, { patch: { first_run: false } }, true);
       await refreshConfig();
@@ -1011,6 +1097,11 @@
 
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape" && S.wizard.open) {
+        // P0：与“以后再说”同闸——首装留空时 Esc 需要再按一次才确认跳过。
+        if ((S.cfg || {}).first_run && wizardWhitelistBlank() && !wizSkipArmed) {
+          armWizardSkip();
+          return;
+        }
         closeWizard();
         if (S.cfg && S.cfg.first_run) call(CMD.update_settings, { patch: { first_run: false } }, true);
       }

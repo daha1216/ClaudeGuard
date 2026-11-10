@@ -112,7 +112,7 @@
 
     <section class="wiz-page" data-step="1">
       <h2 class="wiz-title">代理与白名单</h2>
-      <p class="wiz-p">填写本机代理端口，以及允许的出口 IP。留空则保持当前配置。</p>
+      <p class="wiz-p">填写本机代理端口，以及允许的出口 IP。<strong>留空 = 不放行任何出口：守护启动约 30 秒后将熔断并隔离网络。</strong>建议至少填 1 个白名单 IP 或选择出口地区。</p>
       <label class="wiz-field"><span>代理端口</span><input class="in" id="wiz-port" type="number" min="1" max="65535" step="1" inputmode="numeric" placeholder="7890"></label>
       <label class="wiz-field"><span>白名单 IP</span><input class="in" id="wiz-ips" type="text" placeholder="204.1.100.98, 198.51.100.7"></label>
       <label class="wiz-field"><span>出口地区</span>
@@ -131,7 +131,7 @@
           <option value="AU">澳大利亚</option>
         </select>
       </label>
-      <p class="wiz-hint">白名单会写入「本机出口 / Claude 出口 / Codex 出口」三个内置目标。</p>
+      <p class="wiz-hint">白名单会写入「本机出口 / Claude 出口 / Codex 出口」三个内置目标；两项都留空会一直熔断（与设置里的校验一致）。</p>
     </section>
 
     <section class="wiz-page" data-step="2">

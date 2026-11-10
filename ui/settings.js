@@ -823,6 +823,11 @@
       load();
     },
     isOpen() { return mounted; },
+    // P0：主界面「未配置白名单 — 点此配置」跳转到指定设置组（监控目标）。
+    openGroup(key) {
+      openAcc = key;
+      syncAcc();
+    },
   };
 
   async function load() {
