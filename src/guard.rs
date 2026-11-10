@@ -1107,6 +1107,44 @@ mod tests {
         );
     }
 
+    /// P2-9 行为锁: 单侧解除的成败判定——规则本来就不存在算成功（幂等），
+    /// 真删除失败算失败；预查查不到时用 netsh 结果 + 中英双语"无匹配"提示兜底。
+    #[test]
+    fn release_side_treats_absent_rule_as_success() {
+        // 预查确认规则不存在：netsh 必然非 0，但"本来就没有"必须计成功
+        assert!(release_side_ok(Some(false), false, ""));
+        assert!(release_side_ok(Some(false), false, "Access is denied."));
+        // 规则存在且删除成功
+        assert!(release_side_ok(Some(true), true, "Ok."));
+        assert!(release_side_ok(None, true, "Ok."));
+        // 预查失败（None）+ 竞态下别处已删 → netsh 无匹配提示（中英双语）
+        assert!(release_side_ok(
+            None,
+            false,
+            "No rules match the specified criteria."
+        ));
+        assert!(release_side_ok(None, false, "没有与指定标准相匹配的规则。"));
+        assert!(release_side_ok(None, false, "没有与指定条件匹配的规则。"));
+        // 真失败：规则存在但删除被拒
+        assert!(!release_side_ok(Some(true), false, "Access is denied."));
+        assert!(!release_side_ok(None, false, "Access is denied."));
+        assert!(!release_side_ok(Some(true), false, ""));
+    }
+
+    /// 行为锁: 预查按显示名判"规则本就不存在"（DisplayName 与语言无关）。
+    #[test]
+    fn rule_exists_matches_display_name() {
+        let rules = parse_rule_instances(
+            r#"[{"name":"aaa","display":"ClaudeGuard Block Out (chatgpt)"},
+                 {"name":"bbb","display":"ClaudeGuard Block In (chatgpt)"}]"#,
+        );
+        assert_eq!(rules.len(), 2);
+        assert!(rule_exists(&rules, "ClaudeGuard Block Out (chatgpt)"));
+        assert!(rule_exists(&rules, "  ClaudeGuard Block In (chatgpt)  "));
+        assert!(!rule_exists(&rules, "ClaudeGuard Block Out"));
+        assert!(!rule_exists(&rules, "Windows Defender Firewall"));
+    }
+
     /// 行为锁: GUI 守护对象注册表 = 契约要求的三个 id（config.clean_guarded 依赖）。
     #[test]
     fn agent_ids_match_contract() {
@@ -1352,11 +1390,26 @@ pub(crate) fn decode_b64_text(text: &str) -> Option<String> {
 }
 
 fn netsh(args: &[&str]) -> bool {
-    Command::new(sys32("netsh.exe"))
-        .args(args)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    netsh_out(args).0
+}
+
+/// 执行 netsh 并带回（stdout+stderr 合并的）输出，供"规则本就不存在"这类
+/// 判别复用；拿不到输出时 detail 是 IO 错误文本。
+fn netsh_out(args: &[&str]) -> (bool, String) {
+    match Command::new(sys32("netsh.exe")).args(args).output() {
+        Ok(o) => {
+            let mut detail = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            if !err.is_empty() {
+                if !detail.is_empty() {
+                    detail.push(' ');
+                }
+                detail.push_str(&err);
+            }
+            (o.status.success(), detail)
+        }
+        Err(e) => (false, e.to_string()),
+    }
 }
 
 /// agent 的防火墙规则名。claude 沿用 v1 老名（已装用户的存量规则靠它识别），
@@ -1526,22 +1579,54 @@ pub fn firewall_quarantine_agent(id: &str) -> Coverage {
 /// 解除单个 agent 的隔离规则
 pub fn firewall_release_agent(id: &str) -> bool {
     let (name_out, name_in) = fw_names(id);
-    let a = netsh(&[
-        "advfirewall",
-        "firewall",
-        "delete",
-        "rule",
-        &format!("name={name_out}"),
-    ]);
-    let b = netsh(&[
-        "advfirewall",
-        "firewall",
-        "delete",
-        "rule",
-        &format!("name={name_in}"),
-    ]);
-    log_line(&format!("firewall release({id}): out={a} in={b}"));
-    a || b
+    // 删前先查：预查确认规则本来就不存在 → 直接计成功（幂等，P2-9），
+    // 省一次必然非 0 的 netsh；查询失败（None）则退回 netsh 结果+无匹配提示判别。
+    let pre = query_rules();
+    let existed = |name: &str| pre.as_ref().map(|rules| rule_exists(rules, name));
+    let (a, a_detail) = if existed(&name_out) == Some(false) {
+        (true, String::new())
+    } else {
+        netsh_out(&[
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={name_out}"),
+        ])
+    };
+    let (b, b_detail) = if existed(&name_in) == Some(false) {
+        (true, String::new())
+    } else {
+        netsh_out(&[
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={name_in}"),
+        ])
+    };
+    let ok_a = release_side_ok(existed(&name_out), a, &a_detail);
+    let ok_b = release_side_ok(existed(&name_in), b, &b_detail);
+    log_line(&format!("firewall release({id}): out={ok_a} in={ok_b}"));
+    // 两侧都干净才算解除成功：原来的 `a || b` 会把"一侧删除失败"报成成功。
+    ok_a && ok_b
+}
+
+/// 预查结果里有没有这条显示名的规则（DisplayName 比较，与语言无关）。
+fn rule_exists(rules: &[FwRuleInstance], display: &str) -> bool {
+    let display = display.trim();
+    rules
+        .iter()
+        .any(|r| r.display.trim().eq_ignore_ascii_case(display))
+}
+
+/// 纯函数：单侧（出站或入站）规则解除是否成功。
+/// - 预查确认规则本来就不存在 → 幂等成功（P2-9：netsh 找不到规则也返回非 0，
+///   不能把"本来就没有"报成失败）
+/// - netsh 删除成功 → 成功
+/// - 否则看输出是不是"没有匹配规则"（中英双语，竞态下别处已删；复用 netcut 的判别）
+fn release_side_ok(existed: Option<bool>, deleted: bool, detail: &str) -> bool {
+    existed == Some(false) || deleted || crate::netcut::is_no_match(detail)
 }
 
 /// 本产品防火墙规则总条数（含隔离、兜底封锁、断网规则）。

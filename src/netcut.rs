@@ -704,7 +704,8 @@ fn cut_rule_count() -> usize {
 /// 而当前版本的措辞是「指定标准」，旧版本才是「指定条件」，两种都收。
 /// 实际幂等仍靠删前先用 `show` 计数（`count_rule_in_listing` 按 ASCII 规则名数行，
 /// 与界面语言无关）；这里只是竞态下"规则已被别处删掉"的兜底。
-fn is_no_match(detail: &str) -> bool {
+/// `pub(crate)`：guard 的恢复路径（P2-9）复用同一套中英双语判别。
+pub(crate) fn is_no_match(detail: &str) -> bool {
     let detail = detail.to_ascii_lowercase();
     detail.contains("no rules match") || detail.contains("没有与指定")
 }
