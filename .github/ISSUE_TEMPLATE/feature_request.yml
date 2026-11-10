@@ -1,0 +1,38 @@
+name: 功能建议
+description: 提出新功能、改进或用法上的期望
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决什么问题
+      description: 描述场景与痛点，而不是先入为主的实现方案。
+      placeholder: 例如：希望断网档位可以按目标单独配置……
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的行为
+      description: 功能生效时用户看到什么、设置在哪、熔断/恢复语义如何变化。
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 涉及范围
+      options:
+        - Windows 主功能（校验 / 熔断 / 恢复）
+        - UI（ui/*.js）
+        - CLI 与脚本
+        - macOS 移植预览
+        - 文档
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充材料（可选）
+      description: 截图、复现步骤、参考链接。

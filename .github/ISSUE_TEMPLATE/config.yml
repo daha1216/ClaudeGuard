@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 使用文档与常见问题
+    url: https://github.com/daha1216/ClaudeGuard/blob/master/docs/GUIDE.md
+    about: 安装、白名单配置、熔断与恢复的详细说明（docs/GUIDE.md）
+  - name: v3 行为基准（SPEC）
+    url: https://github.com/daha1216/ClaudeGuard/blob/master/docs/SPEC-v3.md
+    about: v3 的语义基准与 CLI 契约，反馈行为偏差前先对照这里
