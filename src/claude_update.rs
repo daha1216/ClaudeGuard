@@ -471,17 +471,13 @@ fn package(
 }
 
 fn agent(cfg: &Config) -> Result<ureq::Agent, String> {
-    let proxy = ureq::Proxy::new(format!("http://{}:{}", cfg.proxy_host, cfg.proxy_port))
-        .map_err(|_| "代理地址无效")?;
-    Ok(ureq::AgentBuilder::new()
-        .proxy(proxy)
-        .try_proxy_from_env(false)
-        .max_idle_connections(0)
-        .redirects(0)
-        .timeout_connect(Duration::from_secs(15))
-        .timeout_read(Duration::from_secs(45))
-        .timeout(Duration::from_secs(600))
-        .build())
+    // 统一走 netpol（D5）：有代理走代理、没配置即直连，错误文案与其它外发一致；
+    // redirects(0) 与本流程既有的超时/不复用连接语义由 ClientCheck 意图保留。
+    crate::netpol::client(
+        cfg,
+        crate::netpol::EgressIntent::ClientCheck,
+        Duration::from_secs(15),
+    )
 }
 
 fn discover(product: Product, agent: &ureq::Agent, arch: &str) -> Result<(String, String), String> {

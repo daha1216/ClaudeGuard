@@ -35,6 +35,7 @@ Windows 桌面守护器：按监控目标分别校验本地代理出口（IP / �
 | `src/feishu.rs` | 飞书群通知：Webhook/签名、DPAPI 凭据、持久队列、去重与重试 | 改通知 | 在日志或状态里回显凭据 |
 | `src/claude_update.rs` | Claude/Codex 桌面客户端 MSIX 检查、下载校验、原位升级状态机（内嵌 `src/claude_package.ps1`） | 改更新流程 | 绕过签名/包身份校验，或加卸载/重置等破坏性回退 |
 | `src/update.rs` | ClaudeGuard 自身 GitHub Releases 检查/下载/自替换 | 改更新 | 改资产命名规则（见下） |
+| `src/netpol.rs` | D5 统一出网：`route` / `client(EgressIntent)` / `download_agent` / 下载重定向白名单 | 加 `EgressIntent` 意图与路由规则 | **新建出网 Agent 只允许在本文件**（`anchors` 探测与 `macos/` 分支、单测本地夹具除外） |
 | `src/install.rs` | 安装/卸载/自启/快捷方式 | 改安装逻辑 | 写死用户路径；卸载不恢复网络 |
 | `src/macos/`（cfg(target_os="macos")） | macOS 移植预览：`guard/netcut/notify/install/autostart/credentials(Keychain+AES-GCM)/claude_update/self_update(Minisign)/package/ui_acceptance/monitor_acceptance`；`main.rs` 用 `#[cfg_attr(path)]` 挂接同名模块 | 改 macOS 行为（先读 docs/MACOS.md） | 在 Windows 分支引 macOS 依赖语义 |
 | `ui/` | 纯静态前端（index.html/app.css + ipc/icons/main/settings/updates/feishu.js，无构建步骤；macos.css/macos-guide.html 仅 macOS 外观） | 改前端（先读 SPEC §8） | 引入 npm/框架/构建步骤 |
