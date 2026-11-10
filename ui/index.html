@@ -48,6 +48,20 @@
       <div class="grp-rows" id="protect"></div>
     </section>
 
+    <section class="card grp" id="card-timeline" aria-label="24 小时时间线">
+      <div class="grp-title">24 小时时间线<span class="tl-note">本次运行期间 · 重启后从空开始</span></div>
+      <div class="tl-legend">
+        <span class="tl-lg is-pass"><i class="tl-dot is-pass" aria-hidden="true"></i>正常</span>
+        <span class="tl-lg is-trip"><i class="tl-dot is-trip" aria-hidden="true"></i>熔断</span>
+        <span class="tl-lg is-warn"><i class="tl-dot is-warn" aria-hidden="true"></i>暂停 · 未确认</span>
+        <span class="tl-lg is-none"><i class="tl-dot is-none" aria-hidden="true"></i>无数据</span>
+      </div>
+      <div class="tl-track" id="tl-track" tabindex="0" role="group"
+        aria-label="24 小时守护时间线，每格 15 分钟；按左右方向键逐格查看"></div>
+      <div class="tl-axis"><span>24 小时前</span><span>现在</span></div>
+      <div class="sr-only" id="tl-live" aria-live="polite"></div>
+    </section>
+
     <section class="card fold" id="card-details" data-card="details">
       <button class="fold-head" id="head-details" type="button" aria-expanded="false" aria-controls="body-details">
         <span class="fold-title">详情</span>

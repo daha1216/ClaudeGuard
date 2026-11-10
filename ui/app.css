@@ -593,3 +593,49 @@ body[data-ready="1"] .card { animation: enter .36s .12s var(--ease) both; }
 /* 作者样式给这些块设了 display，UA 的 [hidden]{display:none} 会被盖掉——显式补一条。 */
 .titem[hidden], .wline[hidden], .sgroup-title[hidden], .sgroup-note[hidden],
 .tactions[hidden], .sgroup.acc[hidden] { display: none; }
+
+/* ---------- 24 小时时间线（功能 B）：色块用亮色 token，小字前景一律深色 ≥4.5:1 ---------- */
+
+.tl-note { margin-left: 6px; font-size: 9.5px; font-weight: 400; letter-spacing: 0; color: var(--muted2); }
+.tl-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 1px 2px 7px; }
+.tl-lg { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; line-height: 1.3; }
+.tl-lg.is-pass { color: var(--green-deep); }
+.tl-lg.is-trip { color: var(--red-deep); }
+.tl-lg.is-warn { color: var(--orange-deep); }
+.tl-lg.is-none { color: var(--muted2); }
+.tl-dot { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+.tl-dot.is-pass { background: var(--green); }
+.tl-dot.is-trip { background: var(--red); }
+.tl-dot.is-warn { background: var(--orange); }
+.tl-dot.is-none { background: #C7C7CC; }
+.tl-track {
+  display: grid;
+  grid-template-columns: repeat(96, minmax(0, 1fr));
+  gap: 1px;
+  padding: 2px 0 0;
+}
+.tl-track:focus-visible { outline: 2px solid rgba(0, 113, 227, .5); outline-offset: 2px; border-radius: 4px; }
+.tl-cell { display: block; height: 20px; min-width: 0; border-radius: 1.5px; background: #C7C7CC; }
+.tl-cell.is-pass { background: var(--green); }
+.tl-cell.is-trip { background: var(--red); }
+.tl-cell.is-warn { background: var(--orange); }
+.tl-cell.is-none { background: #C7C7CC; }
+.tl-cell.is-sel { box-shadow: 0 0 0 1.5px #1C1C1E; }
+.tl-axis {
+  display: flex;
+  justify-content: space-between;
+  padding-top: 3px;
+  font-size: 9.5px;
+  color: var(--muted2);
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}

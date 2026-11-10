@@ -79,6 +79,10 @@
     pauseBusy: false,
     restoreBusy: false,
     leakFlash: null,
+    // 24 小时时间线（功能 B）：纯前端环形缓冲 {t:ms, kind, note}，不持久化，重启从空开始
+    tl: [],
+    tlLastRender: 0,
+    tlFocus: 95, // 默认选中最后一格「现在」
   };
 
   /* ---------- 小工具 ---------- */
@@ -701,11 +705,16 @@
     }
   }
 
-  /* ---------- 日志 ---------- */
+  /* ---------- 日志（行首 epoch 统一 stamp 成 MM-DD HH:MM:SS） ---------- */
 
   async function loadLogs() {
     const lines = await call(CMD.recent_logs, { limit: 200 }, true);
-    if (Array.isArray(lines)) S.logs = lines.slice();
+    if (Array.isArray(lines)) {
+      // 时间线条 ingest 用未 stamp 的原文（分类看正文、时间取行内 epoch），显示层再补戳。
+      tlIngest(lines, true);
+      S.logs = lines.map(stampLine);
+      tlRender();
+    }
     renderLogs();
   }
   function renderLogs() {
@@ -722,7 +731,10 @@
   }
   function appendLog(line) {
     if (line == null) return;
-    S.logs.push(String(line));
+    const raw = String(line);
+    tlIngest([raw], false); // 实时事件是裸消息 → ts 取 Date.now()；历史行首带 epoch
+    const text = stampLine(raw);
+    S.logs.push(text);
     if (S.logs.length > 400) S.logs.splice(0, S.logs.length - 400);
     if (S.folds.logs) {
       const host = $("log-lines");
@@ -730,7 +742,7 @@
         if (host.querySelector(".log-empty")) host.innerHTML = "";
         const div = document.createElement("div");
         div.className = "log-line";
-        div.textContent = String(line);
+        div.textContent = text;
         host.appendChild(div);
         while (host.childElementCount > 400) host.removeChild(host.firstElementChild);
         host.scrollTop = host.scrollHeight;
@@ -738,6 +750,137 @@
       const sub = $("logs-sub");
       if (sub) sub.textContent = "最近 " + S.logs.length + " 条";
     }
+  }
+
+  /* ---------- 24 小时时间线（纯前端：事件源① 状态事件 + ② 日志文本分类） ---------- */
+
+  const TL_BUCKETS = 96; // 15 分钟/格 × 96 = 24 小时
+  const TL_SPAN = 24 * 60 * 60 * 1000;
+  const TL_CELL = TL_SPAN / TL_BUCKETS;
+  const TL_SEV = { none: 0, pass: 1, warn: 2, trip: 3 };
+  const TL_LABEL = { none: "无数据", pass: "正常", warn: "暂停 · 未确认", trip: "熔断" };
+  const TL_DEDUP_MS = 5 * 60 * 1000; // 同 kind 5 分钟内不重复记（state 按秒级心跳到达）
+  const TL_MAX = 600;
+  const STAMP_RE = /^\[?(\d{10,13})\]?\s+/;
+
+  // 后端 recent_logs 行首是 "<unix秒> <消息>"、实时事件是裸消息；10 位=秒、13 位=毫秒。
+  function stampParts(raw) {
+    const s = String(raw == null ? "" : raw);
+    const m = STAMP_RE.exec(s);
+    if (!m) return { ts: Date.now(), msg: s };
+    const n = Number(m[1]);
+    return { ts: m[1].length > 10 ? n : n * 1000, msg: s.slice(m[0].length) };
+  }
+  function fmtMDHMS(ts) {
+    const d = new Date(ts);
+    return pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " +
+      pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+  }
+  function stampLine(raw) {
+    const p = stampParts(raw);
+    return fmtMDHMS(p.ts) + " " + p.msg;
+  }
+  function fmtHM(ts) {
+    const d = new Date(ts);
+    return pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+  }
+
+  function tlClassify(text) {
+    const s = String(text || "");
+    if (/熔断/.test(s)) return "trip";
+    if (/暂停|停止保护/.test(s)) return "warn";
+    if (/恢复|解除|通过/.test(s)) return "pass";
+    return "";
+  }
+
+  function tlPush(kind, note, ts, silent) {
+    if (!kind) return;
+    const t = ts == null ? Date.now() : ts;
+    for (let i = 0; i < S.tl.length; i++) {
+      const e = S.tl[i];
+      if (e.kind === kind && Math.abs(e.t - t) < TL_DEDUP_MS) return; // 同 kind 5 分钟去重
+    }
+    let i = S.tl.length; // 按 t 升序插入：日志批量回填可能带历史时间
+    while (i > 0 && S.tl[i - 1].t > t) i--;
+    S.tl.splice(i, 0, { t, kind, note: String(note || "") });
+    const cut = Date.now() - TL_SPAN;
+    while (S.tl.length && S.tl[0].t < cut) S.tl.shift(); // 滚动窗口 24h
+    if (S.tl.length > TL_MAX) S.tl.splice(0, S.tl.length - TL_MAX);
+    if (!silent) tlRender();
+  }
+
+  // 日志文本分类入口：lines=未 stamp 原文；时间戳取行内 epoch（没有则按现在）。
+  function tlIngest(lines, silent) {
+    if (!Array.isArray(lines)) return;
+    for (let i = 0; i < lines.length; i++) {
+      const kind = tlClassify(lines[i]);
+      if (kind) {
+        const p = stampParts(lines[i]);
+        tlPush(kind, p.msg, p.ts, true);
+      }
+    }
+    if (!silent) tlRender();
+  }
+
+  // 事件源①：applyState 每帧喂一次；idle/checking 没有可复盘结论，不记。
+  function tlFromState(view) {
+    if (!view || typeof view !== "object") return;
+    if (view.disarmed) {
+      tlPush("warn", view.disarmedReason || "保护已停止");
+      return; // 停止期间不看 overall，避免两套状态打架
+    }
+    const o = view.overall || "idle";
+    if (o === "tripped") tlPush("trip", (view.tripped && view.tripped.reason) || "已熔断");
+    else if (o === "pass") tlPush("pass", "出口校验通过");
+    else if (o === "fail") tlPush("warn", "出口校验未通过");
+    else if (o === "paused") tlPush("warn", "守护已暂停");
+  }
+
+  function tlRender() {
+    const track = $("tl-track");
+    if (!track) return;
+    S.tlLastRender = Date.now();
+    const now = Date.now();
+    const start = now - TL_SPAN;
+    const evs = S.tl; // 已按 t 升序、修剪进 24h 窗口
+    let html = "";
+    let carry = "none"; // carry-forward：格内无事件继承最近已知状态；首事件前保持灰
+    let note = "";
+    let ei = 0;
+    while (ei < evs.length && evs[ei].t < start) { // 窗口外的边界事件只用来定起点状态
+      carry = evs[ei].kind;
+      note = evs[ei].note;
+      ei++;
+    }
+    const winEnd = now + 1; // push→render 常在同一毫秒：末格右端闭到 t == now，否则刚落的事件被挡在格外
+    for (let b = 0; b < TL_BUCKETS; b++) {
+      const bs = start + b * TL_CELL;
+      const be = b === TL_BUCKETS - 1 ? winEnd : bs + TL_CELL;
+      // 不变式：进格时 ei 指向第一个 t >= bs 的事件（更早的已被前一格消费）
+      let pick = null;
+      for (let k = ei; k < evs.length && evs[k].t < be; k++) {
+        if (!pick || TL_SEV[evs[k].kind] > TL_SEV[pick.kind]) pick = evs[k];
+      }
+      while (ei < evs.length && evs[ei].t < be) ei++;
+      if (pick) {
+        carry = pick.kind;
+        note = pick.note;
+      }
+      const label = fmtHM(bs) + "–" + fmtHM(be) + " " + TL_LABEL[carry] + (note && carry !== "none" ? " · " + note : "");
+      html += '<i class="tl-cell is-' + carry + '" title="' + esc(label) + '"></i>';
+    }
+    track.innerHTML = html;
+    tlHighlight();
+  }
+
+  function tlHighlight() {
+    const track = $("tl-track");
+    if (!track || !track.childElementCount) return;
+    const n = track.childElementCount;
+    S.tlFocus = Math.max(0, Math.min(n - 1, S.tlFocus));
+    for (let i = 0; i < n; i++) track.children[i].classList.toggle("is-sel", i === S.tlFocus);
+    const live = $("tl-live");
+    if (live) live.textContent = track.children[S.tlFocus].getAttribute("title") || "";
   }
 
   /* ---------- 设置卡 ---------- */
@@ -797,6 +940,7 @@
     }
     const view = stableView(st);
     S.state = view;
+    tlFromState(view); // 时间线事件源①：状态快照 → 环形缓冲
     const overall = view.overall || "idle";
     document.body.setAttribute("data-overall", overall);
     renderHero();
@@ -1305,6 +1449,24 @@
 
     document.querySelectorAll(".chev").forEach((el) => { el.innerHTML = icon("chevronDown", 12); });
 
+    // 时间线键盘可达：容器可聚焦，左右方向键逐格移动高亮并经 aria-live 播报。
+    const tlTrack = $("tl-track");
+    if (tlTrack) {
+      tlTrack.addEventListener("keydown", (e) => {
+        const n = tlTrack.childElementCount;
+        if (!n) return;
+        let i = S.tlFocus;
+        if (e.key === "ArrowLeft") i--;
+        else if (e.key === "ArrowRight") i++;
+        else if (e.key === "Home") i = 0;
+        else if (e.key === "End") i = n - 1;
+        else return;
+        e.preventDefault();
+        S.tlFocus = Math.max(0, Math.min(n - 1, i));
+        tlHighlight();
+      });
+    }
+
     if (IPC.listen) {
       IPC.listen(EV.state, (e) => {
         const payload = e && e.payload !== undefined ? e.payload : e;
@@ -1320,6 +1482,8 @@
   /* ---------- 时钟（暂停倒计时） ---------- */
 
   function tick() {
+    // 时间线兜底重画：≥30s 刷一次窗口滚动（事件推送时已即时重画），要在 !st 守卫之前。
+    if (Date.now() - S.tlLastRender >= 30000) tlRender();
     const st = S.state;
     if (!st) return;
     if (st.overall === "paused") {
@@ -1351,6 +1515,7 @@
       setTimeout(() => { mountSettings(); setFold("settings", true, false); }, 80);
     }
     maybeWizard();
+    tlRender(); // 时间线首帧（无事件则全灰“无数据”）
     setTimeout(() => document.body.setAttribute("data-ready", "1"), 30);
     setInterval(tick, 1000);
     void renderLogs;
