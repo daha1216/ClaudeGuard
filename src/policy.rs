@@ -108,7 +108,7 @@ fn fail_reason(probe: &ProbeResult) -> String {
     }
 }
 
-/// 出口描述，如 `204.1.100.98（美国）` / `204.1.100.98` / `美国`。
+/// 出口描述，如 `198.51.100.98（美国）` / `198.51.100.98` / `美国`。
 fn egress_label(probe: &ProbeResult) -> String {
     let has_region = probe.country.is_some() || probe.raw_region.is_some();
     match (probe.ip.as_deref(), has_region) {
@@ -210,7 +210,7 @@ mod tests {
     fn empty_whitelist_with_info_is_fail() {
         let eval = evaluate(
             &target(AnchorKind::Auto, &[], &[]),
-            &trace_probe(Some("204.1.100.98"), Some("US")),
+            &trace_probe(Some("198.51.100.98"), Some("US")),
         );
         assert_eq!(eval.verdict, Verdict::Fail);
         assert_eq!(eval.reason, "未配置白名单，按宁可错杀处理");
@@ -229,19 +229,19 @@ mod tests {
     #[test]
     fn ip_hit_passes_even_with_other_region() {
         let eval = evaluate(
-            &target(AnchorKind::Auto, &["204.1.100.98"], &[]),
-            &trace_probe(Some("204.1.100.98"), Some("JP")),
+            &target(AnchorKind::Auto, &["198.51.100.98"], &[]),
+            &trace_probe(Some("198.51.100.98"), Some("JP")),
         );
         assert_eq!(eval.verdict, Verdict::Pass);
-        assert!(eval.reason.contains("204.1.100.98"));
+        assert!(eval.reason.contains("198.51.100.98"));
         assert!(eval.reason.contains("符合白名单"));
     }
 
     #[test]
     fn multi_ip_list_matches_any_entry() {
         let eval = evaluate(
-            &target(AnchorKind::Auto, &["1.1.1.1", "204.1.100.98"], &[]),
-            &trace_probe(Some("204.1.100.98"), None),
+            &target(AnchorKind::Auto, &["1.1.1.1", "198.51.100.98"], &[]),
+            &trace_probe(Some("198.51.100.98"), None),
         );
         assert_eq!(eval.verdict, Verdict::Pass);
     }
@@ -270,10 +270,10 @@ mod tests {
     fn ip_and_region_miss_is_fail() {
         let eval = evaluate(
             &target(AnchorKind::Auto, &["1.1.1.1"], &["US"]),
-            &trace_probe(Some("204.1.100.98"), Some("SG")),
+            &trace_probe(Some("198.51.100.98"), Some("SG")),
         );
         assert_eq!(eval.verdict, Verdict::Fail);
-        assert!(eval.reason.contains("204.1.100.98"));
+        assert!(eval.reason.contains("198.51.100.98"));
         assert!(eval.reason.contains("新加坡"));
         assert!(eval.reason.contains("不在白名单"));
     }
@@ -282,17 +282,17 @@ mod tests {
     fn ip_miss_without_region_expectation_is_fail() {
         let eval = evaluate(
             &target(AnchorKind::Auto, &["1.1.1.1"], &[]),
-            &trace_probe(Some("204.1.100.98"), None),
+            &trace_probe(Some("198.51.100.98"), None),
         );
         assert_eq!(eval.verdict, Verdict::Fail);
-        assert_eq!(eval.reason, "出口 204.1.100.98 不在白名单");
+        assert_eq!(eval.reason, "出口 198.51.100.98 不在白名单");
     }
 
     #[test]
     fn ip_only_with_region_expectation_is_unverified() {
         let eval = evaluate(
             &target(AnchorKind::Auto, &[], &["US"]),
-            &trace_probe(Some("204.1.100.98"), None),
+            &trace_probe(Some("198.51.100.98"), None),
         );
         assert_eq!(eval.verdict, Verdict::Unverified);
         assert_eq!(eval.reason, "只有 IP，无法核对地区");
@@ -323,7 +323,7 @@ mod tests {
     fn unnormalized_region_compares_raw_text() {
         let eval = evaluate(
             &target(AnchorKind::Auto, &[], &["XYZ"]),
-            &trace_probe_with_raw(Some("204.1.100.98"), None, Some("xyz")),
+            &trace_probe_with_raw(Some("198.51.100.98"), None, Some("xyz")),
         );
         assert_eq!(eval.verdict, Verdict::Pass);
         assert!(eval.reason.contains("XYZ") || eval.reason.contains("xyz"));
@@ -342,9 +342,9 @@ mod tests {
 
     #[test]
     fn disabled_target_is_unverified() {
-        let mut demo = target(AnchorKind::Auto, &["204.1.100.98"], &[]);
+        let mut demo = target(AnchorKind::Auto, &["198.51.100.98"], &[]);
         demo.enabled = false;
-        let eval = evaluate(&demo, &trace_probe(Some("204.1.100.98"), Some("US")));
+        let eval = evaluate(&demo, &trace_probe(Some("198.51.100.98"), Some("US")));
         assert_eq!(eval.verdict, Verdict::Unverified);
         assert!(eval.reason.contains("已禁用"));
     }

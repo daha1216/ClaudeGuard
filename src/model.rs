@@ -533,13 +533,13 @@ mod tests {
     #[test]
     fn normalizes_and_matches_ips() {
         assert_eq!(
-            normalize_ip(" 204.1.100.98 ").as_deref(),
-            Some("204.1.100.98")
+            normalize_ip(" 198.51.100.98 ").as_deref(),
+            Some("198.51.100.98")
         );
         assert_eq!(normalize_ip("204.1.100.098").as_deref(), None);
         assert_eq!(normalize_ip("::1").as_deref(), Some("::1"));
-        let expect = vec!["204.1.100.98".to_string()];
-        assert!(ip_hit(&expect, "204.1.100.98"));
+        let expect = vec!["198.51.100.98".to_string()];
+        assert!(ip_hit(&expect, "198.51.100.98"));
         assert!(!ip_hit(&expect, "198.51.100.24"));
         assert!(!ip_hit(&expect, "not-an-ip"));
     }

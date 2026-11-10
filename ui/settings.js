@@ -423,7 +423,7 @@
       "</div>" +
       '<div class="trow2"><input class="in" data-f="anchor_url" value="' + esc(t.anchor_url || "") + '" placeholder="https://…" spellcheck="false" aria-label="锚点 URL"></div>' +
       '<div class="trow3">' +
-      '<label class="tfield"><span>白名单 IP（逗号分隔）</span><input class="in" data-f="expect_ips" value="' + esc((t.expect_ips || []).join(", ")) + '" placeholder="204.1.100.98"></label>' +
+      '<label class="tfield"><span>白名单 IP（逗号分隔）</span><input class="in" data-f="expect_ips" value="' + esc((t.expect_ips || []).join(", ")) + '" placeholder="198.51.100.98"></label>' +
       '<label class="tfield"><span>出口地区（两字母代码）</span><input class="in" data-f="expect_regions" value="' + esc((t.expect_regions || []).join(", ")) + '" placeholder="US, JP"></label>' +
       "</div>" +
       '<div class="trow3">' +

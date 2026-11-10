@@ -285,28 +285,28 @@ mod tests {
 
     #[test]
     fn defaults_have_four_builtins_in_order() {
-        let targets = default_targets(&["204.1.100.98".into()], &["US".into()]);
+        let targets = default_targets(&["198.51.100.98".into()], &["US".into()]);
         let ids: Vec<&str> = targets.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["local", "claude", "codex", "antigravity"]);
         assert!(targets.iter().all(|t| t.builtin));
         assert_eq!(targets[1].bind_agent.as_deref(), Some("claude"));
         assert_eq!(targets[3].anchor_kind, AnchorKind::Reachability);
-        assert_eq!(targets[1].expect_ips, vec!["204.1.100.98"]);
+        assert_eq!(targets[1].expect_ips, vec!["198.51.100.98"]);
         assert_eq!(targets[1].expect_regions, vec!["US"]);
     }
 
     #[test]
     fn ensure_builtins_adds_missing_with_fallback_whitelist() {
-        let only_claude = default_targets(&["204.1.100.98".into()], &[])[1].clone();
+        let only_claude = default_targets(&["198.51.100.98".into()], &[])[1].clone();
         let targets = ensure_builtins(vec![only_claude], &[], &[]);
         assert_eq!(targets.len(), 4);
         let local = targets.iter().find(|t| t.id == "local").unwrap();
-        assert_eq!(local.expect_ips, vec!["204.1.100.98"]);
+        assert_eq!(local.expect_ips, vec!["198.51.100.98"]);
     }
 
     #[test]
     fn validate_accepts_defaults() {
-        let targets = default_targets(&["204.1.100.98".into()], &[]);
+        let targets = default_targets(&["198.51.100.98".into()], &[]);
         assert!(validate(targets).is_ok());
     }
 
@@ -333,13 +333,13 @@ mod tests {
     fn validate_normalizes_ip_and_region() {
         let mut targets = default_targets(&[], &[]);
         for t in targets.iter_mut().take(3) {
-            t.expect_ips = vec!["204.1.100.98".into(), " 204.1.100.98 ".into()];
+            t.expect_ips = vec!["198.51.100.98".into(), " 198.51.100.98 ".into()];
             t.expect_regions = vec!["usa".into()];
             t.timeout_secs = 999;
         }
         let out = validate(targets).unwrap();
         let claude = out.iter().find(|t| t.id == "claude").unwrap();
-        assert_eq!(claude.expect_ips, vec!["204.1.100.98"]);
+        assert_eq!(claude.expect_ips, vec!["198.51.100.98"]);
         assert_eq!(claude.expect_regions, vec!["US"]);
         assert_eq!(claude.timeout_secs, 60);
     }

@@ -136,22 +136,22 @@ mod tests {
 
     #[test]
     fn ipv4_is_redacted_by_default() {
-        let text = "出口：204.1.100.98\n检查：已恢复正常";
+        let text = "出口：198.51.100.98\n检查：已恢复正常";
         let out = redact(text, false);
-        assert!(!out.contains("204.1.100.98"), "默认不得出现出口 IP");
+        assert!(!out.contains("198.51.100.98"), "默认不得出现出口 IP");
         assert!(out.contains(REDACTED));
         assert!(out.contains("检查：已恢复正常"), "其余信息要保留");
     }
 
     #[test]
     fn ipv4_kept_when_user_opts_in() {
-        let text = "出口：204.1.100.98";
+        let text = "出口：198.51.100.98";
         assert_eq!(redact(text, true), text);
     }
 
     #[test]
     fn region_codes_are_redacted_by_default() {
-        for text in ["出口 204.1.100.98 · US", "地区：US", "loc=US colo=LAX"] {
+        for text in ["出口 198.51.100.98 · US", "地区：US", "loc=US colo=LAX"] {
             let out = redact(text, false);
             assert!(!out.contains("US"), "默认不得出现地区代码：{text} -> {out}");
             assert!(out.contains(REDACTED));
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn region_codes_kept_when_user_opts_in() {
-        let text = "出口 204.1.100.98 · US";
+        let text = "出口 198.51.100.98 · US";
         assert_eq!(redact(text, true), text);
     }
 
@@ -174,10 +174,10 @@ mod tests {
 
     #[test]
     fn chinese_region_names_are_redacted_by_default() {
-        // policy::fail_reason 的产物形如「出口 204.1.100.98（美国）不在白名单」
-        let text = "出口 204.1.100.98（美国）不在白名单";
+        // policy::fail_reason 的产物形如「出口 198.51.100.98（美国）不在白名单」
+        let text = "出口 198.51.100.98（美国）不在白名单";
         let out = redact(text, false);
-        assert!(!out.contains("204.1.100.98"), "默认不得出现出口 IP：{out}");
+        assert!(!out.contains("198.51.100.98"), "默认不得出现出口 IP：{out}");
         assert!(!out.contains("美国"), "默认不得出现地区名：{out}");
         assert!(out.contains(REDACTED));
         // 用户显式打开后原样保留

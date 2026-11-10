@@ -696,7 +696,7 @@ fn apply_smoke_state(state: &Arc<AppState>, kind: &str) {
         .map(|target| {
             let mut status =
                 crate::model::TargetStatus::from_target(target, crate::model::TargetState::Pass);
-            status.ip = Some("204.1.100.98".into());
+            status.ip = Some("198.51.100.98".into());
             status.country = Some("US".into());
             status.colo = Some("LAX".into());
             status.latency_ms = 286;

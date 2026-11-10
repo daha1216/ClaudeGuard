@@ -4,9 +4,7 @@
 
 日期为实际发布日期（UTC）。更早的历史版本见 [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases)。
 
-## [未发布]（v3.12.5）
-
-> 版本号已在 `Cargo.toml` 升至 3.12.5，但**尚未打 tag / 发布 Release**；以下为当前 master 上相对 v3.12.4 的全部变更。
+## [3.12.5] - 2026-11-11
 
 ### 新增
 
@@ -34,6 +32,8 @@
 - 依赖安全对齐：`zip` 升到 9.x、`quick-xml` 升到 0.42（PR #13，`44ade22`）；`hmac` 升到 0.13 并同步 `sha2` 0.11（PR #10，`5546f18` / `04a1c01` / `e45b987`）。
 - 补齐 macOS 移植缺的符号，macOS CI job 首次真正编译通过（`a48330c`）。
 - 放宽 inspection 用例超时，避免 CI 冷启动 PowerShell 时误报（`63cd2b8`）。
+- 依赖安全升级：`aes-gcm` 0.11.1、`libloading` 0.9.0、`winreg` 0.56.0（dependabot PR #14 / #15 / #16）。
+- 仓库内示例 IP 统一改为 TEST-NET（`198.51.100.98`），移除真实出口地址残留（测试夹具与界面占位符共 9 个文件）。
 
 ### 文档
 

@@ -289,7 +289,7 @@ mod tests {
     use super::*;
 
     fn trace_panel() -> &'static str {
-        "fl=20f123\nh=cloudflare.com\nip=204.1.100.98\nts=1729470000.123\nvisit_scheme=https\nuag=ClaudeGuard/3.0\ncolo=LAX\nsliver=none\nhttp=http/2\nloc=US\ntls=TLSv1.3\nsni=plaintext\nwarp=off\ngateway=off\nrbi=off\nkex=X25519\n"
+        "fl=20f123\nh=cloudflare.com\nip=198.51.100.98\nts=1729470000.123\nvisit_scheme=https\nuag=ClaudeGuard/3.0\ncolo=LAX\nsliver=none\nhttp=http/2\nloc=US\ntls=TLSv1.3\nsni=plaintext\nwarp=off\ngateway=off\nrbi=off\nkex=X25519\n"
     }
 
     #[test]
@@ -297,11 +297,11 @@ mod tests {
         let probe = parse_trace(trace_panel()).expect("trace 面板应能解析");
         assert_eq!(probe.parsed_as, "trace");
         assert!(probe.reachable);
-        assert_eq!(probe.ip.as_deref(), Some("204.1.100.98"));
+        assert_eq!(probe.ip.as_deref(), Some("198.51.100.98"));
         assert_eq!(probe.country.as_deref(), Some("US"));
         assert_eq!(probe.raw_region.as_deref(), Some("US"));
         assert_eq!(probe.colo.as_deref(), Some("LAX"));
-        assert!(probe.detail.contains("204.1.100.98"));
+        assert!(probe.detail.contains("198.51.100.98"));
     }
 
     #[test]
@@ -317,9 +317,9 @@ mod tests {
 
     #[test]
     fn trace_handles_crlf_and_comments() {
-        let probe = parse_trace("# ip=9.9.9.9\r\nip=204.1.100.98\r\nloc=JPN\r\ncolo=NRT\r\n")
+        let probe = parse_trace("# ip=9.9.9.9\r\nip=198.51.100.98\r\nloc=JPN\r\ncolo=NRT\r\n")
             .expect("CRLF 文本应能解析");
-        assert_eq!(probe.ip.as_deref(), Some("204.1.100.98"));
+        assert_eq!(probe.ip.as_deref(), Some("198.51.100.98"));
         assert_eq!(probe.country.as_deref(), Some("JP"));
         assert_eq!(probe.raw_region.as_deref(), Some("JPN"));
         assert_eq!(probe.colo.as_deref(), Some("NRT"));
@@ -327,17 +327,17 @@ mod tests {
 
     #[test]
     fn trace_keeps_unknown_region_raw() {
-        let probe = parse_trace("ip=204.1.100.98\nloc=XYZ\n").expect("未知地区也应解析");
+        let probe = parse_trace("ip=198.51.100.98\nloc=XYZ\n").expect("未知地区也应解析");
         assert!(probe.country.is_none());
         assert_eq!(probe.raw_region.as_deref(), Some("XYZ"));
     }
 
     #[test]
     fn json_reads_top_level_fields() {
-        let text = r#"{"ip":"204.1.100.98","country":"USA","city":"Los Angeles","org":"AS123"}"#;
+        let text = r#"{"ip":"198.51.100.98","country":"USA","city":"Los Angeles","org":"AS123"}"#;
         let probe = parse_json_ip(text).expect("JSON 出口应能解析");
         assert_eq!(probe.parsed_as, "json_ip");
-        assert_eq!(probe.ip.as_deref(), Some("204.1.100.98"));
+        assert_eq!(probe.ip.as_deref(), Some("198.51.100.98"));
         assert_eq!(probe.country.as_deref(), Some("US"));
         assert_eq!(probe.raw_region.as_deref(), Some("USA"));
         assert_eq!(probe.city.as_deref(), Some("Los Angeles"));
@@ -354,9 +354,9 @@ mod tests {
 
     #[test]
     fn json_prefers_first_alias_in_order() {
-        let text = r#"{"query":"1.1.1.1","ip":"204.1.100.98"}"#;
+        let text = r#"{"query":"1.1.1.1","ip":"198.51.100.98"}"#;
         let probe = parse_json_ip(text).expect("别名应能解析");
-        assert_eq!(probe.ip.as_deref(), Some("204.1.100.98"));
+        assert_eq!(probe.ip.as_deref(), Some("198.51.100.98"));
     }
 
     #[test]
@@ -399,19 +399,19 @@ mod tests {
 
     #[test]
     fn auto_prefers_trace_over_json_and_gemini() {
-        let text = "ip=204.1.100.98\nloc=US\n{\"ip\":\"9.9.9.9\"},2,1,200,\"JPN\"";
+        let text = "ip=198.51.100.98\nloc=US\n{\"ip\":\"9.9.9.9\"},2,1,200,\"JPN\"";
         let probe = parse_auto(text);
         assert_eq!(probe.parsed_as, "trace");
-        assert_eq!(probe.ip.as_deref(), Some("204.1.100.98"));
+        assert_eq!(probe.ip.as_deref(), Some("198.51.100.98"));
         assert_eq!(probe.country.as_deref(), Some("US"));
     }
 
     #[test]
     fn auto_prefers_json_over_gemini() {
-        let text = r#"{"ip":"204.1.100.98","note":",2,1,200,\"JPN\""}"#;
+        let text = r#"{"ip":"198.51.100.98","note":",2,1,200,\"JPN\""}"#;
         let probe = parse_auto(text);
         assert_eq!(probe.parsed_as, "json_ip");
-        assert_eq!(probe.ip.as_deref(), Some("204.1.100.98"));
+        assert_eq!(probe.ip.as_deref(), Some("198.51.100.98"));
     }
 
     #[test]

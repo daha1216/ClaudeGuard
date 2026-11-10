@@ -559,7 +559,7 @@ mod tests {
         r#"{
             "proxy_host": "127.0.0.1",
             "proxy_port": 7890,
-            "allowed_ips": ["204.1.100.98", " 198.51.100.7 "],
+            "allowed_ips": ["198.51.100.98", " 198.51.100.7 "],
             "egress_region": "us",
             "guarded_agents": ["claude", "foo", "claude", "chatgpt"],
             "cli_warn": false,
@@ -584,7 +584,7 @@ mod tests {
         assert!(cfg.targets.len() >= 4);
         for id in ["local", "claude", "codex"] {
             let t = cfg.target(id).expect(id);
-            assert_eq!(t.expect_ips, vec!["204.1.100.98", "198.51.100.7"]);
+            assert_eq!(t.expect_ips, vec!["198.51.100.98", "198.51.100.7"]);
             assert_eq!(t.expect_regions, vec!["US"]);
         }
         let anti = cfg.target("antigravity").unwrap();
@@ -608,12 +608,12 @@ mod tests {
 
     #[test]
     fn migrates_legacy_required_ip() {
-        let text = r#"{"proxy_host":"127.0.0.1","proxy_port":7890,"required_ip":"204.1.100.98"}"#;
+        let text = r#"{"proxy_host":"127.0.0.1","proxy_port":7890,"required_ip":"198.51.100.98"}"#;
         let mut cfg: Config = serde_json::from_str(text).unwrap();
         cfg.migrate();
         assert_eq!(
             cfg.target("claude").unwrap().expect_ips,
-            vec!["204.1.100.98"]
+            vec!["198.51.100.98"]
         );
     }
 
