@@ -443,7 +443,7 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     }
     crate::update::confirm_healthy();
 
-    let all_pass = enabled_count > 0 && passed_count == enabled_count;
+    let all_pass = is_all_pass(enabled_count, passed_count);
     let primary_ip = statuses.iter().find_map(|s| s.ip.clone());
     let reason = if failing.is_empty() {
         String::new()
@@ -476,6 +476,7 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
         );
     }
     let paused = state.is_paused();
+    let tripped = state.is_tripped();
 
     // v3.7 接入路径防抖：未接入与目标 Fail 走同一套阈值语义。
     let access_streak = if access_uncovered && !unconfigured {
@@ -499,7 +500,7 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     let gate = TripGate {
         unconfigured,
         paused,
-        tripped: state.is_tripped(),
+        tripped,
         access_uncovered,
         access_streak,
         failing: failing.len(),
@@ -511,7 +512,7 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     let access_trip = access_uncovered
         && !unconfigured
         && !paused
-        && !state.is_tripped()
+        && !tripped
         && (purpose == Purpose::Launch || access_streak >= cfg.trip_threshold);
     let should_trip = trip_allowed(&gate);
 
@@ -521,14 +522,23 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
             t_rest.elapsed().as_secs_f64() * 1000.0
         );
     }
-    if should_trip {
-        if access_trip && failing.is_empty() {
-            do_trip(state, &cfg, &[], access_reason);
-        } else {
-            do_trip(state, &cfg, &failing_ids, &reason);
+    match decide_round_outcome(&RoundDecision {
+        should_trip,
+        tripped,
+        access_uncovered,
+        enabled_count,
+        passed_count,
+        failing_ids: &failing_ids,
+        reason: &reason,
+    }) {
+        RoundOutcome::Trip => {
+            if access_trip && failing.is_empty() {
+                do_trip(state, &cfg, &[], access_reason);
+            } else {
+                do_trip(state, &cfg, &failing_ids, &reason);
+            }
         }
-    } else if state.is_tripped() {
-        if !failing.is_empty() || access_uncovered {
+        RoundOutcome::StayTripped => {
             if cfg.kill_on_fail && !unconfigured && !disarmed {
                 let mut killed = crate::guard::kill_agents(&cfg);
                 if cfg.guarded_agents.iter().any(|id| id == "claude") {
@@ -538,16 +548,26 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
                     state.log(format!("持续异常：再次结束 {killed} 个进程"));
                 }
             }
-        } else if passed_count > 0
-            && enabled_count > 0
-            && passed_count == enabled_count
-            && !access_uncovered
-        {
-            // v3.7：恢复额外要求接入路径已重新覆盖（系统代理或 TUN）。
+        }
+        RoundOutcome::Recover => {
             do_recover(state, &cfg, primary_ip.as_deref());
         }
-    } else if all_pass && !failing.is_empty() {
-        state.set_launch_error(reason.clone());
+        RoundOutcome::RecordFailure {
+            failing_ids,
+            reason,
+        } => {
+            // 原先这里是 `else if all_pass && !failing.is_empty()` 死分支（all_pass
+            // 已要求 failing 为空），失败原因永远写不进 launch_error。
+            let prev = state.launch_error();
+            if prev != reason {
+                state.log(format!(
+                    "检查未通过：{reason}（failing ids: {}）",
+                    failing_ids.join(",")
+                ));
+            }
+            state.set_launch_error(reason);
+        }
+        RoundOutcome::NoAction => {}
     }
 
     state.set_checking(false);
@@ -562,6 +582,69 @@ pub fn run_round(state: &Arc<AppState>, purpose: Purpose) -> RoundSummary {
     }
     summary.passed = all_pass && !state.is_tripped();
     summary
+}
+
+/// 全过口径：启用目标数 > 0 且全部通过（全 Disabled 不算全过）。
+fn is_all_pass(enabled_count: usize, passed_count: usize) -> bool {
+    enabled_count > 0 && passed_count == enabled_count
+}
+
+/// 一轮检查的处置决策输入（计数口径与 run_round 一致）。
+struct RoundDecision<'a> {
+    should_trip: bool,
+    tripped: bool,
+    access_uncovered: bool,
+    enabled_count: usize,
+    passed_count: usize,
+    failing_ids: &'a [String],
+    reason: &'a str,
+}
+
+/// 一轮检查的处置结果（`decide_round_outcome` 的返回值）。
+#[derive(Debug, PartialEq, Eq)]
+enum RoundOutcome {
+    /// 本轮达到熔断条件，调用方执行 do_trip。
+    Trip,
+    /// 已熔断且仍异常：维持熔断并再次结束进程。
+    StayTripped,
+    /// 已熔断且本轮全过：恢复（do_recover）。
+    Recover,
+    /// 未熔断但存在 Fail：记录失败原因与 failing 目标 id（写入 launch_error，UI 横幅可见）。
+    RecordFailure {
+        failing_ids: Vec<String>,
+        reason: String,
+    },
+    /// 其余情形（全 Unverified / 全 Disabled / 全 Pass 但未熔断）：无操作。
+    NoAction,
+}
+
+/// 一轮检查该做什么（纯函数，便于真值表单测）。
+///
+/// 判定语义与 v3.12.5 的内嵌 if 链一致（信息缺失→Unverified 不熔断、
+/// 连续达阈值才熔断、恢复仍要求"已熔断 + 全过 + 接入路径已覆盖"），
+/// 只修正原先恒为 false 的 `all_pass && !failing.is_empty()` 死分支：
+/// 未熔断且存在 Fail 时记录失败原因，供 UI 的 launch_error 横幅显示。
+fn decide_round_outcome(d: &RoundDecision<'_>) -> RoundOutcome {
+    if d.should_trip {
+        RoundOutcome::Trip
+    } else if d.tripped {
+        // v3.7：恢复额外要求接入路径已重新覆盖（系统代理或 TUN），
+        // 因此未接入走"维持熔断"而不是恢复。
+        if !d.failing_ids.is_empty() || d.access_uncovered {
+            RoundOutcome::StayTripped
+        } else if is_all_pass(d.enabled_count, d.passed_count) {
+            RoundOutcome::Recover
+        } else {
+            RoundOutcome::NoAction
+        }
+    } else if !d.failing_ids.is_empty() {
+        RoundOutcome::RecordFailure {
+            failing_ids: d.failing_ids.to_vec(),
+            reason: d.reason.to_string(),
+        }
+    } else {
+        RoundOutcome::NoAction
+    }
 }
 
 fn do_trip(state: &Arc<AppState>, cfg: &Config, failing_ids: &[String], reason: &str) {
@@ -1175,5 +1258,100 @@ mod tests {
         let summary = RoundSummary::ok();
         assert!(summary.passed);
         assert!(summary.block_reason.is_empty());
+    }
+
+    /// 行为锁：一轮检查的处置真值表（全 Pass / 部分 Fail / 全 Uncovered / 全 Disabled）。
+    /// 修正前 `else if all_pass && !failing.is_empty()` 恒为 false，
+    /// 部分 Fail 时失败原因永远写不进 launch_error。
+    #[test]
+    fn round_outcome_truth_table() {
+        fn dec<'a>(
+            should_trip: bool,
+            tripped: bool,
+            enabled: usize,
+            passed: usize,
+            failing_ids: &'a [String],
+        ) -> RoundDecision<'a> {
+            RoundDecision {
+                should_trip,
+                tripped,
+                access_uncovered: false,
+                enabled_count: enabled,
+                passed_count: passed,
+                failing_ids,
+                reason: if failing_ids.is_empty() {
+                    ""
+                } else {
+                    "Claude 出口不在白名单"
+                },
+            }
+        }
+
+        let failing = vec!["claude".to_string()];
+        let record = RoundOutcome::RecordFailure {
+            failing_ids: failing.clone(),
+            reason: "Claude 出口不在白名单".into(),
+        };
+
+        // 1) 全 Pass（2 启用、2 Pass、0 Fail）
+        assert_eq!(
+            decide_round_outcome(&dec(false, false, 2, 2, &[])),
+            RoundOutcome::NoAction,
+            "未熔断时全 Pass 无需动作（启动门禁会自行清 launch_error）"
+        );
+        assert_eq!(
+            decide_round_outcome(&dec(false, true, 2, 2, &[])),
+            RoundOutcome::Recover,
+            "已熔断且全 Pass 应恢复"
+        );
+
+        // 2) 部分 Fail（3 启用、1 Pass、1 Fail）
+        assert_eq!(
+            decide_round_outcome(&dec(false, false, 3, 1, &failing)),
+            record,
+            "未熔断但存在 Fail 必须记录失败原因与 failing 目标 id（原死分支）"
+        );
+        assert_eq!(
+            decide_round_outcome(&dec(false, true, 3, 1, &failing)),
+            RoundOutcome::StayTripped,
+            "已熔断且仍 Fail 维持熔断并再次结束进程"
+        );
+        assert_eq!(
+            decide_round_outcome(&dec(true, false, 3, 1, &failing)),
+            RoundOutcome::Trip,
+            "达到阈值时熔断优先于记录失败"
+        );
+
+        // 3) 全 Uncovered（探测被跳过 → 全 Unverified：0 Pass、0 Fail）
+        assert_eq!(
+            decide_round_outcome(&dec(false, false, 2, 0, &[])),
+            RoundOutcome::NoAction,
+            "全 Unverified 不熔断、不记失败（信息缺失按 Unverified 处理）"
+        );
+        assert_eq!(
+            decide_round_outcome(&dec(false, true, 2, 0, &[])),
+            RoundOutcome::NoAction,
+            "已熔断但本轮无法确认时不恢复"
+        );
+        assert_eq!(
+            decide_round_outcome(&RoundDecision {
+                access_uncovered: true,
+                ..dec(false, true, 2, 0, &[])
+            }),
+            RoundOutcome::StayTripped,
+            "已熔断且接入路径未覆盖时维持熔断"
+        );
+
+        // 4) 全 Disabled（0 启用）
+        assert_eq!(
+            decide_round_outcome(&dec(false, false, 0, 0, &[])),
+            RoundOutcome::NoAction,
+            "全 Disabled 无操作（is_all_pass 要求启用数 >0）"
+        );
+        assert_eq!(
+            decide_round_outcome(&dec(false, true, 0, 0, &[])),
+            RoundOutcome::NoAction,
+            "全 Disabled 不恢复"
+        );
     }
 }
