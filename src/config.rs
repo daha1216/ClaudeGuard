@@ -15,11 +15,66 @@ pub fn config_dir() -> PathBuf {
         crate::macos::data_dir()
     }
     #[cfg(not(target_os = "macos"))]
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let (base, source) = pick_config_base(
+        std::env::var_os("APPDATA"),
+        std::env::var_os("LOCALAPPDATA"),
+        std::env::var_os("PROGRAMDATA"),
+        std::env::temp_dir(),
+    );
+    // P2-7：取不到 %APPDATA% 时的降级必须看得见（记日志警告），且绝不落 cwd。
+    #[cfg(not(target_os = "macos"))]
+    if source != "APPDATA" {
+        warn_fallback(source, &base);
+    }
     #[cfg(not(target_os = "macos"))]
     base.join("ClaudeGuard")
+}
+
+/// 纯函数：配置基目录的选择顺序。
+///
+/// `%APPDATA%`（正常场景）→ `LOCALAPPDATA` → `ProgramData` → 系统临时目录。
+/// **绝不落 cwd**：计划任务/System32 场景下 cwd 是不可预期的系统目录，
+/// 配置/账本/日志写进去等于"配置丢失 + fail-closed 账本缺失"（P2-7）。
+/// 空串/纯空白视为缺失。返回 `(目录, 来源标签)`；来源不是 `APPDATA` 时
+/// 调用方要记日志警告。
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn pick_config_base(
+    appdata: Option<std::ffi::OsString>,
+    localappdata: Option<std::ffi::OsString>,
+    programdata: Option<std::ffi::OsString>,
+    temp: PathBuf,
+) -> (PathBuf, &'static str) {
+    fn usable(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+        value
+            .filter(|v| !v.to_string_lossy().trim().is_empty())
+            .map(PathBuf::from)
+    }
+    if let Some(dir) = usable(appdata) {
+        return (dir, "APPDATA");
+    }
+    if let Some(dir) = usable(localappdata) {
+        return (dir, "LOCALAPPDATA");
+    }
+    if let Some(dir) = usable(programdata) {
+        return (dir, "ProgramData");
+    }
+    (temp, "TEMP")
+}
+
+/// 降级到非 `%APPDATA%` 目录时记一条警告。
+/// 日志本身写在 `config_dir()` 里，用一次性标志挡住重入
+/// （`log_line` → `config_dir` → 这里 → `log_line`）。
+#[cfg(not(target_os = "macos"))]
+fn warn_fallback(source: &str, base: &std::path::Path) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    guard::log_line(&format!(
+        "config: 未取到 %APPDATA%，配置/账本/日志降级到 {source}（{}）——请检查账户环境变量",
+        base.display()
+    ));
 }
 
 /// 仅 macOS 验收测试使用；Windows 侧统一走 `load_from`/`save_to`。
@@ -659,5 +714,54 @@ mod tests {
         cfg.migrate();
         assert!(!cfg.cut_network);
         assert_eq!(cfg.cut_mode(), CutMode::Off);
+    }
+
+    /// P2-7 行为锁: 基目录 fallback 顺序 APPDATA → LOCALAPPDATA → ProgramData
+    /// → 临时目录；空串视同缺失；任何一路都绝不落到 cwd（"."）。
+    #[test]
+    fn config_base_fallback_never_uses_cwd() {
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+        let temp = std::env::temp_dir();
+        let appdata = temp.join("cg-fixture-appdata");
+        let local = temp.join("cg-fixture-localappdata");
+        let program = temp.join("cg-fixture-programdata");
+        let os = |p: &std::path::Path| Some(OsString::from(p.to_string_lossy().to_string()));
+
+        // 正常场景：%APPDATA% 优先
+        assert_eq!(
+            super::pick_config_base(os(&appdata), os(&local), os(&program), temp.clone()),
+            (appdata.clone(), "APPDATA")
+        );
+        // 缺 %APPDATA% → LOCALAPPDATA
+        assert_eq!(
+            super::pick_config_base(None, os(&local), os(&program), temp.clone()),
+            (local.clone(), "LOCALAPPDATA")
+        );
+        // 再退 ProgramData
+        assert_eq!(
+            super::pick_config_base(None, None, os(&program), temp.clone()),
+            (program.clone(), "ProgramData")
+        );
+        // 全无 → 系统临时目录（仍不是 cwd）
+        assert_eq!(
+            super::pick_config_base(None, None, None, temp.clone()),
+            (temp.clone(), "TEMP")
+        );
+        // 空串/纯空白视同缺失
+        assert_eq!(
+            super::pick_config_base(
+                Some(OsString::from("")),
+                Some(OsString::from("   ")),
+                os(&program),
+                temp.clone()
+            ),
+            (program.clone(), "ProgramData")
+        );
+        // 产出的目录永远是绝对路径，绝不产出 "."
+        for dir in [appdata, local, program, temp] {
+            assert!(dir.is_absolute());
+            assert_ne!(dir, PathBuf::from("."));
+        }
     }
 }
