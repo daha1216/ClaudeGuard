@@ -1,19 +1,23 @@
-> **macOS 移植预览**：仓库现含 macOS 平台适配与深色界面（进程守护模式）。本版不提供系统级按应用网络隔离；客户端升级、回滚与本地自更新已验证，正式远端自更新仍需维护者公钥和 macOS 发布资产。详情与测试方式见 [macOS 说明](docs/MACOS.md)。Windows 版文档如下。
+> **macOS preview**: the repository now ships a macOS port with a dark UI (process-guarding mode). This build has no system-level per-app network isolation; client upgrade/rollback and local self-update are verified, while official remote self-update still needs the maintainer's public key and macOS release assets. See the [macOS notes](docs/MACOS.md) for details and testing. Windows documentation follows.
 
 <p align="center">
   <img src="assets/icon.png" alt="ClaudeGuard Logo" width="128" height="128" />
 </p>
 
-<h1 align="center">ClaudeGuard (Claude 守护器)</h1>
+<h1 align="center">ClaudeGuard</h1>
 
 <p align="center">
-  <strong>给 AI 桌面应用加一道“网络出口门禁”</strong>
+  <strong>A network-egress gate for your AI desktop apps</strong>
+</p>
+
+<p align="center">
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
 <p align="center">
   <a href="https://github.com/daha1216/ClaudeGuard/releases"><img src="https://img.shields.io/github/v/release/daha1216/ClaudeGuard" alt="GitHub Release" /></a>
   <img src="https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-blue" alt="Windows" />
-  <img src="https://img.shields.io/badge/Platform-macOS%20(移植预览)-9aa0a6" alt="macOS preview" />
+  <img src="https://img.shields.io/badge/Platform-macOS%20(preview)-9aa0a6" alt="macOS preview" />
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Rust" />
   <img src="https://img.shields.io/badge/GUI-Tauri%202-brightgreen" alt="Tauri 2" />
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT" />
@@ -21,131 +25,145 @@
 
 ---
 
-### 一句话定位
-ClaudeGuard 是 AI 桌面应用的“网络出口门禁”（Windows 完整支持，macOS 移植预览）：**按每个目标自己的域名**校验它此刻走的是哪条链路、出口 IP 与地区是否在白名单里；全部通过才允许启动 Claude 等桌面应用，任一启用目标不符合就立即熔断——结束相关进程、用防火墙隔离、必要时直接断网，切回合规节点后自动恢复。
+### In one sentence
+ClaudeGuard is a **network-egress gate for AI desktop apps** (full support on Windows, preview port on macOS): it checks — **against each target's own domain** — which route the app is using right now and whether the egress IP and region are on your allowlist. Only when every enabled target passes may apps like Claude start; if any enabled target fails, ClaudeGuard trips at once — ends the related processes, isolates them with the firewall, cuts the network when configured — and restores everything automatically once you are back on a compliant node.
 
-### 为什么需要它
-Claude、ChatGPT、反重力这些客户端对出口环境很敏感，而代理软件经常“整体一个出口”。当节点漂移、断连直连或者某个应用被单独分流时，应用会在你不知情的情况下从非预期出口联网。v3 的核心变化是把“系统出口”拆成**每个应用各测各的**：Claude 走 claude.ai 的 trace、Codex 走 chatgpt.com 的 trace、反重力测 Google 后端可达性——互不牵连，谁不对谁熔断。
+### Why you need it
+Claude, ChatGPT and Antigravity clients are very sensitive to the environment their traffic exits from, while proxy software usually presents **one shared egress**. When a node drifts, the proxy drops and traffic goes direct, or one app gets routed separately, the app can silently reach the network from an unexpected exit — right when you are trying to keep the account in a supported region. In 2026 Anthropic's account enforcement tightened around exactly this: the official [supported-countries list](https://www.anthropic.com/supported-countries) defines the region red line, and community post-mortems such as [this one on network-based ban detection](https://blog.leeguoo.com/en/posts/claude-account-ban-network-detection/) describe how region and IP-type heuristics (datacenter vs. residential) get accounts flagged. ClaudeGuard does not run a proxy and does not touch your routing rules; it only verifies the egress **before** the app talks to the network, and trips first when something is off.
+
+v3's core change is to split "the system egress" into **one probe per app**: Claude goes through `claude.ai`'s trace, Codex through `chatgpt.com`'s trace, Antigravity by Google backend reachability — independent of each other, so the one that is wrong is the one that trips.
+
+### Core capabilities
+
+1. **Per-target allowlist validation** — every monitored target binds its own probe URL and expected values (IP list and/or ISO country/region code); all enabled targets must pass before the guarded apps are allowed to run.
+2. **Trip = kill processes + firewall isolation + optional network cut** — after the debounce threshold, ClaudeGuard ends the guarded GUI app processes, adds Windows firewall block rules for them, and can additionally cut the network (firewall-wide outbound block by default, or disabling the physical NIC).
+3. **Recovery with the ledger first** — every system-changing action writes a ledger entry before it runs; recovery is idempotent and shared by auto-recovery, the tray "release & restore network" action, `--restore`, and program exit.
+4. **Feishu notifications, self-update, and a `--check` CLI** — desktop + Feishu group notifications, GitHub Releases-based self-update, official-MSIX in-place client updates, and a scriptable `--check` that prints JSON with a meaningful exit code.
 
 ---
 
-## 界面预览
+## Screenshots
 
 <table>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshot-main.png" alt="主界面：守护正常" width="400" /><br><sub>主界面 · 各目标出口校验通过，一键启动</sub></td>
-    <td align="center" width="50%"><img src="assets/screenshot-trip.png" alt="熔断态" width="400" /><br><sub>熔断 · 结束进程 + 隔离，一键解除并恢复网络</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshot-main.png" alt="Main window: guarding OK" width="400" /><br><sub>Main · every target's egress validated, one click to launch</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshot-trip.png" alt="Tripped state" width="400" /><br><sub>Tripped · processes ended + isolated, one click to release and restore the network</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshot-settings.png" alt="设置卡" width="400" /><br><sub>设置 · 九个折叠组，组头直接显示当前值</sub></td>
-    <td align="center" width="50%"><img src="assets/screenshot-wizard.png" alt="首次向导" width="400" /><br><sub>首次向导 · 三步完成配置</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshot-settings.png" alt="Settings card" width="400" /><br><sub>Settings · nine collapsible groups, each header shows the current values</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshot-wizard.png" alt="First-run wizard" width="400" /><br><sub>First-run wizard · three steps to configure</sub></td>
   </tr>
 </table>
 
 <p align="center">
-  <img src="assets/screenshot-details.png" alt="详情卡" width="400" /><br>
-  <sub>详情 · 每个目标的锚点、期望值、耗时与运行参数</sub>
+  <img src="assets/screenshot-details.png" alt="Details card" width="400" /><br>
+  <sub>Details · anchor, expected values, latency and runtime parameters per target</sub>
 </p>
 
 ---
 
-## 功能亮点
+## Highlights
 
-- **按目标校验出口（v3 核心）**：每个监控目标绑定自己的探测地址与期望值。Claude → `claude.ai/cdn-cgi/trace`，Codex → `chatgpt.com/cdn-cgi/trace`，反重力 → `cloudcode-pa.googleapis.com` 可达性，本机出口 → `cloudflare.com/cdn-cgi/trace`。支持 HTTP trace、JSON IP、页面地区标记、仅可达性四类锚点，自定义目标同样适用。
-- **接入路径检查（v3.7/3.8）**：探测流量跟随系统代理（换了端口、换了代理软件也测的是应用真实出口）；系统代理没开时靠 TUN 网卡判定接入，两者都没有 = 应用直连真实出口 → 按熔断阈值处理（杀进程/隔离/断网）。此状态下守护器自身**不直连探测**——任何状态下守护器流量都不带家宽 IP 出机器。
-- **防火墙兜底封锁（v3.9）**：没连代理（系统代理与 TUN 都不在）时，自动给守护对象加防火墙出站 Block——应用直连出不去，走系统代理照常可用，接入后规则自动解除；也支持一键手动封锁/解除。需要时会自动开启 Windows 防火墙（默认出站=允许，不影响其他软件），但绝不替你关掉。
-- **双重白名单**：多 IP 列表 + 出口地区（ISO 国家/地区码），任一命中即放行；期望为空的目标会被校验拦下，避免裸连。
-- **防抖熔断**：连续 `2` 次（可调）失败才熔断，任意一次通过清零；探测失败/拿不到出口信息属于“无法确认”，不熔断。
-- **熔断动作**：结束 Claude / ChatGPT / 反重力的全部进程 + 按开关做防火墙入/出站隔离 + 断网档位（关闭 / 防火墙全局出站阻断（默认）/ 禁用物理网卡）。
-- **恢复零残留**：切回合规节点后下一轮自动解除隔离与断网；托盘“解除隔离并恢复网络”、`--restore` 急救、程序退出都会恢复网络。
-- **常驻托盘**：默认每 15 秒复查一次（5–3600 秒可调），可“暂停守护 30 分钟”（暂停期间照常检测但绝不熔断）。
-- **多 Agent 守护**：GUI 应用熔断杀进程，CLI（Claude Code / Codex CLI / Gemini CLI）只提醒不杀，避免误伤终端。
-- **桌面通知 + 飞书群通知**：熔断、恢复、启动被阻止、失败预警、客户端更新五类桌面通知；飞书机器人支持签名校验、DPAPI 凭据加密、持久队列与失败补发。见 [飞书通知](docs/FEISHU.md)。
-- **Claude / Codex 客户端更新**：只走官方 MSIX 源，校验签名与包身份后原位升级，注册版本达标才算完成。见 [客户端更新](docs/CLIENT-UPDATES.md)。
-- **守护器自身更新**：基于 GitHub Releases 的版本检测、下载与自替换。
-- **可脚本化**：`--check` 输出 JSON 与退出码，适合批处理和前置流水线。
+- **Per-target egress validation (the v3 core)**: each monitored target binds its own probe address and expected values. Claude → `claude.ai/cdn-cgi/trace`, Codex → `chatgpt.com/cdn-cgi/trace`, Antigravity → reachability of `cloudcode-pa.googleapis.com`, local egress → `cloudflare.com/cdn-cgi/trace`. Four anchor kinds are supported — HTTP trace, JSON IP, page region marker, reachability-only — and custom targets use the same machinery.
+- **Access-path check (v3.7/3.8)**: probes follow the system proxy (so changing the port or the proxy app still measures the app's real egress); with the system proxy off, TUN adapter presence decides access, and neither present means the app would go direct to its real egress → handled by the trip threshold (kill / isolate / cut). In that state the guard itself **does not probe directly** — under no circumstances does ClaudeGuard's own traffic leave the machine with your home IP.
+- **Firewall fallback lockdown (v3.9)**: with no proxy attached (no system proxy and no TUN), ClaudeGuard automatically adds outbound firewall Block rules for the guarded apps — direct egress is blocked, going through the system proxy still works, and the rules drop automatically once access is restored; a one-click manual lockdown/release is also available. Windows Firewall is turned on automatically when needed (default outbound = allow, other software unaffected), but it is never turned off for you.
+- **Dual allowlist**: multiple IP entries plus egress region (ISO country/region codes) — any match passes; targets whose expectations are empty are rejected by validation, so nothing can run bare.
+- **Debounced tripping**: `2` consecutive failures (configurable) are required to trip, and any single pass resets the counter; probe failures or missing egress info count as "unverified" and do not trip.
+- **Trip actions**: end all Claude / ChatGPT / Antigravity processes + firewall in/outbound isolation per the switches + network-cut level (off / firewall-wide outbound block (default) / disable physical NIC).
+- **Zero-residue recovery**: the next round after switching back to a compliant node releases isolation and the network cut automatically; the tray's "release & restore network", the `--restore` emergency command, and program exit all restore networking.
+- **Resident tray**: re-checks every 15 seconds by default (5–3600 s configurable); "pause guarding for 30 minutes" keeps detecting but never trips.
+- **Multi-agent guarding**: GUI apps are killed on trip, CLIs (Claude Code / Codex CLI / Gemini CLI) only get a log reminder so your terminal is never collateral damage.
+- **Desktop + Feishu notifications**: trip, recovery, launch-blocked, failure warning, client-update desktop toasts; the Feishu bot supports signature verification, DPAPI-encrypted credentials, a persistent queue and retry-on-failure. See [Feishu notifications](docs/FEISHU.md).
+- **Claude / Codex client updates**: official MSIX sources only, signature and package-identity verified, in-place upgrade that only counts as done once the registered version matches. See [client updates](docs/CLIENT-UPDATES.md).
+- **Self-update**: version check, download and self-replacement based on GitHub Releases.
+- **Scriptable**: `--check` prints JSON with exit codes — ready for batch jobs and pre-flight pipelines.
 
 ---
 
-## 守护范围与熔断方式
+## Guarded scope & trip mechanisms
 
-| 类型 | 支持目标 | 熔断机制 | 说明 |
+| Type | Supported targets | Trip mechanism | Notes |
 | :--- | :--- | :--- | :--- |
-| **GUI 桌面应用** | Claude / ChatGPT / 反重力 (Antigravity) | **结束进程 + 防火墙隔离** | 任意组合勾选；熔断时结束全部关联进程，并为其可执行文件添加 Windows 防火墙出/入站阻止规则。 |
-| **CLI 命令行** | Claude Code / Codex / Gemini CLI | **仅日志提醒，绝不杀进程** | CLI 常驻在终端或 Node 环境里，杀进程会误伤整个终端，因此只记录提醒。 |
+| **GUI desktop apps** | Claude / ChatGPT / Antigravity | **End processes + firewall isolation** | Any combination; on trip all associated processes are ended and Windows firewall in/outbound block rules are added for their executables. |
+| **CLI tools** | Claude Code / Codex CLI / Gemini CLI | **Log reminder only, never killed** | CLIs live in your terminal or a Node process; killing them would take the whole terminal down, so they are only recorded. |
 
 ---
 
-## 防误杀与放行语义
+## Fail-safe & pass semantics
 
-- **信息缺失不熔断**：探测超时、返回为空、拿不到 IP/地区时判为“无法确认”，只记录不熔断。
-- **期望为空不放行**：某个目标的期望 IP 与地区都为空时，该目标永远不通过（宁可错杀），需要补白名单。
-- **连续两次才熔断**：单次网络抖动不会立刻熔断；两次检查间隔默认 15 秒。
-- **本机出口默认关闭**：本机常规流量出口往往与 AI 代理出口不同，默认开启会在首次启动就熔断；需要监管本机出口时在设置里打开并补齐白名单。
-
----
-
-## 安装与快速上手
-
-仅支持 **Windows 10 / 11**，界面全中文。在 [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases) 获取最新分发包：
-
-1. **安装版（`ClaudeGuard-vX.Y.Z-setup.exe`）**
-   - Inno Setup 打包，默认安装到 `C:\Program Files\ClaudeGuard`，自动检测 WebView2 运行时。
-   - 需要管理员权限：熔断时要调用 Windows 防火墙与网卡控制接口。
-   - 卸载可在“安装的应用”中完成，**刻意保留** `%APPDATA%\ClaudeGuard` 里的配置与日志。
-2. **便携版（`ClaudeGuard-vX.Y.Z.zip`）**
-   - 裸 exe，解压即用（同样需要管理员权限）。
-
-### 首次运行向导
-三步完成配置：① 欢迎与能力说明 → ② 代理与白名单（代理端口 + 白名单 IP（可多个）+ 出口地区；**两项都留空会一直熔断**，向导会给出闸门警告并要求二次确认才允许跳过）→ ③ 安装方式（「安装并继续」注册开始菜单与开机自启 / 「使用便携版」不写注册表直接运行）。完成后即进入常驻守护。
+- **Missing information never trips**: probe timeout, empty response, no IP/region → judged "unverified", logged only.
+- **Empty expectations never pass**: a target whose expected IP list and region list are both empty never passes (better safe than sorry) — fill in the allowlist.
+- **Two in a row before tripping**: a single network blip won't trip anything; the check interval defaults to 15 seconds.
+- **Local egress target is disabled by default**: your normal traffic usually exits from a different IP than the AI proxy, so enabling it by default would trip on first start; turn it on in settings and fill the allowlist if you really want to guard it.
 
 ---
 
-## macOS 版（移植预览）
+## Install & quick start
 
-v3.6.0 起仓库内置 macOS 适配（社区贡献，进程守护模式，深色界面）。**暂无预编译包**，需从源码构建：
+Windows 10 / 11 only; the UI is fully in Chinese (community translations welcome — see [CONTRIBUTING.md](CONTRIBUTING.md)). Grab the latest package from [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases):
+
+1. **Installer (`ClaudeGuard-vX.Y.Z-setup.exe`)**
+   - Inno Setup package, installs to `C:\Program Files\ClaudeGuard` by default, checks for the WebView2 runtime.
+   - Needs administrator rights: tripping calls the Windows firewall and NIC control interfaces.
+   - Uninstall from "Installed apps"; it **deliberately keeps** config and logs in `%APPDATA%\ClaudeGuard`.
+2. **Portable (`ClaudeGuard-vX.Y.Z.zip`)**
+   - Bare exe, unzip and run (administrator rights still required).
+
+### 3-step quick start
+1. **Download** the installer or the portable zip from Releases and run it (admin elevation is required).
+2. **Fill the first-run wizard**: local proxy port + allowlist IPs (several allowed) and/or egress region — *leaving both empty means nothing ever passes, and the guard trips and isolates the network about 30 seconds after start*, so the wizard shows an explicit gate warning and requires a second confirmation before you may skip it.
+3. **Pick an install mode** — "Install & continue" (registers Start menu + boot autostart) or "Use portable" (no registry writes) — and resident guarding starts.
+
+### First-run wizard
+Three steps: ① welcome & capability overview → ② proxy & allowlist (proxy port + allowlist IPs + egress region; **both left empty = permanent tripping**, gated with a warning and a confirm-twice skip) → ③ install mode ("Install & continue" registers the Start menu and boot autostart / "Use portable" runs from the current directory without touching the registry). Afterwards ClaudeGuard runs resident in the tray.
+
+---
+
+## macOS (preview port)
+
+Since v3.6.0 the repository ships a macOS port (community contribution, process-guarding mode, dark UI). **No prebuilt package yet** — build from source:
 
 ```bash
 git clone https://github.com/daha1216/ClaudeGuard && cd ClaudeGuard
-cargo build --release            # 需要 Xcode Command Line Tools
-python3 scripts/package-macos.py # 产出 ClaudeGuard.app（ad-hoc 签名）
+cargo build --release            # needs Xcode Command Line Tools
+python3 scripts/package-macos.py # produces ClaudeGuard.app (ad-hoc signed)
 ```
 
-把 `ClaudeGuard.app` 拖入「应用程序」后首次启动，走与 Windows 相同的三步向导。
+Drag `ClaudeGuard.app` into "Applications" and run it; it walks the same three-step wizard as Windows.
 
-**与 Windows 版的能力对照**：
+**Capability matrix vs. Windows**:
 
-| 能力 | Windows | macOS（移植预览） |
+| Capability | Windows | macOS (preview) |
 | :--- | :--- | :--- |
-| 按目标出口校验 / 白名单 / 防抖熔断 | ✅ | ✅ 同一套语义 |
-| 熔断动作 | 结束进程 + 防火墙隔离 + 断网档位 | **仅结束进程**（进程守护模式，不断网） |
-| 启动门禁（出口未过禁止启动 Claude） | ✅ | ✅ |
-| 飞书 / 桌面通知 / 客户端更新 | ✅ DPAPI / Toast / MSIX 原位升级 | ✅ Keychain+AES-GCM / 原生通知 / 官方包签名校验升级 |
-| 守护器自更新 | ✅ GitHub Releases 自替换 | 本地签名包流程已验证；远端发布需维护者 Minisign 公钥 |
-| 登录自启 | ✅ | ✅ LaunchAgent |
+| Per-target egress validation / allowlist / debounced trip | ✅ | ✅ same semantics |
+| Trip actions | End processes + firewall isolation + network-cut levels | **End processes only** (process-guarding mode, no network cut) |
+| Launch gate (blocked from starting Claude while egress is invalid) | ✅ | ✅ |
+| Feishu / desktop notifications / client updates | ✅ DPAPI / Toast / MSIX in-place upgrade | ✅ Keychain+AES-GCM / native notifications / signed official-package upgrade |
+| Self-update | ✅ GitHub Releases self-replacement | local signed-package flow verified; remote publishing needs the maintainer's Minisign public key |
+| Login autostart | ✅ | ✅ LaunchAgent |
 
-已知边界：无系统级按应用网络隔离（两次检测之间有窗口期）；未做 Developer ID 公证；Intel 产物仅 Rosetta 验证。详见 [docs/MACOS.md](docs/MACOS.md)（使用说明）与 [docs/MACOS-VALIDATION.md](docs/MACOS-VALIDATION.md)（验证记录）。
+Known limits: no system-level per-app isolation (a window exists between two checks); no Developer ID notarization; Intel builds verified only through Rosetta. See [docs/MACOS.md](docs/MACOS.md) (usage) and [docs/MACOS-VALIDATION.md](docs/MACOS-VALIDATION.md) (validation record).
 
 ---
 
-## 日常使用
+## Daily use
 
-- **主界面**：主卡显示状态点 + 状态标题 + 版本号 + 一行副标题，下面两块 Claude / Codex 出口瓦片；再往下是「监控目标」「保护」两张分组卡，每个目标一行（左：名称/地区，右：出口 IP/耗时）。熔断与暂停**没有横幅**，状态由主卡标题与主按钮表达（熔断时主钮变「解除隔离并恢复网络」，暂停时变「恢复守护」）。CTA 区主按钮旁是「立即检测」，随时手动复查。页脚四链：详情 / 设置 / 清理 Claude 进程 / 日志，展开对应卡片。
-- **设置**：九个折叠组——检测（代理端口、检查间隔、接入路径检查）、熔断与清理（断网档位、熔断动作开关、进程清理、防火墙兜底封锁）、环境与泄露（直连观察、环境一致性与时区/位置对齐）、守护对象、监控目标增删改、通知（桌面通知）、飞书通知、通用（开机自启、关窗到托盘、打开数据文件夹 / 用户指南）、更新（守护器自身与 Claude / Codex 客户端）；组头直接显示当前值摘要。
-- **托盘菜单**（右键图标）：显示主窗口 / 立即检测 / 暂停守护 30 分钟（或恢复守护）/ 解除隔离并恢复网络 / 打开数据文件夹 / 退出。
+- **Main window**: the hero card shows a status dot + status title + version + one subtitle line, with Claude/Codex egress tiles underneath; below sit the "Monitored targets" and "Protection" group cards, one row per target (left: name/region, right: egress IP/latency). Tripped and paused states have **no banner** — they are expressed by the hero title and the primary button (tripped → "Release & restore network", paused → "Resume guarding"). Next to the primary button in the CTA area is "Re-check now". Footer links: Details / Settings / Sweep Claude processes / Logs, each opening its card.
+- **Settings**: nine collapsible groups — Detect (proxy port, check interval, access-path check), Trip & cleanup (network-cut level, trip action switches, process sweep, firewall lockdown), Env & leak (direct-connection watch, environment consistency and timezone/location alignment), Guarded apps, Monitored targets (add/edit/remove), Notifications (desktop), Feishu, General (boot autostart, close-to-tray, open data folder / user guide), Updates (the guard itself plus Claude/Codex clients); every group header summarizes the current values.
+- **Tray menu** (right-click the icon): Show main window / Re-check now / Pause guarding 30 minutes (or resume) / Release & restore network / Open data folder / Quit.
 
-### 命令行
+### Command line
 
 ```powershell
-ClaudeGuard.exe --check        # 单次检测，JSON 输出；退出码 0 通过 / 2 不通过
-ClaudeGuard.exe --restore      # 急救：恢复网络 + 解除全部隔离
-ClaudeGuard.exe --settings     # 打开/唤起主窗口并展开设置
-ClaudeGuard.exe --notify-test trip   # 测试桌面通知（trip/recover/launch_blocked/warning/client_update/self_update）
+ClaudeGuard.exe --check        # single check, JSON output; exit 0 pass / 2 not passed
+ClaudeGuard.exe --restore      # emergency: restore network + release all isolation
+ClaudeGuard.exe --settings     # open/raise the main window and expand Settings
+ClaudeGuard.exe --notify-test trip   # test desktop notification (trip/recover/launch_blocked/warning/client_update/self_update)
 ClaudeGuard.exe --feishu-status --claude-update-status --codex-update-status
 ClaudeGuard.exe --install --uninstall
 ```
 
-`--check` 示例（截断）：
+`--check` sample (truncated):
 
 ```json
 {
@@ -153,8 +171,8 @@ ClaudeGuard.exe --install --uninstall
   "passed": true,
   "targets": [
     { "id": "local", "name": "本机出口", "enabled": false, "verdict": "disabled" },
-    { "id": "claude", "name": "Claude 出口", "enabled": true, "verdict": "pass", "ip": "204.1.100.98" },
-    { "id": "codex", "name": "Codex 出口", "enabled": true, "verdict": "pass", "ip": "204.1.100.98" },
+    { "id": "claude", "name": "Claude 出口", "enabled": true, "verdict": "pass", "ip": "198.51.100.98" },
+    { "id": "codex", "name": "Codex 出口", "enabled": true, "verdict": "pass", "ip": "198.51.100.98" },
     { "id": "antigravity", "name": "反重力出口", "enabled": true, "verdict": "pass", "note": "可达" }
   ]
 }
@@ -162,55 +180,67 @@ ClaudeGuard.exe --install --uninstall
 
 ---
 
-## 数据与隐私
+## FAQ
 
-- 配置与运行状态位于 `%APPDATA%\ClaudeGuard\`：
-  - `config.json`：v3 配置（旧 v2 配置会在首次启动时自动迁移）。
-  - `guard.log`：运行日志（超过 1MB 自动裁剪并保留最近约 400KB）。
-  - `netcut.json`：断网现场，用于崩溃/被杀后的启动自愈。
-  - `feishu.json`：DPAPI 加密凭据、通知队列与失败记录（队列正文未加密，可能含出口 IP）。
-  - `claude-update.json` / `codex-update.json`：客户端更新状态，不含登录凭据。
-- **探测请求**经你配置的本地代理发往各目标自己的探测域名（`claude.ai`、`chatgpt.com`、`cloudflare.com`、`cloudcode-pa.googleapis.com`），只用于读取出口 IP/地区或判断可达性，不上传任何应用数据。
-- 守护器自身更新查询 GitHub Releases；客户端更新只访问官方 MSIX 源；飞书通知直连 HTTPS 发送事件正文。
-- 不包含任何第三方统计或数据回传。
+- **It keeps tripping right after start — why?** Almost always an empty allowlist: if a target's expected IPs and region are both empty it never passes, and the guard trips and isolates about 30 seconds after start. Fill at least one allowlist IP or pick an egress region in the wizard or in Settings → Monitored targets.
+- **Why is the "local egress" target off by default?** Your ordinary traffic usually exits from a different IP than your AI proxy; enabling it by default would trip on first start. Turn it on in Settings and complete its allowlist if you want it guarded.
+- **A probe failure doesn't trip — is the guard broken?** No. Timeouts or missing IP/region are judged "unverified" and only logged; tripping requires *sufficient information proving a mismatch*, twice in a row.
+- **The update check says "GitHub API rate limit"** — anonymous GitHub API allows 60 requests/hour; the guard retries on its next 6-hour cycle. It never falls back to a direct connection for this.
+- **macOS: no firewall isolation or network cut?** Correct — the macOS port is process-guarding only; see the capability matrix above.
 
 ---
 
-## 从源码构建
+## Data & privacy
+
+- Config and runtime state live in `%APPDATA%\ClaudeGuard\`:
+  - `config.json`: v3 config (old v2 config is migrated automatically on first start).
+  - `guard.log`: run log (auto-trimmed above 1 MB, keeping roughly the latest 400 KB).
+  - `netcut.json`: network-cut scene, used for start-up self-healing after a crash or kill.
+  - `feishu.json`: DPAPI-encrypted credentials, notification queue and failure records (queue bodies are plaintext and may contain egress IPs).
+  - `claude-update.json` / `codex-update.json`: client-update state, no login credentials.
+- **Probe requests** travel through your configured local proxy to each target's own probe domain (`claude.ai`, `chatgpt.com`, `cloudflare.com`, `cloudcode-pa.googleapis.com`) and are used only to read the egress IP/region or test reachability — no application data is uploaded.
+- Self-update queries GitHub Releases; client updates only touch official MSIX sources; Feishu notifications are sent over direct HTTPS.
+- No third-party analytics or telemetry of any kind.
+
+---
+
+## Build from source
 
 ```powershell
-cargo build --release        # 产物 target/release/claude-guard.exe
-cargo test                   # 单元测试（v3.12.4 发版时 212 个，含 macOS 移植后更多）
+cargo build --release        # artifact: target/release/claude-guard.exe
+cargo test                   # unit tests (212 at the v3.12.4 release, more after the macOS port)
 cargo clippy --all-targets -- -D warnings
-node --check ui/*.js         # 纯静态前端，无 npm/构建步骤
+node --check ui/*.js         # pure static frontend, no npm/build step
 ```
 
-macOS：`cargo build --release && python3 scripts/package-macos.py`（详见上节）。
+macOS: `cargo build --release && python3 scripts/package-macos.py` (see the section above).
 
-- 技术栈：Rust + Tauri 2（WebView2，纯静态前端）、`sysinfo`（进程）、Windows 防火墙与网卡控制、`ureq`（探测）。
-- 维护者约定、模块地图与已知坑见 [AGENTS.md](AGENTS.md)；v3 行为基准见 [docs/SPEC-v3.md](docs/SPEC-v3.md)；用户指南见 [docs/GUIDE.md](docs/GUIDE.md)。
-
----
-
-## 版本沿革
-
-- **v1.x**：Rust `egui` 单文件原型。
-- **v2.x**：重写为 Tauri 2 架构，加入多 Agent 守护、飞书通知与客户端更新。
-- **v3.x**：从零重构。按目标独立锚点校验、断网两档、桌面通知、A+ 极简仪表盘 UI、断网自愈与 `--restore` 急救。
-- **v3.1.2**：修复桌面通知在未登记过本应用的系统上不弹出（Toast AUMID 需在 `HKCU\Software\Classes\AppUserModelId` 登记）；测试通知改为后台线程发送，不再卡界面。
-- **v3.5.0**：后台每 6 小时静默检查守护器新版本并弹桌面通知（同版本只提醒一次）。
-- **v3.6.0**：合并社区 macOS 移植（进程守护模式 + 深色界面，PR #2）；Windows 端无行为变化。
-- **v3.7.0**：接入路径检查——探测跟随系统代理；系统代理关闭且没有 TUN 网卡时判为「未接入」并熔断，避免应用绕过代理直连真实出口。
-- **v3.8.0**：未接入时守护器自身不再直连探测（隐私加固），判定与熔断完全由注册表/TUN 检查承担。
-- **v3.9.0**：防火墙兜底封锁——未接入时按应用 exe 添加出站 Block 规则，接入后自动解除；同时修复防火墙关闭时既有隔离规则不生效的问题。
-- **v3.10.0**：修复主线——断网自愈与恢复协议（恢复分「安全恢复」与「停止保护」两条流程）、手动封锁、已停止保护状态、配置 `version=4`（新装默认不断网，升级前备份旧配置）、守护器空闲开销降到约 0.5% 单核。
-- **v3.11.0**：主界面按「主卡 + 分组卡」重构，CTA 移出滚动区，熔断与暂停改用标题与主钮表达。
-- **v3.12.0**：新增直连泄露观察（系统代理模式下发现绕过代理的外连即告警）、环境一致性检查，以及时区/默认位置的自动对齐与一键还原（全部走账本，可随时恢复）。
-- **v3.12.4**：修复防火墙自愈在非英文系统上从不触发（改按 `Get-NetFirewallProfile` 的结构化状态判断，不再解析本地化的 netsh 文本）；修正 netsh「找不到规则」提示的匹配串；TLS 栈补丁升级（rustls / rustls-webpki / webpki-roots / tokio）；CI 接入单元测试并新增 macOS job；补 MIT 许可。
-- **v3.12.5**：依赖安全对齐——`zip` 升到 9.x（RUSTSEC-2026-0367/0369 的修补版本线，2.x 无修补版）、`quick-xml` 升到 0.42（RUSTSEC-2026-0194/0195 修补于 0.41，同时消掉锁文件里的重复版本）；补齐 macOS 移植缺的符号，macOS job 首次真正编译通过；放宽一个依赖 PowerShell 冷启动的用例时限，消除 CI 偶发失败。
+- Stack: Rust + Tauri 2 (WebView2, static frontend), `sysinfo` (processes), Windows firewall & NIC control, `ureq` (probing).
+- Maintainer conventions, module map and known pitfalls: [AGENTS.md](AGENTS.md); v3 behavior baseline: [docs/SPEC-v3.md](docs/SPEC-v3.md); user guide: [docs/GUIDE.md](docs/GUIDE.md); release history: [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
-## 许可协议
+## Version history
+
+- **v1.x**: single-file Rust `egui` prototype.
+- **v2.x**: rewritten on Tauri 2, adding multi-agent guarding, Feishu notifications and client updates.
+- **v3.x**: rewritten from scratch — per-target anchor validation, two network-cut levels, desktop notifications, A+ minimal dashboard UI, network-cut self-healing and `--restore` emergency recovery.
+- **v3.1.2**: fixed desktop toasts never appearing on systems that had never registered the app (the Toast AUMID must be registered under `HKCU\Software\Classes\AppUserModelId`); test notifications now send on a background thread and no longer block the UI.
+- **v3.5.0**: silent self-update check every 6 hours with a desktop toast (same version reminded only once).
+- **v3.6.0**: merged the community macOS port (process-guarding mode + dark UI, PR #2); no behavior change on Windows.
+- **v3.7.0**: access-path check — probes follow the system proxy; with the system proxy off and no TUN adapter the state is "not connected" and a trip fires, stopping apps from bypassing the proxy to their real egress.
+- **v3.8.0**: when not connected, the guard itself stops probing directly (privacy hardening); verdicts and tripping rely entirely on the registry/TUN checks.
+- **v3.9.0**: firewall fallback lockdown — outbound Block rules per app exe while not connected, dropped automatically on reconnect; also fixed existing isolation rules not applying while the firewall was off.
+- **v3.10.0**: hardening mainline — network-cut self-healing and the recovery protocol (recovery split into "safe restore" vs "stop guarding"), manual lockdown, the stopped-guarding state, config `version=4` (new installs default to no network cut, old config backed up before upgrade), idle overhead down to ~0.5% of one core.
+- **v3.11.0**: main window restructured into "hero card + group cards", CTA moved out of the scroll area, tripped/paused states expressed via title and primary button.
+- **v3.12.0**: direct-connection leak watch (warn on connections that bypass the proxy in system-proxy mode), environment consistency check, and automatic one-click timezone/default-location alignment (all ledger-backed, always reversible).
+- **v3.12.4**: fixed firewall self-healing never triggering on non-English systems (structured `Get-NetFirewallProfile` status instead of parsing localized netsh text); corrected the netsh "no matching rule" match string; TLS stack patch bumps (rustls / rustls-webpki / webpki-roots / tokio); CI runs unit tests and gains a macOS job; added the MIT license.
+- **v3.12.5**: dependency security alignment — `zip` to 9.x (the patched line for RUSTSEC-2026-0367/0369; 2.x has no fixed version), `quick-xml` to 0.42 (RUSTSEC-2026-0194/0195 fixed in 0.41, also removing a duplicate version from the lockfile); macOS port symbols completed so the macOS job compiles for the first time; a PowerShell-cold-start test timeout relaxed to remove CI flakiness.
+
+See [CHANGELOG.md](CHANGELOG.md) for the unreleased work currently on `master`.
+
+---
+
+## License
 
 [MIT](LICENSE) © 2026 daha1216

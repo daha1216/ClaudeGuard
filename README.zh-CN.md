@@ -1,0 +1,254 @@
+> **macOS 移植预览**：仓库现含 macOS 平台适配与深色界面（进程守护模式）。本版不提供系统级按应用网络隔离；客户端升级、回滚与本地自更新已验证，正式远端自更新仍需维护者公钥和 macOS 发布资产。详情与测试方式见 [macOS 说明](docs/MACOS.md)。Windows 版文档如下。
+
+<p align="center">
+  <img src="assets/icon.png" alt="ClaudeGuard Logo" width="128" height="128" />
+</p>
+
+<h1 align="center">ClaudeGuard（Claude 守护器）</h1>
+
+<p align="center">
+  <strong>给 AI 桌面应用加一道“网络出口门禁”</strong>
+</p>
+
+<p align="center">
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/daha1216/ClaudeGuard/releases"><img src="https://img.shields.io/github/v/release/daha1216/ClaudeGuard" alt="GitHub Release" /></a>
+  <img src="https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-blue" alt="Windows" />
+  <img src="https://img.shields.io/badge/Platform-macOS%20(移植预览)-9aa0a6" alt="macOS preview" />
+  <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Rust" />
+  <img src="https://img.shields.io/badge/GUI-Tauri%202-brightgreen" alt="Tauri 2" />
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="License MIT" />
+</p>
+
+---
+
+### 一句话定位
+ClaudeGuard 是运行在 **Windows 上的 AI 桌面应用网络出口门禁**（macOS 移植预览）：**按每个目标自己的域名**校验它此刻走的是哪条链路、出口 IP 与地区是否在白名单里；全部通过才允许启动 Claude 等桌面应用，任一启用目标不符合就立即**熔断隔离**——结束相关进程、用防火墙隔离、必要时直接断网，切回合规节点后自动恢复。
+
+### 为什么需要它
+Claude、ChatGPT、反重力这些客户端对出口环境很敏感，而代理软件经常“整体一个出口”。当节点漂移、断连直连或者某个应用被单独分流时，应用会在你不知情的情况下从非预期出口联网。
+
+2026 年 Anthropic 对账号的网络环境审查明显收紧，社区里所谓的“封号潮”主要卡在两条线上：
+
+- **region 红线**：官方只在 [supported-countries 列表](https://www.anthropic.com/supported-countries)内的国家/地区提供服务，出口落在列表外或与账号常用地区偏离太远，本身就是高危信号。
+- **IP 类型风控**：数据中心 IP 与家宽 IP 的信誉差异很大；[社区对“账号因网络环境被检测而封禁”的复盘](https://blog.leeguoo.com/en/posts/claude-account-ban-network-detection/)记录了这类检测的大致形态。具体判定逻辑 Anthropic 从未公开，上面两条只是**公开可查的事实与社区观察**，不是对封号规则的完整描述。
+
+ClaudeGuard 不做代理、不改分流脚本，只负责在应用真正联网**之前**把出口校验一遍，异常先熔断——把“带着真实 IP 打一发请求才发现坏了”变成“先拦下来再说”。
+
+v3 的核心变化是把“系统出口”拆成**每个应用各测各的**：Claude 走 claude.ai 的 trace、Codex 走 chatgpt.com 的 trace、反重力测 Google 后端可达性——互不牵连，谁不对谁熔断。
+
+### 核心能力（四条）
+
+1. **按目标白名单校验出口**：每个监控目标绑定自己的探测地址与期望值（多 IP 列表和/或 ISO 国家/地区码），所有启用目标全部通过才放行守护的应用。
+2. **熔断 = 杀进程 + 防火墙隔离 + 可选断网**：达到防抖阈值后，结束被守护 GUI 应用的全部进程、为其添加 Windows 防火墙阻断规则，并按档位可再全局断网（默认防火墙出站阻断）或禁用物理网卡。
+3. **恢复账本先行**：任何改系统动作先写账本再执行；恢复幂等、可重复，自动恢复、托盘“解除隔离并恢复网络”、`--restore` 与程序退出走同一条恢复协议。
+4. **飞书通知 / 自更新 / `--check` CLI**：桌面 + 飞书群通知；基于 GitHub Releases 的守护器自更新；只走官方 MSIX 源的客户端原位升级；可脚本化的 `--check` 输出 JSON 并带退出码。
+
+---
+
+## 界面预览
+
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshot-main.png" alt="主界面：守护正常" width="400" /><br><sub>主界面 · 各目标出口校验通过，一键启动</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshot-trip.png" alt="熔断态" width="400" /><br><sub>熔断 · 结束进程 + 隔离，一键解除并恢复网络</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshot-settings.png" alt="设置卡" width="400" /><br><sub>设置 · 九个折叠组，组头直接显示当前值</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshot-wizard.png" alt="首次向导" width="400" /><br><sub>首次向导 · 三步完成配置</sub></td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="assets/screenshot-details.png" alt="详情卡" width="400" /><br>
+  <sub>详情 · 每个目标的锚点、期望值、耗时与运行参数</sub>
+</p>
+
+---
+
+## 功能亮点
+
+- **按目标校验出口（v3 核心）**：每个监控目标绑定自己的探测地址与期望值。Claude → `claude.ai/cdn-cgi/trace`，Codex → `chatgpt.com/cdn-cgi/trace`，反重力 → `cloudcode-pa.googleapis.com` 可达性，本机出口 → `cloudflare.com/cdn-cgi/trace`。支持 HTTP trace、JSON IP、页面地区标记、仅可达性四类锚点，自定义目标同样适用。
+- **接入路径检查（v3.7/3.8）**：探测流量跟随系统代理（换了端口、换了代理软件也测的是应用真实出口）；系统代理没开时靠 TUN 网卡判定接入，两者都没有 = 应用直连真实出口 → 按熔断阈值处理（杀进程/隔离/断网）。此状态下守护器自身**不直连探测**——任何状态下守护器流量都不带家宽 IP 出机器。
+- **防火墙兜底封锁（v3.9）**：没连代理（系统代理与 TUN 都不在）时，自动给守护对象加防火墙出站 Block——应用直连出不去，走系统代理照常可用，接入后规则自动解除；也支持一键手动封锁/解除。需要时会自动开启 Windows 防火墙（默认出站=允许，不影响其他软件），但绝不替你关掉。
+- **双重白名单**：多 IP 列表 + 出口地区（ISO 国家/地区码），任一命中即放行；期望为空的目标会被校验拦下，避免裸连。
+- **防抖熔断**：连续 `2` 次（可调）失败才熔断，任意一次通过清零；探测失败/拿不到出口信息属于“无法确认”，不熔断。
+- **熔断动作**：结束 Claude / ChatGPT / 反重力的全部进程 + 按开关做防火墙入/出站隔离 + 断网档位（关闭 / 防火墙全局出站阻断（默认）/ 禁用物理网卡）。
+- **恢复零残留**：切回合规节点后下一轮自动解除隔离与断网；托盘“解除隔离并恢复网络”、`--restore` 急救、程序退出都会恢复网络。
+- **常驻托盘**：默认每 15 秒复查一次（5–3600 秒可调），可“暂停守护 30 分钟”（暂停期间照常检测但绝不熔断）。
+- **多 Agent 守护**：GUI 应用熔断杀进程，CLI（Claude Code / Codex CLI / Gemini CLI）只提醒不杀，避免误伤终端。
+- **桌面通知 + 飞书群通知**：熔断、恢复、启动被阻止、失败预警、客户端更新五类桌面通知；飞书机器人支持签名校验、DPAPI 凭据加密、持久队列与失败补发。见 [飞书通知](docs/FEISHU.md)。
+- **Claude / Codex 客户端更新**：只走官方 MSIX 源，校验签名与包身份后原位升级，注册版本达标才算完成。见 [客户端更新](docs/CLIENT-UPDATES.md)。
+- **守护器自身更新**：基于 GitHub Releases 的版本检测、下载与自替换。
+- **可脚本化**：`--check` 输出 JSON 与退出码，适合批处理和前置流水线。
+
+---
+
+## 守护范围与熔断方式
+
+| 类型 | 支持目标 | 熔断机制 | 说明 |
+| :--- | :--- | :--- | :--- |
+| **GUI 桌面应用** | Claude / ChatGPT / 反重力 (Antigravity) | **结束进程 + 防火墙隔离** | 任意组合勾选；熔断时结束全部关联进程，并为其可执行文件添加 Windows 防火墙出/入站阻止规则。 |
+| **CLI 命令行** | Claude Code / Codex CLI / Gemini CLI | **仅日志提醒，绝不杀进程** | CLI 常驻在终端或 Node 环境里，杀进程会误伤整个终端，因此只记录提醒。 |
+
+---
+
+## 防误杀与放行语义
+
+- **信息缺失不熔断**：探测超时、返回为空、拿不到 IP/地区时判为“无法确认”，只记录不熔断。
+- **期望为空不放行**：某个目标的期望 IP 与地区都为空时，该目标永远不通过（宁可错杀），需要补白名单。
+- **连续两次才熔断**：单次网络抖动不会立刻熔断；两次检查间隔默认 15 秒。
+- **本机出口默认关闭**：本机常规流量出口往往与 AI 代理出口不同，默认开启会在首次启动就熔断；需要监管本机出口时在设置里打开并补齐白名单。
+
+---
+
+## 安装与快速上手
+
+仅支持 **Windows 10 / 11**，界面全中文。在 [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases) 获取最新分发包：
+
+1. **安装版（`ClaudeGuard-vX.Y.Z-setup.exe`）**
+   - Inno Setup 打包，默认安装到 `C:\Program Files\ClaudeGuard`，自动检测 WebView2 运行时。
+   - 需要管理员权限：熔断时要调用 Windows 防火墙与网卡控制接口。
+   - 卸载可在“安装的应用”中完成，**刻意保留** `%APPDATA%\ClaudeGuard` 里的配置与日志。
+2. **便携版（`ClaudeGuard-vX.Y.Z.zip`）**
+   - 裸 exe，解压即用（同样需要管理员权限）。
+
+### 3 步上手
+1. **下载**：从 Releases 取安装版或便携版 zip 并运行（都会请求管理员权限）。
+2. **填向导**：本机代理端口 + 白名单 IP（可多个）+ 出口地区——**两项都留空就一直熔断**，守护启动约 30 秒后即熔断隔离网络，所以向导会给出明确的闸门警告，留空跳过需要二次确认。
+3. **选安装方式**：“安装并继续”（注册开始菜单与开机自启）或“使用便携版”（不写注册表），随后进入常驻守护。
+
+### 首次运行向导
+三步完成配置：① 欢迎与能力说明 → ② 代理与白名单（代理端口 + 白名单 IP（可多个）+ 出口地区；**两项都留空会一直熔断**，向导会给出闸门警告并要求二次确认才允许跳过）→ ③ 安装方式（「安装并继续」注册开始菜单与开机自启 / 「使用便携版」不写注册表直接运行）。完成后即进入常驻守护。
+
+---
+
+## macOS 版（移植预览）
+
+v3.6.0 起仓库内置 macOS 适配（社区贡献，进程守护模式，深色界面）。**暂无预编译包**，需从源码构建：
+
+```bash
+git clone https://github.com/daha1216/ClaudeGuard && cd ClaudeGuard
+cargo build --release            # 需要 Xcode Command Line Tools
+python3 scripts/package-macos.py # 产出 ClaudeGuard.app（ad-hoc 签名）
+```
+
+把 `ClaudeGuard.app` 拖入「应用程序」后首次启动，走与 Windows 相同的三步向导。
+
+**与 Windows 版的能力对照**：
+
+| 能力 | Windows | macOS（移植预览） |
+| :--- | :--- | :--- |
+| 按目标出口校验 / 白名单 / 防抖熔断 | ✅ | ✅ 同一套语义 |
+| 熔断动作 | 结束进程 + 防火墙隔离 + 断网档位 | **仅结束进程**（进程守护模式，不断网） |
+| 启动门禁（出口未过禁止启动 Claude） | ✅ | ✅ |
+| 飞书 / 桌面通知 / 客户端更新 | ✅ DPAPI / Toast / MSIX 原位升级 | ✅ Keychain+AES-GCM / 原生通知 / 官方包签名校验升级 |
+| 守护器自更新 | ✅ GitHub Releases 自替换 | 本地签名包流程已验证；远端发布需维护者 Minisign 公钥 |
+| 登录自启 | ✅ | ✅ LaunchAgent |
+
+已知边界：无系统级按应用网络隔离（两次检测之间有窗口期）；未做 Developer ID 公证；Intel 产物仅 Rosetta 验证。详见 [docs/MACOS.md](docs/MACOS.md)（使用说明）与 [docs/MACOS-VALIDATION.md](docs/MACOS-VALIDATION.md)（验证记录）。
+
+---
+
+## 日常使用
+
+- **主界面**：主卡显示状态点 + 状态标题 + 版本号 + 一行副标题，下面两块 Claude / Codex 出口瓦片；再往下是「监控目标」「保护」两张分组卡，每个目标一行（左：名称/地区，右：出口 IP/耗时）。熔断与暂停**没有横幅**，状态由主卡标题与主按钮表达（熔断时主钮变「解除隔离并恢复网络」，暂停时变「恢复守护」）。CTA 区主按钮旁是「立即检测」，随时手动复查。页脚四链：详情 / 设置 / 清理 Claude 进程 / 日志，展开对应卡片。
+- **设置**：九个折叠组——检测（代理端口、检查间隔、接入路径检查）、熔断与清理（断网档位、熔断动作开关、进程清理、防火墙兜底封锁）、环境与泄露（直连观察、环境一致性与时区/位置对齐）、守护对象、监控目标增删改、通知（桌面通知）、飞书通知、通用（开机自启、关窗到托盘、打开数据文件夹 / 用户指南）、更新（守护器自身与 Claude / Codex 客户端）；组头直接显示当前值摘要。
+- **托盘菜单**（右键图标）：显示主窗口 / 立即检测 / 暂停守护 30 分钟（或恢复守护）/ 解除隔离并恢复网络 / 打开数据文件夹 / 退出。
+
+### 命令行
+
+```powershell
+ClaudeGuard.exe --check        # 单次检测，JSON 输出；退出码 0 通过 / 2 不通过
+ClaudeGuard.exe --restore      # 急救：恢复网络 + 解除全部隔离
+ClaudeGuard.exe --settings     # 打开/唤起主窗口并展开设置
+ClaudeGuard.exe --notify-test trip   # 测试桌面通知（trip/recover/launch_blocked/warning/client_update/self_update）
+ClaudeGuard.exe --feishu-status --claude-update-status --codex-update-status
+ClaudeGuard.exe --install --uninstall
+```
+
+`--check` 示例（截断）：
+
+```json
+{
+  "version": "3.12.5",
+  "passed": true,
+  "targets": [
+    { "id": "local", "name": "本机出口", "enabled": false, "verdict": "disabled" },
+    { "id": "claude", "name": "Claude 出口", "enabled": true, "verdict": "pass", "ip": "198.51.100.98" },
+    { "id": "codex", "name": "Codex 出口", "enabled": true, "verdict": "pass", "ip": "198.51.100.98" },
+    { "id": "antigravity", "name": "反重力出口", "enabled": true, "verdict": "pass", "note": "可达" }
+  ]
+}
+```
+
+---
+
+## 常见问题
+
+- **刚启动就一直熔断，怎么回事？** 几乎可以肯定是白名单留空：目标的期望 IP 与地区都为空时永远不通过，守护启动约 30 秒后就会熔断并隔离网络。在向导或「设置 → 监控目标」里至少填 1 个白名单 IP，或选一个出口地区（与向导里的警告是同一条规则）。
+- **为什么“本机出口”默认是关的？** 本机常规流量出口通常与 AI 代理出口不是同一个 IP，默认开启会在首次启动就熔断。确实要监管本机出口时，在设置里打开并补齐它的白名单。
+- **探测失败却不熔断，是坏了吗？** 不是。超时、拿不到 IP/地区属于“无法确认”，只记录不熔断；熔断要求**信息充分且证明不匹配**，并且连续两轮。
+- **更新检查提示“GitHub API 限流”？** GitHub 匿名 API 每小时 60 次，撞到 403/429 属正常，下一轮（6 小时）自动重试，**不会**为此改走直连。
+- **macOS 不做防火墙隔离和断网？** 对——macOS 移植是进程守护模式，见上面的能力对照表。
+
+---
+
+## 数据与隐私
+
+- 配置与运行状态位于 `%APPDATA%\ClaudeGuard\`：
+  - `config.json`：v3 配置（旧 v2 配置会在首次启动时自动迁移）。
+  - `guard.log`：运行日志（超过 1MB 自动裁剪并保留最近约 400KB）。
+  - `netcut.json`：断网现场，用于崩溃/被杀后的启动自愈。
+  - `feishu.json`：DPAPI 加密凭据、通知队列与失败记录（队列正文未加密，可能含出口 IP）。
+  - `claude-update.json` / `codex-update.json`：客户端更新状态，不含登录凭据。
+- **探测请求**经你配置的本地代理发往各目标自己的探测域名（`claude.ai`、`chatgpt.com`、`cloudflare.com`、`cloudcode-pa.googleapis.com`），只用于读取出口 IP/地区或判断可达性，不上传任何应用数据。
+- 守护器自身更新查询 GitHub Releases；客户端更新只访问官方 MSIX 源；飞书通知直连 HTTPS 发送事件正文。
+- 不包含任何第三方统计或数据回传。
+
+---
+
+## 从源码构建
+
+```powershell
+cargo build --release        # 产物 target/release/claude-guard.exe
+cargo test                   # 单元测试（v3.12.4 发版时 212 个，含 macOS 移植后更多）
+cargo clippy --all-targets -- -D warnings
+node --check ui/*.js         # 纯静态前端，无 npm/构建步骤
+```
+
+macOS：`cargo build --release && python3 scripts/package-macos.py`（详见上节）。
+
+- 技术栈：Rust + Tauri 2（WebView2，纯静态前端）、`sysinfo`（进程）、Windows 防火墙与网卡控制、`ureq`（探测）。
+- 维护者约定、模块地图与已知坑见 [AGENTS.md](AGENTS.md)；v3 行为基准见 [docs/SPEC-v3.md](docs/SPEC-v3.md)；用户指南见 [docs/GUIDE.md](docs/GUIDE.md)；版本历史见 [CHANGELOG.md](CHANGELOG.md)。
+- 欢迎贡献：提交 Issue / PR 前请读 [CONTRIBUTING.md](CONTRIBUTING.md)，漏洞私密报告见 [SECURITY.md](SECURITY.md)。
+
+---
+
+## 版本沿革
+
+- **v1.x**：Rust `egui` 单文件原型。
+- **v2.x**：重写为 Tauri 2 架构，加入多 Agent 守护、飞书通知与客户端更新。
+- **v3.x**：从零重构。按目标独立锚点校验、断网两档、桌面通知、A+ 极简仪表盘 UI、断网自愈与 `--restore` 急救。
+- **v3.1.2**：修复桌面通知在未登记过本应用的系统上不弹出（Toast AUMID 需在 `HKCU\Software\Classes\AppUserModelId` 登记）；测试通知改为后台线程发送，不再卡界面。
+- **v3.5.0**：后台每 6 小时静默检查守护器新版本并弹桌面通知（同版本只提醒一次）。
+- **v3.6.0**：合并社区 macOS 移植（进程守护模式 + 深色界面，PR #2）；Windows 端无行为变化。
+- **v3.7.0**：接入路径检查——探测跟随系统代理；系统代理关闭且没有 TUN 网卡时判为「未接入」并熔断，避免应用绕过代理直连真实出口。
+- **v3.8.0**：未接入时守护器自身不再直连探测（隐私加固），判定与熔断完全由注册表/TUN 检查承担。
+- **v3.9.0**：防火墙兜底封锁——未接入时按应用 exe 添加出站 Block 规则，接入后自动解除；同时修复防火墙关闭时既有隔离规则不生效的问题。
+- **v3.10.0**：修复主线——断网自愈与恢复协议（恢复分「安全恢复」与「停止保护」两条流程）、手动封锁、已停止保护状态、配置 `version=4`（新装默认不断网，升级前备份旧配置）、守护器空闲开销降到约 0.5% 单核。
+- **v3.11.0**：主界面按「主卡 + 分组卡」重构，CTA 移出滚动区，熔断与暂停改用标题与主钮表达。
+- **v3.12.0**：新增直连泄露观察（系统代理模式下发现绕过代理的外连即告警）、环境一致性检查，以及时区/默认位置的自动对齐与一键还原（全部走账本，可随时恢复）。
+- **v3.12.4**：修复防火墙自愈在非英文系统上从不触发（改按 `Get-NetFirewallProfile` 的结构化状态判断，不再解析本地化的 netsh 文本）；修正 netsh「找不到规则」提示的匹配串；TLS 栈补丁升级（rustls / rustls-webpki / webpki-roots / tokio）；CI 接入单元测试并新增 macOS job；补 MIT 许可。
+- **v3.12.5**：依赖安全对齐——`zip` 升到 9.x（RUSTSEC-2026-0367/0369 的修补版本线，2.x 无修补版）、`quick-xml` 升到 0.42（RUSTSEC-2026-0194/0195 修补于 0.41，同时消掉锁文件里的重复版本）；补齐 macOS 移植缺的符号，macOS job 首次真正编译通过；放宽一个依赖 PowerShell 冷启动的用例时限，消除 CI 偶发失败。
+
+master 上尚未发版的修复（首装向导闸门、断网 GUID 核验、lockdown 回执、配置目录降级等）见 [CHANGELOG.md](CHANGELOG.md) 的「未发布」段。
+
+---
+
+## 许可协议
+
+[MIT](LICENSE) © 2026 daha1216
