@@ -33,7 +33,7 @@ windows = { version = "0.58", features = [
 security-framework = "3"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSRunningApplication"] }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 plist = "1"
 libc = "0.2"
 libloading = "0.9"
