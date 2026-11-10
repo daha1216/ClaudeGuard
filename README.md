@@ -37,7 +37,7 @@ Claude、ChatGPT、反重力这些客户端对出口环境很敏感，而代理�
     <td align="center" width="50%"><img src="assets/screenshot-trip.png" alt="熔断态" width="400" /><br><sub>熔断 · 结束进程 + 隔离，一键解除并恢复网络</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshot-settings.png" alt="设置卡" width="400" /><br><sub>设置 · 八个折叠组，组头直接显示当前值</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshot-settings.png" alt="设置卡" width="400" /><br><sub>设置 · 九个折叠组，组头直接显示当前值</sub></td>
     <td align="center" width="50%"><img src="assets/screenshot-wizard.png" alt="首次向导" width="400" /><br><sub>首次向导 · 三步完成配置</sub></td>
   </tr>
 </table>
@@ -97,7 +97,7 @@ Claude、ChatGPT、反重力这些客户端对出口环境很敏感，而代理�
    - 裸 exe，解压即用（同样需要管理员权限）。
 
 ### 首次运行向导
-三步完成配置：代理端口 → 出口白名单（IP 可多个，或按地区）/ 守护对象 → 是否安装开机自启。完成后即进入常驻守护。
+三步完成配置：① 欢迎与能力说明 → ② 代理与白名单（代理端口 + 白名单 IP（可多个）+ 出口地区；**两项都留空会一直熔断**，向导会给出闸门警告并要求二次确认才允许跳过）→ ③ 安装方式（「安装并继续」注册开始菜单与开机自启 / 「使用便携版」不写注册表直接运行）。完成后即进入常驻守护。
 
 ---
 
@@ -130,8 +130,8 @@ python3 scripts/package-macos.py # 产出 ClaudeGuard.app（ad-hoc 签名）
 
 ## 日常使用
 
-- **主界面**：状态圆环 + 状态文案 + 每个目标一行（左：名称/地区，右：出口 IP/耗时），主按钮下「立即检测」随时手动复查。底部“详情 / 设置 / 日志”展开对应卡片。
-- **设置**：代理端口、检查间隔、白名单（IP / 地区）、断网档位、熔断动作开关、守护对象、监控目标增删改、桌面通知与飞书、客户端更新、开机自启、关窗到托盘，以及「打开数据文件夹 / 用户指南」。
+- **主界面**：主卡显示状态点 + 状态标题 + 版本号 + 一行副标题，下面两块 Claude / Codex 出口瓦片；再往下是「监控目标」「保护」两张分组卡，每个目标一行（左：名称/地区，右：出口 IP/耗时）。熔断与暂停**没有横幅**，状态由主卡标题与主按钮表达（熔断时主钮变「解除隔离并恢复网络」，暂停时变「恢复守护」）。CTA 区主按钮旁是「立即检测」，随时手动复查。页脚四链：详情 / 设置 / 清理 Claude 进程 / 日志，展开对应卡片。
+- **设置**：九个折叠组——检测（代理端口、检查间隔、接入路径检查）、熔断与清理（断网档位、熔断动作开关、进程清理、防火墙兜底封锁）、环境与泄露（直连观察、环境一致性与时区/位置对齐）、守护对象、监控目标增删改、通知（桌面通知）、飞书通知、通用（开机自启、关窗到托盘、打开数据文件夹 / 用户指南）、更新（守护器自身与 Claude / Codex 客户端）；组头直接显示当前值摘要。
 - **托盘菜单**（右键图标）：显示主窗口 / 立即检测 / 暂停守护 30 分钟（或恢复守护）/ 解除隔离并恢复网络 / 打开数据文件夹 / 退出。
 
 ### 命令行
@@ -149,7 +149,7 @@ ClaudeGuard.exe --install --uninstall
 
 ```json
 {
-  "version": "3.1.0",
+  "version": "3.12.5",
   "passed": true,
   "targets": [
     { "id": "local", "name": "本机出口", "enabled": false, "verdict": "disabled" },
@@ -180,7 +180,7 @@ ClaudeGuard.exe --install --uninstall
 
 ```powershell
 cargo build --release        # 产物 target/release/claude-guard.exe
-cargo test                   # 111 个单元测试
+cargo test                   # 单元测试（v3.12.4 发版时 212 个，含 macOS 移植后更多）
 cargo clippy --all-targets -- -D warnings
 node --check ui/*.js         # 纯静态前端，无 npm/构建步骤
 ```
