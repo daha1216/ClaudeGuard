@@ -438,11 +438,8 @@ fn run_gui(start_hidden: bool, want_settings: bool) {
         // 否则用户会在系统仍被改动的情况下失去守护器与恢复执行器。
         if let RunEvent::ExitRequested { api, .. } = &event {
             let state = app_handle.state::<Arc<AppState>>();
-            state.stop.store(true, Ordering::SeqCst);
-            let report = crate::recover::restore_all();
-            if !report.ok {
-                state.stop.store(false, Ordering::SeqCst);
-                state.set_error(format!("退出前恢复未完成：{}", report.summary()));
+            // 恢复失败时闸门内部已保持运行并报错，这里只需阻止退出。
+            if crate::shutdown_before_exit(&state).is_err() {
                 api.prevent_exit();
             }
         }
@@ -455,6 +452,23 @@ fn run_gui(start_hidden: bool, want_settings: bool) {
             }
         }
     });
+}
+
+/// 退出与更新交接共用的恢复闸门：先置停止标志，再同步跑恢复账本。
+/// 返回 `Ok(())` 才允许真正退出；失败沿用契约 D3 的 fail-closed 语义——
+/// 恢复停止标志继续守护、把失败原因写进状态栏，返回 `Err(summary)`，
+/// 由调用方决定阻止退出（`api.prevent_exit()`）还是中止本次更新退出。
+/// 自更新成功路径必须先过这道闸门，不得直接 `process::exit(0)` 绕过。
+fn shutdown_before_exit(state: &AppState) -> Result<(), String> {
+    state.stop.store(true, Ordering::SeqCst);
+    let report = crate::recover::restore_all();
+    if report.ok {
+        return Ok(());
+    }
+    state.stop.store(false, Ordering::SeqCst);
+    let summary = report.summary();
+    state.set_error(format!("退出前恢复未完成：{summary}"));
+    Err(summary)
 }
 
 fn with_ipc(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {

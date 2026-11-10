@@ -1,0 +1,80 @@
+name: Bug 反馈
+description: 报告 ClaudeGuard 运行异常、误熔断、无法恢复等问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！提交前请先搜索 [已有 Issues](../../issues) 避免重复。
+        **提交前请脱敏日志与截图中的真实 IP、节点地址和飞书 Webhook。**
+  - type: input
+    id: version
+    attributes:
+      label: ClaudeGuard 版本
+      description: 主界面右上角或 `ClaudeGuard.exe --version` 的输出（如 `3.12.5`）。
+      placeholder: "3.12.5"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      description: 例如 `Windows 11 23H2 (22631)`；按 `Win + R` → `winver` 查看。
+      placeholder: "Windows 11 23H2 (22631)"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: 安装方式
+      options:
+        - 安装版（setup.exe）
+        - 便携版（zip 解压）
+        - 从源码构建
+    validations:
+      required: true
+  - type: dropdown
+    id: access
+    attributes:
+      label: 接入方式（探测流量怎么出去的）
+      description: 见「设置 → 检查 → 接入路径检查」的读数。
+      options:
+        - system_proxy（跟随系统代理）
+        - tun（TUN 虚拟网卡）
+        - 两个都没有（未接入，判定为直连）
+        - 不清楚
+    validations:
+      required: true
+  - type: textarea
+    id: symptom
+    attributes:
+      label: 问题现象
+      description: 什么时候发生的、做了什么操作、期望与实际结果。误熔断请说明当轮是哪个目标不合规。
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志片段
+      description: |
+        粘贴出问题时间段的 `%APPDATA%\ClaudeGuard\guard.log` 片段（前后各几行即可）。
+        **请先把真实出口 IP、代理服务器地址、飞书 Webhook 替换为 `198.51.100.x`、`PROXY`、`WEBHOOK` 等占位符。**
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: check
+    attributes:
+      label: `--check` 输出（可选）
+      description: 命令行执行 `ClaudeGuard.exe --check` 的 JSON（同样先脱敏 IP）。
+      render: json
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 已脱敏日志与截图中的真实 IP / 节点地址 / Webhook
+          required: true
+        - label: 已搜索现有 Issues，没有重复
+          required: true

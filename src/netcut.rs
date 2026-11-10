@@ -265,7 +265,7 @@ fn cut_locked(mode: CutMode) -> (bool, String) {
     if !firewall_ok {
         notes.push(format!("防火墙全局阻断失败：{firewall_detail}"));
     }
-    let mut nics: Vec<String> = Vec::new();
+    let mut nics: Vec<(String, String)> = Vec::new();
     if mode == CutMode::Nics {
         // 已断网时重新枚举会看到 0 个 Up 网卡，优先沿用状态文件里记录的初始网卡。
         let recorded = previous
@@ -291,7 +291,7 @@ fn cut_locked(mode: CutMode) -> (bool, String) {
             txn.record(&format!("禁用网卡 {name}"), ok, "");
             let _ = crate::ledger::save(&txn);
             if ok {
-                nics.push(name.clone());
+                nics.push((name.clone(), guid));
             } else {
                 notes.push(format!("禁用网卡失败：{name}"));
             }
@@ -307,13 +307,17 @@ fn cut_locked(mode: CutMode) -> (bool, String) {
     let state = CutState {
         mode: mode_name(mode).to_string(),
         firewall: firewall_ok,
-        nics: nics.clone(),
+        nics: nics.iter().map(|(name, _)| name.clone()).collect(),
         since: now(),
     };
     // 现场写不下去就回滚：没有 netcut.json 的话，进程一崩网络就永久断着。
     if !save_state_to(&path, &state) {
-        for name in &nics {
-            let _ = enable_nic(name);
+        for (name, guid) in &nics {
+            if guid.is_empty() {
+                let _ = enable_nic(name);
+            } else {
+                let _ = set_nic_enabled_by_guid(guid, true);
+            }
         }
         let _ = delete_cut_rule();
         let msg = "断网状态记录写入失败，已回滚断网".to_string();
@@ -325,10 +329,20 @@ fn cut_locked(mode: CutMode) -> (bool, String) {
     txn.record("核验全局阻断规则", rule_present, "");
     let mut nics_verified = true;
     if mode == CutMode::Nics {
-        for name in &nics {
-            let down = !nic_is_up(name);
-            nics_verified &= down;
-            txn.record(&format!("核验网卡已断开 {name}"), down, "");
+        for (name, guid) in &nics {
+            // P2-5：按 GUID 回查（与禁用同一身份），查询失败/查无此卡 → Err → 核验不过。
+            match nic_is_up(guid, name) {
+                Ok(true) => {
+                    nics_verified = false;
+                    txn.record(&format!("核验网卡已断开 {name}"), false, "网卡仍处于 Up");
+                }
+                Ok(false) => txn.record(&format!("核验网卡已断开 {name}"), true, ""),
+                Err(err) => {
+                    nics_verified = false;
+                    txn.record(&format!("核验网卡已断开 {name}"), false, &err);
+                    log_line(&format!("netcut: 核验网卡 {name} 失败（{err}）"));
+                }
+            }
         }
     }
     let verified = rule_present && nics_verified;
@@ -690,7 +704,8 @@ fn cut_rule_count() -> usize {
 /// 而当前版本的措辞是「指定标准」，旧版本才是「指定条件」，两种都收。
 /// 实际幂等仍靠删前先用 `show` 计数（`count_rule_in_listing` 按 ASCII 规则名数行，
 /// 与界面语言无关）；这里只是竞态下"规则已被别处删掉"的兜底。
-fn is_no_match(detail: &str) -> bool {
+/// `pub(crate)`：guard 的恢复路径（P2-9）复用同一套中英双语判别。
+pub(crate) fn is_no_match(detail: &str) -> bool {
     let detail = detail.to_ascii_lowercase();
     detail.contains("no rules match") || detail.contains("没有与指定")
 }
@@ -703,17 +718,58 @@ fn powershell(script: &str) -> (bool, String) {
     )
 }
 
-/// 网卡当前是否处于 Up（核验断网是否真的生效）。
-fn nic_is_up(name: &str) -> bool {
-    let script = format!(
-        "$a = Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue; if ($a) {{ [string]$a.Status }} else {{ 'Missing' }}",
-        name.replace('\'', "''")
-    );
+/// `Get-NetAdapter` 查无此卡时脚本自报的哨兵（ASCII 常量，非本地化文本）。
+const NIC_NOT_FOUND: &str = "CG-NOT-FOUND";
+
+/// 纯函数：解析按 GUID/名称查到的 `Status`。
+///
+/// `Status` 是英文枚举值（Up/Disabled/Disconnected…），与界面语言无关，
+/// 只认这几个稳定取值：`Up` → 仍在 Up；`Disabled`/`Disconnected` → 已断开。
+/// 其余一律 Err——空输出、查无此卡的哨兵、本地化/未知文案都必须让核验**失败**，
+/// 不能当成"已断开"（P2-5 的假通过就是把 Missing/查询失败读成了已断开）。
+fn parse_nic_status(text: &str) -> Result<bool, String> {
+    let status = text.trim();
+    if status.is_empty() {
+        return Err("网卡状态查询无输出".to_string());
+    }
+    if status.eq_ignore_ascii_case(NIC_NOT_FOUND) {
+        return Err("查无此网卡（GUID/名称不存在）".to_string());
+    }
+    match status.to_ascii_lowercase().as_str() {
+        "up" => Ok(true),
+        "disabled" | "disconnected" => Ok(false),
+        other => Err(format!("无法识别的网卡状态：{other}")),
+    }
+}
+
+/// 纯函数：生成按 GUID（优先）或名称查 `Status` 的 PowerShell 脚本。
+///
+/// 禁用走的是 `set_nic_enabled_by_guid`，核验必须按同一个 GUID 回查，
+/// 按名字过滤会在改名/重名时查无此卡；只有旧现场（状态文件只记了名称）
+/// 才退化为按名称查。查不到时输出 `CG-NOT-FOUND` 由 [`parse_nic_status`] 判 Err。
+fn nic_status_script(guid: &str, name: &str) -> String {
+    if guid.trim().is_empty() {
+        format!(
+            "$a = Get-NetAdapter -Name {} -ErrorAction SilentlyContinue | Select-Object -First 1; if ($a) {{ [string]$a.Status }} else {{ '{NIC_NOT_FOUND}' }}",
+            ps_literal(name)
+        )
+    } else {
+        format!(
+            "$a = Get-NetAdapter -IncludeHidden | Where-Object {{ $_.InterfaceGuid -eq {} }} | Select-Object -First 1; if ($a) {{ [string]$a.Status }} else {{ '{NIC_NOT_FOUND}' }}",
+            ps_literal(guid)
+        )
+    }
+}
+
+/// 网卡当前是否处于 Up（核验断网是否真的生效），按 GUID 查询。
+/// 查询失败或查无此卡返回 Err（fail-closed）：核验失败，绝不冒充"已断开"。
+fn nic_is_up(guid: &str, name: &str) -> Result<bool, String> {
+    let script = nic_status_script(guid, name);
     let (ok, detail) = powershell(&script);
     if !ok {
-        return true; // 查不出来就不敢说"已断开"，按仍在线处理
+        return Err(format!("网卡状态查询失败：{detail}"));
     }
-    detail.trim().eq_ignore_ascii_case("Up")
+    parse_nic_status(&detail)
 }
 
 fn list_up_nics() -> Vec<String> {
@@ -1030,5 +1086,54 @@ mod tests {
             plan[0].name, "6f1c2f9a-1b2c-4d5e-8f90-1234567890ab",
             "没有名称时应回落到 GUID"
         );
+    }
+
+    /// P2-5 行为锁: 状态解析只认稳定枚举值；查无此卡/空输出/本地化文案
+    /// 必须 Err（核验失败），绝不能被读成"已断开"。
+    #[test]
+    fn nic_status_parser_fails_closed() {
+        assert_eq!(parse_nic_status("Up"), Ok(true));
+        assert_eq!(parse_nic_status(" up \r\n"), Ok(true));
+        assert_eq!(parse_nic_status("Disabled"), Ok(false));
+        assert_eq!(parse_nic_status("Disconnected"), Ok(false));
+        // 查无此卡（旧代码的 Missing 被当"已断开"→核验假通过）
+        assert!(parse_nic_status("CG-NOT-FOUND").is_err());
+        assert!(parse_nic_status("Missing").is_err());
+        // 空输出 = 查询无结果，同样 fail-closed
+        assert!(parse_nic_status("").is_err());
+        assert!(parse_nic_status("   ").is_err());
+        // 本地化/未知文案不得当成"已断开"
+        assert!(parse_nic_status("已禁用").is_err());
+        assert!(parse_nic_status("Connecting").is_err());
+        assert!(parse_nic_status("Bogus").is_err());
+    }
+
+    /// P2-5 行为锁: 核验脚本按 InterfaceGuid 过滤（与禁用同一身份），
+    /// 只有旧现场（无 GUID）才退化为按名称查；名称/引号走 ps_literal 防注入。
+    #[test]
+    fn nic_status_script_filters_by_interface_guid() {
+        let guid = "6f1c2f9a-1b2c-4d5e-8f90-1234567890ab";
+        let script = nic_status_script(guid, "以太网");
+        assert!(
+            script.contains("InterfaceGuid"),
+            "必须按 GUID 过滤：{script}"
+        );
+        assert!(script.contains(&ps_literal(guid)));
+        assert!(
+            !script.contains("-Name "),
+            "有 GUID 时不得按名称查：{script}"
+        );
+        assert!(
+            script.contains(NIC_NOT_FOUND),
+            "查无此卡要输出哨兵：{script}"
+        );
+
+        let legacy = nic_status_script("", "O'Brien");
+        assert!(
+            legacy.contains("-Name "),
+            "无 GUID 的旧现场按名称查：{legacy}"
+        );
+        assert!(!legacy.contains("InterfaceGuid"));
+        assert!(legacy.contains(&ps_literal("O'Brien")));
     }
 }

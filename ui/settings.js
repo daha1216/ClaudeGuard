@@ -24,6 +24,8 @@
   let mounted = false;
   let loading = false;
   let msgtimer = 0;
+  // 设置内搜索（跨 build 保留）：fill() 只赋值不重建，搜索态必须由这里持有。
+  let searchQ = "";
 
   const KIND_OPTIONS = [
     ["auto", "自动识别"],
@@ -42,17 +44,19 @@
   function notifyToast(msg, ok) {
     if (typeof OPTS.onToast === "function") OPTS.onToast(msg, ok);
   }
-  function switchHtml(id, checked, disabled) {
+  // P1-8a：开关只有一个色块，没有可见文字——给 input 一个可访问名（aria-label）。
+  function switchHtml(id, checked, disabled, label) {
     return (
       '<label class="switch"><input type="checkbox" id="' + id + '"' + (checked ? " checked" : "") +
-      (disabled ? " disabled" : "") + '><span class="switch-track"><span class="switch-knob"></span></span></label>'
+      (disabled ? " disabled" : "") + (label ? ' aria-label="' + esc(label) + '"' : "") +
+      '><span class="switch-track"><span class="switch-knob"></span></span></label>'
     );
   }
   function rowSwitch(id, title, hint, checked, disabled) {
     return (
       '<div class="srow"><div class="slabel">' + esc(title) +
       (hint ? '<span class="shint">' + esc(hint) + "</span>" : "") +
-      '</div><div class="sval">' + switchHtml(id, checked, disabled) + "</div></div>"
+      '</div><div class="sval">' + switchHtml(id, checked, disabled, title) + "</div></div>"
     );
   }
   function rowInput(id, title, hint, value, unit, attrs) {
@@ -82,6 +86,7 @@
     if (!HOST) return;
     const notify = (CFG && CFG.notify) || {};
     HOST.innerHTML =
+      searchHtml() +
       group("detect", "检测",
         '<div class="srow"><div class="slabel">代理端口<span class="shint">本机代理软件的端口</span></div><div class="sval"><input class="in num" id="st-port" type="number" min="1" max="65535" step="1"></div></div>' +
         '<div class="srow"><div class="slabel">检查间隔<span class="shint">自动复查的周期</span></div><div class="sval"><input class="in num" id="st-interval" type="number" min="5" max="3600" step="1"><span class="unit">秒</span></div></div>' +
@@ -158,6 +163,77 @@
     fill();
     mountChildren();
     syncAcc();
+    // 重建后恢复搜索态：输入框是新元素，重新绑定并按当前关键词重跑过滤。
+    wireSearch();
+    applySearch();
+  }
+
+  /* ---------- 设置内搜索（行级 hidden 过滤，不改数据模型、不全量重建） ---------- */
+
+  // 参与过滤的“行”：按各自 title/hint 文本大小写不敏感匹配；嵌套元素随父块显隐。
+  const SEARCH_BLOCK = ".srow, .titem, .wline, .sgroup-title, .sgroup-note, .tactions, .formhint";
+
+  function searchHtml() {
+    return (
+      '<div class="st-search">' +
+      '<input class="in" id="st-search" type="search" autocomplete="off" spellcheck="false" ' +
+      'placeholder="搜索设置：例如「白名单」「通知」「端口」" aria-label="搜索设置项">' +
+      '<div class="formhint st-search-empty" id="st-search-empty" hidden>没有匹配的设置项，清空搜索框恢复全部。</div>' +
+      "</div>"
+    );
+  }
+
+  function wireSearch() {
+    const box = $("st-search");
+    if (!box) return;
+    box.value = searchQ;
+    box.addEventListener("input", () => {
+      searchQ = box.value;
+      applySearch();
+    });
+    box.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape") return;
+      // Esc 清空搜索；stopPropagation 避免冒泡到 document 触发 main.js 的向导 Esc 闸门。
+      e.stopPropagation();
+      box.value = "";
+      searchQ = "";
+      applySearch();
+    });
+  }
+
+  function applySearch() {
+    if (!HOST) return;
+    const groups = HOST.querySelectorAll(".sgroup.acc");
+    const empty = $("st-search-empty");
+    const q = String(searchQ || "").trim().toLowerCase();
+    if (!q) {
+      // 清空恢复原状：全部取消隐藏，交给既有 syncAcc() 还原单开/inert 状态。
+      groups.forEach((g) => {
+        g.hidden = false;
+        g.querySelectorAll(SEARCH_BLOCK).forEach((b) => { b.hidden = false; });
+      });
+      if (empty) empty.hidden = true;
+      syncAcc();
+      return;
+    }
+    let any = false;
+    groups.forEach((g) => {
+      // textContent 含已隐藏块的文本，同一份语料既判组也判行，结果一致。
+      const hit = (g.textContent || "").toLowerCase().indexOf(q) >= 0;
+      g.hidden = !hit;
+      if (!hit) return;
+      any = true;
+      // 匹配组逐个展开（不借 openAcc，多组同开）；openAcc 不动，清空时 syncAcc 复原。
+      g.classList.add("is-open");
+      const head = g.querySelector(".acc-head");
+      if (head) head.setAttribute("aria-expanded", "true");
+      const body = g.querySelector(".acc-body");
+      if (body) body.removeAttribute("inert");
+      g.querySelectorAll(SEARCH_BLOCK).forEach((b) => {
+        b.hidden = (b.textContent || "").toLowerCase().indexOf(q) < 0;
+      });
+    });
+    if (empty) empty.hidden = any;
   }
 
   /* ---------- 折叠手风琴（单开） ---------- */
@@ -171,6 +247,13 @@
       g.classList.toggle("is-open", on);
       const head = g.querySelector(".acc-head");
       if (head) head.setAttribute("aria-expanded", on ? "true" : "false");
+      // P1-8b：收起只是视觉（grid 0fr），内容仍可 Tab 进入——用 inert 挡住焦点；
+      // 不支持 inert 的环境忽略该属性，行为与原来一致。
+      const body = g.querySelector(".acc-body");
+      if (body) {
+        if (on) body.removeAttribute("inert");
+        else body.setAttribute("inert", "");
+      }
     });
   }
 
@@ -335,7 +418,7 @@
       '<div class="titem-top">' +
       '<input class="in tname" data-f="name" maxlength="16" value="' + esc(t.name || "") + '" aria-label="目标名称" placeholder="名称">' +
       '<select class="in" data-f="anchor_kind" aria-label="识别类型">' + opts + "</select>" +
-      '<label class="switch" title="启用"><input type="checkbox" data-f="enabled"' + (t.enabled !== false ? " checked" : "") + '><span class="switch-track"><span class="switch-knob"></span></span></label>' +
+      '<label class="switch" title="启用"><input type="checkbox" data-f="enabled" aria-label="启用此目标"' + (t.enabled !== false ? " checked" : "") + '><span class="switch-track"><span class="switch-knob"></span></span></label>' +
       '<button class="tdel" type="button" data-del="' + i + '" title="删除" aria-label="删除目标"' + (t.builtin ? " disabled" : "") + ">" + ic("trash", 13) + "</button>" +
       "</div>" +
       '<div class="trow2"><input class="in" data-f="anchor_url" value="' + esc(t.anchor_url || "") + '" placeholder="https://…" spellcheck="false" aria-label="锚点 URL"></div>' +
@@ -355,9 +438,11 @@
     if (!host) return;
     if (!TARGETS.length) {
       host.innerHTML = '<div class="formhint">还没有监控目标。点“恢复默认”取回四个内置目标。</div>';
-      return;
+    } else {
+      host.innerHTML = TARGETS.map(targetItem).join("");
     }
-    host.innerHTML = TARGETS.map(targetItem).join("");
+    // 目标行是重建出来的（新增/删除/保存后），若正处在搜索中要立刻重新过滤。
+    if (searchQ) applySearch();
   }
 
   function readTargets() {
@@ -434,8 +519,50 @@
     }
   }
 
+  // P1-4：恢复默认是破坏性操作，两段确认（4 秒内再点一次才执行）。
+  let resetArmed = false;
+  let resetTimer = 0;
+  function resetArmOff() {
+    resetArmed = false;
+    clearTimeout(resetTimer);
+    const btn = $("st-target-reset");
+    if (btn) {
+      btn.textContent = "恢复默认";
+      btn.classList.remove("is-danger");
+      btn.classList.add("is-ghost");
+    }
+    const m = $("st-target-msg");
+    if (m && !m.hidden && String(m.textContent || "").indexOf("将恢复默认监控目标") === 0) {
+      m.hidden = true;
+      m.textContent = "";
+    }
+  }
   async function resetTargets() {
+    const btn = $("st-target-reset");
     const msg = $("st-target-msg");
+    if (!resetArmed) {
+      resetArmed = true;
+      if (btn) {
+        btn.textContent = "确认恢复？";
+        btn.classList.remove("is-ghost");
+        btn.classList.add("is-danger");
+      }
+      if (msg) {
+        msg.hidden = false;
+        msg.className = "formerr";
+        msg.textContent = "将恢复默认监控目标（保留白名单），当前自定义目标会被覆盖——再点一次确认执行。";
+      }
+      clearTimeout(resetTimer);
+      resetTimer = setTimeout(resetArmOff, 4000);
+      return;
+    }
+    clearTimeout(resetTimer);
+    resetArmed = false;
+    if (btn) {
+      btn.textContent = "恢复默认";
+      btn.classList.remove("is-danger");
+      btn.classList.add("is-ghost");
+    }
     if (msg) { msg.hidden = true; msg.textContent = ""; }
     try {
       await invoke(CMD.reset_targets);
@@ -458,8 +585,9 @@
       if (okMsg) notifyToast(okMsg, true);
       if (typeof OPTS.reloadConfig === "function") OPTS.reloadConfig();
     } catch (e) {
+      // P1-4：保存失败只提示，不重建表单——fill() 会把监控目标编辑器里
+      // 尚未保存的输入全部清掉，用户得从头再填。
       notifyToast((e && e.message) || "保存失败");
-      fill();
       return false;
     }
     return true;
@@ -483,6 +611,8 @@
         if (!g) return;
         openAcc = openAcc === g.dataset.g ? "" : g.dataset.g;
         syncAcc();
+        // 搜索过滤期间以过滤结果为准：syncAcc 的单开收敛后再重跑一次展开匹配组。
+        if (searchQ) applySearch();
       });
     }
     const port = $("st-port");
@@ -543,6 +673,39 @@
     const lockAuto = $("st-lockdown-auto");
     if (lockAuto) lockAuto.addEventListener("change", () => patch({ lockdown_on_uncovered: !!lockAuto.checked }, "已保存"));
     const lockState = $("st-lockdown-state");
+    // P2-4：lockdown 回执 {on, queryOk, rules}（camelCase 契约）——
+    // 回查失败/没核验到规则必须报出来，不能再恒显"已生效"。
+    const describeLockdown = (r) => {
+      const want = !!(r && r.on);
+      if (!r || !r.queryOk) {
+        return {
+          state: want
+            ? "封锁结果无法核验：防火墙规则查询失败，可能并未生效"
+            : "解除结果无法核验：防火墙规则查询失败",
+          toast: "操作结果无法核验",
+        };
+      }
+      if (want) {
+        return r.rules > 0
+          ? {
+              state: "已封锁（手动）：核验到 " + r.rules + " 条出站规则，守护对象直连出站被阻断，走系统代理不受影响；会一直保持到你点「解除封锁」",
+              toast: "已启用防火墙兜底封锁",
+            }
+          : {
+              state: "封锁未生效：未核验到任何出站规则（未找到守护对象 exe 或规则未生效）",
+              toast: "封锁未生效",
+            };
+      }
+      return r.rules === 0
+        ? {
+            state: "已解除手动封锁：规则已删除；若当前仍未接入代理，下一轮检查会按自动策略重新封锁",
+            toast: "已解除防火墙封锁",
+          }
+        : {
+            state: "解除未完成：仍剩 " + r.rules + " 条封锁规则，请以管理员身份重试",
+            toast: "解除未完成",
+          };
+    };
     const lockBtns = [["st-lockdown-on", true], ["st-lockdown-off", false]];
     lockBtns.forEach(([id, on]) => {
       const b = $(id);
@@ -550,14 +713,13 @@
       b.addEventListener("click", async () => {
         b.disabled = true;
         try {
-          await invoke(CMD.lockdown, { on });
+          const r = await invoke(CMD.lockdown, { on });
+          const msg = describeLockdown(r);
           if (lockState) {
-            lockState.textContent = on
-              ? "已封锁（手动）：守护对象直连出站被阻断，走系统代理不受影响；会一直保持到你点「解除封锁」"
-              : "已解除手动封锁：规则已删除；若当前仍未接入代理，下一轮检查会按自动策略重新封锁";
+            lockState.textContent = msg.state;
             lockState.style.display = "";
           }
-          notifyToast(on ? "已启用防火墙兜底封锁" : "已解除防火墙封锁");
+          notifyToast(msg.toast);
         } catch (e) {
           notifyToast("操作失败：" + e);
         } finally {
@@ -817,12 +979,27 @@
       if (U && U.setState) U.setState(state);
       const F = CG.feishu;
       if (F && F.setState) F.setState(state);
+      // 异步子组件（updates/feishu）随状态重渲染后，行文本可能变了——重跑过滤。
+      if (searchQ) applySearch();
     },
     refresh() {
       if (!mounted) return;
       load();
     },
     isOpen() { return mounted; },
+    // P0：主界面「未配置白名单 — 点此配置」跳转到指定设置组（监控目标）。
+    openGroup(key) {
+      openAcc = key;
+      if (searchQ) {
+        // 跳转定位必须可见：先清空搜索过滤（内部会 syncAcc 还原），再套用目标组。
+        searchQ = "";
+        const box = $("st-search");
+        if (box) box.value = "";
+        applySearch();
+      } else {
+        syncAcc();
+      }
+    },
   };
 
   async function load() {

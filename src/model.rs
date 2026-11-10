@@ -313,6 +313,22 @@ pub struct AgentCount {
     pub count: usize,
 }
 
+/// 一键封锁/解除的执行回执（IPC `lockdown(on)` 的返回值）。
+///
+/// P2-4：apply 可能因非管理员/PowerShell 被策略禁用而失败，
+/// 不能恒回显请求值——`query_ok=false` 时 `rules` 不可信，
+/// UI 不得宣称"已生效/已解除"。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LockdownResult {
+    /// 请求的目标状态（true=封锁，false=解除）。
+    pub on: bool,
+    /// 执行后回查是否成功；false 表示防火墙规则查询失败。
+    pub query_ok: bool,
+    /// 执行后核验到的规则条数：封锁=生效条数，解除=剩余条数（应为 0）。
+    pub rules: usize,
+}
+
 // ---------- 软件更新状态机 ----------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

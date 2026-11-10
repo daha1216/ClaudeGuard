@@ -478,6 +478,20 @@ pub fn lockdown_clear() -> bool {
     false
 }
 
+/// 当前生效的兜底封锁规则条数。这个构建不创建任何封锁规则（见
+/// [`lockdown_apply`]），0 是确知值——同 [`firewall_rule_count`] 的理由，
+/// 返回 `Some(0)` 而非 `None`，让上层把"确知无规则"与"查询失败"分开。
+pub fn lockdown_rules_now() -> Option<usize> {
+    Some(0)
+}
+
+/// 是否还有应加封锁规则的 exe：本构建不创建任何封锁规则（见
+/// [`lockdown_apply`]），恒为"没有可覆盖对象"——让上层把 macOS 的 0 条
+/// 当确知状态（无需重试），而不是"执行失败"。
+pub fn lockdown_coverable(_cfg: &crate::config::Config) -> bool {
+    false
+}
+
 pub fn trip(cfg: &crate::config::Config, reason: &str) -> TripResult {
     let mut report = TripResult {
         agents: cfg

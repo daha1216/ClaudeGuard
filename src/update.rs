@@ -837,7 +837,19 @@ pub fn spawn_download(state: &Arc<AppState>, url: String, size: u64) {
                 match applied {
                     Ok(()) => {
                         #[cfg(windows)]
-                        std::process::exit(0);
+                        {
+                            // 与正常退出同一道恢复闸门（R06/D3）：核验成功才退出。
+                            // 失败则 fail-closed：守护继续运行、中止本次更新退出，
+                            // 不得绕过退出前恢复直接 process::exit(0)。
+                            if let Err(summary) = crate::shutdown_before_exit(&state) {
+                                let msg = format!("退出前恢复未完成，已中止更新重启：{summary}");
+                                state.set_upd(UpdState::Failed { msg: msg.clone() });
+                                state.log(format!("更新已中止：{msg}"));
+                                state.emit_state();
+                                return;
+                            }
+                            std::process::exit(0);
+                        }
                         #[cfg(target_os = "macos")]
                         {
                             state.stop.store(true, std::sync::atomic::Ordering::Relaxed);

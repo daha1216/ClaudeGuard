@@ -52,6 +52,8 @@ body[data-overall="fail"] { --page-bg: #F8F4EF; }
 body[data-overall="tripped"] { --page-bg: #F8F1F2; }
 body[data-overall="tripped"] .hero-title { color: #A3121A; }
 body[data-overall="paused"] { --page-bg: #F2F2F4; }
+/* P1-1：保护已停止时主卡标题转橙（deep 变体，15px 小字对比度达标）。 */
+body[data-disarmed="1"] .hero-title { color: var(--orange-deep); }
 
 button, input, select { font-family: inherit; }
 button { cursor: pointer; }
@@ -105,6 +107,20 @@ svg { display: block; }
 .hero-title { font-size: 15px; font-weight: 600; letter-spacing: .01em; color: var(--txt); }
 .hero-ver { margin-left: auto; font-size: 10.5px; color: var(--muted2); font-variant-numeric: tabular-nums; }
 .hero-sub { font-size: 12px; color: var(--txt2); margin: 6px 0 0 20px; line-height: 1.4; }
+/* P0：「未配置白名单 — 点此配置」专属入口；继承 .hero-title 排版，橙色深字保证小字对比度。 */
+.hero-unconf {
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: .01em;
+  color: var(--orange-deep);
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+}
+.hero-unconf:hover { text-decoration: underline; }
 
 .dot { width: 11px; height: 11px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(52, 199, 89, .16); flex: none; }
 .dot.fail { background: var(--red); box-shadow: 0 0 0 4px rgba(255, 59, 48, .16); }
@@ -143,9 +159,9 @@ svg { display: block; }
 }
 .banner .bact:active { transform: scale(.96); }
 .banner.trip { background: rgba(228, 0, 43, .06); border: 1px solid rgba(228, 0, 43, .14); color: var(--red-deep); }
-.banner.trip .bact { color: var(--red); border: 1px solid rgba(228, 0, 43, .22); box-shadow: 0 .5px 1px rgba(228, 0, 43, .1); }
+.banner.trip .bact { color: var(--red-deep); border: 1px solid rgba(228, 0, 43, .22); box-shadow: 0 .5px 1px rgba(228, 0, 43, .1); }
 .banner.warn { background: rgba(237, 99, 0, .07); border: 1px solid rgba(237, 99, 0, .16); color: var(--orange-deep); }
-.banner.warn .bact { color: var(--orange); border: 1px solid rgba(237, 99, 0, .22); box-shadow: 0 .5px 1px rgba(237, 99, 0, .1); }
+.banner.warn .bact { color: var(--orange-deep); border: 1px solid rgba(237, 99, 0, .22); box-shadow: 0 .5px 1px rgba(237, 99, 0, .1); }
 .banner.notice { background: rgba(3, 170, 73, .06); border: 1px solid rgba(3, 170, 73, .14); color: var(--green-deep); }
 .banner.notice .bact { color: var(--green-deep); border: 1px solid rgba(3, 170, 73, .2); }
 .banner.info { background: rgba(0, 0, 0, .035); border: 1px solid rgba(0, 0, 0, .045); color: var(--txt2); }
@@ -317,8 +333,15 @@ textarea.in { height: auto; min-height: 44px; padding: 5px 7px; resize: vertical
 .btn.is-ghost { background: transparent; border: 1px solid rgba(0, 0, 0, .1); color: var(--txt2); }
 .btn[disabled] { opacity: .45; pointer-events: none; }
 
+/* P1-2：保护卡行内按钮（立即观察）与动作条（暂停守护 / 完全恢复网络） */
+.row .val.has-act { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.rowbtn { flex: none; margin-left: 2px; height: 24px; padding: 0 10px; font-size: 11px; }
+.pacts { display: flex; gap: 6px; padding: 8px 0 6px; border-top: 1px solid var(--hairline); }
+.pacts .btn { flex: 1; white-space: normal; font-size: 10.5px; line-height: 1.3; height: auto; min-height: 28px; padding: 5px 8px; }
+.pacts .btn.is-danger { color: var(--red-deep); background: rgba(228, 0, 43, .1); }
+
 .sactions { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 6px; }
-.formerr { font-size: 10.5px; line-height: 1.45; color: var(--red); padding: 5px 0 1px; word-break: break-word; }
+.formerr { font-size: 10.5px; line-height: 1.45; color: var(--red-deep); padding: 5px 0 1px; word-break: break-word; }
 .formok { font-size: 10.5px; line-height: 1.45; color: var(--green-deep); padding: 5px 0 1px; }
 .formhint { font-size: 10px; line-height: 1.45; color: var(--muted2); padding: 2px 0 0; }
 
@@ -353,7 +376,7 @@ textarea.in { height: auto; min-height: 44px; padding: 5px 7px; resize: vertical
 .progress { height: 4px; border-radius: 2px; background: rgba(0, 0, 0, .07); overflow: hidden; margin: 6px 0 2px; }
 .progress > i { display: block; height: 100%; border-radius: 2px; background: linear-gradient(90deg, var(--blue-top), var(--blue)); transform-origin: 0 50%; transition: transform .2s var(--ease); }
 
-.werror { font-size: 10px; line-height: 1.45; color: var(--red); padding: 3px 0 1px; word-break: break-word; }
+.werror { font-size: 10px; line-height: 1.45; color: var(--red-deep); padding: 3px 0 1px; word-break: break-word; }
 .wok { font-size: 10px; line-height: 1.45; color: var(--green-deep); padding: 3px 0 1px; }
 
 .fsline { display: flex; gap: 6px; align-items: flex-start; padding: 2px 0; }
@@ -401,7 +424,7 @@ textarea.in { height: auto; min-height: 44px; padding: 5px 7px; resize: vertical
 /* ---------- toast ---------- */
 
 .toast {
-  position: fixed; left: 50%; bottom: 62px; z-index: 60;
+  position: fixed; left: 50%; bottom: 100px; z-index: 60;
   max-width: calc(100% - 40px);
   padding: 8px 12px; border-radius: 10px;
   background: rgba(29, 29, 31, .92); color: #fff;
@@ -424,8 +447,10 @@ textarea.in { height: auto; min-height: 44px; padding: 5px 7px; resize: vertical
   backdrop-filter: blur(24px) saturate(180%);
 }
 .wizard[hidden] { display: none; }
-/* 向导打开时把首页内容与滚动条隐去，避免蓝色 CTA 光晕透过磨砂背景 */
+/* 向导打开时把首页内容与滚动条隐去，避免蓝色 CTA 光晕透过磨砂背景；
+   .cta/.footer 也要一并藏掉——visibility:hidden 的元素不进 Tab 序（P1-8c）。 */
 body.wiz-open #content { visibility: hidden; }
+body.wiz-open .cta, body.wiz-open .footer { visibility: hidden; }
 body.wiz-open #scroll { overflow: hidden; }
 
 .wizard-card {
@@ -469,7 +494,7 @@ body.wiz-open #scroll { overflow: hidden; }
 .wiz-choice:active { transform: scale(.98); }
 .wiz-choice strong { font-size: 12px; font-weight: 600; color: var(--txt); }
 .wiz-choice span { font-size: 10px; line-height: 1.45; color: var(--muted); }
-.wiz-err { margin-top: 10px; font-size: 10.5px; line-height: 1.45; color: var(--red); word-break: break-word; }
+.wiz-err { margin-top: 10px; font-size: 10.5px; line-height: 1.45; color: var(--red-deep); word-break: break-word; }
 .wiz-err[hidden] { display: none; }
 .wiz-nav { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 14px; }
 .wiz-nav-right { display: flex; align-items: center; gap: 6px; }
@@ -554,8 +579,63 @@ body[data-ready="1"] .card { animation: enter .36s .12s var(--ease) both; }
   word-break: break-word;
 }
 .upd-status.is-ok { color: var(--green-deep); }
-.upd-status.is-warn { color: var(--orange); }
-.upd-status.is-bad { color: var(--red); }
+.upd-status.is-warn { color: var(--orange-deep); }
+.upd-status.is-bad { color: var(--red-deep); }
 .srow[hidden], .formhint[hidden], .progress[hidden] { display: none; }
 .in[disabled] { opacity: .55; }
 .in[type="password"] { letter-spacing: .5px; }
+
+/* ---------- 设置内搜索（功能 A）：搜索框与行级 hidden 过滤 ---------- */
+
+.st-search { padding: 0 0 8px; }
+.st-search .in { height: 28px; font-size: 11.5px; }
+.st-search .st-search-empty { padding-top: 6px; }
+/* 作者样式给这些块设了 display，UA 的 [hidden]{display:none} 会被盖掉——显式补一条。 */
+.titem[hidden], .wline[hidden], .sgroup-title[hidden], .sgroup-note[hidden],
+.tactions[hidden], .sgroup.acc[hidden] { display: none; }
+
+/* ---------- 24 小时时间线（功能 B）：色块用亮色 token，小字前景一律深色 ≥4.5:1 ---------- */
+
+.tl-note { margin-left: 6px; font-size: 9.5px; font-weight: 400; letter-spacing: 0; color: var(--muted2); }
+.tl-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 1px 2px 7px; }
+.tl-lg { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; line-height: 1.3; }
+.tl-lg.is-pass { color: var(--green-deep); }
+.tl-lg.is-trip { color: var(--red-deep); }
+.tl-lg.is-warn { color: var(--orange-deep); }
+.tl-lg.is-none { color: var(--muted2); }
+.tl-dot { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+.tl-dot.is-pass { background: var(--green); }
+.tl-dot.is-trip { background: var(--red); }
+.tl-dot.is-warn { background: var(--orange); }
+.tl-dot.is-none { background: #C7C7CC; }
+.tl-track {
+  display: grid;
+  grid-template-columns: repeat(96, minmax(0, 1fr));
+  gap: 1px;
+  padding: 2px 0 0;
+}
+.tl-track:focus-visible { outline: 2px solid rgba(0, 113, 227, .5); outline-offset: 2px; border-radius: 4px; }
+.tl-cell { display: block; height: 20px; min-width: 0; border-radius: 1.5px; background: #C7C7CC; }
+.tl-cell.is-pass { background: var(--green); }
+.tl-cell.is-trip { background: var(--red); }
+.tl-cell.is-warn { background: var(--orange); }
+.tl-cell.is-none { background: #C7C7CC; }
+.tl-cell.is-sel { box-shadow: 0 0 0 1.5px #1C1C1E; }
+.tl-axis {
+  display: flex;
+  justify-content: space-between;
+  padding-top: 3px;
+  font-size: 9.5px;
+  color: var(--muted2);
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}

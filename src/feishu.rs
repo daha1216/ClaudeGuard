@@ -272,11 +272,14 @@ fn send(stored: &Stored, text: &str) -> Result<(), DeliveryError> {
         decrypt(&stored.secret).map_err(DeliveryError::permanent)?
     };
     // Do not inherit the monitored proxy; never redirect a credential-bearing request.
-    let agent = ureq::AgentBuilder::new()
-        .try_proxy_from_env(false)
-        .timeout(Duration::from_secs(10))
-        .redirects(0)
-        .build();
+    // 凭据不走监控代理：显式 Notify 意图经 netpol 统一出网入口构造，恒直连 + redirects(0)。
+    // Notify 不读任何代理字段，这里传默认配置只为满足统一入口的签名。
+    let agent = crate::netpol::client(
+        &crate::config::Config::default(),
+        crate::netpol::EgressIntent::Notify,
+        Duration::from_secs(10),
+    )
+    .map_err(DeliveryError::permanent)?;
     let body = request_body(text, &secret, now()).to_string();
     let response = agent
         .post(&url)

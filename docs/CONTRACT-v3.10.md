@@ -260,6 +260,7 @@ struct RecoveryJournal { version: u32, tx_id: String, epoch: u64, created_at: i6
 5. `docs/SPEC-v3.md` §4：恢复条件改为流程 A；暂停不自动解除隔离；`release` 语义按 D3。
 6. `docs/SPEC-v3.md` §6：`trip` 文案"修正后自动恢复"改为"确认出口正常后可恢复"；通知默认脱敏。
 7. `docs/GUIDE.md` / `README.md` 在 M5 按最终能力重写，不提前承诺。
+8. P2-4（v3.12.5）：IPC `lockdown(on)` 返回值由 `bool` 改为 `LockdownResult{on,queryOk,rules}`（camelCase）——执行后必须回查防火墙规则；`queryOk=false` 表示回查失败、`rules` 不可信，UI 不得宣称"已生效/已解除"，只能报"结果无法核验"。
 
 ## 9. 失败模式矩阵
 

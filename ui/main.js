@@ -72,8 +72,17 @@
     settingsMounted: false,
     smokeOpened: false,
     launchErrShown: "",
-    wizard: { open: false, step: 0, busy: false },
+    wizard: { open: false, step: 0, busy: false, returnFocus: null },
     detailsKey: "",
+    // P1-2：保护卡行内动作的状态（直连观察 / 暂停 / 完全恢复网络）
+    leakBusy: false,
+    pauseBusy: false,
+    restoreBusy: false,
+    leakFlash: null,
+    // 24 小时时间线（功能 B）：纯前端环形缓冲 {t:ms, kind, note}，不持久化，重启从空开始
+    tl: [],
+    tlLastRender: 0,
+    tlFocus: 95, // 默认选中最后一格「现在」
   };
 
   /* ---------- 小工具 ---------- */
@@ -208,6 +217,18 @@
 
   /* ---------- 英雄区 ---------- */
 
+  // P1-3：不合规（fail）与未确认（unverified）分开计数，主卡与横幅共用同一口径，
+  // 避免同屏两个数字互相矛盾。
+  function badSummary(targets) {
+    const list = targets || [];
+    const bad = list.filter((x) => x.state === "fail").length;
+    const pending = list.filter((x) => x.state === "unverified").length;
+    const parts = [];
+    if (bad) parts.push(bad + " 个不合规");
+    if (pending) parts.push(pending + " 个未确认");
+    return parts.join(" · ");
+  }
+
   const RING_STROKE = {
     pass: "#03AA49",
     fail: "#ED6300",
@@ -223,19 +244,35 @@
     const sub = $("hero-sub");
     if (!st || !title || !sub) return;
     const overall = st.overall || "idle";
+    const targets = st.targets || [];
+    // P0：内置目标期望全空（一个白名单 IP / 出口地区都没填）→ 后端按“未配置白名单，
+    // 宁可错杀”持续失败，保护启动约 30 秒后熔断隔离。给专属提示与配置入口，
+    // 不套用 fail 的“校验未通过”红色熔断样式（tripped 时不覆盖，尊重真实熔断态）。
+    const unconf = !st.disarmed && whitelistEmpty(st) && overall !== "tripped";
+    // P1-1：已停止保护是前端要优先表达的状态（后端 overall() 无 disarmed 分支，
+    // 不能沿用它的结果），主卡给橙色“保护已停止”，不显示绿色“守护正常”。
+    const off = !!st.disarmed;
+    document.body.dataset.disarmed = off ? "1" : "0";
     const dot = $("hero-dot");
     if (dot) {
       dot.className =
-        overall === "tripped" ? "dot fail"
+        off ? "dot unverified"
+        : overall === "tripped" ? "dot fail"
         : overall === "paused" ? "dot unverified"
+        : unconf ? "dot unverified"
         : dotClass(overall);
     }
     const ver = $("hero-ver");
     if (ver) ver.textContent = st.version ? "v" + st.version : "";
-    const targets = st.targets || [];
     let t = "守护待命";
     let s = "等待首次检测";
-    if (overall === "pass") {
+    if (off) {
+      t = "保护已停止";
+      s = (st.disarmedReason ? st.disarmedReason + "。" : "") + "当前只做出口检测，不结束进程、不隔离、不断网。";
+    } else if (unconf) {
+      t = "";
+      s = "留空 = 不放行任何出口；守护启动约 30 秒后熔断并隔离网络，建议现在填上白名单。";
+    } else if (overall === "pass") {
       t = "守护正常";
       s = heroPassText(st, targets);
       if (S.manualBusy) s = "正在重新校验出口 IP…";
@@ -243,9 +280,8 @@
       t = "正在检查";
       s = "正在校验出口 IP…";
     } else if (overall === "fail") {
-      const bad = targets.filter((x) => x.state === "fail" || x.state === "unverified").length;
       t = "校验未通过";
-      s = bad + " 个出口不符合白名单";
+      s = badSummary(targets) || "出口不符合白名单";
     } else if (overall === "tripped") {
       t = "已熔断";
       s = (st.tripped && st.tripped.reason) || "出口 IP 不符合白名单";
@@ -258,15 +294,24 @@
       s = passed ? "等待下一次自动检测" : "等待首次检测";
     }
     // v3.7：未接入提示（系统代理关 + 无 TUN，应用直连真实出口）。
-    if (st.access && st.access.path === "uncovered" && st.enforceAccess && overall !== "tripped") {
+    if (!off && !unconf && st.access && st.access.path === "uncovered" && st.enforceAccess && overall !== "tripped") {
       s = "未接入代理链路：" + (st.access.note || "系统代理未开启且未检测到 TUN 网卡");
       // v3.9：兜底封锁生效时说明现状。
       if (st.lockdownManual) s += "；已手动封锁出站";
       else if (st.lockdown) s += "；已启用防火墙兜底封锁";
-    } else if (st.access && st.access.path === "unknown" && st.enforceAccess && overall !== "tripped") {
+    } else if (!off && !unconf && st.access && st.access.path === "unknown" && st.enforceAccess && overall !== "tripped") {
       s = "接入路径无法确认：" + (st.access.note || "PAC 或代理配置无法等价复用");
     }
     title.textContent = t;
+    if (unconf) {
+      // 专属配置入口：首装打开向导，否则展开设置的「监控目标」组。
+      const go = document.createElement("button");
+      go.type = "button";
+      go.className = "hero-unconf";
+      go.textContent = "未配置白名单 — 点此配置";
+      go.addEventListener("click", configWhitelist);
+      title.appendChild(go);
+    }
     sub.textContent = s;
     renderTiles(st);
   }
@@ -373,19 +418,46 @@
     const tripped = !!st.tripped;
     const agents = tripped && st.tripped.agents ? st.tripped.agents.length : 0;
     const fw = tripped ? "已隔离" + (agents ? " " + agents + " 个应用" : "") : st.lockdown ? "兜底封锁中" : "待命";
+    // 直连观察：刚点过「立即观察」时就地展示本次结果，到期还原为摘要。
+    const leakText = S.leakFlash ? S.leakFlash.text : leakLabel(st.leak);
+    const paused = (st.overall || "") === "paused";
+    const left = paused ? minutesLeft(st.pausedUntil) : 0;
+    const pauseLabel = paused
+      ? left > 0 ? left + " 分钟后自动恢复" : "已暂停"
+      : S.pauseBusy ? "正在暂停…" : "暂停守护 30 分钟";
     const rows = [
       ["防火墙隔离", fw, tripped ? " fail" : ""],
       ["断网档位", CUT_LABEL[st.cutMode] || "不断网", ""],
       ["进程清理", (st.guardedAgents || []).length ? "已开启" : "已关闭", ""],
-      ["直连观察", leakLabel(st.leak), st.leak && st.leak.directTotal > 0 ? " fail" : ""],
+      ["直连观察", leakText, st.leak && st.leak.directTotal > 0 ? " fail" : ""],
       ["环境", envLabel(st.env), st.env && st.env.tzMatch === false ? " fail" : ""],
     ];
     host.innerHTML = rows
-      .map(
-        (r) =>
-          '<div class="row"><span class="nm">' + esc(r[0]) + '</span><span class="val' + r[2] + '">' + esc(r[1]) + "</span></div>"
-      )
-      .join("");
+      .map((r, i) => {
+        const isLeak = i === 3;
+        const valCls = "val" + r[2] + (isLeak ? " has-act" : "");
+        const act = isLeak
+          ? '<button type="button" class="btn rowbtn" data-pact="leak"' + (S.leakBusy ? " disabled" : "") + ">" +
+            (S.leakBusy ? "观察中…" : "立即观察") + "</button>"
+          : "";
+        return '<div class="row"><span class="nm">' + esc(r[0]) + '</span><span class="' + valCls + '">' +
+          esc(r[1]) + "</span>" + act + "</div>";
+      })
+      .join("") +
+      '<div class="pacts">' +
+        '<button type="button" class="btn" data-pact="pause"' + (paused || S.pauseBusy ? " disabled" : "") + ">" +
+          esc(pauseLabel) + "</button>" +
+        '<button type="button" class="btn' + (restoreArmed ? " is-danger" : "") + '" data-pact="restore">' +
+          esc(restoreArmed ? "再点一次确认完全恢复" : "完全恢复网络（解除防火墙与断网）") + "</button>" +
+      "</div>";
+    host.querySelectorAll("[data-pact]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const act = el.getAttribute("data-pact");
+        if (act === "leak") doLeakScan();
+        else if (act === "pause") doPause();
+        else if (act === "restore") onRestoreClick();
+      });
+    });
   }
 
   // v3.12：直连观察与环境的单行摘要（详情卡用，后端结构体是 camelCase）
@@ -437,7 +509,10 @@
     // 熔断与暂停不占横幅位：主卡标题已表达状态，解除/恢复动作落在主钮上（设计 A）。
     if (overall === "fail") {
       const bad = (st.targets || []).filter((x) => x.state === "fail").map((x) => x.name);
-      parts.push(banner("warn", ["出口校验未通过", (bad.length ? bad.join("、") + " " : "") + "不符合白名单，熔断前可修正"], { id: "details", label: "查看详情" }));
+      // 与主卡同口径：名单（fail 的目标名）+「N 个不合规 · M 个未确认」汇总。
+      const sum = badSummary(st.targets);
+      parts.push(banner("warn", ["出口校验未通过",
+        (bad.length ? bad.join("、") + "：" : "") + (sum || "不符合白名单") + "，熔断前可修正"], { id: "details", label: "查看详情" }));
     }
     // v3.7：未接入横幅（系统代理关 + 无 TUN，应用直连真实出口；未熔断时提示）。
     if (
@@ -499,7 +574,13 @@
     let role = "recheck";
     let disabled = false;
     let ghostLabel = "";
-    if (overall === "tripped") {
+    if (st && st.disarmed) {
+      // P1-1：停止保护时主钮不能再是「启动 Claude」（会被后端拦截），改为重新布防。
+      label = "重新布防";
+      icons = icon("shield", 16);
+      role = "rearm";
+      ghostLabel = "立即检测";
+    } else if (overall === "tripped") {
       label = st.platform === "macos" ? "清除熔断状态" : "解除隔离并恢复网络";
       icons = icon("unlock", 16);
       cls = "btn-primary is-blocked";
@@ -624,11 +705,16 @@
     }
   }
 
-  /* ---------- 日志 ---------- */
+  /* ---------- 日志（行首 epoch 统一 stamp 成 MM-DD HH:MM:SS） ---------- */
 
   async function loadLogs() {
     const lines = await call(CMD.recent_logs, { limit: 200 }, true);
-    if (Array.isArray(lines)) S.logs = lines.slice();
+    if (Array.isArray(lines)) {
+      // 时间线条 ingest 用未 stamp 的原文（分类看正文、时间取行内 epoch），显示层再补戳。
+      tlIngest(lines, true);
+      S.logs = lines.map(stampLine);
+      tlRender();
+    }
     renderLogs();
   }
   function renderLogs() {
@@ -645,7 +731,10 @@
   }
   function appendLog(line) {
     if (line == null) return;
-    S.logs.push(String(line));
+    const raw = String(line);
+    tlIngest([raw], false); // 实时事件是裸消息 → ts 取 Date.now()；历史行首带 epoch
+    const text = stampLine(raw);
+    S.logs.push(text);
     if (S.logs.length > 400) S.logs.splice(0, S.logs.length - 400);
     if (S.folds.logs) {
       const host = $("log-lines");
@@ -653,7 +742,7 @@
         if (host.querySelector(".log-empty")) host.innerHTML = "";
         const div = document.createElement("div");
         div.className = "log-line";
-        div.textContent = String(line);
+        div.textContent = text;
         host.appendChild(div);
         while (host.childElementCount > 400) host.removeChild(host.firstElementChild);
         host.scrollTop = host.scrollHeight;
@@ -661,6 +750,137 @@
       const sub = $("logs-sub");
       if (sub) sub.textContent = "最近 " + S.logs.length + " 条";
     }
+  }
+
+  /* ---------- 24 小时时间线（纯前端：事件源① 状态事件 + ② 日志文本分类） ---------- */
+
+  const TL_BUCKETS = 96; // 15 分钟/格 × 96 = 24 小时
+  const TL_SPAN = 24 * 60 * 60 * 1000;
+  const TL_CELL = TL_SPAN / TL_BUCKETS;
+  const TL_SEV = { none: 0, pass: 1, warn: 2, trip: 3 };
+  const TL_LABEL = { none: "无数据", pass: "正常", warn: "暂停 · 未确认", trip: "熔断" };
+  const TL_DEDUP_MS = 5 * 60 * 1000; // 同 kind 5 分钟内不重复记（state 按秒级心跳到达）
+  const TL_MAX = 600;
+  const STAMP_RE = /^\[?(\d{10,13})\]?\s+/;
+
+  // 后端 recent_logs 行首是 "<unix秒> <消息>"、实时事件是裸消息；10 位=秒、13 位=毫秒。
+  function stampParts(raw) {
+    const s = String(raw == null ? "" : raw);
+    const m = STAMP_RE.exec(s);
+    if (!m) return { ts: Date.now(), msg: s };
+    const n = Number(m[1]);
+    return { ts: m[1].length > 10 ? n : n * 1000, msg: s.slice(m[0].length) };
+  }
+  function fmtMDHMS(ts) {
+    const d = new Date(ts);
+    return pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " +
+      pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+  }
+  function stampLine(raw) {
+    const p = stampParts(raw);
+    return fmtMDHMS(p.ts) + " " + p.msg;
+  }
+  function fmtHM(ts) {
+    const d = new Date(ts);
+    return pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+  }
+
+  function tlClassify(text) {
+    const s = String(text || "");
+    if (/熔断/.test(s)) return "trip";
+    if (/暂停|停止保护/.test(s)) return "warn";
+    if (/恢复|解除|通过/.test(s)) return "pass";
+    return "";
+  }
+
+  function tlPush(kind, note, ts, silent) {
+    if (!kind) return;
+    const t = ts == null ? Date.now() : ts;
+    for (let i = 0; i < S.tl.length; i++) {
+      const e = S.tl[i];
+      if (e.kind === kind && Math.abs(e.t - t) < TL_DEDUP_MS) return; // 同 kind 5 分钟去重
+    }
+    let i = S.tl.length; // 按 t 升序插入：日志批量回填可能带历史时间
+    while (i > 0 && S.tl[i - 1].t > t) i--;
+    S.tl.splice(i, 0, { t, kind, note: String(note || "") });
+    const cut = Date.now() - TL_SPAN;
+    while (S.tl.length && S.tl[0].t < cut) S.tl.shift(); // 滚动窗口 24h
+    if (S.tl.length > TL_MAX) S.tl.splice(0, S.tl.length - TL_MAX);
+    if (!silent) tlRender();
+  }
+
+  // 日志文本分类入口：lines=未 stamp 原文；时间戳取行内 epoch（没有则按现在）。
+  function tlIngest(lines, silent) {
+    if (!Array.isArray(lines)) return;
+    for (let i = 0; i < lines.length; i++) {
+      const kind = tlClassify(lines[i]);
+      if (kind) {
+        const p = stampParts(lines[i]);
+        tlPush(kind, p.msg, p.ts, true);
+      }
+    }
+    if (!silent) tlRender();
+  }
+
+  // 事件源①：applyState 每帧喂一次；idle/checking 没有可复盘结论，不记。
+  function tlFromState(view) {
+    if (!view || typeof view !== "object") return;
+    if (view.disarmed) {
+      tlPush("warn", view.disarmedReason || "保护已停止");
+      return; // 停止期间不看 overall，避免两套状态打架
+    }
+    const o = view.overall || "idle";
+    if (o === "tripped") tlPush("trip", (view.tripped && view.tripped.reason) || "已熔断");
+    else if (o === "pass") tlPush("pass", "出口校验通过");
+    else if (o === "fail") tlPush("warn", "出口校验未通过");
+    else if (o === "paused") tlPush("warn", "守护已暂停");
+  }
+
+  function tlRender() {
+    const track = $("tl-track");
+    if (!track) return;
+    S.tlLastRender = Date.now();
+    const now = Date.now();
+    const start = now - TL_SPAN;
+    const evs = S.tl; // 已按 t 升序、修剪进 24h 窗口
+    let html = "";
+    let carry = "none"; // carry-forward：格内无事件继承最近已知状态；首事件前保持灰
+    let note = "";
+    let ei = 0;
+    while (ei < evs.length && evs[ei].t < start) { // 窗口外的边界事件只用来定起点状态
+      carry = evs[ei].kind;
+      note = evs[ei].note;
+      ei++;
+    }
+    const winEnd = now + 1; // push→render 常在同一毫秒：末格右端闭到 t == now，否则刚落的事件被挡在格外
+    for (let b = 0; b < TL_BUCKETS; b++) {
+      const bs = start + b * TL_CELL;
+      const be = b === TL_BUCKETS - 1 ? winEnd : bs + TL_CELL;
+      // 不变式：进格时 ei 指向第一个 t >= bs 的事件（更早的已被前一格消费）
+      let pick = null;
+      for (let k = ei; k < evs.length && evs[k].t < be; k++) {
+        if (!pick || TL_SEV[evs[k].kind] > TL_SEV[pick.kind]) pick = evs[k];
+      }
+      while (ei < evs.length && evs[ei].t < be) ei++;
+      if (pick) {
+        carry = pick.kind;
+        note = pick.note;
+      }
+      const label = fmtHM(bs) + "–" + fmtHM(be) + " " + TL_LABEL[carry] + (note && carry !== "none" ? " · " + note : "");
+      html += '<i class="tl-cell is-' + carry + '" title="' + esc(label) + '"></i>';
+    }
+    track.innerHTML = html;
+    tlHighlight();
+  }
+
+  function tlHighlight() {
+    const track = $("tl-track");
+    if (!track || !track.childElementCount) return;
+    const n = track.childElementCount;
+    S.tlFocus = Math.max(0, Math.min(n - 1, S.tlFocus));
+    for (let i = 0; i < n; i++) track.children[i].classList.toggle("is-sel", i === S.tlFocus);
+    const live = $("tl-live");
+    if (live) live.textContent = track.children[S.tlFocus].getAttribute("title") || "";
   }
 
   /* ---------- 设置卡 ---------- */
@@ -720,6 +940,7 @@
     }
     const view = stableView(st);
     S.state = view;
+    tlFromState(view); // 时间线事件源①：状态快照 → 环形缓冲
     const overall = view.overall || "idle";
     document.body.setAttribute("data-overall", overall);
     renderHero();
@@ -801,6 +1022,92 @@
     await refreshState();
   }
 
+  /* ---------- P1-2：保护卡提层功能（暂停 / 完全恢复网络 / 行内直连观察） ---------- */
+
+  // 暂停守护 30 分钟（后端 monitor::PAUSE_MINUTES = 30）。
+  async function doPause() {
+    if (S.pauseBusy) return;
+    S.pauseBusy = true;
+    if (S.state) renderProtect(S.state);
+    try {
+      const r = await call(CMD.pause);
+      if (r !== undefined) {
+        await refreshState();
+        toast("已暂停守护，30 分钟后自动恢复", true);
+      }
+    } finally {
+      S.pauseBusy = false;
+      if (S.state) renderProtect(S.state);
+    }
+  }
+
+  // 「完全恢复网络」= --restore 的 UI 化：先 release 真正解除防火墙与断网，
+  // 再 disarm 写入停止保护意图（此后守护不再杀进程、隔离、断网）。
+  async function doFullRestore() {
+    if (S.restoreBusy) return;
+    S.restoreBusy = true;
+    if (S.state) renderProtect(S.state);
+    try {
+      await call(CMD.release);
+      const r = await call(CMD.disarm);
+      await refreshState();
+      if (r !== undefined) toast("已完全恢复网络：防火墙与断网已解除，守护已停止", true);
+    } finally {
+      S.restoreBusy = false;
+      if (S.state) renderProtect(S.state);
+    }
+  }
+
+  // 两段确认（与「清理 Claude 进程」同款交互）：首点臂起，4 秒内再点执行。
+  let restoreArmed = false;
+  let restoreTimer = 0;
+  function onRestoreClick() {
+    if (!restoreArmed) {
+      restoreArmed = true;
+      clearTimeout(restoreTimer);
+      restoreTimer = setTimeout(() => {
+        restoreArmed = false;
+        if (S.state) renderProtect(S.state);
+      }, 4000);
+      if (S.state) renderProtect(S.state);
+      return;
+    }
+    clearTimeout(restoreTimer);
+    restoreArmed = false;
+    doFullRestore();
+  }
+
+  // 行内「立即观察」：走 settings.js 同款 leak_scan IPC，结果就地展示 6 秒。
+  async function doLeakScan() {
+    if (S.leakBusy) return;
+    S.leakBusy = true;
+    if (S.state) renderProtect(S.state);
+    try {
+      const r = await call(CMD.leak_scan);
+      if (r !== undefined) {
+        S.leakFlash = { text: leakReportLabel(r), until: Date.now() + 6000 };
+        if (S.state) renderProtect(S.state);
+        toast("已观察一次", true);
+      }
+    } finally {
+      S.leakBusy = false;
+      if (S.state) renderProtect(S.state);
+    }
+  }
+
+  // 与 settings.js renderLeak 同口径的单行摘要（LeakReport 是 camelCase）。
+  function leakReportLabel(r) {
+    if (!r) return "未观察";
+    if (!r.checkedAt) return "尚未观察";
+    if (!r.applicable) return r.note || "当前接入方式不判定直连";
+    if (r.directTotal > 0) {
+      const who = (r.direct || []).map((c) => (c.agent || "?") + " → " + c.remote).join("、");
+      return "发现 " + r.directTotal + " 条直连：" + who;
+    }
+    if (r.agentConns > 0) return "正常 · " + r.proxied + " 条连接全部经过代理";
+    return "正常 · 无出站连接";
+  }
+
   /* ---------- 首启向导 ---------- */
 
   function wizStep(n) {
@@ -819,6 +1126,8 @@
     }
     if (skip) skip.hidden = S.wizard.step === 2;
     wizErr("");
+    // 翻页后把焦点带到新页的主控件（P1-8c 焦点管理）。
+    if (S.wizard.open) focusWizardStep();
   }
   function wizErr(msg) {
     const el = $("wiz-err");
@@ -826,9 +1135,36 @@
     el.textContent = msg || "";
     el.hidden = !msg;
   }
+  // P0：首装跳过（“以后再说”/ Esc）的两段确认——留空跳过会让守护约 30 秒后熔断。
+  let wizSkipArmed = false;
+  let wizSkipTimer = 0;
+  function armWizardSkip() {
+    const skip = $("wiz-skip");
+    wizSkipArmed = true;
+    if (skip) {
+      skip.textContent = "再点一次确认跳过";
+      skip.classList.add("is-danger");
+    }
+    wizErr("跳过将导致守护约 30 秒后熔断并隔离网络：两个框都留空，不会放行任何出口。");
+    clearTimeout(wizSkipTimer);
+    wizSkipTimer = setTimeout(resetWizardSkip, 4000);
+  }
+  function resetWizardSkip() {
+    const skip = $("wiz-skip");
+    wizSkipArmed = false;
+    clearTimeout(wizSkipTimer);
+    if (skip) {
+      skip.textContent = "以后再说";
+      skip.classList.remove("is-danger");
+    }
+    const err = $("wiz-err");
+    if (err && !err.hidden && String(err.textContent || "").indexOf("跳过将导致") === 0) wizErr("");
+  }
   function openWizard() {
     const wiz = $("wizard");
     if (!wiz) return;
+    // P1-8c：打开时记住触发点，关闭后把焦点还回去；初始焦点落在当前页主控件。
+    S.wizard.returnFocus = document.activeElement;
     S.wizard.open = true;
     wiz.hidden = false;
     document.body.classList.add("wiz-open");
@@ -842,13 +1178,35 @@
       const expect = (local && local.expect_ips) || [];
       if (expect.length) ips.value = expect.join(", ");
     }
+    focusWizardStep();
+  }
+  function wizFocusables() {
+    const wiz = $("wizard");
+    if (!wiz) return [];
+    return Array.prototype.slice
+      .call(wiz.querySelectorAll('button, input, select, textarea, [href], [tabindex]:not([tabindex="-1"])'))
+      .filter((el) => !el.disabled && el.offsetParent !== null && !el.hidden);
+  }
+  function focusWizardStep() {
+    const target = S.wizard.step === 1 ? $("wiz-port") : $("wiz-next");
+    if (target && target.offsetParent !== null && target.focus) target.focus();
+    else {
+      const foc = wizFocusables();
+      if (foc.length) foc[0].focus();
+    }
   }
   function closeWizard() {
     const wiz = $("wizard");
     if (!wiz) return;
+    resetWizardSkip();
     S.wizard.open = false;
     wiz.hidden = true;
     document.body.classList.remove("wiz-open");
+    const back = S.wizard.returnFocus;
+    S.wizard.returnFocus = null;
+    if (back && document.contains(back) && typeof back.focus === "function") {
+      try { back.focus(); } catch (e) { /* 元素已不可聚焦时忽略 */ }
+    }
   }
   function maybeWizard() {
     if (!S.cfg) return;
@@ -869,6 +1227,33 @@
     if (!Number.isInteger(n) || n < 1 || n > 65535) return NaN;
     return n;
   }
+
+  /* ---------- P0：白名单留空检测与配置入口（不改后端，由 StateView.targets 推导） ---------- */
+
+  // 所有需要校验出口的目标（排除未启用与纯可达性目标）期望全部为空 → 后端会
+  // 按“未配置白名单”持续熔断。Config 侧的 expect_ips/expect_regions 是 snake_case。
+  function whitelistEmpty(st) {
+    const list = (st && st.targets) || [];
+    const active = list.filter((t) => t.state !== "disabled" && t.anchorKind !== "reachability");
+    if (!active.length) return false;
+    return active.every((t) => !(t.expectIps || []).length && !(t.expectRegions || []).length);
+  }
+  // 向导两个输入框 + 已保存配置的白名单，三者全空才算“留空”。
+  function wizardWhitelistBlank() {
+    if (parseIpList(($("wiz-ips") || {}).value || "").length) return false;
+    if (String(($("wiz-region") || {}).value || "").trim()) return false;
+    const list = (S.cfg && S.cfg.targets) || [];
+    return !list.some((t) => (t.expect_ips || []).length || (t.expect_regions || []).length);
+  }
+  function configWhitelist() {
+    if (S.cfg && S.cfg.first_run && !S.wizard.open) {
+      openWizard();
+      return;
+    }
+    expand("settings");
+    const comp = root.CG_UI && root.CG_UI.settings;
+    if (comp && comp.openGroup) comp.openGroup("targets");
+  }
   async function finishWizard(install) {
     if (S.wizard.busy) return;
     const portRaw = ($("wiz-port") || {}).value || "";
@@ -876,6 +1261,17 @@
     if (Number.isNaN(port)) { wizErr("代理端口要填 1-65535 之间的数字"); return; }
     const ips = parseIpList(($("wiz-ips") || {}).value || "");
     const region = (($("wiz-region") || {}).value || "").trim().toUpperCase();
+    // P0：首装且两个框都留空 → 这里不写 first_run:false（写了就会让守护在
+    // 约 30 秒后熔断并隔离网络），停留在第 1 步给内联错误；文案与后端
+    // src/targets.rs 的“至少要填一个白名单 IP 或出口地区（都不填会一直熔断）”一致。
+    if (!S.cfg) await refreshConfig();
+    if ((S.cfg || {}).first_run && !ips.length && !region) {
+      wizStep(1);
+      wizErr("两个框都留空会一直熔断：留空 = 不放行任何出口，守护启动约 30 秒后将熔断并隔离网络。请至少填 1 个白名单 IP 或选择出口地区。");
+      const ipsEl = $("wiz-ips");
+      if (ipsEl && ipsEl.focus) ipsEl.focus();
+      return;
+    }
     S.wizard.busy = true;
     const buttons = ["wiz-install", "wiz-portable"].map((id) => $(id)).filter(Boolean);
     buttons.forEach((b) => (b.disabled = true));
@@ -948,6 +1344,7 @@
         if (!st) return;
         if (primary.dataset.role === "release") doRelease();
         else if (primary.dataset.role === "resume") doResume();
+        else if (primary.dataset.role === "rearm") doRearm();
         else if (st.overall === "pass") doLaunch();
         else doRecheck();
       });
@@ -1002,6 +1399,11 @@
     if (wizNext) wizNext.addEventListener("click", () => wizStep(S.wizard.step + 1));
     if (wizPrev) wizPrev.addEventListener("click", () => wizStep(S.wizard.step - 1));
     if (wizSkip) wizSkip.addEventListener("click", async () => {
+      // P0：首装且白名单留空 → 先两段确认（“再点一次确认跳过”），不直接放行。
+      if ((S.cfg || {}).first_run && wizardWhitelistBlank() && !wizSkipArmed) {
+        armWizardSkip();
+        return;
+      }
       closeWizard();
       if (S.cfg && S.cfg.first_run) await call(CMD.update_settings, { patch: { first_run: false } }, true);
       await refreshConfig();
@@ -1010,13 +1412,60 @@
     if (wizPortable) wizPortable.addEventListener("click", () => finishWizard(false));
 
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && S.wizard.open) {
+      if (!S.wizard.open) return;
+      // P1-8c：向导内 Tab 循环（焦点陷阱），Esc 走两段确认的跳过闸门。
+      if (e.key === "Tab") {
+        const foc = wizFocusables();
+        if (foc.length) {
+          const wiz = $("wizard");
+          const first = foc[0];
+          const last = foc[foc.length - 1];
+          const cur = document.activeElement;
+          if (!wiz || !wiz.contains(cur)) {
+            e.preventDefault();
+            first.focus();
+            return;
+          }
+          if (e.shiftKey && cur === first) {
+            e.preventDefault();
+            last.focus();
+          } else if (!e.shiftKey && cur === last) {
+            e.preventDefault();
+            first.focus();
+          }
+        }
+        return;
+      }
+      if (e.key === "Escape") {
+        // P0：与“以后再说”同闸——首装留空时 Esc 需要再按一次才确认跳过。
+        if ((S.cfg || {}).first_run && wizardWhitelistBlank() && !wizSkipArmed) {
+          armWizardSkip();
+          return;
+        }
         closeWizard();
         if (S.cfg && S.cfg.first_run) call(CMD.update_settings, { patch: { first_run: false } }, true);
       }
     });
 
     document.querySelectorAll(".chev").forEach((el) => { el.innerHTML = icon("chevronDown", 12); });
+
+    // 时间线键盘可达：容器可聚焦，左右方向键逐格移动高亮并经 aria-live 播报。
+    const tlTrack = $("tl-track");
+    if (tlTrack) {
+      tlTrack.addEventListener("keydown", (e) => {
+        const n = tlTrack.childElementCount;
+        if (!n) return;
+        let i = S.tlFocus;
+        if (e.key === "ArrowLeft") i--;
+        else if (e.key === "ArrowRight") i++;
+        else if (e.key === "Home") i = 0;
+        else if (e.key === "End") i = n - 1;
+        else return;
+        e.preventDefault();
+        S.tlFocus = Math.max(0, Math.min(n - 1, i));
+        tlHighlight();
+      });
+    }
 
     if (IPC.listen) {
       IPC.listen(EV.state, (e) => {
@@ -1033,11 +1482,19 @@
   /* ---------- 时钟（暂停倒计时） ---------- */
 
   function tick() {
+    // 时间线兜底重画：≥30s 刷一次窗口滚动（事件推送时已即时重画），要在 !st 守卫之前。
+    if (Date.now() - S.tlLastRender >= 30000) tlRender();
     const st = S.state;
     if (!st) return;
     if (st.overall === "paused") {
       renderHero();
       renderBanners();
+      // 暂停倒计时随 1s 心跳刷新（保护卡内的「N 分钟后自动恢复」）。
+      renderProtect(st);
+    }
+    if (S.leakFlash && Date.now() >= S.leakFlash.until) {
+      S.leakFlash = null;
+      renderProtect(st);
     }
     if (S.folds.logs && !S.folds.details) { /* 日志卡打开时无需额外刷新 */ }
   }
@@ -1058,6 +1515,7 @@
       setTimeout(() => { mountSettings(); setFold("settings", true, false); }, 80);
     }
     maybeWizard();
+    tlRender(); // 时间线首帧（无事件则全灰“无数据”）
     setTimeout(() => document.body.setAttribute("data-ready", "1"), 30);
     setInterval(tick, 1000);
     void renderLogs;
