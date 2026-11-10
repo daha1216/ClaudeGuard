@@ -284,30 +284,90 @@ impl AppState {
         !(paused && want && current != Some(true))
     }
 
+    /// lockdown 执行后的回查核验（纯函数，可单测）：这次 IO 是否真的达成了意图，
+    /// 能否把 `lockdown_last` / `lockdown_manual` 记为已同步。
+    ///
+    /// P1-2：`sync_lockdown` / `lockdown_now` 的秒级子进程 IO 放在锁外执行，
+    /// 只有核验通过才短锁回写——**IO 失败不得写入意图**，否则界面会把没生效的
+    /// 封锁/解除记成已生效，而且意图被写死后永远不再重试。
+    ///
+    /// - `want=true`（封锁）：`applied>0` → 回查必须拿得到且条数不少于已生效
+    ///   条数（`None`=查询失败；变少=规则被并发改动）；`applied==0` → 只有
+    ///   `!coverable`（没有可覆盖对象：守护列表显式为空 / 对象未安装 / 非
+    ///   Windows 桩构建）才是确知状态，有对象却没加上 = 失败。
+    /// - `want=false`（解除）：回查必须是 0 条残留
+    ///   （`None`=查询失败，`Some(>0)`=没删干净）。
+    pub fn lockdown_confirmed(
+        want: bool,
+        applied: usize,
+        seen: Option<usize>,
+        coverable: bool,
+    ) -> bool {
+        if want {
+            if applied > 0 {
+                seen.is_some_and(|c| c >= applied)
+            } else {
+                // 没有可覆盖对象时 0 条就是目标状态，不依赖回查（否则每次
+                // 轮次都会为"无事可做"重跑一轮 PowerShell/netsh）。
+                !coverable
+            }
+        } else {
+            seen == Some(0)
+        }
+    }
+
     /// 把"想要的状态"同步到防火墙：只在意图变化时增删规则（避免每轮重复 add 堆积）。
     /// 启动后首轮 `last=None` 必然不同步状态——顺带清理崩溃残留或补上未接入封锁。
     ///
     /// 暂停期间不新增副作用（CONTRACT D3）：暂停时不施加封锁，但**也不解除**既有封锁。
+    ///
+    /// P1-2：锁内只读意图判定，秒级子进程 IO（netsh/PowerShell）放锁外执行，
+    /// 结束后短锁回写——持 `lockdown_last` 锁跨 IO 会阻塞 UI 300ms tick 的
+    /// state_view / log / emit_state。核验未通过不写 `lockdown_last`：
+    /// 下一轮按同一意图重试，不把失败记成"已同步"。
     pub fn sync_lockdown(&self, want: bool, cfg: &Config) {
         // R13：手动封锁优先，且不被自动逻辑（接入状态变化）清除。
         let want = Self::desired_lockdown(want, self.lockdown_manual());
-        let mut last = lock(&self.lockdown_last);
-        if *last == Some(want) {
-            return;
+        // ① 短锁：只读判定（意图是否已同步 / 暂停是否允许），随即释放。
+        {
+            let last = lock(&self.lockdown_last);
+            if *last == Some(want) {
+                return;
+            }
+            if !Self::lockdown_sync_allowed(self.is_paused(), *last, want) {
+                return;
+            }
         }
-        if !Self::lockdown_sync_allowed(self.is_paused(), *last, want) {
-            return;
-        }
-        if want {
-            let n = crate::guard::lockdown_apply(cfg);
-            self.log(format!(
-                "防火墙兜底：已封锁守护对象出站（{n} 条规则）；走系统代理不受影响，接入后自动解除"
-            ));
+        // ② 锁外执行 + 回查核验（不得持锁做 IO；日志同样在锁外）。
+        let confirmed = if want {
+            let applied = crate::guard::lockdown_apply(cfg);
+            let seen = crate::guard::lockdown_rules_now();
+            // 只在 0 条时才扫盘判定"有没有可覆盖对象"（applied>0 已说明有）。
+            let coverable = applied == 0 && crate::guard::lockdown_coverable(cfg);
+            let ok = Self::lockdown_confirmed(true, applied, seen, coverable);
+            if ok {
+                self.log(format!(
+                    "防火墙兜底：已封锁守护对象出站（{applied} 条规则）；走系统代理不受影响，接入后自动解除"
+                ));
+            } else {
+                self.log("防火墙兜底：出站封锁未生效（回查未确认），下一轮按同一意图重试");
+            }
+            ok
         } else {
             crate::guard::lockdown_clear();
-            self.log("防火墙兜底：已解除出站封锁");
+            let seen = crate::guard::lockdown_rules_now();
+            let ok = Self::lockdown_confirmed(false, 0, seen, false);
+            if ok {
+                self.log("防火墙兜底：已解除出站封锁");
+            } else {
+                self.log("防火墙兜底：出站封锁未解除（仍有残留或回查失败），下一轮按同一意图重试");
+            }
+            ok
+        };
+        // ③ 短锁回写：只有核验通过才记录意图。
+        if confirmed {
+            *lock(&self.lockdown_last) = Some(want);
         }
-        *last = Some(want);
     }
 
     /// 手动一键：立即封锁 / 解除封锁。
@@ -315,28 +375,40 @@ impl AppState {
     /// R13：手动封锁意图有独立生命周期——开启后一直保持，直到用户手动解除；
     /// 自动逻辑（未接入时维持封锁）只在没有手动意图时生效。解除手动封锁后
     /// 由下一轮自动逻辑按接入状态接管。
+    ///
+    /// P2-4：返回执行回执（含回查结果），IPC/UI 不再恒回显请求值。
+    /// P1-2：IO 在锁外执行、先核验后写意图——核验未通过时不写
+    /// `lockdown_manual` / `lockdown_last`（IO 失败不得写入意图），
+    /// 回执仍如实带回 query_ok / rules 供 UI 展示失败。
     pub fn lockdown_now(&self, on: bool, cfg: &Config) -> crate::model::LockdownResult {
-        // P2-4：返回执行回执（含回查结果），IPC/UI 不再恒回显请求值。
-        // 只补返回值；锁结构与既有日志/flag 顺序不动。
         if on {
-            let n = crate::guard::lockdown_apply(cfg);
-            *lock(&self.lockdown_manual) = true;
-            self.log(format!(
-                "手动封锁：已添加 {n} 条出站封锁规则；将持续生效，直到你手动解除"
-            ));
-            *lock(&self.lockdown_last) = Some(true);
-            let query_ok = crate::guard::lockdown_rules_now().is_some();
+            let applied = crate::guard::lockdown_apply(cfg);
+            let seen = crate::guard::lockdown_rules_now();
+            let coverable = applied == 0 && crate::guard::lockdown_coverable(cfg);
+            if Self::lockdown_confirmed(true, applied, seen, coverable) {
+                *lock(&self.lockdown_manual) = true;
+                self.log(format!(
+                    "手动封锁：已添加 {applied} 条出站封锁规则；将持续生效，直到你手动解除"
+                ));
+                *lock(&self.lockdown_last) = Some(true);
+            } else {
+                self.log("手动封锁：出站封锁未生效（回查未确认），未记录手动意图");
+            }
             crate::model::LockdownResult {
                 on: true,
-                query_ok,
-                rules: n,
+                query_ok: seen.is_some(),
+                rules: applied,
             }
         } else {
             crate::guard::lockdown_clear();
-            *lock(&self.lockdown_manual) = false;
-            self.log("手动解除：已删除出站封锁规则；之后按接入状态自动接管");
-            *lock(&self.lockdown_last) = Some(false);
             let remaining = crate::guard::lockdown_rules_now();
+            if Self::lockdown_confirmed(false, 0, remaining, false) {
+                *lock(&self.lockdown_manual) = false;
+                self.log("手动解除：已删除出站封锁规则；之后按接入状态自动接管");
+                *lock(&self.lockdown_last) = Some(false);
+            } else {
+                self.log("手动解除：出站封锁未清除（仍有残留或回查失败），未记录解除意图");
+            }
             crate::model::LockdownResult {
                 on: false,
                 query_ok: remaining.is_some(),
@@ -786,5 +858,29 @@ mod tests {
             overall_of(false, false, false, &[TargetState::Disabled]),
             Overall::Idle
         );
+    }
+
+    /// P1-2：回查核验真值表——sync_lockdown / lockdown_now 只有核验通过才写
+    /// lockdown_last / lockdown_manual（IO 失败不得写入意图，否则失败后不再重试）。
+    #[test]
+    fn lockdown_confirmation_truth_table() {
+        // 封锁：apply 报了条数 → 回查必须拿得到且对得上。
+        assert!(AppState::lockdown_confirmed(true, 3, Some(3), true));
+        // 旧 exe 残留的多余规则不算失败。
+        assert!(AppState::lockdown_confirmed(true, 3, Some(5), true));
+        // apply 说有、回查没有 = 矛盾，按失败处理。
+        assert!(!AppState::lockdown_confirmed(true, 3, Some(0), true));
+        // 回查失败（None）一律按失败处理。
+        assert!(!AppState::lockdown_confirmed(true, 3, None, true));
+        // 封锁：apply 0 条 → 没有可覆盖对象才是确知状态（0 条无需每轮重试）。
+        assert!(AppState::lockdown_confirmed(true, 0, Some(0), false));
+        // 有可覆盖对象却没加上 = 执行失败，不写意图，下一轮重试。
+        assert!(!AppState::lockdown_confirmed(true, 0, Some(0), true));
+        // 解除：必须回查到 0 条残留。
+        assert!(AppState::lockdown_confirmed(false, 0, Some(0), false));
+        // 没删干净（仍有残留）。
+        assert!(!AppState::lockdown_confirmed(false, 0, Some(2), false));
+        // 回查失败。
+        assert!(!AppState::lockdown_confirmed(false, 0, None, false));
     }
 }

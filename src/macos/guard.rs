@@ -485,6 +485,13 @@ pub fn lockdown_rules_now() -> Option<usize> {
     Some(0)
 }
 
+/// 是否还有应加封锁规则的 exe：本构建不创建任何封锁规则（见
+/// [`lockdown_apply`]），恒为"没有可覆盖对象"——让上层把 macOS 的 0 条
+/// 当确知状态（无需重试），而不是"执行失败"。
+pub fn lockdown_coverable(_cfg: &crate::config::Config) -> bool {
+    false
+}
+
 pub fn trip(cfg: &crate::config::Config, reason: &str) -> TripResult {
     let mut report = TripResult {
         agents: cfg

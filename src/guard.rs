@@ -1921,13 +1921,7 @@ fn any_profile_disabled(text: &str) -> bool {
 /// 直连/TUN 流量被拦。返回添加的规则数。
 pub fn lockdown_apply(cfg: &crate::config::Config) -> usize {
     fw_ensure_on();
-    let mut expected: Vec<(String, PathBuf, &'static str)> = Vec::new();
-    for id in &cfg.guarded_agents {
-        let name = lockdown_rule_name(id);
-        for exe in agent_exes(id) {
-            expected.push((name.clone(), exe, "out"));
-        }
-    }
+    let expected = lockdown_expected(cfg);
     if expected.is_empty() {
         log_line("lockdown: 没有可覆盖的 exe，未添加规则");
         return 0;
@@ -1945,6 +1939,27 @@ pub fn lockdown_apply(cfg: &crate::config::Config) -> usize {
         ));
     }
     cov.verified
+}
+
+/// 当前应加封锁规则的 (规则名, exe, 方向)——[`lockdown_apply`] 与
+/// [`lockdown_coverable`] 共用同一口径，保证"没有可覆盖对象"的判定
+/// 与 apply 里 0 条早退的条件完全一致。
+fn lockdown_expected(cfg: &crate::config::Config) -> Vec<(String, PathBuf, &'static str)> {
+    let mut expected: Vec<(String, PathBuf, &'static str)> = Vec::new();
+    for id in &cfg.guarded_agents {
+        let name = lockdown_rule_name(id);
+        for exe in agent_exes(id) {
+            expected.push((name.clone(), exe, "out"));
+        }
+    }
+    expected
+}
+
+/// 是否还有应加封锁规则的 exe。`lockdown_apply` 返回 0 时，上层（state 的
+/// 回查核验 `lockdown_confirmed`）据此区分"没有可覆盖对象（0 条是确知状态，
+/// 不必重试）"与"有对象却没加上（执行失败，不得记为已同步）"。
+pub fn lockdown_coverable(cfg: &crate::config::Config) -> bool {
+    !lockdown_expected(cfg).is_empty()
 }
 
 /// 解除全部兜底封锁规则（防火墙本身保持开启）。返回是否删到规则。
