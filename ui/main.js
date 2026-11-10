@@ -74,6 +74,11 @@
     launchErrShown: "",
     wizard: { open: false, step: 0, busy: false },
     detailsKey: "",
+    // P1-2：保护卡行内动作的状态（直连观察 / 暂停 / 完全恢复网络）
+    leakBusy: false,
+    pauseBusy: false,
+    restoreBusy: false,
+    leakFlash: null,
   };
 
   /* ---------- 小工具 ---------- */
@@ -398,19 +403,46 @@
     const tripped = !!st.tripped;
     const agents = tripped && st.tripped.agents ? st.tripped.agents.length : 0;
     const fw = tripped ? "已隔离" + (agents ? " " + agents + " 个应用" : "") : st.lockdown ? "兜底封锁中" : "待命";
+    // 直连观察：刚点过「立即观察」时就地展示本次结果，到期还原为摘要。
+    const leakText = S.leakFlash ? S.leakFlash.text : leakLabel(st.leak);
+    const paused = (st.overall || "") === "paused";
+    const left = paused ? minutesLeft(st.pausedUntil) : 0;
+    const pauseLabel = paused
+      ? left > 0 ? left + " 分钟后自动恢复" : "已暂停"
+      : S.pauseBusy ? "正在暂停…" : "暂停守护 30 分钟";
     const rows = [
       ["防火墙隔离", fw, tripped ? " fail" : ""],
       ["断网档位", CUT_LABEL[st.cutMode] || "不断网", ""],
       ["进程清理", (st.guardedAgents || []).length ? "已开启" : "已关闭", ""],
-      ["直连观察", leakLabel(st.leak), st.leak && st.leak.directTotal > 0 ? " fail" : ""],
+      ["直连观察", leakText, st.leak && st.leak.directTotal > 0 ? " fail" : ""],
       ["环境", envLabel(st.env), st.env && st.env.tzMatch === false ? " fail" : ""],
     ];
     host.innerHTML = rows
-      .map(
-        (r) =>
-          '<div class="row"><span class="nm">' + esc(r[0]) + '</span><span class="val' + r[2] + '">' + esc(r[1]) + "</span></div>"
-      )
-      .join("");
+      .map((r, i) => {
+        const isLeak = i === 3;
+        const valCls = "val" + r[2] + (isLeak ? " has-act" : "");
+        const act = isLeak
+          ? '<button type="button" class="btn rowbtn" data-pact="leak"' + (S.leakBusy ? " disabled" : "") + ">" +
+            (S.leakBusy ? "观察中…" : "立即观察") + "</button>"
+          : "";
+        return '<div class="row"><span class="nm">' + esc(r[0]) + '</span><span class="' + valCls + '">' +
+          esc(r[1]) + "</span>" + act + "</div>";
+      })
+      .join("") +
+      '<div class="pacts">' +
+        '<button type="button" class="btn" data-pact="pause"' + (paused || S.pauseBusy ? " disabled" : "") + ">" +
+          esc(pauseLabel) + "</button>" +
+        '<button type="button" class="btn' + (restoreArmed ? " is-danger" : "") + '" data-pact="restore">' +
+          esc(restoreArmed ? "再点一次确认完全恢复" : "完全恢复网络（解除防火墙与断网）") + "</button>" +
+      "</div>";
+    host.querySelectorAll("[data-pact]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const act = el.getAttribute("data-pact");
+        if (act === "leak") doLeakScan();
+        else if (act === "pause") doPause();
+        else if (act === "restore") onRestoreClick();
+      });
+    });
   }
 
   // v3.12：直连观察与环境的单行摘要（详情卡用，后端结构体是 camelCase）
@@ -832,6 +864,92 @@
     await refreshState();
   }
 
+  /* ---------- P1-2：保护卡提层功能（暂停 / 完全恢复网络 / 行内直连观察） ---------- */
+
+  // 暂停守护 30 分钟（后端 monitor::PAUSE_MINUTES = 30）。
+  async function doPause() {
+    if (S.pauseBusy) return;
+    S.pauseBusy = true;
+    if (S.state) renderProtect(S.state);
+    try {
+      const r = await call(CMD.pause);
+      if (r !== undefined) {
+        await refreshState();
+        toast("已暂停守护，30 分钟后自动恢复", true);
+      }
+    } finally {
+      S.pauseBusy = false;
+      if (S.state) renderProtect(S.state);
+    }
+  }
+
+  // 「完全恢复网络」= --restore 的 UI 化：先 release 真正解除防火墙与断网，
+  // 再 disarm 写入停止保护意图（此后守护不再杀进程、隔离、断网）。
+  async function doFullRestore() {
+    if (S.restoreBusy) return;
+    S.restoreBusy = true;
+    if (S.state) renderProtect(S.state);
+    try {
+      await call(CMD.release);
+      const r = await call(CMD.disarm);
+      await refreshState();
+      if (r !== undefined) toast("已完全恢复网络：防火墙与断网已解除，守护已停止", true);
+    } finally {
+      S.restoreBusy = false;
+      if (S.state) renderProtect(S.state);
+    }
+  }
+
+  // 两段确认（与「清理 Claude 进程」同款交互）：首点臂起，4 秒内再点执行。
+  let restoreArmed = false;
+  let restoreTimer = 0;
+  function onRestoreClick() {
+    if (!restoreArmed) {
+      restoreArmed = true;
+      clearTimeout(restoreTimer);
+      restoreTimer = setTimeout(() => {
+        restoreArmed = false;
+        if (S.state) renderProtect(S.state);
+      }, 4000);
+      if (S.state) renderProtect(S.state);
+      return;
+    }
+    clearTimeout(restoreTimer);
+    restoreArmed = false;
+    doFullRestore();
+  }
+
+  // 行内「立即观察」：走 settings.js 同款 leak_scan IPC，结果就地展示 6 秒。
+  async function doLeakScan() {
+    if (S.leakBusy) return;
+    S.leakBusy = true;
+    if (S.state) renderProtect(S.state);
+    try {
+      const r = await call(CMD.leak_scan);
+      if (r !== undefined) {
+        S.leakFlash = { text: leakReportLabel(r), until: Date.now() + 6000 };
+        if (S.state) renderProtect(S.state);
+        toast("已观察一次", true);
+      }
+    } finally {
+      S.leakBusy = false;
+      if (S.state) renderProtect(S.state);
+    }
+  }
+
+  // 与 settings.js renderLeak 同口径的单行摘要（LeakReport 是 camelCase）。
+  function leakReportLabel(r) {
+    if (!r) return "未观察";
+    if (!r.checkedAt) return "尚未观察";
+    if (!r.applicable) return r.note || "当前接入方式不判定直连";
+    if (r.directTotal > 0) {
+      const who = (r.direct || []).map((c) => (c.agent || "?") + " → " + c.remote).join("、");
+      return "发现 " + r.directTotal + " 条直连：" + who;
+    }
+    if (r.agentConns > 0) return "正常 · " + r.proxied + " 条连接全部经过代理";
+    return "正常 · 无出站连接";
+  }
+
   /* ---------- 首启向导 ---------- */
 
   function wizStep(n) {
@@ -1144,6 +1262,12 @@
     if (st.overall === "paused") {
       renderHero();
       renderBanners();
+      // 暂停倒计时随 1s 心跳刷新（保护卡内的「N 分钟后自动恢复」）。
+      renderProtect(st);
+    }
+    if (S.leakFlash && Date.now() >= S.leakFlash.until) {
+      S.leakFlash = null;
+      renderProtect(st);
     }
     if (S.folds.logs && !S.folds.details) { /* 日志卡打开时无需额外刷新 */ }
   }
