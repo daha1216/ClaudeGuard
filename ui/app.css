@@ -159,9 +159,9 @@ svg { display: block; }
 }
 .banner .bact:active { transform: scale(.96); }
 .banner.trip { background: rgba(228, 0, 43, .06); border: 1px solid rgba(228, 0, 43, .14); color: var(--red-deep); }
-.banner.trip .bact { color: var(--red); border: 1px solid rgba(228, 0, 43, .22); box-shadow: 0 .5px 1px rgba(228, 0, 43, .1); }
+.banner.trip .bact { color: var(--red-deep); border: 1px solid rgba(228, 0, 43, .22); box-shadow: 0 .5px 1px rgba(228, 0, 43, .1); }
 .banner.warn { background: rgba(237, 99, 0, .07); border: 1px solid rgba(237, 99, 0, .16); color: var(--orange-deep); }
-.banner.warn .bact { color: var(--orange); border: 1px solid rgba(237, 99, 0, .22); box-shadow: 0 .5px 1px rgba(237, 99, 0, .1); }
+.banner.warn .bact { color: var(--orange-deep); border: 1px solid rgba(237, 99, 0, .22); box-shadow: 0 .5px 1px rgba(237, 99, 0, .1); }
 .banner.notice { background: rgba(3, 170, 73, .06); border: 1px solid rgba(3, 170, 73, .14); color: var(--green-deep); }
 .banner.notice .bact { color: var(--green-deep); border: 1px solid rgba(3, 170, 73, .2); }
 .banner.info { background: rgba(0, 0, 0, .035); border: 1px solid rgba(0, 0, 0, .045); color: var(--txt2); }
@@ -341,7 +341,7 @@ textarea.in { height: auto; min-height: 44px; padding: 5px 7px; resize: vertical
 .pacts .btn.is-danger { color: var(--red-deep); background: rgba(228, 0, 43, .1); }
 
 .sactions { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 6px; }
-.formerr { font-size: 10.5px; line-height: 1.45; color: var(--red); padding: 5px 0 1px; word-break: break-word; }
+.formerr { font-size: 10.5px; line-height: 1.45; color: var(--red-deep); padding: 5px 0 1px; word-break: break-word; }
 .formok { font-size: 10.5px; line-height: 1.45; color: var(--green-deep); padding: 5px 0 1px; }
 .formhint { font-size: 10px; line-height: 1.45; color: var(--muted2); padding: 2px 0 0; }
 
@@ -376,7 +376,7 @@ textarea.in { height: auto; min-height: 44px; padding: 5px 7px; resize: vertical
 .progress { height: 4px; border-radius: 2px; background: rgba(0, 0, 0, .07); overflow: hidden; margin: 6px 0 2px; }
 .progress > i { display: block; height: 100%; border-radius: 2px; background: linear-gradient(90deg, var(--blue-top), var(--blue)); transform-origin: 0 50%; transition: transform .2s var(--ease); }
 
-.werror { font-size: 10px; line-height: 1.45; color: var(--red); padding: 3px 0 1px; word-break: break-word; }
+.werror { font-size: 10px; line-height: 1.45; color: var(--red-deep); padding: 3px 0 1px; word-break: break-word; }
 .wok { font-size: 10px; line-height: 1.45; color: var(--green-deep); padding: 3px 0 1px; }
 
 .fsline { display: flex; gap: 6px; align-items: flex-start; padding: 2px 0; }
@@ -424,7 +424,7 @@ textarea.in { height: auto; min-height: 44px; padding: 5px 7px; resize: vertical
 /* ---------- toast ---------- */
 
 .toast {
-  position: fixed; left: 50%; bottom: 62px; z-index: 60;
+  position: fixed; left: 50%; bottom: 100px; z-index: 60;
   max-width: calc(100% - 40px);
   padding: 8px 12px; border-radius: 10px;
   background: rgba(29, 29, 31, .92); color: #fff;
@@ -447,8 +447,10 @@ textarea.in { height: auto; min-height: 44px; padding: 5px 7px; resize: vertical
   backdrop-filter: blur(24px) saturate(180%);
 }
 .wizard[hidden] { display: none; }
-/* 向导打开时把首页内容与滚动条隐去，避免蓝色 CTA 光晕透过磨砂背景 */
+/* 向导打开时把首页内容与滚动条隐去，避免蓝色 CTA 光晕透过磨砂背景；
+   .cta/.footer 也要一并藏掉——visibility:hidden 的元素不进 Tab 序（P1-8c）。 */
 body.wiz-open #content { visibility: hidden; }
+body.wiz-open .cta, body.wiz-open .footer { visibility: hidden; }
 body.wiz-open #scroll { overflow: hidden; }
 
 .wizard-card {
@@ -492,7 +494,7 @@ body.wiz-open #scroll { overflow: hidden; }
 .wiz-choice:active { transform: scale(.98); }
 .wiz-choice strong { font-size: 12px; font-weight: 600; color: var(--txt); }
 .wiz-choice span { font-size: 10px; line-height: 1.45; color: var(--muted); }
-.wiz-err { margin-top: 10px; font-size: 10.5px; line-height: 1.45; color: var(--red); word-break: break-word; }
+.wiz-err { margin-top: 10px; font-size: 10.5px; line-height: 1.45; color: var(--red-deep); word-break: break-word; }
 .wiz-err[hidden] { display: none; }
 .wiz-nav { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 14px; }
 .wiz-nav-right { display: flex; align-items: center; gap: 6px; }
@@ -577,8 +579,8 @@ body[data-ready="1"] .card { animation: enter .36s .12s var(--ease) both; }
   word-break: break-word;
 }
 .upd-status.is-ok { color: var(--green-deep); }
-.upd-status.is-warn { color: var(--orange); }
-.upd-status.is-bad { color: var(--red); }
+.upd-status.is-warn { color: var(--orange-deep); }
+.upd-status.is-bad { color: var(--red-deep); }
 .srow[hidden], .formhint[hidden], .progress[hidden] { display: none; }
 .in[disabled] { opacity: .55; }
 .in[type="password"] { letter-spacing: .5px; }

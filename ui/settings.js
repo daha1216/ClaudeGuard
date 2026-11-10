@@ -42,17 +42,19 @@
   function notifyToast(msg, ok) {
     if (typeof OPTS.onToast === "function") OPTS.onToast(msg, ok);
   }
-  function switchHtml(id, checked, disabled) {
+  // P1-8a：开关只有一个色块，没有可见文字——给 input 一个可访问名（aria-label）。
+  function switchHtml(id, checked, disabled, label) {
     return (
       '<label class="switch"><input type="checkbox" id="' + id + '"' + (checked ? " checked" : "") +
-      (disabled ? " disabled" : "") + '><span class="switch-track"><span class="switch-knob"></span></span></label>'
+      (disabled ? " disabled" : "") + (label ? ' aria-label="' + esc(label) + '"' : "") +
+      '><span class="switch-track"><span class="switch-knob"></span></span></label>'
     );
   }
   function rowSwitch(id, title, hint, checked, disabled) {
     return (
       '<div class="srow"><div class="slabel">' + esc(title) +
       (hint ? '<span class="shint">' + esc(hint) + "</span>" : "") +
-      '</div><div class="sval">' + switchHtml(id, checked, disabled) + "</div></div>"
+      '</div><div class="sval">' + switchHtml(id, checked, disabled, title) + "</div></div>"
     );
   }
   function rowInput(id, title, hint, value, unit, attrs) {
@@ -171,6 +173,13 @@
       g.classList.toggle("is-open", on);
       const head = g.querySelector(".acc-head");
       if (head) head.setAttribute("aria-expanded", on ? "true" : "false");
+      // P1-8b：收起只是视觉（grid 0fr），内容仍可 Tab 进入——用 inert 挡住焦点；
+      // 不支持 inert 的环境忽略该属性，行为与原来一致。
+      const body = g.querySelector(".acc-body");
+      if (body) {
+        if (on) body.removeAttribute("inert");
+        else body.setAttribute("inert", "");
+      }
     });
   }
 
@@ -335,7 +344,7 @@
       '<div class="titem-top">' +
       '<input class="in tname" data-f="name" maxlength="16" value="' + esc(t.name || "") + '" aria-label="目标名称" placeholder="名称">' +
       '<select class="in" data-f="anchor_kind" aria-label="识别类型">' + opts + "</select>" +
-      '<label class="switch" title="启用"><input type="checkbox" data-f="enabled"' + (t.enabled !== false ? " checked" : "") + '><span class="switch-track"><span class="switch-knob"></span></span></label>' +
+      '<label class="switch" title="启用"><input type="checkbox" data-f="enabled" aria-label="启用此目标"' + (t.enabled !== false ? " checked" : "") + '><span class="switch-track"><span class="switch-knob"></span></span></label>' +
       '<button class="tdel" type="button" data-del="' + i + '" title="删除" aria-label="删除目标"' + (t.builtin ? " disabled" : "") + ">" + ic("trash", 13) + "</button>" +
       "</div>" +
       '<div class="trow2"><input class="in" data-f="anchor_url" value="' + esc(t.anchor_url || "") + '" placeholder="https://…" spellcheck="false" aria-label="锚点 URL"></div>' +

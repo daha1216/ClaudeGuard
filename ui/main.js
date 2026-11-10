@@ -72,7 +72,7 @@
     settingsMounted: false,
     smokeOpened: false,
     launchErrShown: "",
-    wizard: { open: false, step: 0, busy: false },
+    wizard: { open: false, step: 0, busy: false, returnFocus: null },
     detailsKey: "",
     // P1-2：保护卡行内动作的状态（直连观察 / 暂停 / 完全恢复网络）
     leakBusy: false,
@@ -982,6 +982,8 @@
     }
     if (skip) skip.hidden = S.wizard.step === 2;
     wizErr("");
+    // 翻页后把焦点带到新页的主控件（P1-8c 焦点管理）。
+    if (S.wizard.open) focusWizardStep();
   }
   function wizErr(msg) {
     const el = $("wiz-err");
@@ -1017,6 +1019,8 @@
   function openWizard() {
     const wiz = $("wizard");
     if (!wiz) return;
+    // P1-8c：打开时记住触发点，关闭后把焦点还回去；初始焦点落在当前页主控件。
+    S.wizard.returnFocus = document.activeElement;
     S.wizard.open = true;
     wiz.hidden = false;
     document.body.classList.add("wiz-open");
@@ -1030,6 +1034,22 @@
       const expect = (local && local.expect_ips) || [];
       if (expect.length) ips.value = expect.join(", ");
     }
+    focusWizardStep();
+  }
+  function wizFocusables() {
+    const wiz = $("wizard");
+    if (!wiz) return [];
+    return Array.prototype.slice
+      .call(wiz.querySelectorAll('button, input, select, textarea, [href], [tabindex]:not([tabindex="-1"])'))
+      .filter((el) => !el.disabled && el.offsetParent !== null && !el.hidden);
+  }
+  function focusWizardStep() {
+    const target = S.wizard.step === 1 ? $("wiz-port") : $("wiz-next");
+    if (target && target.offsetParent !== null && target.focus) target.focus();
+    else {
+      const foc = wizFocusables();
+      if (foc.length) foc[0].focus();
+    }
   }
   function closeWizard() {
     const wiz = $("wizard");
@@ -1038,6 +1058,11 @@
     S.wizard.open = false;
     wiz.hidden = true;
     document.body.classList.remove("wiz-open");
+    const back = S.wizard.returnFocus;
+    S.wizard.returnFocus = null;
+    if (back && document.contains(back) && typeof back.focus === "function") {
+      try { back.focus(); } catch (e) { /* 元素已不可聚焦时忽略 */ }
+    }
   }
   function maybeWizard() {
     if (!S.cfg) return;
@@ -1243,7 +1268,31 @@
     if (wizPortable) wizPortable.addEventListener("click", () => finishWizard(false));
 
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && S.wizard.open) {
+      if (!S.wizard.open) return;
+      // P1-8c：向导内 Tab 循环（焦点陷阱），Esc 走两段确认的跳过闸门。
+      if (e.key === "Tab") {
+        const foc = wizFocusables();
+        if (foc.length) {
+          const wiz = $("wizard");
+          const first = foc[0];
+          const last = foc[foc.length - 1];
+          const cur = document.activeElement;
+          if (!wiz || !wiz.contains(cur)) {
+            e.preventDefault();
+            first.focus();
+            return;
+          }
+          if (e.shiftKey && cur === first) {
+            e.preventDefault();
+            last.focus();
+          } else if (!e.shiftKey && cur === last) {
+            e.preventDefault();
+            first.focus();
+          }
+        }
+        return;
+      }
+      if (e.key === "Escape") {
         // P0：与“以后再说”同闸——首装留空时 Esc 需要再按一次才确认跳过。
         if ((S.cfg || {}).first_run && wizardWhitelistBlank() && !wizSkipArmed) {
           armWizardSkip();
