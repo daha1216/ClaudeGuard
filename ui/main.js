@@ -213,6 +213,18 @@
 
   /* ---------- 英雄区 ---------- */
 
+  // P1-3：不合规（fail）与未确认（unverified）分开计数，主卡与横幅共用同一口径，
+  // 避免同屏两个数字互相矛盾。
+  function badSummary(targets) {
+    const list = targets || [];
+    const bad = list.filter((x) => x.state === "fail").length;
+    const pending = list.filter((x) => x.state === "unverified").length;
+    const parts = [];
+    if (bad) parts.push(bad + " 个不合规");
+    if (pending) parts.push(pending + " 个未确认");
+    return parts.join(" · ");
+  }
+
   const RING_STROKE = {
     pass: "#03AA49",
     fail: "#ED6300",
@@ -264,9 +276,8 @@
       t = "正在检查";
       s = "正在校验出口 IP…";
     } else if (overall === "fail") {
-      const bad = targets.filter((x) => x.state === "fail" || x.state === "unverified").length;
       t = "校验未通过";
-      s = bad + " 个出口不符合白名单";
+      s = badSummary(targets) || "出口不符合白名单";
     } else if (overall === "tripped") {
       t = "已熔断";
       s = (st.tripped && st.tripped.reason) || "出口 IP 不符合白名单";
@@ -494,7 +505,10 @@
     // 熔断与暂停不占横幅位：主卡标题已表达状态，解除/恢复动作落在主钮上（设计 A）。
     if (overall === "fail") {
       const bad = (st.targets || []).filter((x) => x.state === "fail").map((x) => x.name);
-      parts.push(banner("warn", ["出口校验未通过", (bad.length ? bad.join("、") + " " : "") + "不符合白名单，熔断前可修正"], { id: "details", label: "查看详情" }));
+      // 与主卡同口径：名单（fail 的目标名）+「N 个不合规 · M 个未确认」汇总。
+      const sum = badSummary(st.targets);
+      parts.push(banner("warn", ["出口校验未通过",
+        (bad.length ? bad.join("、") + "：" : "") + (sum || "不符合白名单") + "，熔断前可修正"], { id: "details", label: "查看详情" }));
     }
     // v3.7：未接入横幅（系统代理关 + 无 TUN，应用直连真实出口；未熔断时提示）。
     if (

@@ -434,8 +434,50 @@
     }
   }
 
+  // P1-4：恢复默认是破坏性操作，两段确认（4 秒内再点一次才执行）。
+  let resetArmed = false;
+  let resetTimer = 0;
+  function resetArmOff() {
+    resetArmed = false;
+    clearTimeout(resetTimer);
+    const btn = $("st-target-reset");
+    if (btn) {
+      btn.textContent = "恢复默认";
+      btn.classList.remove("is-danger");
+      btn.classList.add("is-ghost");
+    }
+    const m = $("st-target-msg");
+    if (m && !m.hidden && String(m.textContent || "").indexOf("将恢复默认监控目标") === 0) {
+      m.hidden = true;
+      m.textContent = "";
+    }
+  }
   async function resetTargets() {
+    const btn = $("st-target-reset");
     const msg = $("st-target-msg");
+    if (!resetArmed) {
+      resetArmed = true;
+      if (btn) {
+        btn.textContent = "确认恢复？";
+        btn.classList.remove("is-ghost");
+        btn.classList.add("is-danger");
+      }
+      if (msg) {
+        msg.hidden = false;
+        msg.className = "formerr";
+        msg.textContent = "将恢复默认监控目标（保留白名单），当前自定义目标会被覆盖——再点一次确认执行。";
+      }
+      clearTimeout(resetTimer);
+      resetTimer = setTimeout(resetArmOff, 4000);
+      return;
+    }
+    clearTimeout(resetTimer);
+    resetArmed = false;
+    if (btn) {
+      btn.textContent = "恢复默认";
+      btn.classList.remove("is-danger");
+      btn.classList.add("is-ghost");
+    }
     if (msg) { msg.hidden = true; msg.textContent = ""; }
     try {
       await invoke(CMD.reset_targets);
@@ -458,8 +500,9 @@
       if (okMsg) notifyToast(okMsg, true);
       if (typeof OPTS.reloadConfig === "function") OPTS.reloadConfig();
     } catch (e) {
+      // P1-4：保存失败只提示，不重建表单——fill() 会把监控目标编辑器里
+      // 尚未保存的输入全部清掉，用户得从头再填。
       notifyToast((e && e.message) || "保存失败");
-      fill();
       return false;
     }
     return true;
