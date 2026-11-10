@@ -315,7 +315,9 @@ impl AppState {
     /// R13：手动封锁意图有独立生命周期——开启后一直保持，直到用户手动解除；
     /// 自动逻辑（未接入时维持封锁）只在没有手动意图时生效。解除手动封锁后
     /// 由下一轮自动逻辑按接入状态接管。
-    pub fn lockdown_now(&self, on: bool, cfg: &Config) {
+    pub fn lockdown_now(&self, on: bool, cfg: &Config) -> crate::model::LockdownResult {
+        // P2-4：返回执行回执（含回查结果），IPC/UI 不再恒回显请求值。
+        // 只补返回值；锁结构与既有日志/flag 顺序不动。
         if on {
             let n = crate::guard::lockdown_apply(cfg);
             *lock(&self.lockdown_manual) = true;
@@ -323,11 +325,23 @@ impl AppState {
                 "手动封锁：已添加 {n} 条出站封锁规则；将持续生效，直到你手动解除"
             ));
             *lock(&self.lockdown_last) = Some(true);
+            let query_ok = crate::guard::lockdown_rules_now().is_some();
+            crate::model::LockdownResult {
+                on: true,
+                query_ok,
+                rules: n,
+            }
         } else {
             crate::guard::lockdown_clear();
             *lock(&self.lockdown_manual) = false;
             self.log("手动解除：已删除出站封锁规则；之后按接入状态自动接管");
             *lock(&self.lockdown_last) = Some(false);
+            let remaining = crate::guard::lockdown_rules_now();
+            crate::model::LockdownResult {
+                on: false,
+                query_ok: remaining.is_some(),
+                rules: remaining.unwrap_or(0),
+            }
         }
     }
 

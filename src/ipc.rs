@@ -178,12 +178,13 @@ pub fn resume(state: State<'_, Arc<AppState>>) {
 
 /// v3.9 一键防火墙兜底封锁：on=立即封锁守护对象出站，off=立即解除。
 /// 自动逻辑（未接入时维持）在下一轮检查继续接管。
+/// 返回执行回执（P2-4）：`queryOk=false` 表示回查失败，UI 不得宣称已生效/已解除。
 #[tauri::command]
-pub fn lockdown(state: State<'_, Arc<AppState>>, on: bool) -> bool {
+pub fn lockdown(state: State<'_, Arc<AppState>>, on: bool) -> crate::model::LockdownResult {
     let cfg = state.config();
-    state.lockdown_now(on, &cfg);
+    let result = state.lockdown_now(on, &cfg);
     state.emit_state();
-    on
+    result
 }
 
 /// 一键扫描并结束全部 Claude 进程（桌面端 + Claude Code CLI）。

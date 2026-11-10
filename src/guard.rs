@@ -1880,6 +1880,19 @@ pub fn lockdown_clear() -> bool {
     any
 }
 
+/// 当前生效的兜底封锁规则条数（按显示名前缀 `ClaudeGuard Lockdown` 统计）。
+/// 返回 None = 查询失败——此时不得宣称"已封锁/已解除"（P2-4：让 UI 能看到
+/// apply 失败，而不是恒回显请求值）。
+pub fn lockdown_rules_now() -> Option<usize> {
+    let rules = query_rules()?;
+    Some(
+        rules
+            .iter()
+            .filter(|r| r.display.trim().starts_with(LOCKDOWN_RULE))
+            .count(),
+    )
+}
+
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct TripResult {
     pub killed: usize,

@@ -595,6 +595,39 @@
     const lockAuto = $("st-lockdown-auto");
     if (lockAuto) lockAuto.addEventListener("change", () => patch({ lockdown_on_uncovered: !!lockAuto.checked }, "已保存"));
     const lockState = $("st-lockdown-state");
+    // P2-4：lockdown 回执 {on, queryOk, rules}（camelCase 契约）——
+    // 回查失败/没核验到规则必须报出来，不能再恒显"已生效"。
+    const describeLockdown = (r) => {
+      const want = !!(r && r.on);
+      if (!r || !r.queryOk) {
+        return {
+          state: want
+            ? "封锁结果无法核验：防火墙规则查询失败，可能并未生效"
+            : "解除结果无法核验：防火墙规则查询失败",
+          toast: "操作结果无法核验",
+        };
+      }
+      if (want) {
+        return r.rules > 0
+          ? {
+              state: "已封锁（手动）：核验到 " + r.rules + " 条出站规则，守护对象直连出站被阻断，走系统代理不受影响；会一直保持到你点「解除封锁」",
+              toast: "已启用防火墙兜底封锁",
+            }
+          : {
+              state: "封锁未生效：未核验到任何出站规则（未找到守护对象 exe 或规则未生效）",
+              toast: "封锁未生效",
+            };
+      }
+      return r.rules === 0
+        ? {
+            state: "已解除手动封锁：规则已删除；若当前仍未接入代理，下一轮检查会按自动策略重新封锁",
+            toast: "已解除防火墙封锁",
+          }
+        : {
+            state: "解除未完成：仍剩 " + r.rules + " 条封锁规则，请以管理员身份重试",
+            toast: "解除未完成",
+          };
+    };
     const lockBtns = [["st-lockdown-on", true], ["st-lockdown-off", false]];
     lockBtns.forEach(([id, on]) => {
       const b = $(id);
@@ -602,14 +635,13 @@
       b.addEventListener("click", async () => {
         b.disabled = true;
         try {
-          await invoke(CMD.lockdown, { on });
+          const r = await invoke(CMD.lockdown, { on });
+          const msg = describeLockdown(r);
           if (lockState) {
-            lockState.textContent = on
-              ? "已封锁（手动）：守护对象直连出站被阻断，走系统代理不受影响；会一直保持到你点「解除封锁」"
-              : "已解除手动封锁：规则已删除；若当前仍未接入代理，下一轮检查会按自动策略重新封锁";
+            lockState.textContent = msg.state;
             lockState.style.display = "";
           }
-          notifyToast(on ? "已启用防火墙兜底封锁" : "已解除防火墙封锁");
+          notifyToast(msg.toast);
         } catch (e) {
           notifyToast("操作失败：" + e);
         } finally {

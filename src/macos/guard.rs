@@ -478,6 +478,13 @@ pub fn lockdown_clear() -> bool {
     false
 }
 
+/// 当前生效的兜底封锁规则条数。这个构建不创建任何封锁规则（见
+/// [`lockdown_apply`]），0 是确知值——同 [`firewall_rule_count`] 的理由，
+/// 返回 `Some(0)` 而非 `None`，让上层把"确知无规则"与"查询失败"分开。
+pub fn lockdown_rules_now() -> Option<usize> {
+    Some(0)
+}
+
 pub fn trip(cfg: &crate::config::Config, reason: &str) -> TripResult {
     let mut report = TripResult {
         agents: cfg
