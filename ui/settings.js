@@ -24,6 +24,8 @@
   let mounted = false;
   let loading = false;
   let msgtimer = 0;
+  // 设置内搜索（跨 build 保留）：fill() 只赋值不重建，搜索态必须由这里持有。
+  let searchQ = "";
 
   const KIND_OPTIONS = [
     ["auto", "自动识别"],
@@ -84,6 +86,7 @@
     if (!HOST) return;
     const notify = (CFG && CFG.notify) || {};
     HOST.innerHTML =
+      searchHtml() +
       group("detect", "检测",
         '<div class="srow"><div class="slabel">代理端口<span class="shint">本机代理软件的端口</span></div><div class="sval"><input class="in num" id="st-port" type="number" min="1" max="65535" step="1"></div></div>' +
         '<div class="srow"><div class="slabel">检查间隔<span class="shint">自动复查的周期</span></div><div class="sval"><input class="in num" id="st-interval" type="number" min="5" max="3600" step="1"><span class="unit">秒</span></div></div>' +
@@ -160,6 +163,77 @@
     fill();
     mountChildren();
     syncAcc();
+    // 重建后恢复搜索态：输入框是新元素，重新绑定并按当前关键词重跑过滤。
+    wireSearch();
+    applySearch();
+  }
+
+  /* ---------- 设置内搜索（行级 hidden 过滤，不改数据模型、不全量重建） ---------- */
+
+  // 参与过滤的“行”：按各自 title/hint 文本大小写不敏感匹配；嵌套元素随父块显隐。
+  const SEARCH_BLOCK = ".srow, .titem, .wline, .sgroup-title, .sgroup-note, .tactions, .formhint";
+
+  function searchHtml() {
+    return (
+      '<div class="st-search">' +
+      '<input class="in" id="st-search" type="search" autocomplete="off" spellcheck="false" ' +
+      'placeholder="搜索设置：例如「白名单」「通知」「端口」" aria-label="搜索设置项">' +
+      '<div class="formhint st-search-empty" id="st-search-empty" hidden>没有匹配的设置项，清空搜索框恢复全部。</div>' +
+      "</div>"
+    );
+  }
+
+  function wireSearch() {
+    const box = $("st-search");
+    if (!box) return;
+    box.value = searchQ;
+    box.addEventListener("input", () => {
+      searchQ = box.value;
+      applySearch();
+    });
+    box.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape") return;
+      // Esc 清空搜索；stopPropagation 避免冒泡到 document 触发 main.js 的向导 Esc 闸门。
+      e.stopPropagation();
+      box.value = "";
+      searchQ = "";
+      applySearch();
+    });
+  }
+
+  function applySearch() {
+    if (!HOST) return;
+    const groups = HOST.querySelectorAll(".sgroup.acc");
+    const empty = $("st-search-empty");
+    const q = String(searchQ || "").trim().toLowerCase();
+    if (!q) {
+      // 清空恢复原状：全部取消隐藏，交给既有 syncAcc() 还原单开/inert 状态。
+      groups.forEach((g) => {
+        g.hidden = false;
+        g.querySelectorAll(SEARCH_BLOCK).forEach((b) => { b.hidden = false; });
+      });
+      if (empty) empty.hidden = true;
+      syncAcc();
+      return;
+    }
+    let any = false;
+    groups.forEach((g) => {
+      // textContent 含已隐藏块的文本，同一份语料既判组也判行，结果一致。
+      const hit = (g.textContent || "").toLowerCase().indexOf(q) >= 0;
+      g.hidden = !hit;
+      if (!hit) return;
+      any = true;
+      // 匹配组逐个展开（不借 openAcc，多组同开）；openAcc 不动，清空时 syncAcc 复原。
+      g.classList.add("is-open");
+      const head = g.querySelector(".acc-head");
+      if (head) head.setAttribute("aria-expanded", "true");
+      const body = g.querySelector(".acc-body");
+      if (body) body.removeAttribute("inert");
+      g.querySelectorAll(SEARCH_BLOCK).forEach((b) => {
+        b.hidden = (b.textContent || "").toLowerCase().indexOf(q) < 0;
+      });
+    });
+    if (empty) empty.hidden = any;
   }
 
   /* ---------- 折叠手风琴（单开） ---------- */
@@ -364,9 +438,11 @@
     if (!host) return;
     if (!TARGETS.length) {
       host.innerHTML = '<div class="formhint">还没有监控目标。点“恢复默认”取回四个内置目标。</div>';
-      return;
+    } else {
+      host.innerHTML = TARGETS.map(targetItem).join("");
     }
-    host.innerHTML = TARGETS.map(targetItem).join("");
+    // 目标行是重建出来的（新增/删除/保存后），若正处在搜索中要立刻重新过滤。
+    if (searchQ) applySearch();
   }
 
   function readTargets() {
@@ -535,6 +611,8 @@
         if (!g) return;
         openAcc = openAcc === g.dataset.g ? "" : g.dataset.g;
         syncAcc();
+        // 搜索过滤期间以过滤结果为准：syncAcc 的单开收敛后再重跑一次展开匹配组。
+        if (searchQ) applySearch();
       });
     }
     const port = $("st-port");
@@ -901,6 +979,8 @@
       if (U && U.setState) U.setState(state);
       const F = CG.feishu;
       if (F && F.setState) F.setState(state);
+      // 异步子组件（updates/feishu）随状态重渲染后，行文本可能变了——重跑过滤。
+      if (searchQ) applySearch();
     },
     refresh() {
       if (!mounted) return;
@@ -910,7 +990,15 @@
     // P0：主界面「未配置白名单 — 点此配置」跳转到指定设置组（监控目标）。
     openGroup(key) {
       openAcc = key;
-      syncAcc();
+      if (searchQ) {
+        // 跳转定位必须可见：先清空搜索过滤（内部会 syncAcc 还原），再套用目标组。
+        searchQ = "";
+        const box = $("st-search");
+        if (box) box.value = "";
+        applySearch();
+      } else {
+        syncAcc();
+      }
     },
   };
 

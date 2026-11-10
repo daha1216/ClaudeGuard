@@ -584,3 +584,12 @@ body[data-ready="1"] .card { animation: enter .36s .12s var(--ease) both; }
 .srow[hidden], .formhint[hidden], .progress[hidden] { display: none; }
 .in[disabled] { opacity: .55; }
 .in[type="password"] { letter-spacing: .5px; }
+
+/* ---------- 设置内搜索（功能 A）：搜索框与行级 hidden 过滤 ---------- */
+
+.st-search { padding: 0 0 8px; }
+.st-search .in { height: 28px; font-size: 11.5px; }
+.st-search .st-search-empty { padding-top: 6px; }
+/* 作者样式给这些块设了 display，UA 的 [hidden]{display:none} 会被盖掉——显式补一条。 */
+.titem[hidden], .wline[hidden], .sgroup-title[hidden], .sgroup-note[hidden],
+.tactions[hidden], .sgroup.acc[hidden] { display: none; }
