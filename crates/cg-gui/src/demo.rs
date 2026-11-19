@@ -887,6 +887,17 @@ pub fn build_demo_snapshot(scenario: DemoScenario) -> GuardSnapshot {
             String::new()
         },
         recent_logs: demo_logs(now, scenario),
+        recent_toasts: Vec::new(),
+        feishu: crate::protocol::FeishuStatus {
+            enabled: false,
+            has_webhook: false,
+            webhook_masked: String::new(),
+            has_secret: false,
+            queued: 0,
+            failed: 0,
+            last_sent_at: None,
+            last_error: String::new(),
+        },
     }
 }
 

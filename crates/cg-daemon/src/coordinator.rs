@@ -14,8 +14,8 @@ use cg_core::CheckPurpose;
 
 use crate::protocol::{
     AccessEvidence, AgentRuntimeStatus, AntigravityProxyStatus, DefenseSelfCheck, EnvCheck,
-    ErrorCode, GuardSnapshot, LeakReport, OperationReceipt, PipeRequest, PipeResponse, ProbeResult,
-    UpdateSummary,
+    ErrorCode, FeishuStatus, GuardSnapshot, LeakReport, OperationReceipt, PipeRequest,
+    PipeResponse, ProbeResult, UpdateSummary,
 };
 
 const QUEUE_CAPACITY: usize = 256;
@@ -92,6 +92,20 @@ pub enum CoordinatorEvent {
         access: AccessEvidence,
         probes: Vec<(String, ProbeResult)>,
         now_secs: u64,
+    },
+    SingleTargetProbed {
+        cfg_rev: u64,
+        runtime_epoch: u64,
+        target_id: String,
+        access: AccessEvidence,
+        probe: ProbeResult,
+        now_secs: u64,
+        reply: SyncSender<PipeResponse>,
+    },
+    FeishuTestFinished {
+        result: Result<FeishuStatus, String>,
+        now_secs: u64,
+        reply: SyncSender<PipeResponse>,
     },
     Telemetry(Box<TelemetryBundle>),
     UpdatesChecked {

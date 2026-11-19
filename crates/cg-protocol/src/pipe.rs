@@ -88,6 +88,21 @@ pub enum PipeRequest {
         #[serde(default = "crate::model::default_true")]
         include_cli: bool,
     },
+    SaveFeishuConfig {
+        enabled: bool,
+        #[serde(default)]
+        webhook: Option<String>,
+        #[serde(default)]
+        secret: Option<String>,
+        #[serde(default)]
+        clear_secret: bool,
+    },
+    TestFeishu {
+        #[serde(default)]
+        webhook: Option<String>,
+        #[serde(default)]
+        secret: Option<String>,
+    },
 }
 
 /// Responses sent from the daemon back to GUI/CLI clients over the Named Pipe.
@@ -369,8 +384,18 @@ mod tests {
                 agent_id: Some("claude".into()),
                 include_cli: false,
             },
+            PipeRequest::SaveFeishuConfig {
+                enabled: true,
+                webhook: Some("https://open.feishu.cn/open-apis/bot/v2/hook/demo-token".into()),
+                secret: Some("demo-secret".into()),
+                clear_secret: false,
+            },
+            PipeRequest::TestFeishu {
+                webhook: None,
+                secret: None,
+            },
         ];
-        assert_eq!(all.len(), 16);
+        assert_eq!(all.len(), 18);
         for req in all {
             let frame = encode_frame(&req).expect("encode");
             let decoded: PipeRequest = decode_frame(&frame).expect("decode");

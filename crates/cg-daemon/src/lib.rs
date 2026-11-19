@@ -16,6 +16,7 @@ pub mod config_store;
 pub mod coordinator;
 pub mod disarm;
 pub mod engine_runtime;
+pub mod feishu;
 pub mod ipc_pipe;
 pub mod journal;
 pub mod protocol;

@@ -391,6 +391,37 @@ where
     })
 }
 
+/// Send a JSON webhook notification (e.g., Feishu / Lark) through `NetworkPolicy` using
+/// `EgressIntent::Notify` (direct domestic egress by default, zero unexpected proxy dependency).
+pub fn post_json_notify(
+    policy: &NetworkPolicy,
+    url: &str,
+    payload: &serde_json::Value,
+    timeout: Duration,
+) -> PlatformResult<(u16, String)> {
+    let agent = build_client(policy, EgressIntent::Notify, timeout)?;
+    let body_str = serde_json::to_string(payload)
+        .map_err(|e| PlatformError::InvalidInput(format!("序列化通知 JSON 失败：{e}")))?;
+    match agent
+        .post(url)
+        .set("Content-Type", "application/json; charset=utf-8")
+        .set("User-Agent", "ClaudeGuard/4.0")
+        .timeout(timeout)
+        .send_string(&body_str)
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            let text = resp.into_string().unwrap_or_default();
+            Ok((status, text))
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            Ok((code, text))
+        }
+        Err(err) => Err(PlatformError::Network(format!("通知请求发送失败：{err}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

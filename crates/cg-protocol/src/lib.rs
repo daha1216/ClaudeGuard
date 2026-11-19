@@ -13,12 +13,13 @@ pub use config::{
 pub use model::{
     AccessEvidence, AccessLevel, AgentKind, AgentRuntimeStatus, AnchorKind, AntigravityProxyState,
     AntigravityProxyStatus, AppliedEnv, BUILTIN_TARGET_IDS, ComponentUpdateStatus, CutMode,
-    DefenseCheckItem, DefenseSelfCheck, EnvCheck, EnvInfo, Evaluation, IpRule, Ipv4Cidr, LeakConn,
-    LeakReport, LogEntry, LogLevel, OnboardingOption, OnboardingProbeResult, OnboardingStrategy,
-    PolicyPreset, PolicyVerdict, ProbeResult, SelfCheckStatus, Target, TargetState, TargetStatus,
-    ThemeMode, TimelineBucket, TimelineStatus, TripInfo, UpdateCheckPhase, UpdateSummary,
-    default_builtin_targets, ensure_builtin_targets, ip_hit, is_builtin_target, is_known_region,
-    matched_ip_rule, normalize_ip, normalize_ip_or_cidr, normalize_region, region_hit, region_name,
+    DefenseCheckItem, DefenseSelfCheck, EnvCheck, EnvInfo, Evaluation, FeishuStatus, IpRule,
+    Ipv4Cidr, LeakConn, LeakReport, LogEntry, LogLevel, OnboardingOption, OnboardingProbeResult,
+    OnboardingStrategy, PolicyPreset, PolicyVerdict, ProbeResult, SelfCheckStatus, Target,
+    TargetState, TargetStatus, ThemeMode, TimelineBucket, TimelineStatus, ToastNotificationEvent,
+    TripInfo, UpdateCheckPhase, UpdateSummary, default_builtin_targets, ensure_builtin_targets,
+    ip_hit, is_builtin_target, is_known_region, matched_ip_rule, normalize_ip,
+    normalize_ip_or_cidr, normalize_region, region_hit, region_name,
 };
 pub use pipe::{
     DEFAULT_PIPE_NAME, ErrorCode, FrameError, MAX_FRAME_BYTES, PipeRequest, PipeResponse,

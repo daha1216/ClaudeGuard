@@ -6,13 +6,14 @@ pub use cg_protocol::{
     decode_frame, encode_frame, read_frame, try_decode_frame, write_frame, AccessEvidence,
     AccessLevel, AgentKind, AgentRuntimeStatus, AnchorKind, AntigravityProxyState,
     AntigravityProxyStatus, AppliedEnv, ComponentUpdateStatus, Config, CutMode, DefenseCheckItem,
-    DefenseSelfCheck, EnvCheck, EnvInfo, ErrorCode, Evaluation, FrameError, GuardSnapshot,
-    LeakConn, LeakReport, Lifecycle, LogEntry, LogLevel, MigrationOutcome, NotifyPrefs,
-    OnboardingOption, OnboardingProbeResult, OnboardingStrategy, OperationItemReceipt,
-    OperationReceipt, OperationStatus, PipeRequest, PipeResponse, PolicyPreset, PolicyVerdict,
-    ProbeResult, ProtectionState, SelfCheckStatus, Target, TargetState, TargetStatus, ThemeMode,
-    TimelineBucket, TimelineStatus, TripInfo, UpdateCheckPhase, UpdateSummary, DEFAULT_PIPE_NAME,
-    MAX_FRAME_BYTES, SNAPSHOT_SCHEMA_VERSION,
+    DefenseSelfCheck, EnvCheck, EnvInfo, ErrorCode, Evaluation, FeishuStatus, FrameError,
+    GuardSnapshot, LeakConn, LeakReport, Lifecycle, LogEntry, LogLevel, MigrationOutcome,
+    NotifyPrefs, OnboardingOption, OnboardingProbeResult, OnboardingStrategy,
+    OperationItemReceipt, OperationReceipt, OperationStatus, PipeRequest, PipeResponse,
+    PolicyPreset, PolicyVerdict, ProbeResult, ProtectionState, SelfCheckStatus, Target,
+    TargetState, TargetStatus, ThemeMode, TimelineBucket, TimelineStatus, ToastNotificationEvent,
+    TripInfo, UpdateCheckPhase, UpdateSummary, DEFAULT_PIPE_NAME, MAX_FRAME_BYTES,
+    SNAPSHOT_SCHEMA_VERSION,
 };
 
 /// Daemon package version string.

@@ -92,9 +92,9 @@ procedure StopLegacyAndCurrentProcesses();
 var
   WaitIdx: Integer;
 begin
-  // Stop Windows Service gracefully first so WAL / Flow B cleanup runs before upgrade.
+  // Stop Windows Service gracefully first so WAL / Flow B cleanup (up to 15s wait hint) runs before upgrade.
   Exec(ExpandConstant('{sys}\sc.exe'), 'stop {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
-  for WaitIdx := 1 to 20 do
+  for WaitIdx := 1 to 64 do
   begin
     Exec(ExpandConstant('{cmd}'), '/C sc query {#MyServiceName} | findstr /C:"STOPPED" >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
     if ExecResultCode = 0 then

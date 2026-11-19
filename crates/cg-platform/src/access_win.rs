@@ -493,17 +493,152 @@ pub fn is_elevated() -> crate::traits::PlatformResult<bool> {
     ))
 }
 
-/// Read `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`.
+/// Returns true if a registry SID string under `HKEY_USERS` represents a normal interactive user
+/// (`S-1-5-21-...`, excluding `*_Classes`).
+pub fn is_interactive_user_sid(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.starts_with("S-1-5-21-") && !trimmed.ends_with("_Classes")
+}
+
+/// Returns true when running inside Windows Session 0 (e.g., `LocalSystem` Windows Service).
 #[cfg(windows)]
-pub fn read_proxy_evidence() -> AccessEvidenceRaw {
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+pub fn is_session_zero() -> bool {
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+
+    let mut sid: u32 = 0;
+    let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut sid) }.is_ok();
+    ok && sid == 0
+}
+
+#[cfg(not(windows))]
+pub fn is_session_zero() -> bool {
+    false
+}
+
+/// Resolves the SID string (`S-1-5-21-...`) of the currently active console session user.
+///
+/// Works under `LocalSystem` (Session 0 service) via `WTSGetActiveConsoleSessionId` +
+/// `WTSQueryUserToken` + `GetTokenInformation(TokenUser)` + `ConvertSidToStringSidW`.
+#[cfg(windows)]
+pub fn active_interactive_user_sid() -> Option<String> {
+    use core::ffi::c_void;
+    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER};
+    use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+
+    let session_id = unsafe { WTSGetActiveConsoleSessionId() };
+    if session_id == u32::MAX || session_id == 0 {
+        return None;
+    }
+    let mut token = HANDLE::default();
+    if unsafe { WTSQueryUserToken(session_id, &mut token) }.is_err() {
+        return None;
+    }
+
+    struct HandleGuard(HANDLE);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+    let _token = HandleGuard(token);
+
+    let mut needed: u32 = 0;
+    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
+    if needed == 0 || needed > 64 * 1024 {
+        return None;
+    }
+    let mut buf = vec![0u8; needed as usize];
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr().cast::<c_void>()),
+            needed,
+            &mut needed,
+        )
+    }
+    .is_err()
+    {
+        return None;
+    }
+    let user = unsafe { &*(buf.as_ptr().cast::<TOKEN_USER>()) };
+    let mut sid_pwstr = windows::core::PWSTR::null();
+    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_pwstr) }.is_err() {
+        return None;
+    }
+    let sid_str = wide_to_string(&unsafe { pwstr_units(sid_pwstr) });
+    unsafe {
+        let _ = LocalFree(HLOCAL(sid_pwstr.0.cast::<c_void>()));
+    }
+    if is_interactive_user_sid(&sid_str) {
+        Some(sid_str)
+    } else {
+        None
+    }
+}
+
+/// Opens a per-user registry subkey for the interactive desktop user.
+///
+/// - When running in an interactive user session (`Session > 0`), opens `HKCU\<subpath>` directly.
+/// - When running in Session 0 (`LocalSystem` Windows Service), opens
+///   `HKEY_USERS\<ActiveConsoleUserSID>\<subpath>`, falling back to the first loaded interactive
+///   `S-1-5-21-*` hive under `HKEY_USERS` (so RDP/multi-session hosts still resolve cleanly), and
+///   finally `HKCU\<subpath>`.
+#[cfg(windows)]
+pub fn open_interactive_user_subkey(subpath: &str) -> Option<winreg::RegKey> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_USERS, KEY_READ};
     use winreg::RegKey;
 
+    if !is_session_zero() {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        return hkcu.open_subkey_with_flags(subpath, KEY_READ).ok();
+    }
+
+    let hku = RegKey::predef(HKEY_USERS);
+    if let Some(sid) = active_interactive_user_sid() {
+        let full = format!("{sid}\\{subpath}");
+        if let Ok(key) = hku.open_subkey_with_flags(&full, KEY_READ) {
+            return Some(key);
+        }
+    }
+
+    // Fallback: enumerate loaded interactive user hives in HKEY_USERS (`S-1-5-21-*`, non-`_Classes`).
+    let mut first_match: Option<RegKey> = None;
+    for sub in hku.enum_keys().flatten() {
+        if !is_interactive_user_sid(&sub) {
+            continue;
+        }
+        let full = format!("{sub}\\{subpath}");
+        if let Ok(key) = hku.open_subkey_with_flags(&full, KEY_READ) {
+            let proxy_on: u32 = key.get_value("ProxyEnable").unwrap_or(0);
+            if proxy_on != 0 {
+                return Some(key);
+            }
+            if first_match.is_none() {
+                first_match = Some(key);
+            }
+        }
+    }
+    if first_match.is_some() {
+        return first_match;
+    }
+
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let Ok(settings) = hkcu.open_subkey_with_flags(
-        r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-        KEY_READ,
-    ) else {
+    hkcu.open_subkey_with_flags(subpath, KEY_READ).ok()
+}
+
+/// Read `Software\Microsoft\Windows\CurrentVersion\Internet Settings` for the active desktop user
+/// (Session-0 `LocalSystem`-safe via `HKEY_USERS\<ActiveUserSID>`).
+#[cfg(windows)]
+pub fn read_proxy_evidence() -> AccessEvidenceRaw {
+    let Some(settings) =
+        open_interactive_user_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+    else {
         return AccessEvidenceRaw::default();
     };
     let enabled: u32 = settings.get_value("ProxyEnable").unwrap_or(0);

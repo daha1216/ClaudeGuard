@@ -137,8 +137,8 @@ mod win_impl {
     use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Shell::{
-        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIN_SELECT,
-        NOTIFYICONDATAW, Shell_NotifyIconW,
+        NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIM_ADD, NIM_DELETE,
+        NIM_MODIFY, NIN_SELECT, NOTIFYICONDATAW, Shell_NotifyIconW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
@@ -153,6 +153,7 @@ mod win_impl {
 
     const WM_TRAY_CALLBACK: u32 = WM_APP + 101;
     const WM_TRAY_SYNC: u32 = WM_USER + 102;
+    const WM_TRAY_BALLOON: u32 = WM_USER + 103;
     const TRAY_ICON_ID: u32 = 1;
 
     const CMD_OPEN_CONSOLE: u32 = 1001;
@@ -168,6 +169,7 @@ mod win_impl {
         tone: AtomicU8,
         paused: AtomicBool,
         tooltip: Mutex<String>,
+        pending_balloon: Mutex<Option<(String, String, bool)>>,
         taskbar_created_msg: u32,
         hwnd: Mutex<Option<isize>>,
     }
@@ -184,6 +186,7 @@ mod win_impl {
                 tone: AtomicU8::new(0),
                 paused: AtomicBool::new(false),
                 tooltip: Mutex::new("ClaudeGuard v4 · 守护中".to_string()),
+                pending_balloon: Mutex::new(None),
                 taskbar_created_msg: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
                 hwnd: Mutex::new(None),
             });
@@ -221,6 +224,19 @@ mod win_impl {
             {
                 let hwnd = HWND(raw as *mut _);
                 let _ = unsafe { PostMessageW(hwnd, WM_TRAY_SYNC, WPARAM(0), LPARAM(0)) };
+            }
+        }
+
+        /// Surfaces a native Windows Action Center notification in interactive Session 1.
+        pub fn show_balloon(&self, title: &str, body: &str, is_error: bool) {
+            if let Ok(mut guard) = self.shared.pending_balloon.lock() {
+                *guard = Some((title.to_string(), body.to_string(), is_error));
+            }
+            if let Ok(guard) = self.shared.hwnd.lock()
+                && let Some(raw) = *guard
+            {
+                let hwnd = HWND(raw as *mut _);
+                let _ = unsafe { PostMessageW(hwnd, WM_TRAY_BALLOON, WPARAM(0), LPARAM(0)) };
             }
         }
 
@@ -373,6 +389,14 @@ mod win_impl {
                 let _ = add_or_update_tray_icon(hwnd, ctx, false);
                 LRESULT(0)
             }
+            WM_TRAY_BALLOON => {
+                if let Ok(mut guard) = ctx.shared.pending_balloon.lock()
+                    && let Some((title, body, is_error)) = guard.take()
+                {
+                    let _ = show_tray_balloon(hwnd, &title, &body, is_error);
+                }
+                LRESULT(0)
+            }
             WM_TRAY_CALLBACK => {
                 let event_code = (lparam.0 as u32) & 0xFFFF;
                 if event_code == WM_LBUTTONUP || event_code == NIN_SELECT {
@@ -493,6 +517,24 @@ mod win_impl {
 
         let cmd = if add { NIM_ADD } else { NIM_MODIFY };
         unsafe { Shell_NotifyIconW(cmd, &nid) }.as_bool()
+    }
+
+    fn show_tray_balloon(hwnd: HWND, title: &str, body: &str, is_error: bool) -> bool {
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: TRAY_ICON_ID,
+            uFlags: NIF_INFO,
+            dwInfoFlags: if is_error { NIIF_ERROR } else { NIIF_INFO },
+            ..Default::default()
+        };
+        for (idx, code) in title.encode_utf16().take(63).enumerate() {
+            nid.szInfoTitle[idx] = code;
+        }
+        for (idx, code) in body.encode_utf16().take(255).enumerate() {
+            nid.szInfo[idx] = code;
+        }
+        unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) }.as_bool()
     }
 
     fn remove_tray_icon(hwnd: HWND) -> bool {
@@ -711,6 +753,8 @@ mod win_impl {
         }
 
         pub fn set_status(&self, _tone: TrayTone, _paused: bool, _tooltip: &str) {}
+
+        pub fn show_balloon(&self, _title: &str, _body: &str, _is_error: bool) {}
 
         pub fn shutdown(&mut self) {}
     }

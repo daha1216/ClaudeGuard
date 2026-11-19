@@ -3,8 +3,8 @@
 use crate::config::Config;
 use crate::model::{
     AccessEvidence, AgentRuntimeStatus, AntigravityProxyStatus, AppliedEnv, DefenseSelfCheck,
-    EnvCheck, LeakReport, LogEntry, PolicyPreset, TargetState, TargetStatus, ThemeMode,
-    TimelineBucket, TripInfo, UpdateSummary,
+    EnvCheck, FeishuStatus, LeakReport, LogEntry, PolicyPreset, TargetState, TargetStatus,
+    ThemeMode, TimelineBucket, ToastNotificationEvent, TripInfo, UpdateSummary,
 };
 use crate::state::{Lifecycle, OperationReceipt, ProtectionState, is_legal_state_pair};
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,10 @@ pub struct GuardSnapshot {
     pub disarmed_reason: String,
     #[serde(default)]
     pub recent_logs: Vec<LogEntry>,
+    #[serde(default)]
+    pub recent_toasts: Vec<ToastNotificationEvent>,
+    #[serde(default)]
+    pub feishu: FeishuStatus,
 }
 
 impl GuardSnapshot {

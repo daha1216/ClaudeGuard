@@ -5,9 +5,10 @@
 
 use crate::demo::{DemoScenario, build_demo_onboarding_probe, build_demo_snapshot, now_unix_secs};
 use crate::protocol::{
-    AgentKind, DEFAULT_PIPE_NAME, GuardSnapshot, Lifecycle, MAX_FRAME_BYTES, OperationItemReceipt,
-    OperationReceipt, OperationStatus, PipeRequest, PipeResponse, PolicyPreset, ProtectionState,
-    TargetState, UpdateCheckPhase, encode_frame, read_frame, write_frame,
+    AgentKind, DEFAULT_PIPE_NAME, ErrorCode, GuardSnapshot, Lifecycle, MAX_FRAME_BYTES,
+    OperationItemReceipt, OperationReceipt, OperationStatus, PipeRequest, PipeResponse,
+    PolicyPreset, ProtectionState, TargetState, UpdateCheckPhase, encode_frame, read_frame,
+    write_frame,
 };
 use std::sync::{Arc, Mutex};
 
@@ -86,8 +87,19 @@ impl DaemonClient {
             PipeRequest::GetSnapshot => PipeResponse::Snapshot {
                 snapshot: Box::new(snap.clone()),
             },
-            PipeRequest::RecheckNow { .. } => {
+            PipeRequest::RecheckNow { target_id } => {
                 snap.checked_at = Some(now);
+                if let Some(tid) = target_id.as_deref() {
+                    if let Some(t) = snap.targets.iter_mut().find(|t| t.id == tid) {
+                        t.checked_at = Some(now);
+                    }
+                } else {
+                    for t in &mut snap.targets {
+                        if t.state != TargetState::Disabled {
+                            t.checked_at = Some(now);
+                        }
+                    }
+                }
                 if snap.lifecycle == Lifecycle::Armed && !snap.is_tripped() {
                     snap.protection = ProtectionState::Monitoring;
                 }
@@ -350,6 +362,72 @@ impl DaemonClient {
                 snap.last_receipt = Some(receipt.clone());
                 PipeResponse::Ack {
                     receipt: Some(receipt),
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::SaveFeishuConfig {
+                enabled,
+                webhook,
+                secret,
+                clear_secret,
+            } => {
+                if let Some(url) = webhook.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    if !url.starts_with("https://open.feishu.cn/open-apis/bot/v2/hook/")
+                        && !url.starts_with("https://open.larksuite.com/open-apis/bot/v2/hook/")
+                    {
+                        return PipeResponse::Error {
+                            code: ErrorCode::ValidationFailed,
+                            message: "请填写飞书 / Lark 群自定义机器人的官方 HTTPS Webhook 地址"
+                                .into(),
+                            receipt: None,
+                        };
+                    }
+                    let tail = url.get(url.len().saturating_sub(4)..).unwrap_or("");
+                    snap.feishu.has_webhook = true;
+                    snap.feishu.webhook_masked = format!("open.feishu.cn/.../{tail}");
+                }
+                if clear_secret {
+                    snap.feishu.has_secret = false;
+                } else if secret.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                    snap.feishu.has_secret = true;
+                }
+                if enabled && !snap.feishu.has_webhook {
+                    return PipeResponse::Error {
+                        code: ErrorCode::ValidationFailed,
+                        message: "启用飞书通知前请先填写有效的飞书 Webhook HTTPS 地址".into(),
+                        receipt: None,
+                    };
+                }
+                snap.feishu.enabled = enabled;
+                snap.feishu.last_error.clear();
+                PipeResponse::Ack {
+                    receipt: None,
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::TestFeishu { webhook, .. } => {
+                let effective = webhook.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                if let Some(url) = effective
+                    && !url.starts_with("https://open.feishu.cn/open-apis/bot/v2/hook/")
+                    && !url.starts_with("https://open.larksuite.com/open-apis/bot/v2/hook/")
+                {
+                    return PipeResponse::Error {
+                        code: ErrorCode::ValidationFailed,
+                        message: "Webhook 地址格式无效，需为飞书 / Lark 官方 HTTPS Webhook".into(),
+                        receipt: None,
+                    };
+                }
+                if effective.is_none() && !snap.feishu.has_webhook {
+                    return PipeResponse::Error {
+                        code: ErrorCode::ValidationFailed,
+                        message: "请先填写或保存飞书 Webhook 地址后再测试".into(),
+                        receipt: None,
+                    };
+                }
+                snap.feishu.last_sent_at = Some(now);
+                snap.feishu.last_error.clear();
+                PipeResponse::Ack {
+                    receipt: None,
                     snapshot: Some(Box::new(snap.clone())),
                 }
             }

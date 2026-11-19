@@ -162,6 +162,8 @@ pub struct AppController {
     pub env_action_note: Option<String>,
     pub update_status_note: Option<String>,
     pub feishu_status_note: Option<String>,
+    pub feishu_initialized: bool,
+    pub last_seen_toast_seq: Option<u64>,
     pub hud_window: Option<gpui::WindowHandle<HudWindowView>>,
     pub console_window: Option<gpui::WindowHandle<ConsoleWindowView>>,
     pub tray: Option<TrayHandle>,
@@ -363,6 +365,8 @@ impl AppController {
             env_action_note: None,
             update_status_note: None,
             feishu_status_note: None,
+            feishu_initialized: false,
+            last_seen_toast_seq: None,
             hud_window: None,
             console_window: None,
             tray,
@@ -588,6 +592,41 @@ impl AppController {
             }
         } else if snapshot.lifecycle != Lifecycle::Unconfigured {
             self.show_onboarding = false;
+        }
+        // Relay new Session-0 daemon notifications to Session-1 Windows Action Center
+        let max_toast_seq = snapshot
+            .recent_toasts
+            .iter()
+            .map(|t| t.seq)
+            .max()
+            .unwrap_or(0);
+        match self.last_seen_toast_seq {
+            None => {
+                // Seed high-water mark on first snapshot so historical events do not replay
+                self.last_seen_toast_seq = Some(max_toast_seq);
+            }
+            Some(prev_seq) => {
+                if snapshot.config.notify.enabled
+                    && let Some(tray) = self.tray.as_ref()
+                {
+                    for ev in &snapshot.recent_toasts {
+                        if ev.seq > prev_seq {
+                            let is_err = matches!(
+                                ev.class.as_str(),
+                                "trip" | "leak" | "antigravity_proxy" | "warning"
+                            );
+                            tray.show_balloon(&ev.title, &ev.body, is_err);
+                        }
+                    }
+                }
+                if max_toast_seq > prev_seq {
+                    self.last_seen_toast_seq = Some(max_toast_seq);
+                }
+            }
+        }
+        if !self.feishu_initialized {
+            self.drafts.feishu_enabled = snapshot.feishu.enabled;
+            self.feishu_initialized = true;
         }
         self.snapshot = Some(snapshot);
         self.sync_tray_status();
@@ -1528,22 +1567,22 @@ impl Render for ConsoleWindowView {
                     views::overview::render_overview(ctrl_entity.clone(), &proj, p, cx)
                 }
                 NavSection::Targets => {
-                    views::subpages::render_targets_page(ctrl_entity.clone(), p, cx)
+                    views::targets::render_targets_page(ctrl_entity.clone(), p, cx)
                 }
                 NavSection::Breaker => {
-                    views::subpages::render_breaker_page(ctrl_entity.clone(), &proj, p, cx)
+                    views::breaker::render_breaker_page(ctrl_entity.clone(), &proj, p, cx)
                 }
                 NavSection::Environment => {
-                    views::subpages::render_environment_page(ctrl_entity.clone(), p, cx)
+                    views::environment::render_environment_page(ctrl_entity.clone(), p, cx)
                 }
                 NavSection::Audit => {
-                    views::subpages::render_audit_page(ctrl_entity.clone(), &proj, p, cx)
+                    views::audit::render_audit_page(ctrl_entity.clone(), &proj, p, cx)
                 }
                 NavSection::Updates => {
-                    views::subpages::render_updates_page(ctrl_entity.clone(), p, cx)
+                    views::updates::render_updates_page(ctrl_entity.clone(), p, cx)
                 }
                 NavSection::Notify => {
-                    views::subpages::render_notify_page(ctrl_entity.clone(), p, cx)
+                    views::notify::render_notify_page(ctrl_entity.clone(), p, cx)
                 }
             });
 
@@ -1576,7 +1615,7 @@ impl Render for ConsoleWindowView {
             .child(workspace);
 
         if show_onboarding {
-            root = root.child(views::subpages::render_onboarding_modal(ctrl_entity, p, cx));
+            root = root.child(views::onboarding::render_onboarding_modal(ctrl_entity, p, cx));
         }
         root
     }

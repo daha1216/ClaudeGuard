@@ -4,14 +4,14 @@ pub use cg_protocol::{
     AccessEvidence, AccessLevel, AgentKind, AgentRuntimeStatus, AnchorKind, AntigravityProxyState,
     AntigravityProxyStatus, AppliedEnv, BUILTIN_TARGET_IDS, CONFIG_VERSION, ComponentUpdateStatus,
     Config, CutMode, DEFAULT_PIPE_NAME, DefenseCheckItem, DefenseSelfCheck, EnvCheck, EnvInfo,
-    ErrorCode, FrameError, GuardSnapshot, KNOWN_GUI_AGENT_IDS, LeakConn, LeakReport, Lifecycle,
-    LogEntry, LogLevel, MAX_FRAME_BYTES, NotifyPrefs, OnboardingOption, OnboardingProbeResult,
-    OnboardingStrategy, OperationItemReceipt, OperationReceipt, OperationStatus, PipeRequest,
-    PipeResponse, PolicyPreset, PolicyVerdict, ProbeResult, ProtectionState,
-    SNAPSHOT_SCHEMA_VERSION, SelfCheckStatus, Target, TargetState, TargetStatus, ThemeMode,
-    TimelineBucket, TimelineStatus, TripInfo, UpdateCheckPhase, UpdateSummary, decode_frame,
-    default_builtin_targets, encode_frame, normalize_ip, normalize_ip_or_cidr, normalize_region,
-    read_frame, region_name, try_decode_frame, write_frame,
+    ErrorCode, FeishuStatus, FrameError, GuardSnapshot, KNOWN_GUI_AGENT_IDS, LeakConn, LeakReport,
+    Lifecycle, LogEntry, LogLevel, MAX_FRAME_BYTES, NotifyPrefs, OnboardingOption,
+    OnboardingProbeResult, OnboardingStrategy, OperationItemReceipt, OperationReceipt,
+    OperationStatus, PipeRequest, PipeResponse, PolicyPreset, PolicyVerdict, ProbeResult,
+    ProtectionState, SNAPSHOT_SCHEMA_VERSION, SelfCheckStatus, Target, TargetState, TargetStatus,
+    ThemeMode, TimelineBucket, TimelineStatus, ToastNotificationEvent, TripInfo, UpdateCheckPhase,
+    UpdateSummary, decode_frame, default_builtin_targets, encode_frame, normalize_ip,
+    normalize_ip_or_cidr, normalize_region, read_frame, region_name, try_decode_frame, write_frame,
 };
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -22,8 +22,8 @@ pub const POLICY_PRESETS: [PolicyPreset; 3] = [
     PolicyPreset::StrictStaticIp,
 ];
 
-/// Network cut-mode choices in display order.
-pub const CUT_MODES: [CutMode; 3] = [CutMode::Off, CutMode::Firewall, CutMode::Nics];
+/// Supported network cut-mode choices in display order (excludes unimplemented NIC driver).
+pub const CUT_MODES: [CutMode; 2] = [CutMode::Off, CutMode::Firewall];
 
 /// Anchor parser choices when cycling target anchor kinds.
 pub const ANCHOR_KINDS: [AnchorKind; 5] = [

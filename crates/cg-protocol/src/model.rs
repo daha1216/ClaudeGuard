@@ -860,6 +860,44 @@ impl Default for UpdateSummary {
     }
 }
 
+/// Session-0 daemon -> Session-1 GUI native desktop notification relay event.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToastNotificationEvent {
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub timestamp: u64,
+    #[serde(default)]
+    pub class: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+}
+
+/// Public (credential-free) status of the durable Feishu webhook notifier.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeishuStatus {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub has_webhook: bool,
+    #[serde(default)]
+    pub webhook_masked: String,
+    #[serde(default)]
+    pub has_secret: bool,
+    #[serde(default)]
+    pub queued: usize,
+    #[serde(default)]
+    pub failed: usize,
+    #[serde(default)]
+    pub last_sent_at: Option<u64>,
+    #[serde(default)]
+    pub last_error: String,
+}
+
 /// Audit/operational log severity level.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

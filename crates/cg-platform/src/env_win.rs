@@ -123,11 +123,8 @@ fn read_timezone_reg() -> (String, i32) {
 
 #[cfg(windows)]
 fn read_locale_reg() -> String {
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
-    use winreg::RegKey;
-
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let Ok(key) = hkcu.open_subkey_with_flags(r"Control Panel\International", KEY_READ) else {
+    let Some(key) = crate::access_win::open_interactive_user_subkey(r"Control Panel\International")
+    else {
         return String::new();
     };
     if let Ok(name) = key.get_value::<String, _>("LocaleName") {

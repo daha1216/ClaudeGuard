@@ -221,6 +221,8 @@ impl EngineState {
             last_receipt: self.last_receipt.clone(),
             disarmed_reason: self.disarmed_reason.clone(),
             recent_logs: self.logs.clone(),
+            recent_toasts: Vec::new(),
+            feishu: cg_protocol::FeishuStatus::default(),
         }
     }
 }
@@ -336,6 +338,14 @@ pub enum EngineEvent {
     },
     AntigravityProxyUpdated {
         status: AntigravityProxyStatus,
+    },
+    /// Single-target manual recheck completion (updates only `target_id`, preserving other targets).
+    TargetRechecked {
+        cfg_rev: u64,
+        runtime_epoch: u64,
+        target_id: String,
+        access: AccessEvidence,
+        probe: ProbeResult,
     },
     UpdatesChecked {
         summary: Box<UpdateSummary>,
@@ -601,6 +611,24 @@ impl GuardEngine {
             }
             EngineEvent::AntigravityProxyUpdated { status } => {
                 handle_antigravity_proxy_updated(&mut state, status, now_secs, &mut cmds);
+            }
+            EngineEvent::TargetRechecked {
+                cfg_rev,
+                runtime_epoch,
+                target_id,
+                access,
+                probe,
+            } => {
+                handle_target_rechecked(
+                    &mut state,
+                    cfg_rev,
+                    runtime_epoch,
+                    target_id,
+                    access,
+                    probe,
+                    now_secs,
+                    &mut cmds,
+                );
             }
             EngineEvent::UpdatesChecked { summary } => {
                 handle_updates_checked(&mut state, *summary, now_secs, &mut cmds);
@@ -1176,6 +1204,130 @@ fn handle_round_completed(
                     state.launch_error = "部分目标无法确认，暂不允许启动".into();
                 }
             }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_target_rechecked(
+    state: &mut EngineState,
+    cfg_rev: u64,
+    runtime_epoch: u64,
+    target_id: String,
+    access: AccessEvidence,
+    probe: ProbeResult,
+    now_secs: u64,
+    cmds: &mut Vec<EffectCommand>,
+) {
+    if cfg_rev != state.cfg_rev || runtime_epoch != state.runtime_epoch {
+        return;
+    }
+    let Some(target) = state
+        .config
+        .targets
+        .iter()
+        .find(|t| t.id == target_id && t.enabled)
+        .cloned()
+    else {
+        return;
+    };
+
+    state.access = access.clone();
+    state.checked_at = Some(now_secs);
+
+    let paused = state.is_paused(now_secs);
+    let armed = state.lifecycle == Lifecycle::Armed;
+    let access_enforced = state.network_isolation_supported && state.config.enforce_access_path;
+    let access_uncovered = access_enforced && access.is_uncovered();
+    let access_unknown = access_enforced && access.is_unknown();
+
+    let prev_streak = state
+        .target_statuses
+        .iter()
+        .find(|s| s.id == target.id)
+        .map(|s| s.fail_streak)
+        .unwrap_or(0);
+
+    let mut slot = TargetStatus::from_target(&target, TargetState::Pending);
+    let eval = if access_uncovered || access_unknown {
+        slot.state = TargetState::Unverified;
+        slot.reason = if access_unknown {
+            format!("接入路径无法确认，已跳过探测：{}", access.note)
+        } else {
+            "未接入代理链路，已跳过探测".into()
+        };
+        slot.checked_at = Some(now_secs);
+        slot.fail_streak = 0;
+        None
+    } else {
+        let ev = policy::evaluate_with_preset(&target, &probe, state.config.preset);
+        let streak = match ev.verdict {
+            PolicyVerdict::Fail => prev_streak.saturating_add(1),
+            PolicyVerdict::Pass | PolicyVerdict::Unverified => 0,
+        };
+        slot.apply_at(&probe, &ev, streak, now_secs);
+        Some(ev)
+    };
+
+    if let Some(existing) = state.target_statuses.iter_mut().find(|s| s.id == target.id) {
+        *existing = slot.clone();
+    } else {
+        state.target_statuses.push(slot.clone());
+    }
+
+    let verdict_opt = eval
+        .as_ref()
+        .map(|e| e.verdict)
+        .or(Some(PolicyVerdict::Unverified));
+    state
+        .timeline
+        .record(now_secs, state.protection, verdict_opt, slot.latency_ms);
+    cmds.push(EffectCommand::PersistTimeline);
+
+    log_both(
+        state,
+        now_secs,
+        if slot.state == TargetState::Fail {
+            LogLevel::Warn
+        } else {
+            LogLevel::Info
+        },
+        "probe",
+        format!(
+            "单目标复检 [{}]：{:?}（{}）",
+            slot.name,
+            slot.state,
+            if slot.reason.is_empty() {
+                slot.matched_rule.as_deref().unwrap_or("已核验")
+            } else {
+                slot.reason.as_str()
+            }
+        ),
+        cmds,
+    );
+
+    if armed
+        && !paused
+        && matches!(
+            state.protection,
+            ProtectionState::Pending | ProtectionState::Monitoring
+        )
+    {
+        if slot.state == TargetState::Fail && slot.fail_streak >= state.config.trip_threshold {
+            begin_isolation(
+                state,
+                format!("{} 出口不在白名单", slot.name),
+                vec![slot.id],
+                now_secs,
+                cmds,
+            );
+        } else if state.target_statuses.iter().all(|s| {
+            s.state == TargetState::Disabled || s.state == TargetState::Pass
+        }) && !access_uncovered
+            && !access_unknown
+        {
+            state.protection = ProtectionState::Monitoring;
+            state.launch_error.clear();
         }
     }
 }

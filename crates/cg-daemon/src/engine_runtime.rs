@@ -1,7 +1,7 @@
 //! Real Wave-2 daemon engine actor wiring `cg-core::GuardEngine`, `cg-platform::PlatformDriver`,
 //! `JournalStore`, `ConfigStore`, `TimelineAggregator`, and background monitor/telemetry loops.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
@@ -33,6 +33,7 @@ use crate::coordinator::{
     TelemetryBundle,
 };
 use crate::disarm;
+use crate::feishu::FeishuNotifier;
 use crate::journal::{
     self, BaselineState, FirewallDirection, HealReport, HealStatus, JournalStore, LoadedJournal,
     PlannedStep, RecoveryExecutor, RecoveryJournal, TxKind, WalAction,
@@ -42,8 +43,8 @@ use crate::protocol::{
     AntigravityProxyStatus, ComponentUpdateStatus, Config, CutMode, DefenseCheckItem,
     DefenseSelfCheck, ErrorCode, GuardSnapshot, LeakReport, Lifecycle, LogLevel,
     OnboardingProbeResult, OperationReceipt, OperationStatus, PipeRequest, PipeResponse,
-    PolicyPreset, ProbeResult, ProtectionState, SelfCheckStatus, Target, UpdateCheckPhase,
-    UpdateSummary,
+    PolicyPreset, ProbeResult, ProtectionState, SelfCheckStatus, Target, ToastNotificationEvent,
+    UpdateCheckPhase, UpdateSummary,
 };
 
 pub const TIMELINE_FILE: &str = "timeline.json";
@@ -450,6 +451,9 @@ pub struct RealEngineActor {
     launch_waiters: Vec<(Option<String>, SyncSender<PipeResponse>)>,
     last_rejected: Option<(ErrorCode, String)>,
     stopping_ready: bool,
+    feishu: Arc<FeishuNotifier>,
+    recent_toasts: VecDeque<ToastNotificationEvent>,
+    toast_seq: u64,
 }
 
 impl RealEngineActor {
@@ -560,6 +564,7 @@ impl RealEngineActor {
             })
             .expect("failed to spawn probe worker thread");
 
+        let feishu = Arc::new(FeishuNotifier::load(&data_dir));
         let mut actor = Self {
             engine,
             driver,
@@ -579,6 +584,9 @@ impl RealEngineActor {
             launch_waiters: Vec::new(),
             last_rejected: None,
             stopping_ready: false,
+            feishu,
+            recent_toasts: VecDeque::new(),
+            toast_seq: 0,
         };
 
         actor.step_and_run(
@@ -608,7 +616,7 @@ impl RealEngineActor {
             },
             now,
         );
-        let initial_snapshot = actor.engine.to_snapshot(now, actor.cached_agents.clone());
+        let initial_snapshot = actor.build_snapshot(now);
 
         BootstrappedActor {
             actor,
@@ -618,8 +626,15 @@ impl RealEngineActor {
         }
     }
 
+    fn build_snapshot(&self, now: u64) -> GuardSnapshot {
+        let mut snap = self.engine.to_snapshot(now, self.cached_agents.clone());
+        snap.recent_toasts = self.recent_toasts.iter().cloned().collect();
+        snap.feishu = self.feishu.status();
+        snap
+    }
+
     fn publish_snapshot(&self, snapshot_store: &SnapshotStoreRef<'_>, now: u64) -> GuardSnapshot {
-        let snap = self.engine.to_snapshot(now, self.cached_agents.clone());
+        let snap = self.build_snapshot(now);
         snapshot_store.replace(snap.clone());
         snap
     }
@@ -781,10 +796,36 @@ impl RealEngineActor {
                             &body,
                             self.engine.config.notify.include_egress,
                         );
-                        let drv = self.driver.clone();
-                        std::thread::spawn(move || {
-                            let _ = drv.send_toast(&title, &safe_body);
+                        // Always enqueue into the Session-1 GUI toast relay ring so Session-0
+                        // Windows Service notifications reliably surface on the user's desktop.
+                        self.toast_seq = self.toast_seq.saturating_add(1);
+                        if self.recent_toasts.len() >= 16 {
+                            self.recent_toasts.pop_front();
+                        }
+                        self.recent_toasts.push_back(ToastNotificationEvent {
+                            seq: self.toast_seq,
+                            timestamp: now,
+                            class: class.clone(),
+                            title: title.clone(),
+                            body: safe_body.clone(),
                         });
+
+                        if !access_win::is_session_zero() {
+                            let drv = self.driver.clone();
+                            let t_title = title.clone();
+                            let t_body = safe_body.clone();
+                            std::thread::spawn(move || {
+                                let _ = drv.send_toast(&t_title, &t_body);
+                            });
+                        }
+
+                        if self.feishu.enqueue(&class, &title, &safe_body) {
+                            let feishu = self.feishu.clone();
+                            let policy = NetworkPolicy::direct();
+                            std::thread::spawn(move || {
+                                let _ = feishu.flush_due(&policy);
+                            });
+                        }
                     }
                 }
                 EffectCommand::AuditLog { .. } => {}
@@ -1496,7 +1537,95 @@ impl RealEngineActor {
                     snapshot: Box::new(snap),
                 });
             }
-            PipeRequest::RecheckNow { target_id: _ } => {
+            PipeRequest::RecheckNow { target_id } => {
+                if let Some(raw_tid) = target_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if matches!(
+                        self.engine.lifecycle,
+                        Lifecycle::Stopping | Lifecycle::Maintenance
+                    ) {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IllegalState,
+                            message: "当前生命周期不允许发起单目标复检".into(),
+                            receipt: None,
+                        });
+                        return;
+                    }
+                    if self.engine.protection == ProtectionState::Recovering {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::Busy,
+                            message: "恢复事务正在执行，请稍后再试".into(),
+                            receipt: None,
+                        });
+                        return;
+                    }
+                    let Some(target) = self
+                        .engine
+                        .config
+                        .targets
+                        .iter()
+                        .find(|t| t.id == raw_tid)
+                        .cloned()
+                    else {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::NotFound,
+                            message: format!("未找到监控目标：{raw_tid}"),
+                            receipt: None,
+                        });
+                        return;
+                    };
+                    if !target.enabled {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::ValidationFailed,
+                            message: format!("目标「{}」当前已禁用，请先启用后再复检", target.name),
+                            receipt: None,
+                        });
+                        return;
+                    }
+
+                    let cfg = self.engine.config.clone();
+                    let cfg_rev = self.engine.cfg_rev;
+                    let runtime_epoch = self.engine.runtime_epoch;
+                    let enforce_access = self.engine.network_isolation_supported
+                        && self.engine.config.enforce_access_path;
+                    let skip_network = self.engine.lifecycle == Lifecycle::Unconfigured;
+                    let driver = self.driver.clone();
+                    let runner = self.probe_runner.clone();
+                    let event_tx = self.event_tx.clone();
+                    let tid = target.id.clone();
+
+                    std::thread::spawn(move || {
+                        let ts = now_unix_secs();
+                        let (access, probes) = runner.inspect_and_probe(
+                            &*driver,
+                            &cfg,
+                            cfg_rev,
+                            &[target],
+                            enforce_access,
+                            skip_network,
+                            ts,
+                        );
+                        let probe = probes
+                            .into_iter()
+                            .find(|(id, _)| id == &tid)
+                            .map(|(_, p)| p)
+                            .unwrap_or_else(|| ProbeResult::failed("未收到目标探测结果"));
+                        let _ = event_tx.send(CoordinatorEvent::SingleTargetProbed {
+                            cfg_rev,
+                            runtime_epoch,
+                            target_id: tid,
+                            access,
+                            probe,
+                            now_secs: now_unix_secs(),
+                            reply,
+                        });
+                    });
+                    return;
+                }
+
                 self.step_and_run(
                     EngineEvent::StartRound {
                         purpose: CheckPurpose::Manual,
@@ -1929,6 +2058,58 @@ impl RealEngineActor {
                     snapshot: Some(Box::new(snap)),
                 });
             }
+            PipeRequest::SaveFeishuConfig {
+                enabled,
+                webhook,
+                secret,
+                clear_secret,
+            } => match self
+                .feishu
+                .save_config(enabled, webhook, secret, clear_secret)
+            {
+                Ok(st) => {
+                    let detail = if st.enabled {
+                        format!("飞书推送已启用（{}）", st.webhook_masked)
+                    } else {
+                        "飞书推送已保存为关闭状态".into()
+                    };
+                    let mut receipt =
+                        OperationReceipt::new(format!("feishu-save-{now}"), OperationStatus::Verified);
+                    receipt.verified_scope = "feishu.config".into();
+                    receipt.push_item("feishu_config", OperationStatus::Verified, detail.clone());
+                    self.engine.push_log(now, LogLevel::Audit, "notify", &detail);
+                    self.engine.last_receipt = Some(receipt.clone());
+                    let snap = self.publish_snapshot(snapshot_store, now);
+                    let _ = reply.send(PipeResponse::Ack {
+                        receipt: Some(receipt),
+                        snapshot: Some(Box::new(snap)),
+                    });
+                }
+                Err(msg) => {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::ValidationFailed,
+                        message: msg,
+                        receipt: None,
+                    });
+                }
+            },
+            PipeRequest::TestFeishu { webhook, secret } => {
+                let feishu = self.feishu.clone();
+                let event_tx = self.event_tx.clone();
+                let policy = NetworkPolicy::direct();
+                std::thread::spawn(move || {
+                    let result = feishu.send_test(
+                        &policy,
+                        webhook.as_deref(),
+                        secret.as_deref(),
+                    );
+                    let _ = event_tx.send(CoordinatorEvent::FeishuTestFinished {
+                        result,
+                        now_secs: now_unix_secs(),
+                        reply,
+                    });
+                });
+            }
         }
     }
 
@@ -2057,8 +2238,102 @@ impl CoordinatorActor for RealEngineActor {
             CoordinatorEvent::Tick => {
                 let now = now_unix_secs();
                 self.step_and_run(EngineEvent::Tick, now);
+                if self.feishu.status().queued > 0 {
+                    let feishu = self.feishu.clone();
+                    let policy = NetworkPolicy::direct();
+                    std::thread::spawn(move || {
+                        let _ = feishu.flush_due(&policy);
+                    });
+                }
                 let _ = self.publish_snapshot(ctx.snapshot, now);
             }
+            CoordinatorEvent::SingleTargetProbed {
+                cfg_rev,
+                runtime_epoch,
+                target_id,
+                access,
+                probe,
+                now_secs,
+                reply,
+            } => {
+                self.step_and_run(
+                    EngineEvent::TargetRechecked {
+                        cfg_rev,
+                        runtime_epoch,
+                        target_id: target_id.clone(),
+                        access,
+                        probe,
+                    },
+                    now_secs,
+                );
+                let mut receipt = OperationReceipt::new(
+                    format!("recheck-{target_id}-{now_secs}"),
+                    OperationStatus::Verified,
+                );
+                receipt.verified_scope = format!("target:{target_id}");
+                if let Some(st) = self
+                    .engine
+                    .target_statuses
+                    .iter()
+                    .find(|t| t.id == target_id)
+                {
+                    receipt.push_item(
+                        &st.name,
+                        OperationStatus::Verified,
+                        format!("{:?} ({}ms)", st.state, st.latency_ms),
+                    );
+                }
+                self.engine.last_receipt = Some(receipt.clone());
+                let snap = self.publish_snapshot(ctx.snapshot, now_secs);
+                let _ = reply.send(PipeResponse::Ack {
+                    receipt: Some(receipt),
+                    snapshot: Some(Box::new(snap)),
+                });
+            }
+            CoordinatorEvent::FeishuTestFinished {
+                result,
+                now_secs,
+                reply,
+            } => match result {
+                Ok(_) => {
+                    let mut receipt = OperationReceipt::new(
+                        format!("feishu-test-{now_secs}"),
+                        OperationStatus::Verified,
+                    );
+                    receipt.verified_scope = "feishu.test".into();
+                    receipt.push_item(
+                        "feishu_test",
+                        OperationStatus::Verified,
+                        "脱敏测试卡片已成功送达飞书群机器人",
+                    );
+                    self.engine.push_log(
+                        now_secs,
+                        LogLevel::Audit,
+                        "notify",
+                        "飞书机器人脱敏连通性测试发送成功",
+                    );
+                    self.engine.last_receipt = Some(receipt.clone());
+                    let snap = self.publish_snapshot(ctx.snapshot, now_secs);
+                    let _ = reply.send(PipeResponse::Ack {
+                        receipt: Some(receipt),
+                        snapshot: Some(Box::new(snap)),
+                    });
+                }
+                Err(msg) => {
+                    self.engine.push_log(
+                        now_secs,
+                        LogLevel::Warn,
+                        "notify",
+                        &format!("飞书测试发送失败：{msg}"),
+                    );
+                    let _ = self.publish_snapshot(ctx.snapshot, now_secs);
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IoFailed,
+                        message: msg,
+                        receipt: None,
+                    });
+                }
+            },
             CoordinatorEvent::RoundFinished {
                 cfg_rev,
                 runtime_epoch,
