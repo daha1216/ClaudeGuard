@@ -130,15 +130,20 @@ impl PlatformDriver for WindowsPlatformDriver {
         prev: &cg_protocol::UpdateSummary,
         now_secs: u64,
     ) -> cg_protocol::UpdateSummary {
-        let claude_msix = process_win::installed_msix_version("Claude_");
-        let codex_msix = process_win::installed_msix_version("OpenAI.Codex_")
-            .or_else(|| process_win::installed_msix_version("OpenAI.ChatGPT_"));
-        update_check::check_all_updates(
+        let (ag_ide_ver, ag_manifest_base) = process_win::installed_antigravity_ide_info();
+        let local = update_check::LocalClientVersions {
+            claude_desktop: process_win::installed_claude_desktop_version(),
+            claude_code: process_win::installed_claude_code_version(),
+            codex_desktop: process_win::installed_codex_desktop_version(),
+            codex_cli: process_win::installed_codex_cli_version(),
+            antigravity_ide: ag_ide_ver,
+            antigravity_manifest_base: ag_manifest_base,
+        };
+        update_check::check_all_updates_full(
             route,
             cg_version,
             ag_proxy,
-            claude_msix,
-            codex_msix,
+            &local,
             component,
             prev,
             now_secs,

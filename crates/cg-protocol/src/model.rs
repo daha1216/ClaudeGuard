@@ -775,7 +775,52 @@ fn default_antigravity_proxy_update_status() -> ComponentUpdateStatus {
     }
 }
 
-/// Aggregated software update and local MSIX package version summary.
+fn default_claude_desktop_update_status() -> ComponentUpdateStatus {
+    ComponentUpdateStatus {
+        id: "claude_desktop".into(),
+        name: "Claude 桌面端".into(),
+        repo: "Anthropic MSIX 官方渠道".into(),
+        ..ComponentUpdateStatus::default()
+    }
+}
+
+fn default_claude_code_update_status() -> ComponentUpdateStatus {
+    ComponentUpdateStatus {
+        id: "claude_code".into(),
+        name: "Claude Code CLI".into(),
+        repo: "@anthropic-ai/claude-code".into(),
+        ..ComponentUpdateStatus::default()
+    }
+}
+
+fn default_codex_desktop_update_status() -> ComponentUpdateStatus {
+    ComponentUpdateStatus {
+        id: "codex_desktop".into(),
+        name: "ChatGPT / Codex 桌面端".into(),
+        repo: "OpenAI MSIX 官方渠道".into(),
+        ..ComponentUpdateStatus::default()
+    }
+}
+
+fn default_codex_cli_update_status() -> ComponentUpdateStatus {
+    ComponentUpdateStatus {
+        id: "codex_cli".into(),
+        name: "Codex CLI".into(),
+        repo: "@openai/codex".into(),
+        ..ComponentUpdateStatus::default()
+    }
+}
+
+fn default_antigravity_ide_update_status() -> ComponentUpdateStatus {
+    ComponentUpdateStatus {
+        id: "antigravity_ide".into(),
+        name: "Antigravity 客户端".into(),
+        repo: "Google 官方更新源".into(),
+        ..ComponentUpdateStatus::default()
+    }
+}
+
+/// Aggregated software update and local MSIX / CLI / IDE package version summary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSummary {
@@ -783,6 +828,16 @@ pub struct UpdateSummary {
     pub claudeguard: ComponentUpdateStatus,
     #[serde(default = "default_antigravity_proxy_update_status")]
     pub antigravity_proxy: ComponentUpdateStatus,
+    #[serde(default = "default_claude_desktop_update_status")]
+    pub claude_desktop: ComponentUpdateStatus,
+    #[serde(default = "default_claude_code_update_status")]
+    pub claude_code: ComponentUpdateStatus,
+    #[serde(default = "default_codex_desktop_update_status")]
+    pub codex_desktop: ComponentUpdateStatus,
+    #[serde(default = "default_codex_cli_update_status")]
+    pub codex_cli: ComponentUpdateStatus,
+    #[serde(default = "default_antigravity_ide_update_status")]
+    pub antigravity_ide: ComponentUpdateStatus,
     #[serde(default)]
     pub claude_msix_version: Option<String>,
     #[serde(default)]
@@ -794,6 +849,11 @@ impl Default for UpdateSummary {
         Self {
             claudeguard: default_claudeguard_update_status(),
             antigravity_proxy: default_antigravity_proxy_update_status(),
+            claude_desktop: default_claude_desktop_update_status(),
+            claude_code: default_claude_code_update_status(),
+            codex_desktop: default_codex_desktop_update_status(),
+            codex_cli: default_codex_cli_update_status(),
+            antigravity_ide: default_antigravity_ide_update_status(),
             claude_msix_version: None,
             codex_msix_version: None,
         }

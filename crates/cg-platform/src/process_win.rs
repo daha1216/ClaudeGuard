@@ -1569,6 +1569,261 @@ pub fn resolve_app_id(prefix: &str, app_name: &str, fallback: &str) -> String {
     fallback.to_string()
 }
 
+/// Read `VS_FIXEDFILEINFO` file version (e.g. `2.33.0`) directly from a Windows PE executable without spawning subprocesses.
+#[cfg(windows)]
+pub fn read_pe_file_version(path: &Path) -> Option<String> {
+    use core::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{PCWSTR, w};
+    use windows::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FIXEDFILEINFO, VerQueryValueW,
+    };
+
+    if !path.is_file() {
+        return None;
+    }
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut handle: u32 = 0;
+    let size = unsafe { GetFileVersionInfoSizeW(PCWSTR(wide.as_ptr()), Some(&mut handle)) };
+    if size == 0 || size > 4 * 1024 * 1024 {
+        return None;
+    }
+    let mut buf = vec![0u8; size as usize];
+    unsafe {
+        if GetFileVersionInfoW(PCWSTR(wide.as_ptr()), 0, size, buf.as_mut_ptr().cast::<c_void>())
+            .is_err()
+        {
+            return None;
+        }
+        let mut ptr: *mut c_void = core::ptr::null_mut();
+        let mut len: u32 = 0;
+        if !VerQueryValueW(buf.as_ptr().cast::<c_void>(), w!("\\"), &mut ptr, &mut len).as_bool()
+            || ptr.is_null()
+            || (len as usize) < core::mem::size_of::<VS_FIXEDFILEINFO>()
+        {
+            return None;
+        }
+        let info = &*(ptr.cast::<VS_FIXEDFILEINFO>());
+        if info.dwSignature != 0xFEEF_04BD {
+            return None;
+        }
+        let major = (info.dwFileVersionMS >> 16) & 0xFFFF;
+        let minor = info.dwFileVersionMS & 0xFFFF;
+        let build = (info.dwFileVersionLS >> 16) & 0xFFFF;
+        let rev = info.dwFileVersionLS & 0xFFFF;
+        if major == 0 && minor == 0 && build == 0 && rev == 0 {
+            return None;
+        }
+        if rev == 0 {
+            Some(format!("{major}.{minor}.{build}"))
+        } else {
+            Some(format!("{major}.{minor}.{build}.{rev}"))
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn read_pe_file_version(_path: &Path) -> Option<String> {
+    None
+}
+
+fn pick_newer_version(best: &mut Option<String>, candidate: &str) {
+    let clean = candidate.trim().trim_start_matches(['v', 'V']).trim();
+    if clean.is_empty() || version_key(clean).is_empty() {
+        return;
+    }
+    match best {
+        None => *best = Some(clean.to_string()),
+        Some(prev) => {
+            if version_key(clean) > version_key(prev) {
+                *best = Some(clean.to_string());
+            }
+        }
+    }
+}
+
+fn read_package_json_version(pkg_json: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(pkg_json).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    val.get("version")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().trim_start_matches(['v', 'V']).to_string())
+        .filter(|s| !s.is_empty() && !version_key(s).is_empty())
+}
+
+fn scan_versioned_claude_code_dir(root: &Path, best: &mut Option<String>) {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if version_key(&name).is_empty() {
+            continue;
+        }
+        let has_bin = p.join("claude.exe").is_file()
+            || std::fs::read_dir(&p)
+                .ok()
+                .is_some_and(|mut sub| {
+                    sub.any(|e| {
+                        e.ok()
+                            .is_some_and(|se| se.path().join("claude.exe").is_file())
+                    })
+                });
+        if has_bin {
+            pick_newer_version(best, &name);
+        }
+    }
+}
+
+/// Detect installed Claude Desktop version (MSIX registry/folder or non-MSIX PE FileVersion).
+pub fn installed_claude_desktop_version() -> Option<String> {
+    if let Some(msix) = installed_msix_version("Claude_") {
+        return Some(msix);
+    }
+    let mut best = None;
+    for dir in per_user_local_app_subdirs(&["AnthropicClaude", r"Programs\Claude"]) {
+        for exe in [dir.join("Claude.exe"), dir.join("app").join("Claude.exe")] {
+            if let Some(v) = read_pe_file_version(&exe) {
+                pick_newer_version(&mut best, &v);
+            }
+        }
+    }
+    best
+}
+
+/// Detect installed ChatGPT / Codex Desktop MSIX version.
+pub fn installed_codex_desktop_version() -> Option<String> {
+    installed_msix_version("OpenAI.Codex_").or_else(|| installed_msix_version("OpenAI.ChatGPT_"))
+}
+
+/// Testable detector reading newest installed `@anthropic-ai/claude-code` / native `claude-code` version.
+pub fn installed_claude_code_version_in_homes(homes: &[PathBuf]) -> Option<String> {
+    let mut best = None;
+    for home in homes {
+        let roaming_cc = home
+            .join("AppData")
+            .join("Roaming")
+            .join("Claude")
+            .join("claude-code");
+        scan_versioned_claude_code_dir(&roaming_cc, &mut best);
+
+        let pkg_json = home
+            .join("AppData")
+            .join("Roaming")
+            .join("npm")
+            .join("node_modules")
+            .join("@anthropic-ai")
+            .join("claude-code")
+            .join("package.json");
+        if let Some(v) = read_package_json_version(&pkg_json) {
+            pick_newer_version(&mut best, &v);
+        }
+
+        let local_exe = home.join(".local").join("bin").join("claude.exe");
+        if let Some(v) = read_pe_file_version(&local_exe) {
+            pick_newer_version(&mut best, &v);
+        }
+    }
+    best
+}
+
+/// Detect installed Claude Code CLI version across user homes.
+pub fn installed_claude_code_version() -> Option<String> {
+    installed_claude_code_version_in_homes(&user_home_dirs())
+}
+
+/// Testable detector reading newest installed `@openai/codex` / native `codex` CLI version.
+pub fn installed_codex_cli_version_in_homes(homes: &[PathBuf]) -> Option<String> {
+    let mut best = None;
+    for home in homes {
+        let pkg_json = home
+            .join("AppData")
+            .join("Roaming")
+            .join("npm")
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("package.json");
+        if let Some(v) = read_package_json_version(&pkg_json) {
+            pick_newer_version(&mut best, &v);
+        }
+        for bin_exe in [
+            home.join(".local").join("bin").join("codex.exe"),
+            home.join(".cargo").join("bin").join("codex.exe"),
+        ] {
+            if let Some(v) = read_pe_file_version(&bin_exe) {
+                pick_newer_version(&mut best, &v);
+            }
+        }
+    }
+    best
+}
+
+/// Detect installed Codex CLI version across user homes.
+pub fn installed_codex_cli_version() -> Option<String> {
+    installed_codex_cli_version_in_homes(&user_home_dirs())
+}
+
+fn parse_app_update_url(yml_text: &str) -> Option<String> {
+    for line in yml_text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("url:") {
+            let clean = rest.trim().trim_matches(['"', '\'']).trim();
+            if clean.starts_with("https://") || clean.starts_with("http://") {
+                return Some(clean.trim_end_matches('/').to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Testable detector returning `(ide_version, updater_base_url)` from Antigravity install roots.
+pub fn installed_antigravity_ide_info_in_dirs(dirs: &[PathBuf]) -> (Option<String>, Option<String>) {
+    let mut best_ver = None;
+    let mut updater_url = None;
+
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        for exe_name in ["Antigravity.exe", "Antigravity IDE.exe"] {
+            let exe = dir.join(exe_name);
+            if let Some(v) = read_pe_file_version(&exe) {
+                pick_newer_version(&mut best_ver, &v);
+            }
+        }
+        if best_ver.is_none() {
+            if let Some(v) =
+                read_package_json_version(&dir.join("resources").join("app").join("package.json"))
+            {
+                pick_newer_version(&mut best_ver, &v);
+            }
+        }
+        if best_ver.is_none() {
+            if let Ok(raw) = std::fs::read_to_string(dir.join("version")) {
+                pick_newer_version(&mut best_ver, &raw);
+            }
+        }
+        if updater_url.is_none() {
+            if let Ok(yml) =
+                std::fs::read_to_string(dir.join("resources").join("app-update.yml"))
+            {
+                updater_url = parse_app_update_url(&yml);
+            }
+        }
+    }
+    (best_ver, updater_url)
+}
+
+/// Detect installed Antigravity client version (`Antigravity.exe` FileVersion / package.json) and its `app-update.yml` URL.
+pub fn installed_antigravity_ide_info() -> (Option<String>, Option<String>) {
+    installed_antigravity_ide_info_in_dirs(&antigravity_covered_dirs())
+}
+
 // ---------- Cached ProcessScanner (zero scan on UI reads) ----------
 
 /// Immutable process table snapshot served lock-free / RwLock-fast to UI and leak watch.
@@ -3682,5 +3937,76 @@ mod tests {
                 .map(|i| codex_after_exit[i].pid)
                 .collect();
         assert_eq!(after_exit_pids, vec![202, 201]);
+    }
+
+    #[test]
+    fn client_local_version_detectors_read_cli_packages_and_antigravity_manifest() {
+        let root = unique_temp_dir("client-ver");
+        let home = root.join("UserA");
+
+        // Claude Code versioned directory + npm package (versioned dir is newer: 2.1.308 > 2.1.284)
+        let cc_dir = home
+            .join("AppData")
+            .join("Roaming")
+            .join("Claude")
+            .join("claude-code")
+            .join("2.1.308");
+        std::fs::create_dir_all(&cc_dir).unwrap();
+        std::fs::write(cc_dir.join("claude.exe"), b"stub").unwrap();
+        let npm_cc = home
+            .join("AppData")
+            .join("Roaming")
+            .join("npm")
+            .join("node_modules")
+            .join("@anthropic-ai")
+            .join("claude-code");
+        std::fs::create_dir_all(&npm_cc).unwrap();
+        std::fs::write(npm_cc.join("package.json"), r#"{"name":"@anthropic-ai/claude-code","version":"2.1.284"}"#).unwrap();
+        assert_eq!(
+            installed_claude_code_version_in_homes(std::slice::from_ref(&home)).as_deref(),
+            Some("2.1.308")
+        );
+
+        // Codex CLI npm package
+        let npm_codex = home
+            .join("AppData")
+            .join("Roaming")
+            .join("npm")
+            .join("node_modules")
+            .join("@openai")
+            .join("codex");
+        std::fs::create_dir_all(&npm_codex).unwrap();
+        std::fs::write(npm_codex.join("package.json"), r#"{"name":"@openai/codex","version":"0.158.0"}"#).unwrap();
+        assert_eq!(
+            installed_codex_cli_version_in_homes(std::slice::from_ref(&home)).as_deref(),
+            Some("0.158.0")
+        );
+
+        // Antigravity app-update.yml + package.json fallback
+        let ag_dir = root.join("antigravity");
+        std::fs::create_dir_all(ag_dir.join("resources").join("app")).unwrap();
+        std::fs::write(
+            ag_dir.join("resources").join("app").join("package.json"),
+            r#"{"name":"antigravity","version":"2.33.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ag_dir.join("resources").join("app-update.yml"),
+            "provider: generic\nurl: https://example.invalid/manifest/\n",
+        )
+        .unwrap();
+        let (ag_ver, ag_url) = installed_antigravity_ide_info_in_dirs(&[ag_dir]);
+        assert_eq!(ag_ver.as_deref(), Some("2.33.0"));
+        assert_eq!(ag_url.as_deref(), Some("https://example.invalid/manifest"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Real Windows system PE version check on kernel32.dll
+        #[cfg(windows)]
+        {
+            let k32 = Path::new(r"C:\Windows\System32\kernel32.dll");
+            if k32.is_file() {
+                assert!(read_pe_file_version(k32).is_some());
+            }
+        }
     }
 }

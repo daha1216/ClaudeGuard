@@ -16,8 +16,39 @@ use crate::traits::{PlatformError, PlatformResult};
 pub const CLAUDEGUARD_REPO: &str = "daha1216/ClaudeGuard";
 /// Upstream `antigravity-proxy` injector repository.
 pub const ANTIGRAVITY_PROXY_REPO: &str = "yuaotian/antigravity-proxy";
-/// Default HTTP timeout for GitHub Release API checks.
+/// Exact user-facing description for `antigravity-proxy`.
+pub const ANTIGRAVITY_PROXY_DESC: &str =
+    "专为 Antigravity 打造的免 TUN 强制代理工具，支持 DLL 注入与进程流量劫持。";
+/// Official npm package for Claude Code CLI.
+pub const CLAUDE_CODE_NPM_PKG: &str = "@anthropic-ai/claude-code";
+/// Official npm package for Codex CLI.
+pub const CODEX_CLI_NPM_PKG: &str = "@openai/codex";
+/// Official GitHub fallback repo for Codex CLI.
+pub const CODEX_CLI_REPO: &str = "openai/codex";
+/// Official Antigravity Desktop generic updater manifest base URL.
+pub const ANTIGRAVITY_DEFAULT_MANIFEST_BASE: &str =
+    "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest";
+/// Default HTTP timeout for update API checks.
 pub const DEFAULT_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Local detected client versions passed from `cg-platform::process_win` into update comparison.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LocalClientVersions {
+    pub claude_desktop: Option<String>,
+    pub claude_code: Option<String>,
+    pub codex_desktop: Option<String>,
+    pub codex_cli: Option<String>,
+    pub antigravity_ide: Option<String>,
+    pub antigravity_manifest_base: Option<String>,
+}
+
+/// Remote version discovery result for desktop MSIX, npm CLI, and Antigravity clients.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteClientVersion {
+    pub version: String,
+    pub release_url: Option<String>,
+    pub asset_url: Option<String>,
+}
 
 /// Parsed GitHub latest release metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,9 +61,25 @@ pub struct GithubReleaseInfo {
     pub published_at: Option<String>,
 }
 
-/// Trim whitespace and leading `'v'` / `'V'` prefix from a version string.
+/// Windows architecture string (`x64` or `arm64`) used by Claude / Codex / Antigravity feeds.
+pub fn current_windows_arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x64"
+    }
+}
+
+/// Strip prefixes like `rust-v`, `v`, `V` cleanly before SemVer comparison.
 pub fn normalize_version(raw: &str) -> String {
-    raw.trim().trim_start_matches(['v', 'V']).trim().to_string()
+    let mut s = raw.trim();
+    for prefix in ["rust-v", "rust-V", "v", "V"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest;
+            break;
+        }
+    }
+    s.trim().to_string()
 }
 
 fn parse_semver_parts(raw: &str) -> Option<(Vec<u64>, Option<String>)> {
@@ -229,6 +276,44 @@ pub fn parse_github_latest_release(
     })
 }
 
+fn build_update_agent(
+    route: &ProbeRoute,
+    timeout: Duration,
+    redirects: u32,
+) -> PlatformResult<ureq::Agent> {
+    match route {
+        ProbeRoute::Skip(reason) => Err(PlatformError::Network(reason.clone())),
+        ProbeRoute::Proxy(proxy_url) => {
+            let proxy = ureq::Proxy::new(proxy_url).map_err(|e| {
+                PlatformError::Network(proxy_required_error(&format!("代理地址无效：{e}")))
+            })?;
+            Ok(ureq::AgentBuilder::new()
+                .timeout_connect(timeout)
+                .timeout(timeout)
+                .redirects(redirects)
+                .try_proxy_from_env(false)
+                .user_agent(PROBE_USER_AGENT)
+                .proxy(proxy)
+                .build())
+        }
+        ProbeRoute::Direct => Ok(ureq::AgentBuilder::new()
+            .timeout_connect(timeout)
+            .timeout(timeout)
+            .redirects(redirects)
+            .try_proxy_from_env(false)
+            .user_agent(PROBE_USER_AGENT)
+            .build()),
+    }
+}
+
+fn map_transport_err(route: &ProbeRoute, err: ureq::Error) -> PlatformError {
+    let detail = err.to_string();
+    PlatformError::Network(match route {
+        ProbeRoute::Proxy(_) => proxy_required_error(&detail),
+        _ => detail,
+    })
+}
+
 /// Fetch and parse a GitHub Release JSON endpoint honoring `ProbeRoute`.
 ///
 /// - Immediately refuses `ProbeRoute::Skip` without opening any socket.
@@ -240,29 +325,7 @@ pub fn fetch_github_latest_from_url(
     preferred_exts: &[&str],
     timeout: Duration,
 ) -> PlatformResult<GithubReleaseInfo> {
-    let agent = match route {
-        ProbeRoute::Skip(reason) => return Err(PlatformError::Network(reason.clone())),
-        ProbeRoute::Proxy(proxy_url) => {
-            let proxy = ureq::Proxy::new(proxy_url).map_err(|e| {
-                PlatformError::Network(proxy_required_error(&format!("代理地址无效：{e}")))
-            })?;
-            ureq::AgentBuilder::new()
-                .timeout_connect(timeout)
-                .timeout(timeout)
-                .redirects(MAX_PROBE_REDIRECTS)
-                .try_proxy_from_env(false)
-                .user_agent(PROBE_USER_AGENT)
-                .proxy(proxy)
-                .build()
-        }
-        ProbeRoute::Direct => ureq::AgentBuilder::new()
-            .timeout_connect(timeout)
-            .timeout(timeout)
-            .redirects(MAX_PROBE_REDIRECTS)
-            .try_proxy_from_env(false)
-            .user_agent(PROBE_USER_AGENT)
-            .build(),
-    };
+    let agent = build_update_agent(route, timeout, MAX_PROBE_REDIRECTS)?;
 
     let call = agent
         .get(api_url)
@@ -319,13 +382,7 @@ pub fn fetch_github_latest_from_url(
                 "GitHub API 请求失败（HTTP {status}）"
             )))
         }
-        Err(err) => {
-            let detail = err.to_string();
-            Err(PlatformError::Network(match route {
-                ProbeRoute::Proxy(_) => proxy_required_error(&detail),
-                _ => detail,
-            }))
-        }
+        Err(err) => Err(map_transport_err(route, err)),
     }
 }
 
@@ -341,27 +398,388 @@ pub fn fetch_github_latest_release(
     fetch_github_latest_from_url(route, &api_url, preferred_exts, timeout)
 }
 
-fn ensure_component_defaults(summary: &mut UpdateSummary, cg_version: &str) {
-    if summary.claudeguard.id.is_empty() {
-        summary.claudeguard.id = "claudeguard".to_string();
+/// Parse official Claude Desktop MSIX redirect `Location` URL into semantic version.
+pub fn parse_claude_desktop_redirect(location: &str, arch: &str) -> PlatformResult<String> {
+    if !matches!(arch, "x64" | "arm64") {
+        return Err(PlatformError::InvalidInput("不支持的 Windows 架构".into()));
     }
-    if summary.claudeguard.name.is_empty() {
-        summary.claudeguard.name = "ClaudeGuard 主程序".to_string();
+    let prefix = format!("https://downloads.claude.ai/releases/win32/{arch}/");
+    let tail = location
+        .trim()
+        .strip_prefix(&prefix)
+        .ok_or_else(|| PlatformError::Network("Claude Desktop 更新重定向地址非官方来源".into()))?;
+    let (ver, file) = tail
+        .split_once('/')
+        .ok_or_else(|| PlatformError::Network("Claude Desktop 更新地址格式无效".into()))?;
+    if parse_semver_parts(ver).is_none() {
+        return Err(PlatformError::Network("Claude Desktop 返回版本号无效".into()));
     }
-    if summary.claudeguard.repo.is_empty() {
-        summary.claudeguard.repo = CLAUDEGUARD_REPO.to_string();
+    let hash = file
+        .strip_prefix("Claude-")
+        .and_then(|f| f.strip_suffix(".msix"))
+        .ok_or_else(|| PlatformError::Network("Claude Desktop 更新文件名格式无效".into()))?;
+    if hash.len() != 40 || !hash.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(PlatformError::Network("Claude Desktop MSIX 校验摘要路径无效".into()));
     }
+    Ok(normalize_version(ver))
+}
+
+/// Check latest Claude Desktop MSIX version via `claude.ai/api/desktop/win32/{arch}/msix/latest/redirect`.
+pub fn fetch_claude_desktop_latest(
+    route: &ProbeRoute,
+    arch: &str,
+    timeout: Duration,
+) -> PlatformResult<RemoteClientVersion> {
+    if !matches!(arch, "x64" | "arm64") {
+        return Err(PlatformError::InvalidInput("不支持的 Windows 架构".into()));
+    }
+    let agent = build_update_agent(route, timeout, 0)?;
+    let url = format!("https://claude.ai/api/desktop/win32/{arch}/msix/latest/redirect");
+    let resp = match agent.get(&url).timeout(timeout).call() {
+        Ok(r) | Err(ureq::Error::Status(_, r)) => r,
+        Err(err) => return Err(map_transport_err(route, err)),
+    };
+    if !matches!(resp.status(), 301 | 302 | 303 | 307 | 308) {
+        return Err(PlatformError::Network(format!(
+            "Claude 官方更新接口未返回重定向（HTTP {}）",
+            resp.status()
+        )));
+    }
+    let location = resp
+        .header("Location")
+        .ok_or_else(|| PlatformError::Network("Claude 官方更新接口缺少 Location".into()))?
+        .to_string();
+    let version = parse_claude_desktop_redirect(&location, arch)?;
+    Ok(RemoteClientVersion {
+        version,
+        release_url: Some("https://claude.ai/download".into()),
+        asset_url: Some(location),
+    })
+}
+
+/// Check latest ChatGPT / Codex Desktop MSIX version via `persistent.oaistatic.com` HEAD metadata.
+pub fn fetch_codex_desktop_latest_from_url(
+    route: &ProbeRoute,
+    url: &str,
+    arch: &str,
+    timeout: Duration,
+) -> PlatformResult<RemoteClientVersion> {
+    if !matches!(arch, "x64" | "arm64") {
+        return Err(PlatformError::InvalidInput("不支持的 Windows 架构".into()));
+    }
+    let agent = build_update_agent(route, timeout, 0)?;
+    let resp = match agent.head(url).timeout(timeout).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, _)) => {
+            return Err(PlatformError::Network(format!(
+                "OpenAI 桌面更新接口返回 HTTP {code}"
+            )));
+        }
+        Err(err) => return Err(map_transport_err(route, err)),
+    };
+    if resp.header("x-ms-meta-package_identity") != Some("OpenAI.Codex")
+        || resp.header("x-ms-meta-architecture") != Some(arch)
+    {
+        return Err(PlatformError::Network(
+            "OpenAI 桌面安装包元数据不匹配".into(),
+        ));
+    }
+    let ver = resp
+        .header("x-ms-meta-package_version")
+        .map(normalize_version)
+        .filter(|s| !s.is_empty() && parse_semver_parts(s).is_some())
+        .ok_or_else(|| PlatformError::Network("OpenAI 桌面更新接口缺少有效版本号".into()))?;
+    Ok(RemoteClientVersion {
+        version: ver,
+        release_url: Some("https://chatgpt.com/download".into()),
+        asset_url: Some(url.to_string()),
+    })
+}
+
+pub fn fetch_codex_desktop_latest(
+    route: &ProbeRoute,
+    arch: &str,
+    timeout: Duration,
+) -> PlatformResult<RemoteClientVersion> {
+    let url = format!("https://persistent.oaistatic.com/codex-app-prod/ChatGPT-{arch}.msix");
+    fetch_codex_desktop_latest_from_url(route, &url, arch, timeout)
+}
+
+/// Parse `https://registry.npmjs.org/<pkg>/latest` JSON payload for `"version"`.
+pub fn parse_npm_latest_version(json_body: &str, pkg_name: &str) -> PlatformResult<RemoteClientVersion> {
+    let val: serde_json::Value = serde_json::from_str(json_body)
+        .map_err(|e| PlatformError::Network(format!("npm 清单解析失败：{e}")))?;
+    let ver = val
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(normalize_version)
+        .filter(|s| !s.is_empty() && parse_semver_parts(s).is_some())
+        .ok_or_else(|| PlatformError::Network(format!("{pkg_name} 响应缺少有效版本号")))?;
+    let tarball = val
+        .pointer("/dist/tarball")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    Ok(RemoteClientVersion {
+        version: ver,
+        release_url: Some(format!("https://www.npmjs.com/package/{pkg_name}")),
+        asset_url: tarball,
+    })
+}
+
+/// Shared npm registry `/latest` checker honoring `ProbeRoute`.
+pub fn fetch_npm_latest_from_url(
+    route: &ProbeRoute,
+    url: &str,
+    pkg_name: &str,
+    timeout: Duration,
+) -> PlatformResult<RemoteClientVersion> {
+    let agent = build_update_agent(route, timeout, MAX_PROBE_REDIRECTS)?;
+    let resp = match agent.get(url).timeout(timeout).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, _)) => {
+            return Err(PlatformError::Network(format!(
+                "npm 官方仓库请求失败（HTTP {code}）"
+            )));
+        }
+        Err(err) => return Err(map_transport_err(route, err)),
+    };
+    let mut buf = Vec::new();
+    let _ = resp
+        .into_reader()
+        .take(MAX_PROBE_BODY_BYTES as u64)
+        .read_to_end(&mut buf);
+    let body = String::from_utf8_lossy(&buf);
+    parse_npm_latest_version(&body, pkg_name)
+}
+
+pub fn fetch_npm_latest(
+    route: &ProbeRoute,
+    pkg_name: &str,
+    timeout: Duration,
+) -> PlatformResult<RemoteClientVersion> {
+    let url = format!("https://registry.npmjs.org/{pkg_name}/latest");
+    fetch_npm_latest_from_url(route, &url, pkg_name, timeout)
+}
+
+/// Parse Antigravity electron-updater `latest-x64-win.yml` YAML body for `version:` and `path:`.
+pub fn parse_antigravity_yaml_latest(
+    yaml_body: &str,
+    manifest_base: &str,
+) -> PlatformResult<RemoteClientVersion> {
+    let mut ver: Option<String> = None;
+    let mut path_rel: Option<String> = None;
+    for line in yaml_body.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("version:") {
+            let v = normalize_version(rest.trim().trim_matches(['"', '\'']));
+            if !v.is_empty() && parse_semver_parts(&v).is_some() {
+                ver = Some(v);
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("path:") {
+            let p = rest.trim().trim_matches(['"', '\'']).to_string();
+            if !p.is_empty() {
+                path_rel = Some(p);
+            }
+        }
+    }
+    let version = ver.ok_or_else(|| {
+        PlatformError::Network("Antigravity 更新清单缺少有效 version 字段".into())
+    })?;
+    let asset_url = path_rel.map(|rel| {
+        if rel.starts_with("https://") || rel.starts_with("http://") {
+            rel
+        } else {
+            format!(
+                "{}/{}",
+                manifest_base.trim_end_matches('/'),
+                rel.trim_start_matches('/')
+            )
+        }
+    });
+    Ok(RemoteClientVersion {
+        version,
+        release_url: Some("https://antigravity.google".into()),
+        asset_url,
+    })
+}
+
+pub fn fetch_antigravity_ide_latest(
+    route: &ProbeRoute,
+    manifest_base_opt: Option<&str>,
+    arch: &str,
+    timeout: Duration,
+) -> PlatformResult<RemoteClientVersion> {
+    let base = manifest_base_opt
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(ANTIGRAVITY_DEFAULT_MANIFEST_BASE)
+        .trim_end_matches('/');
+    let arch_seg = if arch == "arm64" { "arm64" } else { "x64" };
+    let url = format!("{base}/latest-{arch_seg}-win.yml");
+    let agent = build_update_agent(route, timeout, MAX_PROBE_REDIRECTS)?;
+    let resp = match agent.get(&url).timeout(timeout).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, _)) => {
+            return Err(PlatformError::Network(format!(
+                "Antigravity 官方更新源请求失败（HTTP {code}）"
+            )));
+        }
+        Err(err) => return Err(map_transport_err(route, err)),
+    };
+    let mut buf = Vec::new();
+    let _ = resp
+        .into_reader()
+        .take(MAX_PROBE_BODY_BYTES as u64)
+        .read_to_end(&mut buf);
+    let body = String::from_utf8_lossy(&buf);
+    parse_antigravity_yaml_latest(&body, base)
+}
+
+fn ensure_slot(slot: &mut ComponentUpdateStatus, id: &str, name: &str, repo: &str) {
+    if slot.id.is_empty() {
+        slot.id = id.to_string();
+    }
+    if slot.name.is_empty() {
+        slot.name = name.to_string();
+    }
+    if slot.repo.is_empty() {
+        slot.repo = repo.to_string();
+    }
+}
+
+/// Synchronize locally detected versions onto `UpdateSummary` without touching network.
+pub fn hydrate_summary_locals(
+    summary: &mut UpdateSummary,
+    cg_version: &str,
+    ag_proxy: &AntigravityProxyStatus,
+    local: &LocalClientVersions,
+) {
+    ensure_slot(&mut summary.claudeguard, "claudeguard", "ClaudeGuard 主程序", CLAUDEGUARD_REPO);
     summary.claudeguard.installed_version = Some(normalize_version(cg_version));
 
-    if summary.antigravity_proxy.id.is_empty() {
-        summary.antigravity_proxy.id = "antigravity_proxy".to_string();
+    ensure_slot(
+        &mut summary.antigravity_proxy,
+        "antigravity_proxy",
+        "antigravity-proxy 注入器",
+        ANTIGRAVITY_PROXY_REPO,
+    );
+    summary.antigravity_proxy.installed_version = ag_proxy
+        .injector_version
+        .as_deref()
+        .map(normalize_version)
+        .filter(|s| !s.is_empty());
+
+    ensure_slot(
+        &mut summary.claude_desktop,
+        "claude_desktop",
+        "Claude 桌面端",
+        "Anthropic MSIX 官方渠道",
+    );
+    summary.claude_desktop.installed_version = local.claude_desktop.as_deref().map(normalize_version);
+    summary.claude_msix_version = summary.claude_desktop.installed_version.clone();
+
+    ensure_slot(
+        &mut summary.claude_code,
+        "claude_code",
+        "Claude Code CLI",
+        CLAUDE_CODE_NPM_PKG,
+    );
+    summary.claude_code.installed_version = local.claude_code.as_deref().map(normalize_version);
+
+    ensure_slot(
+        &mut summary.codex_desktop,
+        "codex_desktop",
+        "ChatGPT / Codex 桌面端",
+        "OpenAI MSIX 官方渠道",
+    );
+    summary.codex_desktop.installed_version = local.codex_desktop.as_deref().map(normalize_version);
+    summary.codex_msix_version = summary.codex_desktop.installed_version.clone();
+
+    ensure_slot(&mut summary.codex_cli, "codex_cli", "Codex CLI", CODEX_CLI_NPM_PKG);
+    summary.codex_cli.installed_version = local.codex_cli.as_deref().map(normalize_version);
+
+    ensure_slot(
+        &mut summary.antigravity_ide,
+        "antigravity_ide",
+        "Antigravity 客户端",
+        "Google 官方更新源",
+    );
+    summary.antigravity_ide.installed_version = local
+        .antigravity_ide
+        .as_deref()
+        .map(normalize_version)
+        .or_else(|| {
+            ag_proxy
+                .antigravity_version
+                .as_deref()
+                .map(normalize_version)
+                .filter(|s| !s.is_empty())
+        });
+}
+
+fn ensure_component_defaults(summary: &mut UpdateSummary, cg_version: &str) {
+    ensure_slot(&mut summary.claudeguard, "claudeguard", "ClaudeGuard 主程序", CLAUDEGUARD_REPO);
+    summary.claudeguard.installed_version = Some(normalize_version(cg_version));
+    ensure_slot(
+        &mut summary.antigravity_proxy,
+        "antigravity_proxy",
+        "antigravity-proxy 注入器",
+        ANTIGRAVITY_PROXY_REPO,
+    );
+}
+
+fn apply_client_update_check<F>(
+    prev: &ComponentUpdateStatus,
+    id: &str,
+    name: &str,
+    repo: &str,
+    installed_ver: Option<&str>,
+    now_secs: u64,
+    mut fetcher: F,
+) -> ComponentUpdateStatus
+where
+    F: FnMut() -> PlatformResult<RemoteClientVersion>,
+{
+    let installed_clean = installed_ver
+        .map(normalize_version)
+        .filter(|s| !s.is_empty());
+    let mut next = prev.clone();
+    next.id = id.to_string();
+    next.name = name.to_string();
+    next.repo = repo.to_string();
+    next.installed_version = installed_clean.clone();
+    next.checked_at = Some(now_secs);
+
+    match fetcher() {
+        Ok(remote) => {
+            next.latest_version = Some(remote.version.clone());
+            if remote.release_url.is_some() {
+                next.release_url = remote.release_url;
+            }
+            if remote.asset_url.is_some() {
+                next.asset_url = remote.asset_url;
+            }
+            match installed_clean.as_deref() {
+                None => {
+                    next.phase = UpdateCheckPhase::NotInstalled;
+                    next.note = format!("本机未检测到 {name}（官方最新 v{}）", remote.version);
+                }
+                Some(ins) if is_version_newer(&remote.version, ins) => {
+                    next.phase = UpdateCheckPhase::UpdateAvailable;
+                    next.note = format!("发现新版本：当前 v{ins} -> 最新 v{}", remote.version);
+                }
+                Some(ins) => {
+                    next.phase = UpdateCheckPhase::UpToDate;
+                    next.note = format!("当前 v{ins} 已是最新官方版本");
+                }
+            }
+        }
+        Err(err) => {
+            next.phase = UpdateCheckPhase::Failed;
+            next.note = format!("检查 {name} 更新失败：{err}");
+        }
     }
-    if summary.antigravity_proxy.name.is_empty() {
-        summary.antigravity_proxy.name = "antigravity-proxy 注入器".to_string();
-    }
-    if summary.antigravity_proxy.repo.is_empty() {
-        summary.antigravity_proxy.repo = ANTIGRAVITY_PROXY_REPO.to_string();
-    }
+    next
 }
 
 fn apply_claudeguard_check<F>(
@@ -504,6 +922,165 @@ where
     out
 }
 
+/// Full multi-client orchestrator checking ClaudeGuard, `antigravity-proxy`,
+/// Claude Desktop, Claude Code CLI, ChatGPT/Codex Desktop, Codex CLI, and Antigravity IDE.
+#[allow(clippy::too_many_arguments)]
+pub fn check_all_updates_full_with_fetchers<FGh, FClient>(
+    cg_version: &str,
+    ag_proxy: &AntigravityProxyStatus,
+    local: &LocalClientVersions,
+    component_filter: Option<&str>,
+    prev: &UpdateSummary,
+    now_secs: u64,
+    mut gh_fetcher: FGh,
+    mut client_fetcher: FClient,
+) -> UpdateSummary
+where
+    FGh: FnMut(&str, &[&str]) -> PlatformResult<GithubReleaseInfo>,
+    FClient: FnMut(&str) -> PlatformResult<RemoteClientVersion>,
+{
+    let mut out = prev.clone();
+    hydrate_summary_locals(&mut out, cg_version, ag_proxy, local);
+
+    let filter = component_filter
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let matches = |keys: &[&str]| -> bool {
+        filter
+            .as_deref()
+            .is_none_or(|f| keys.contains(&f))
+    };
+
+    if matches(&["claudeguard"]) {
+        out.claudeguard =
+            apply_claudeguard_check(&out.claudeguard, cg_version, now_secs, &mut gh_fetcher);
+    }
+    if matches(&["antigravity_proxy", "antigravity-proxy"]) {
+        out.antigravity_proxy = apply_antigravity_proxy_check(
+            &out.antigravity_proxy,
+            ag_proxy,
+            now_secs,
+            &mut gh_fetcher,
+        );
+    }
+    if matches(&["claude_desktop", "claude-desktop", "claude"]) {
+        out.claude_desktop = apply_client_update_check(
+            &out.claude_desktop,
+            "claude_desktop",
+            "Claude 桌面端",
+            "Anthropic MSIX 官方渠道",
+            out.claude_desktop.installed_version.as_deref(),
+            now_secs,
+            || client_fetcher("claude_desktop"),
+        );
+    }
+    if matches(&["claude_code", "claude-code"]) {
+        out.claude_code = apply_client_update_check(
+            &out.claude_code,
+            "claude_code",
+            "Claude Code CLI",
+            CLAUDE_CODE_NPM_PKG,
+            out.claude_code.installed_version.as_deref(),
+            now_secs,
+            || client_fetcher("claude_code"),
+        );
+    }
+    if matches(&["codex_desktop", "codex-desktop", "chatgpt"]) {
+        out.codex_desktop = apply_client_update_check(
+            &out.codex_desktop,
+            "codex_desktop",
+            "ChatGPT / Codex 桌面端",
+            "OpenAI MSIX 官方渠道",
+            out.codex_desktop.installed_version.as_deref(),
+            now_secs,
+            || client_fetcher("codex_desktop"),
+        );
+    }
+    if matches(&["codex_cli", "codex-cli", "codex"]) {
+        out.codex_cli = apply_client_update_check(
+            &out.codex_cli,
+            "codex_cli",
+            "Codex CLI",
+            CODEX_CLI_NPM_PKG,
+            out.codex_cli.installed_version.as_deref(),
+            now_secs,
+            || client_fetcher("codex_cli"),
+        );
+    }
+    if matches(&["antigravity_ide", "antigravity-ide", "antigravity"]) {
+        out.antigravity_ide = apply_client_update_check(
+            &out.antigravity_ide,
+            "antigravity_ide",
+            "Antigravity 客户端",
+            "Google 官方更新源",
+            out.antigravity_ide.installed_version.as_deref(),
+            now_secs,
+            || client_fetcher("antigravity_ide"),
+        );
+    }
+
+    out
+}
+
+/// Live network check across all 7 tracked components strictly honoring `ProbeRoute`.
+#[allow(clippy::too_many_arguments)]
+pub fn check_all_updates_full(
+    route: &ProbeRoute,
+    cg_version: &str,
+    ag_proxy: &AntigravityProxyStatus,
+    local: &LocalClientVersions,
+    component_filter: Option<&str>,
+    prev: &UpdateSummary,
+    now_secs: u64,
+) -> UpdateSummary {
+    let arch = current_windows_arch();
+    let ag_manifest_base = local.antigravity_manifest_base.as_deref();
+    check_all_updates_full_with_fetchers(
+        cg_version,
+        ag_proxy,
+        local,
+        component_filter,
+        prev,
+        now_secs,
+        |repo, preferred_exts| {
+            fetch_github_latest_release(route, repo, preferred_exts, DEFAULT_UPDATE_CHECK_TIMEOUT)
+        },
+        |component_id| match component_id {
+            "claude_desktop" => {
+                fetch_claude_desktop_latest(route, arch, DEFAULT_UPDATE_CHECK_TIMEOUT)
+            }
+            "claude_code" => {
+                fetch_npm_latest(route, CLAUDE_CODE_NPM_PKG, DEFAULT_UPDATE_CHECK_TIMEOUT)
+            }
+            "codex_desktop" => {
+                fetch_codex_desktop_latest(route, arch, DEFAULT_UPDATE_CHECK_TIMEOUT)
+            }
+            "codex_cli" => fetch_npm_latest(route, CODEX_CLI_NPM_PKG, DEFAULT_UPDATE_CHECK_TIMEOUT)
+                .or_else(|npm_err| {
+                    fetch_github_latest_release(
+                        route,
+                        CODEX_CLI_REPO,
+                        &[".exe", ".zip"],
+                        DEFAULT_UPDATE_CHECK_TIMEOUT,
+                    )
+                    .map(|rel| RemoteClientVersion {
+                        version: rel.version,
+                        release_url: (!rel.html_url.is_empty()).then_some(rel.html_url),
+                        asset_url: rel.asset_url,
+                    })
+                    .map_err(|_| npm_err)
+                }),
+            "antigravity_ide" => fetch_antigravity_ide_latest(
+                route,
+                ag_manifest_base,
+                arch,
+                DEFAULT_UPDATE_CHECK_TIMEOUT,
+            ),
+            other => Err(PlatformError::InvalidInput(other.to_string())),
+        },
+    )
+}
+
 /// Check updates across ClaudeGuard and `yuaotian/antigravity-proxy`, plus MSIX versions.
 #[allow(clippy::too_many_arguments)]
 pub fn check_all_updates(
@@ -516,17 +1093,19 @@ pub fn check_all_updates(
     prev: &UpdateSummary,
     now_secs: u64,
 ) -> UpdateSummary {
-    check_all_updates_with_fetcher(
+    let local = LocalClientVersions {
+        claude_desktop: claude_msix_ver,
+        codex_desktop: codex_msix_ver,
+        ..LocalClientVersions::default()
+    };
+    check_all_updates_full(
+        route,
         cg_version,
         ag_proxy,
-        claude_msix_ver,
-        codex_msix_ver,
+        &local,
         component_filter,
         prev,
         now_secs,
-        |repo, preferred_exts| {
-            fetch_github_latest_release(route, repo, preferred_exts, DEFAULT_UPDATE_CHECK_TIMEOUT)
-        },
     )
 }
 
@@ -852,5 +1431,102 @@ mod tests {
             Some("2.6.3")
         );
         assert!(s4.antigravity_proxy.note.contains("GitHub API 限流"));
+    }
+
+    #[test]
+    fn parses_all_client_feeds_and_orchestrates_full_matrix() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let loc = format!("https://downloads.claude.ai/releases/win32/x64/1.0.214/Claude-{hash}.msix");
+        assert_eq!(
+            parse_claude_desktop_redirect(&loc, "x64").unwrap(),
+            "1.0.214"
+        );
+        assert!(parse_claude_desktop_redirect("https://evil.invalid/Claude.msix", "x64").is_err());
+
+        let npm_res = parse_npm_latest_version(
+            r#"{"name":"@anthropic-ai/claude-code","version":"2.1.320","dist":{"tarball":"https://registry.npmjs.org/t.tgz"}}"#,
+            "@anthropic-ai/claude-code",
+        )
+        .unwrap();
+        assert_eq!(npm_res.version, "2.1.320");
+        assert_eq!(
+            npm_res.asset_url.as_deref(),
+            Some("https://registry.npmjs.org/t.tgz")
+        );
+
+        let ag_yaml = "version: 2.34.0\npath: Antigravity-x64.exe\nsha512: abc\n";
+        let ag_res = parse_antigravity_yaml_latest(ag_yaml, "https://example.invalid/manifest").unwrap();
+        assert_eq!(ag_res.version, "2.34.0");
+        assert_eq!(
+            ag_res.asset_url.as_deref(),
+            Some("https://example.invalid/manifest/Antigravity-x64.exe")
+        );
+
+        assert_eq!(normalize_version("rust-v0.160.0"), "0.160.0");
+
+        // Codex Desktop HEAD server test
+        let (addr, h) = serve_once_capturing_req(
+            "HTTP/1.1 200 OK\r\nx-ms-meta-package_identity: OpenAI.Codex\r\nx-ms-meta-architecture: x64\r\nx-ms-meta-package_version: 26.1200.5.0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+        );
+        let codex_head = fetch_codex_desktop_latest_from_url(
+            &ProbeRoute::Direct,
+            &format!("http://{addr}/ChatGPT-x64.msix"),
+            "x64",
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(codex_head.version, "26.1200.5.0");
+        h.join().unwrap();
+
+        let local = LocalClientVersions {
+            claude_desktop: Some("1.0.100".into()),
+            claude_code: Some("2.1.308".into()),
+            codex_desktop: Some("26.1111.2228.0".into()),
+            codex_cli: None,
+            antigravity_ide: Some("2.33.0".into()),
+            antigravity_manifest_base: None,
+        };
+        let ag_healthy = AntigravityProxyStatus {
+            installed: true,
+            dll_present: true,
+            dll_valid: true,
+            injector_version: Some("2.6.3".into()),
+            ..AntigravityProxyStatus::default()
+        };
+        let summary = check_all_updates_full_with_fetchers(
+            "4.0.0",
+            &ag_healthy,
+            &local,
+            None,
+            &UpdateSummary::default(),
+            5000,
+            |repo, _| Ok(GithubReleaseInfo {
+                tag_name: match repo {
+                    CLAUDEGUARD_REPO => "v4.0.0".into(),
+                    _ => "v2.6.3".into(),
+                },
+                version: match repo {
+                    CLAUDEGUARD_REPO => "4.0.0".into(),
+                    _ => "2.6.3".into(),
+                },
+                html_url: String::new(),
+                asset_url: None,
+                published_at: None,
+            }),
+            |cid| match cid {
+                "claude_desktop" => Ok(RemoteClientVersion { version: "1.0.214".into(), release_url: None, asset_url: None }),
+                "claude_code" => Ok(RemoteClientVersion { version: "2.1.320".into(), release_url: None, asset_url: None }),
+                "codex_desktop" => Ok(RemoteClientVersion { version: "26.1111.2228.0".into(), release_url: None, asset_url: None }),
+                "codex_cli" => Ok(RemoteClientVersion { version: "0.160.0".into(), release_url: None, asset_url: None }),
+                "antigravity_ide" => Ok(RemoteClientVersion { version: "2.34.0".into(), release_url: None, asset_url: None }),
+                other => Err(PlatformError::InvalidInput(other.into())),
+            },
+        );
+        assert_eq!(summary.claude_desktop.phase, UpdateCheckPhase::UpdateAvailable);
+        assert_eq!(summary.claude_code.phase, UpdateCheckPhase::UpdateAvailable);
+        assert_eq!(summary.codex_desktop.phase, UpdateCheckPhase::UpToDate);
+        assert_eq!(summary.codex_cli.phase, UpdateCheckPhase::NotInstalled);
+        assert_eq!(summary.antigravity_ide.phase, UpdateCheckPhase::UpdateAvailable);
+        assert!(ANTIGRAVITY_PROXY_DESC.contains("免 TUN 强制代理工具"));
     }
 }

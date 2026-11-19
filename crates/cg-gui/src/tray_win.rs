@@ -752,10 +752,10 @@ mod tests {
             height: 1032.0,
         };
         let hud = compute_hud_bounds(work_area);
-        assert_eq!(hud.width, 376.0);
-        assert_eq!(hud.height, 486.0);
-        assert_eq!(hud.x, 1920.0 - 376.0 - 10.0);
-        assert_eq!(hud.y, 1032.0 - 486.0 - 10.0);
+        assert_eq!(hud.width, layout::HUD_WIDTH);
+        assert_eq!(hud.height, layout::HUD_HEIGHT);
+        assert_eq!(hud.x, 1920.0 - layout::HUD_WIDTH - 10.0);
+        assert_eq!(hud.y, 1032.0 - layout::HUD_HEIGHT - 10.0);
     }
 
     #[test]
@@ -768,10 +768,11 @@ mod tests {
             height: 516.0,
         };
         let hud = compute_hud_bounds(work_area);
-        assert_eq!(hud.width, 376.0);
-        assert_eq!(hud.height, 486.0);
-        assert_eq!(hud.x, 574.0);
-        assert_eq!(hud.y, 20.0);
+        let expected_h = layout::HUD_HEIGHT.min(516.0 - 20.0);
+        assert_eq!(hud.width, layout::HUD_WIDTH);
+        assert_eq!(hud.height, expected_h);
+        assert_eq!(hud.x, 960.0 - layout::HUD_WIDTH - 10.0);
+        assert_eq!(hud.y, 516.0 - expected_h - 10.0);
         assert!(hud.x + hud.width <= work_area.width);
         assert!(hud.y + hud.height <= work_area.height);
     }

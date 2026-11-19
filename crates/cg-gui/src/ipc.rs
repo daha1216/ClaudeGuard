@@ -253,23 +253,52 @@ impl DaemonClient {
             }
             PipeRequest::CheckUpdates { component } => {
                 let comp = component.as_deref().map(str::trim);
-                if comp.is_none() || comp == Some("claudeguard") {
-                    snap.updates.claudeguard.checked_at = Some(now);
-                    if snap.updates.claudeguard.phase == UpdateCheckPhase::Idle {
-                        snap.updates.claudeguard.phase = UpdateCheckPhase::UpToDate;
+                let touch = |slot: &mut crate::protocol::ComponentUpdateStatus, key: &str, default_note: &str| {
+                    if comp.is_none() || comp == Some(key) {
+                        slot.checked_at = Some(now);
+                        if slot.phase == UpdateCheckPhase::Idle {
+                            slot.phase = UpdateCheckPhase::UpToDate;
+                        }
+                        if slot.note.is_empty() {
+                            slot.note = default_note.into();
+                        }
                     }
-                    if snap.updates.claudeguard.note.is_empty() {
-                        snap.updates.claudeguard.note =
-                            "当前 v4.0.0 已是最新渠道版本（Ed25519 + Authenticode 验签通道就绪）"
-                                .into();
-                    }
-                }
-                if comp.is_none() || comp == Some("antigravity_proxy") {
-                    snap.updates.antigravity_proxy.checked_at = Some(now);
-                    if snap.updates.antigravity_proxy.phase == UpdateCheckPhase::Idle {
-                        snap.updates.antigravity_proxy.phase = UpdateCheckPhase::UpToDate;
-                    }
-                }
+                };
+                touch(
+                    &mut snap.updates.claudeguard,
+                    "claudeguard",
+                    "当前 v4.0.0 已是最新正式版本（官方签名校验已启用）",
+                );
+                touch(
+                    &mut snap.updates.antigravity_proxy,
+                    "antigravity_proxy",
+                    "已完成 antigravity-proxy 版本核验",
+                );
+                touch(
+                    &mut snap.updates.claude_desktop,
+                    "claude_desktop",
+                    "已完成 Claude Desktop 官方最新版本核验",
+                );
+                touch(
+                    &mut snap.updates.claude_code,
+                    "claude_code",
+                    "已完成 Claude Code CLI 官方最新版本核验",
+                );
+                touch(
+                    &mut snap.updates.codex_desktop,
+                    "codex_desktop",
+                    "已完成 ChatGPT / Codex 桌面端版本核验",
+                );
+                touch(
+                    &mut snap.updates.codex_cli,
+                    "codex_cli",
+                    "已完成 Codex CLI 官方最新版本核验",
+                );
+                touch(
+                    &mut snap.updates.antigravity_ide,
+                    "antigravity_ide",
+                    "已完成 Antigravity IDE 官方最新版本核验",
+                );
                 PipeResponse::Ack {
                     receipt: None,
                     snapshot: Some(Box::new(snap.clone())),
@@ -282,9 +311,17 @@ impl DaemonClient {
                 let mut cleared_agents = 0usize;
                 let mut cleared_procs = 0usize;
                 for agent in &mut snap.agents {
-                    let matches_id = agent_id.as_deref().is_none_or(|id| agent.id == id);
-                    let matches_kind = include_cli || agent.kind == AgentKind::Gui;
-                    if matches_id && matches_kind {
+                    let matches = match agent_id.as_deref() {
+                        None => include_cli || agent.kind == AgentKind::Gui,
+                        Some("claude") => {
+                            agent.id == "claude" || (include_cli && agent.id == "claude-code")
+                        }
+                        Some("chatgpt") => {
+                            agent.id == "chatgpt" || (include_cli && agent.id == "codex")
+                        }
+                        Some(id) => agent.id == id,
+                    };
+                    if matches {
                         cleared_agents += 1;
                         cleared_procs += agent.running_count + agent.orphan_count;
                         agent.running_count = 0;
@@ -293,8 +330,8 @@ impl DaemonClient {
                 }
                 let scope = match agent_id.as_deref() {
                     Some(id) => format!("强制全清 {id} 进程树与孤儿残留"),
-                    None if include_cli => "强制全清全部受管 GUI 与 CLI 进程".into(),
-                    None => "强制全清全部受管 GUI 进程".into(),
+                    None if include_cli => "强制全清全部受管桌面端与 CLI 进程".into(),
+                    None => "强制全清全部受管桌面端进程".into(),
                 };
                 let receipt = OperationReceipt {
                     id: format!("rcpt-kill-{now}"),
@@ -583,15 +620,15 @@ mod tests {
             other => panic!("unexpected full CheckUpdates response: {other:?}"),
         }
 
-        // Pass scenario ForceKillAgent: targeted single-agent kill, GUI-only kill, and full kill.
+        // Pass scenario ForceKillAgent: desktop-only single-agent kill, paired suite kill, GUI-only, and full kill.
         let pass_client = DaemonClient::new(TransportEndpoint::Demo(DemoScenario::Pass));
-        let kill_claude = pass_client
+        let kill_claude_desktop = pass_client
             .exchange(PipeRequest::ForceKillAgent {
                 agent_id: Some("claude".into()),
-                include_cli: true,
+                include_cli: false,
             })
-            .expect("force kill claude");
-        match kill_claude {
+            .expect("force kill claude desktop");
+        match kill_claude_desktop {
             PipeResponse::Ack {
                 receipt: Some(rcpt),
                 snapshot: Some(snap),
@@ -603,7 +640,26 @@ mod tests {
                 let claude_code = snap.agents.iter().find(|a| a.id == "claude-code").unwrap();
                 assert!(claude_code.running_count > 0);
             }
-            other => panic!("unexpected ForceKillAgent(claude) response: {other:?}"),
+            other => panic!("unexpected ForceKillAgent(claude desktop) response: {other:?}"),
+        }
+
+        let kill_claude_suite = pass_client
+            .exchange(PipeRequest::ForceKillAgent {
+                agent_id: Some("claude".into()),
+                include_cli: true,
+            })
+            .expect("force kill claude suite");
+        match kill_claude_suite {
+            PipeResponse::Ack {
+                receipt: Some(rcpt),
+                snapshot: Some(snap),
+            } => {
+                assert_eq!(rcpt.status, OperationStatus::Verified);
+                let claude_code = snap.agents.iter().find(|a| a.id == "claude-code").unwrap();
+                assert_eq!(claude_code.running_count, 0);
+                assert_eq!(claude_code.orphan_count, 0);
+            }
+            other => panic!("unexpected ForceKillAgent(claude suite) response: {other:?}"),
         }
 
         let kill_gui_only = pass_client

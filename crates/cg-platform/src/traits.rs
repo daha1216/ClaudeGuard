@@ -380,7 +380,7 @@ pub trait PlatformDriver: Send + Sync {
         self.sweep_claude(SweepMode::Residual)
     }
 
-    /// Check GitHub Releases for ClaudeGuard and `antigravity-proxy`, plus local MSIX package versions.
+    /// Check updates across ClaudeGuard, `antigravity-proxy`, and all tracked AI clients.
     fn check_updates(
         &self,
         route: &ProbeRoute,
@@ -390,11 +390,18 @@ pub trait PlatformDriver: Send + Sync {
         prev: &cg_protocol::UpdateSummary,
         now_secs: u64,
     ) -> cg_protocol::UpdateSummary {
-        let _ = (route, cg_version, ag_proxy, component, now_secs);
+        let _ = (route, ag_proxy, component, now_secs);
+        let (ag_ide_ver, ag_manifest_base) = crate::process_win::installed_antigravity_ide_info();
+        let local = crate::update_check::LocalClientVersions {
+            claude_desktop: crate::process_win::installed_claude_desktop_version(),
+            claude_code: crate::process_win::installed_claude_code_version(),
+            codex_desktop: crate::process_win::installed_codex_desktop_version(),
+            codex_cli: crate::process_win::installed_codex_cli_version(),
+            antigravity_ide: ag_ide_ver,
+            antigravity_manifest_base: ag_manifest_base,
+        };
         let mut out = prev.clone();
-        out.claude_msix_version = crate::process_win::installed_msix_version("Claude_");
-        out.codex_msix_version = crate::process_win::installed_msix_version("OpenAI.Codex_")
-            .or_else(|| crate::process_win::installed_msix_version("OpenAI.ChatGPT_"));
+        crate::update_check::hydrate_summary_locals(&mut out, cg_version, ag_proxy, &local);
         out
     }
 

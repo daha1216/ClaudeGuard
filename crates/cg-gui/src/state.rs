@@ -311,7 +311,17 @@ pub struct TrippedDiagnosticViewModel {
     pub receipt: Option<OperationReceipt>,
 }
 
-/// Projected Mode A Tray Quick HUD (`376 x 486`).
+/// Projected quick cleanup chip for the 3 guarded AI app suites on Mode A HUD.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HudCleanupChipViewModel {
+    pub agent_id: String,
+    pub label: String,
+    pub running_count: usize,
+    pub orphan_count: usize,
+    pub quarantined: bool,
+}
+
+/// Projected Mode A Tray Quick HUD (`424 x 590`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HudProjection {
     pub connected: bool,
@@ -324,6 +334,7 @@ pub struct HudProjection {
     pub process_tile_sub: String,
     pub total_orphans: usize,
     pub launch_apps: Vec<SafeLaunchAppViewModel>,
+    pub quick_cleanup_apps: Vec<HudCleanupChipViewModel>,
     pub pause_button_label: String,
 }
 
@@ -579,7 +590,7 @@ pub fn project_hero(
             HeroTone::Healthy,
             "实时守护正常".into(),
             "出口安全合规".into(),
-            format!("{primary_loc} · COM 防火墙与进程防线正常"),
+            format!("{primary_loc} · 应用防线与进程守护正常"),
         )
     } else {
         (
@@ -809,23 +820,46 @@ pub fn project_hud(
         .unwrap_or(0);
 
     let (process_tile_value, process_tile_sub) = if !connected && snap.is_none() {
-        ("未连接守护服务".into(), "无法读取进程或防火墙防线".into())
+        ("未连接守护服务".into(), "无法读取进程或防线状态".into())
     } else if snap.is_some_and(GuardSnapshot::is_tripped) {
         (
             format!("已隔离 {quarantined_rules} 规则"),
-            "点击「打开主控制台」一键复检解封".into(),
+            "隔离生效 · 可快捷清理".into(),
         )
     } else if total_orphans > 0 {
         (
             format!("发现 {total_orphans} 个孤儿进程"),
-            "点击右侧「清孤儿」立即清理".into(),
+            "可点「清孤儿」立即清理".into(),
         )
     } else {
         (
-            format!("{total_running} 个守护进程正常"),
-            "无孤儿残留 · 守护链路干净".into(),
+            format!("{total_running} 个运行中"),
+            "无孤儿残留 · 防线干净".into(),
         )
     };
+
+    let quick_cleanup_apps = [
+        ("claude", "Claude", Some("claude-code")),
+        ("chatgpt", "ChatGPT", Some("codex")),
+        ("antigravity", "反重力", None),
+    ]
+    .into_iter()
+    .map(|(gui_id, label, cli_id)| {
+        let gui = snap.and_then(|s| s.agents.iter().find(|a| a.id == gui_id));
+        let cli = cli_id.and_then(|cid| snap.and_then(|s| s.agents.iter().find(|a| a.id == cid)));
+        let running_count = gui.map(|a| a.running_count).unwrap_or(0)
+            + cli.map(|a| a.running_count).unwrap_or(0);
+        let orphan_count =
+            gui.map(|a| a.orphan_count).unwrap_or(0) + cli.map(|a| a.orphan_count).unwrap_or(0);
+        HudCleanupChipViewModel {
+            agent_id: gui_id.into(),
+            label: label.into(),
+            running_count,
+            orphan_count,
+            quarantined: gui.is_some_and(|a| a.quarantined),
+        }
+    })
+    .collect();
 
     let pause_button_label = if hero.is_paused {
         "▶ 恢复守护".into()
@@ -857,6 +891,7 @@ pub fn project_hud(
         process_tile_sub,
         total_orphans,
         launch_apps: project_launch_apps(snap),
+        quick_cleanup_apps,
         pause_button_label,
     }
 }
@@ -954,7 +989,6 @@ pub fn project_console(
             s.targets
                 .iter()
                 .filter(|t| t.state != TargetState::Disabled)
-                .take(3)
                 .map(|t| project_target_card(t, privacy_mask))
                 .collect::<Vec<_>>()
         })
@@ -1019,12 +1053,12 @@ pub fn project_console(
                 .iter()
                 .map(|a| {
                     let kind = match a.kind {
-                        AgentKind::Gui => "GUI".to_string(),
+                        AgentKind::Gui => "桌面应用".to_string(),
                         AgentKind::Cli => {
                             if s.config.kill_cli_on_fail {
-                                "CLI (支持熔断同步终止)".to_string()
+                                "终端 CLI · 随熔断终止".to_string()
                             } else {
-                                "CLI (仅告警/清孤儿)".to_string()
+                                "终端 CLI · 仅清孤儿".to_string()
                             }
                         }
                     };
@@ -1127,25 +1161,25 @@ fn project_self_checks(snap: Option<&GuardSnapshot>) -> Vec<DefenseCheckItem> {
         return vec![
             DefenseCheckItem {
                 id: "daemon".into(),
-                name: "Guardian 服务".into(),
+                name: "守护服务".into(),
                 status: SelfCheckStatus::Unknown,
-                detail: "等待命名管道连接".into(),
+                detail: "等待守护服务连接".into(),
             },
             DefenseCheckItem {
                 id: "firewall".into(),
-                name: "Win32 COM 防火墙".into(),
+                name: "应用级防火墙".into(),
                 status: SelfCheckStatus::Unknown,
                 detail: "未读取".into(),
             },
             DefenseCheckItem {
                 id: "leak".into(),
-                name: "直连防泄露雷达".into(),
+                name: "防直连监测".into(),
                 status: SelfCheckStatus::Unknown,
                 detail: "未读取".into(),
             },
             DefenseCheckItem {
                 id: "wal".into(),
-                name: "WAL 崩溃恢复账本".into(),
+                name: "断电恢复账本".into(),
                 status: SelfCheckStatus::Unknown,
                 detail: "未读取".into(),
             },
@@ -1160,49 +1194,49 @@ fn project_self_checks(snap: Option<&GuardSnapshot>) -> Vec<DefenseCheckItem> {
     let mut items = vec![
         DefenseCheckItem {
             id: "daemon".into(),
-            name: "Guardian 服务".into(),
+            name: "守护服务".into(),
             status: if sc.daemon_running {
                 SelfCheckStatus::Healthy
             } else {
                 SelfCheckStatus::Degraded
             },
             detail: if sc.daemon_elevated {
-                "服务运行中 · 高权限执行器已就绪".into()
+                "系统守护运行中 · 防护执行器已就绪".into()
             } else {
                 "运行中".into()
             },
         },
         DefenseCheckItem {
             id: "firewall".into(),
-            name: "Win32 COM 防火墙".into(),
+            name: "应用级防火墙".into(),
             status: if sc.firewall_com_ready && sc.firewall_query_ok {
                 SelfCheckStatus::Healthy
             } else {
                 SelfCheckStatus::Degraded
             },
             detail: if sc.firewall_query_ok {
-                "INetFwPolicy2 规则读写与回读核验正常".into()
+                "应用出站隔离规则读写与回读核验正常".into()
             } else {
                 "防火墙规则查询异常".into()
             },
         },
         DefenseCheckItem {
             id: "leak".into(),
-            name: "直连防泄露雷达".into(),
+            name: "防直连监测".into(),
             status: if sc.leak_radar_active {
                 SelfCheckStatus::Healthy
             } else {
                 SelfCheckStatus::Disabled
             },
             detail: if sc.leak_radar_active {
-                "TCP 套接字直连监测运行中".into()
+                "外连直连监测巡检中".into()
             } else {
                 "已关闭".into()
             },
         },
         DefenseCheckItem {
             id: "wal".into(),
-            name: "WAL 崩溃恢复账本".into(),
+            name: "断电恢复账本".into(),
             status: if sc.wal_clean {
                 SelfCheckStatus::Healthy
             } else {
@@ -1211,8 +1245,8 @@ fn project_self_checks(snap: Option<&GuardSnapshot>) -> Vec<DefenseCheckItem> {
             detail: sc
                 .wal_pending_tx
                 .as_ref()
-                .map(|tx| format!("待提交恢复事务：{tx}"))
-                .unwrap_or_else(|| "账本干净 · 无崩溃残留".into()),
+                .map(|tx| format!("待恢复事务：{tx}"))
+                .unwrap_or_else(|| "账本状态干净 · 支持异常断电自动还原".into()),
         },
     ];
 
@@ -1634,7 +1668,7 @@ mod tests {
         let all = project_console(Some(&trip), true, None, false, None, "", None);
         assert!(!all.filtered_logs.is_empty());
 
-        let search = project_console(Some(&trip), true, None, false, None, "INetFwRule", None);
+        let search = project_console(Some(&trip), true, None, false, None, "防火墙隔离规则", None);
         assert_eq!(search.filtered_logs.len(), 1);
         assert_eq!(search.filtered_logs[0].category, "firewall");
 

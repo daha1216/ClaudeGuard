@@ -432,13 +432,13 @@ pub fn c_hsla(hex: u32) -> Hsla {
 
 /// Layout constants for Mode A (Tray Quick HUD) and Mode B (Wide Bento Main Console).
 pub mod layout {
-    pub const HUD_WIDTH: f32 = 376.0;
-    pub const HUD_HEIGHT: f32 = 486.0;
+    pub const HUD_WIDTH: f32 = 428.0;
+    pub const HUD_HEIGHT: f32 = 648.0;
 
-    pub const CONSOLE_WIDTH: f32 = 1040.0;
-    pub const CONSOLE_HEIGHT: f32 = 768.0;
+    pub const CONSOLE_WIDTH: f32 = 1080.0;
+    pub const CONSOLE_HEIGHT: f32 = 800.0;
     pub const CONSOLE_MIN_WIDTH: f32 = 760.0;
-    pub const CONSOLE_MIN_HEIGHT: f32 = 440.0;
+    pub const CONSOLE_MIN_HEIGHT: f32 = 480.0;
 
     pub const SIDEBAR_WIDTH: f32 = 192.0;
     pub const TOPBAR_HEIGHT: f32 = 46.0;

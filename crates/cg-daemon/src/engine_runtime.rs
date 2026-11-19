@@ -39,10 +39,11 @@ use crate::journal::{
 };
 use crate::protocol::{
     now_unix_secs, AccessEvidence, AccessLevel, AgentKind, AgentRuntimeStatus,
-    AntigravityProxyStatus, Config, CutMode, DefenseCheckItem, DefenseSelfCheck, ErrorCode,
-    GuardSnapshot, LeakReport, Lifecycle, LogLevel, OnboardingProbeResult, OperationReceipt,
-    OperationStatus, PipeRequest, PipeResponse, PolicyPreset, ProbeResult, ProtectionState,
-    SelfCheckStatus, Target, UpdateCheckPhase, UpdateSummary,
+    AntigravityProxyStatus, ComponentUpdateStatus, Config, CutMode, DefenseCheckItem,
+    DefenseSelfCheck, ErrorCode, GuardSnapshot, LeakReport, Lifecycle, LogLevel,
+    OnboardingProbeResult, OperationReceipt, OperationStatus, PipeRequest, PipeResponse,
+    PolicyPreset, ProbeResult, ProtectionState, SelfCheckStatus, Target, UpdateCheckPhase,
+    UpdateSummary,
 };
 
 pub const TIMELINE_FILE: &str = "timeline.json";
@@ -103,73 +104,56 @@ fn resolve_access_and_route(
     }
 }
 
-fn local_msix_versions() -> (Option<String>, Option<String>) {
-    let claude = process_win::installed_msix_version("Claude_");
-    let codex = process_win::installed_msix_version("OpenAI.Codex_")
-        .or_else(|| process_win::installed_msix_version("OpenAI.ChatGPT_"));
-    (claude, codex)
+fn local_client_versions() -> update_check::LocalClientVersions {
+    let (ag_ide_ver, ag_manifest_base) = process_win::installed_antigravity_ide_info();
+    update_check::LocalClientVersions {
+        claude_desktop: process_win::installed_claude_desktop_version(),
+        claude_code: process_win::installed_claude_code_version(),
+        codex_desktop: process_win::installed_codex_desktop_version(),
+        codex_cli: process_win::installed_codex_cli_version(),
+        antigravity_ide: ag_ide_ver,
+        antigravity_manifest_base: ag_manifest_base,
+    }
 }
 
 fn hydrate_local_updates(
     updates: &mut UpdateSummary,
     cg_version: &str,
     ag_proxy: &AntigravityProxyStatus,
-    claude_msix: Option<String>,
-    codex_msix: Option<String>,
+    local: &update_check::LocalClientVersions,
 ) {
-    if updates.claudeguard.id.is_empty() {
-        updates.claudeguard.id = "claudeguard".to_string();
-    }
-    if updates.claudeguard.name.is_empty() {
-        updates.claudeguard.name = "ClaudeGuard 主程序".to_string();
-    }
-    if updates.claudeguard.repo.is_empty() {
-        updates.claudeguard.repo = update_check::CLAUDEGUARD_REPO.to_string();
-    }
-    let norm_cg = update_check::normalize_version(cg_version);
-    if !norm_cg.is_empty() {
-        updates.claudeguard.installed_version = Some(norm_cg);
-    }
+    update_check::hydrate_summary_locals(updates, cg_version, ag_proxy, local);
+}
 
-    if updates.antigravity_proxy.id.is_empty() {
-        updates.antigravity_proxy.id = "antigravity_proxy".to_string();
+fn merge_slot(dst: &mut ComponentUpdateStatus, incoming: ComponentUpdateStatus) {
+    if incoming.installed_version.is_some() {
+        dst.installed_version = incoming.installed_version.clone();
     }
-    if updates.antigravity_proxy.name.is_empty() {
-        updates.antigravity_proxy.name = "antigravity-proxy 注入器".to_string();
+    if incoming.checked_at > dst.checked_at
+        || (dst.phase == UpdateCheckPhase::Idle && incoming.phase != UpdateCheckPhase::Idle)
+    {
+        *dst = incoming;
     }
-    if updates.antigravity_proxy.repo.is_empty() {
-        updates.antigravity_proxy.repo = update_check::ANTIGRAVITY_PROXY_REPO.to_string();
-    }
-    updates.antigravity_proxy.installed_version = ag_proxy
-        .injector_version
-        .as_deref()
-        .map(update_check::normalize_version)
-        .filter(|s| !s.is_empty());
-
-    updates.claude_msix_version = claude_msix;
-    updates.codex_msix_version = codex_msix;
 }
 
 fn merge_telemetry_updates(dst: &mut UpdateSummary, incoming: UpdateSummary) {
     dst.claude_msix_version = incoming.claude_msix_version;
     dst.codex_msix_version = incoming.codex_msix_version;
-    if incoming.claudeguard.installed_version.is_some() {
-        dst.claudeguard.installed_version = incoming.claudeguard.installed_version.clone();
-    }
+    // Note: Keep installed_version cleared cleanly when uninstalled for antigravity_proxy / clients
     dst.antigravity_proxy.installed_version = incoming.antigravity_proxy.installed_version.clone();
 
-    if incoming.claudeguard.checked_at > dst.claudeguard.checked_at
-        || (dst.claudeguard.phase == UpdateCheckPhase::Idle
-            && incoming.claudeguard.phase != UpdateCheckPhase::Idle)
-    {
-        dst.claudeguard = incoming.claudeguard;
-    }
+    merge_slot(&mut dst.claudeguard, incoming.claudeguard);
     if incoming.antigravity_proxy.checked_at > dst.antigravity_proxy.checked_at
         || (dst.antigravity_proxy.phase == UpdateCheckPhase::Idle
             && incoming.antigravity_proxy.phase != UpdateCheckPhase::Idle)
     {
         dst.antigravity_proxy = incoming.antigravity_proxy;
     }
+    merge_slot(&mut dst.claude_desktop, incoming.claude_desktop);
+    merge_slot(&mut dst.claude_code, incoming.claude_code);
+    merge_slot(&mut dst.codex_desktop, incoming.codex_desktop);
+    merge_slot(&mut dst.codex_cli, incoming.codex_cli);
+    merge_slot(&mut dst.antigravity_ide, incoming.antigravity_ide);
 }
 
 fn parse_update_component_filter(
@@ -182,9 +166,20 @@ fn parse_update_component_filter(
             "antigravity_proxy" | "antigravity-proxy" => {
                 Ok((false, true, Some("antigravity_proxy".to_string())))
             }
-            _ => Err(format!(
-                "未知的更新检查组件 '{raw}'（期望 claudeguard 或 antigravity_proxy）"
-            )),
+            "claude_desktop" | "claude-desktop" | "claude" => {
+                Ok((false, false, Some("claude_desktop".to_string())))
+            }
+            "claude_code" | "claude-code" => Ok((false, false, Some("claude_code".to_string()))),
+            "codex_desktop" | "codex-desktop" | "chatgpt" => {
+                Ok((false, false, Some("codex_desktop".to_string())))
+            }
+            "codex_cli" | "codex-cli" | "codex" => {
+                Ok((false, false, Some("codex_cli".to_string())))
+            }
+            "antigravity_ide" | "antigravity-ide" | "antigravity" => {
+                Ok((false, false, Some("antigravity_ide".to_string())))
+            }
+            _ => Err(format!("未知的更新检查组件 '{raw}'")),
         },
     }
 }
@@ -198,10 +193,11 @@ fn build_skipped_update_summary(
     now_secs: u64,
 ) -> UpdateSummary {
     let mut out = prev.clone();
-    let (claude_msix, codex_msix) = local_msix_versions();
-    hydrate_local_updates(&mut out, cg_version, ag_proxy, claude_msix, codex_msix);
-    let (check_cg, check_ag, _) =
+    let local = local_client_versions();
+    hydrate_local_updates(&mut out, cg_version, ag_proxy, &local);
+    let (check_cg, check_ag, norm) =
         parse_update_component_filter(component).unwrap_or((true, true, None));
+    let check_all = norm.is_none();
     if check_cg {
         out.claudeguard.phase = UpdateCheckPhase::Failed;
         out.claudeguard.checked_at = Some(now_secs);
@@ -215,6 +211,19 @@ fn build_skipped_update_summary(
         } else {
             out.antigravity_proxy.phase = UpdateCheckPhase::Failed;
             out.antigravity_proxy.note = format!("当前接入路径受阻，已拒绝直连检查更新：{reason}");
+        }
+    }
+    for (id, slot) in [
+        ("claude_desktop", &mut out.claude_desktop),
+        ("claude_code", &mut out.claude_code),
+        ("codex_desktop", &mut out.codex_desktop),
+        ("codex_cli", &mut out.codex_cli),
+        ("antigravity_ide", &mut out.antigravity_ide),
+    ] {
+        if check_all || norm.as_deref() == Some(id) {
+            slot.phase = UpdateCheckPhase::Failed;
+            slot.checked_at = Some(now_secs);
+            slot.note = format!("当前接入路径受阻，已拒绝直连检查更新：{reason}");
         }
     }
     out
@@ -578,13 +587,12 @@ impl RealEngineActor {
             },
             now,
         );
-        let (claude_msix, codex_msix) = local_msix_versions();
+        let init_local = local_client_versions();
         hydrate_local_updates(
             &mut actor.engine.updates,
             &actor.engine.version,
             &actor.engine.antigravity_proxy,
-            claude_msix,
-            codex_msix,
+            &init_local,
         );
         let init_self_check = build_defense_self_check(
             &actor.engine.config,
@@ -2137,18 +2145,36 @@ impl CoordinatorActor for RealEngineActor {
                 }
 
                 let mut next_summary = *summary;
-                let (check_cg, check_ag, _) = parse_update_component_filter(component.as_deref())
-                    .unwrap_or((true, true, None));
+                let (check_cg, check_ag, normalized) =
+                    parse_update_component_filter(component.as_deref())
+                        .unwrap_or((true, true, None));
+                let check_client =
+                    |id: &str| normalized.is_none() || normalized.as_deref() == Some(id);
                 if !check_cg {
                     next_summary.claudeguard = self.engine.updates.claudeguard.clone();
                 }
                 if !check_ag {
                     next_summary.antigravity_proxy = self.engine.updates.antigravity_proxy.clone();
                 }
+                if !check_client("claude_desktop") {
+                    next_summary.claude_desktop = self.engine.updates.claude_desktop.clone();
+                }
+                if !check_client("claude_code") {
+                    next_summary.claude_code = self.engine.updates.claude_code.clone();
+                }
+                if !check_client("codex_desktop") {
+                    next_summary.codex_desktop = self.engine.updates.codex_desktop.clone();
+                }
+                if !check_client("codex_cli") {
+                    next_summary.codex_cli = self.engine.updates.codex_cli.clone();
+                }
+                if !check_client("antigravity_ide") {
+                    next_summary.antigravity_ide = self.engine.updates.antigravity_ide.clone();
+                }
 
                 self.step_and_run(
                     EngineEvent::UpdatesChecked {
-                        summary: next_summary.clone(),
+                        summary: Box::new(next_summary.clone()),
                     },
                     now_secs,
                 );
@@ -2161,36 +2187,50 @@ impl CoordinatorActor for RealEngineActor {
                     let mut failed_notes = Vec::new();
                     let mut scope_parts = Vec::new();
 
-                    if check_cg {
-                        let st = if next_summary.claudeguard.phase == UpdateCheckPhase::Failed {
-                            failed_notes.push(next_summary.claudeguard.note.clone());
-                            OperationStatus::Failed
-                        } else {
-                            OperationStatus::Verified
-                        };
-                        scope_parts
-                            .push(format!("claudeguard={:?}", next_summary.claudeguard.phase));
-                        receipt.push_item("claudeguard", st, next_summary.claudeguard.note.clone());
-                    }
-                    if check_ag {
-                        let st = match next_summary.antigravity_proxy.phase {
-                            UpdateCheckPhase::Failed => {
-                                failed_notes.push(next_summary.antigravity_proxy.note.clone());
-                                OperationStatus::Failed
+                    let mut record_slot =
+                        |key: &str, checked: bool, slot: &ComponentUpdateStatus| {
+                            if !checked {
+                                return;
                             }
-                            UpdateCheckPhase::NotInstalled => OperationStatus::NotApplicable,
-                            _ => OperationStatus::Verified,
+                            let st = match slot.phase {
+                                UpdateCheckPhase::Failed => {
+                                    failed_notes.push(slot.note.clone());
+                                    OperationStatus::Failed
+                                }
+                                UpdateCheckPhase::NotInstalled => OperationStatus::NotApplicable,
+                                _ => OperationStatus::Verified,
+                            };
+                            scope_parts.push(format!("{key}={:?}", slot.phase));
+                            receipt.push_item(key, st, slot.note.clone());
                         };
-                        scope_parts.push(format!(
-                            "antigravity_proxy={:?}",
-                            next_summary.antigravity_proxy.phase
-                        ));
-                        receipt.push_item(
-                            "antigravity_proxy",
-                            st,
-                            next_summary.antigravity_proxy.note.clone(),
-                        );
-                    }
+
+                    record_slot("claudeguard", check_cg, &next_summary.claudeguard);
+                    record_slot("antigravity_proxy", check_ag, &next_summary.antigravity_proxy);
+                    record_slot(
+                        "claude_desktop",
+                        check_client("claude_desktop"),
+                        &next_summary.claude_desktop,
+                    );
+                    record_slot(
+                        "claude_code",
+                        check_client("claude_code"),
+                        &next_summary.claude_code,
+                    );
+                    record_slot(
+                        "codex_desktop",
+                        check_client("codex_desktop"),
+                        &next_summary.codex_desktop,
+                    );
+                    record_slot(
+                        "codex_cli",
+                        check_client("codex_cli"),
+                        &next_summary.codex_cli,
+                    );
+                    record_slot(
+                        "antigravity_ide",
+                        check_client("antigravity_ide"),
+                        &next_summary.antigravity_ide,
+                    );
 
                     receipt.verified_scope = scope_parts.join(", ");
                     if failed_notes.is_empty() {
@@ -2575,14 +2615,13 @@ impl BackgroundMonitorHandle {
                             now,
                         );
 
-                        let (claude_msix, codex_msix) = local_msix_versions();
+                        let local_clients = local_client_versions();
                         let mut local_updates = snap.updates.clone();
                         hydrate_local_updates(
                             &mut local_updates,
                             &snap.version,
                             &antigravity_proxy,
-                            claude_msix,
-                            codex_msix,
+                            &local_clients,
                         );
 
                         coordinator.try_send_telemetry(TelemetryBundle {
@@ -3006,7 +3045,12 @@ mod tests {
                 return f(route, cg_version, ag_proxy, component, prev, now_secs);
             }
             let mut out = prev.clone();
-            hydrate_local_updates(&mut out, cg_version, ag_proxy, None, None);
+            hydrate_local_updates(
+                &mut out,
+                cg_version,
+                ag_proxy,
+                &update_check::LocalClientVersions::default(),
+            );
             let (check_cg, check_ag, _) =
                 parse_update_component_filter(component).unwrap_or((true, true, None));
             if check_cg {

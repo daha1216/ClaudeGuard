@@ -40,6 +40,7 @@ actions!([FocusGlobalSearch, DismissHudWindow]);
 pub struct LaunchArgs {
     pub start_in_tray: bool,
     pub start_hud: bool,
+    pub initial_nav: NavSection,
     pub endpoint: TransportEndpoint,
 }
 
@@ -48,16 +49,18 @@ impl Default for LaunchArgs {
         Self {
             start_in_tray: false,
             start_hud: false,
+            initial_nav: NavSection::Overview,
             endpoint: TransportEndpoint::Pipe(DEFAULT_PIPE_NAME.to_string()),
         }
     }
 }
 
 pub const USAGE: &str = concat!(
-    "用法：claudeguard-gui [--tray | --hud] [--demo pass|trip|disarmed|wizard] [--pipe <端点>]\n",
+    "用法：claudeguard-gui [--tray | --hud] [--nav overview|targets|breaker|env|audit|updates|notify] [--demo pass|trip|disarmed|wizard] [--pipe <端点>]\n",
     "\n",
     "  --tray                    启动后驻留系统托盘（0 窗口、0 VRAM），点击托盘呼出 HUD\n",
-    "  --hud                     启动即打开 Mode A 快捷托盘 HUD (368x452)\n",
+    "  --hud                     启动即打开 Mode A 快捷托盘 HUD (424x590)\n",
+    "  --nav <section>           指定主控制台默认打开的页面（默认 overview）\n",
     "  --demo <scenario>         独立演示模式：pass | trip | disarmed | wizard（不连接真实守护）\n",
     "  --pipe / --guardian-pipe  指定 Windows 命名管道端点（默认 \\\\.\\pipe\\ClaudeGuardV4）\n",
     "  --help                    显示帮助并退出\n",
@@ -76,6 +79,21 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchArgs, 
             "--help" | "-h" => return Err(USAGE.to_string()),
             "--tray" => out.start_in_tray = true,
             "--hud" => out.start_hud = true,
+            "--nav" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| format!("{arg} 缺少页面名\n{USAGE}"))?;
+                out.initial_nav = match val.to_ascii_lowercase().as_str() {
+                    "overview" => NavSection::Overview,
+                    "targets" => NavSection::Targets,
+                    "breaker" => NavSection::Breaker,
+                    "env" | "environment" => NavSection::Environment,
+                    "audit" => NavSection::Audit,
+                    "updates" => NavSection::Updates,
+                    "notify" => NavSection::Notify,
+                    _ => return Err(format!("未知 --nav 页面：{val}\n{USAGE}")),
+                };
+            }
             "--demo" => {
                 let next = args.next().unwrap_or_else(|| "pass".to_string());
                 let scenario = DemoScenario::parse(&next).ok_or_else(|| {
@@ -324,7 +342,7 @@ impl AppController {
             theme_mode: ThemeMode::Auto,
             system_prefers_light,
             privacy_mask: false,
-            nav_section: NavSection::Overview,
+            nav_section: args.initial_nav,
             selected_bucket: None,
             drafts: DraftStore::default(),
             inputs,
@@ -1405,22 +1423,23 @@ impl Render for ConsoleWindowView {
             .flex()
             .flex_col()
             .flex_1()
+            .w_full()
+            .min_w(px(0.))
             .min_h(px(0.))
             .overflow_y_scroll()
             .p(px(16.))
             .gap(px(14.))
             .when_some(proj.connection_banner.clone(), |root, banner| {
-                let endpoint_label = match ctrl_entity.read(cx).client.endpoint() {
-                    TransportEndpoint::Pipe(ep) => ep.clone(),
-                    TransportEndpoint::Demo(_) => "demo".into(),
-                };
+                let _ = ctrl_entity.read(cx).client.endpoint();
                 root.child(
                     bento_card(p)
+                        .w_full()
                         .p(px(14.))
                         .gap(px(10.))
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .justify_between()
                                 .gap(px(10.))
@@ -1435,7 +1454,7 @@ impl Render for ConsoleWindowView {
                                                 .text_size(px(13.5))
                                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                                 .text_color(rgb(p.text_primary))
-                                                .child("Guardian 守护服务未连接"),
+                                                .child("后台守护服务未连接"),
                                         ),
                                 )
                                 .child(
@@ -1453,7 +1472,7 @@ impl Render for ConsoleWindowView {
                                                 view.ctrl.update(cx, |ctrl, cx| {
                                                     ctrl.send_request(
                                                         PipeRequest::GetSnapshot,
-                                                        Some("已重新连接到 Guardian 守护服务"),
+                                                        Some("已重新连接到后台守护服务"),
                                                         cx,
                                                     );
                                                 });
@@ -1467,7 +1486,7 @@ impl Render for ConsoleWindowView {
                                 .text_size(px(12.))
                                 .text_color(rgb(p.text_secondary))
                                 .child(format!(
-                                    "{banner} · 命名管道：{endpoint_label}。未连接期间严格保持安全闭锁，不假报通过且禁止启动 AI 应用。"
+                                    "{banner}。未连接期间严格保持安全闭锁，不假报通过且禁止启动 AI 应用。"
                                 )),
                         ),
                 )

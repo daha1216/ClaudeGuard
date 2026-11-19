@@ -4,8 +4,8 @@
 use crate::app::{AppController, ConsoleWindowView};
 use crate::demo::now_unix_secs;
 use crate::protocol::{
-    AntigravityProxyStatus, CUT_MODES, LogLevel, OnboardingStrategy, PipeRequest, TimelineStatus,
-    UiLabelExt, UpdateCheckPhase, UpdateSummary, mask_ip_str,
+    AntigravityProxyStatus, CUT_MODES, ComponentUpdateStatus, LogLevel, OnboardingStrategy,
+    PipeRequest, TimelineStatus, UiLabelExt, UpdateCheckPhase, UpdateSummary, mask_ip_str,
 };
 use crate::state::{
     ConsoleProjection, NavSection, format_relative_secs, format_unix_hm,
@@ -375,16 +375,16 @@ pub fn render_breaker_page(
     let agent_rows = proj.agent_statuses.iter().map(|row| {
         let can_row_kill = connected && !busy && (row.running_count > 0 || row.orphan_count > 0);
         let row_id = row.id.clone();
-        let row_is_cli = row.kind.starts_with("CLI");
+        let row_is_cli = row.kind.contains("CLI");
         let ctrl_row = ctrl.clone();
         let sub_line = if row.orphan_count > 0 {
             format!(
-                "运行进程 {} · 孤儿 {} · COM 防火墙规则 {}",
+                "运行进程 {} · 孤儿 {} · 防火墙隔离规则 {}",
                 row.running_count, row.orphan_count, row.firewall_rules
             )
         } else {
             format!(
-                "运行进程 {} · COM 防火墙规则 {}",
+                "运行进程 {} · 防火墙隔离规则 {}",
                 row.running_count, row.firewall_rules
             )
         };
@@ -518,16 +518,20 @@ pub fn render_breaker_page(
             bento_card(p)
                 .p(px(16.))
                 .gap(px(12.))
-                .child(card_header("熔断处置与隔离策略", "CONTRACT §D1/D2", p))
+                .child(card_header("熔断处置与隔离策略", "支持自动核验与无损恢复", p))
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
+                        .gap(px(10.))
                         .child(
                             div()
                                 .flex()
                                 .flex_col()
+                                .flex_1()
+                                .min_w(px(220.))
                                 .child(
                                     div()
                                         .text_size(px(12.5))
@@ -539,15 +543,15 @@ pub fn render_breaker_page(
                                     div()
                                         .text_size(px(11.))
                                         .text_color(rgb(p.text_muted))
-                                        .child("默认仅应用级隔离；全局断网由 WAL 写前账本保护并支持流程 A/B 安全恢复"),
+                                        .child("默认仅应用级隔离；开启全局断网后支持一键安全恢复与撤防回滚"),
                                 ),
                         )
                         .child(segmented_capsule_track(p).children(cut_items)),
                 )
                 .child(switch_row(
                     "br-kill",
-                    "熔断时终止受管 GUI 进程",
-                    "按 PID + 启动时间 + 映像路径二次核验防误杀（CLI 策略由下方开关独立控制）",
+                    "熔断时终止受管桌面端进程",
+                    "多重进程校验防止误杀无关程序（终端 CLI 策略由下方开关独立控制）",
                     cfg.kill_on_fail,
                     p,
                     cx.listener(move |_, _, _, cx| {
@@ -560,7 +564,7 @@ pub fn render_breaker_page(
                 .child(switch_row(
                     "br-kill-cli",
                     "熔断时同步终止 Claude Code / Codex CLI 会话",
-                    "开启后触发熔断时同步清理 @anthropic-ai/claude-code 与 @openai/codex CLI 进程树",
+                    "开启后触发熔断时同步清理 Claude Code 与 Codex 命令行会话进程",
                     cfg.kill_cli_on_fail,
                     p,
                     cx.listener(move |_, _, _, cx| {
@@ -572,8 +576,8 @@ pub fn render_breaker_page(
                 ))
                 .child(switch_row(
                     "br-quar",
-                    "Win32 COM 应用级防火墙隔离",
-                    "通过 INetFwPolicy2 写入精确 Block 规则并回读核验",
+                    "应用级防火墙隔离",
+                    "触发熔断时写入精确出站/入站阻断规则并自动回读核验",
                     cfg.quarantine_on_fail,
                     p,
                     cx.listener(move |_, _, _, cx| {
@@ -586,7 +590,7 @@ pub fn render_breaker_page(
                 .child(switch_row(
                     "br-access",
                     "接入路径强校验（防代理关闭后直连）",
-                    "系统代理关且无活跃 TUN 网卡时立即判 Uncovered 并触发防泄露封锁",
+                    "系统代理关闭且无活跃 TUN 虚拟网卡时立即触发防泄露封锁",
                     cfg.enforce_access_path,
                     p,
                     cx.listener(move |_, _, _, cx| {
@@ -599,7 +603,7 @@ pub fn render_breaker_page(
                 .child(switch_row(
                     "br-sweep",
                     "退出后自动清扫残留与孤儿进程",
-                    "Claude 桌面端关闭后清理无主 renderer 与孤儿 CLI 子进程",
+                    "AI 桌面客户端关闭后自动清理无主渲染进程与孤儿后台子进程",
                     cfg.sweep_on_exit,
                     p,
                     cx.listener(move |_, _, _, cx| {
@@ -612,7 +616,7 @@ pub fn render_breaker_page(
                 .child(switch_row(
                     "br-lock-auto",
                     "未接入代理时自动兜底封锁出站",
-                    "检测到系统代理与 TUN 均不可用时自动封锁受管 GUI 应用出站",
+                    "检测到系统代理与 TUN 均不可用时自动封锁受管应用出站",
                     cfg.lockdown_on_uncovered,
                     p,
                     cx.listener(move |_, _, _, cx| {
@@ -629,7 +633,7 @@ pub fn render_breaker_page(
                 .child(switch_row(
                     "br-ag-claude",
                     "守护 Claude 桌面版",
-                    "熔断时终止并写入 INetFwRule 出站/入站隔离",
+                    "熔断时自动终止进程并写入应用级出站/入站防火墙隔离规则",
                     guarded_claude,
                     p,
                     cx.listener(move |_, _, _, cx| {
@@ -864,7 +868,7 @@ pub fn render_environment_page(
             bento_card(p)
                 .p(px(16.))
                 .gap(px(10.))
-                .child(card_header("直连防泄露雷达（GetExtendedTcpTable）", leak.note.clone(), p))
+                .child(card_header("直连防泄露雷达", leak.note.clone(), p))
                 .child(switch_row(
                     "env-leak-watch",
                     "开启直连防泄露观察",
@@ -1592,7 +1596,7 @@ pub fn render_audit_page(
                                         .text_size(px(13.5))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(rgb(p.text_primary))
-                                        .child("虚拟化审计日志流（uniform_list）"),
+                                        .child("实时审计日志流"),
                                 )
                                 .child(
                                     div()
@@ -1652,6 +1656,208 @@ fn format_ver_label(ver: Option<&str>, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
+const ANTIGRAVITY_PROXY_INTRO: &str =
+    "专为 Antigravity 打造的免 TUN 强制代理工具，支持 DLL 注入与进程流量劫持。";
+
+fn client_update_toast(component_id: &str) -> &'static str {
+    match component_id {
+        "claude_desktop" => "已完成 Claude Desktop 官方最新版本检查",
+        "claude_code" => "已完成 Claude Code CLI 官方最新版本检查",
+        "codex_desktop" => "已完成 ChatGPT / Codex 桌面端官方版本检查",
+        "codex_cli" => "已完成 Codex CLI 官方最新版本检查",
+        "antigravity_ide" => "已完成 Antigravity IDE 官方最新版本检查",
+        _ => "已完成组件版本检查",
+    }
+}
+
+fn render_client_update_card(
+    ctrl: Entity<AppController>,
+    item: &ComponentUpdateStatus,
+    subtitle: &'static str,
+    can_check: bool,
+    now: u64,
+    p: &'static ThemePalette,
+    cx: &mut Context<ConsoleWindowView>,
+) -> Div {
+    let comp_id = item.id.clone();
+    let toast_msg = client_update_toast(&item.id);
+    let installed_str = format_ver_label(item.installed_version.as_deref(), "未检测到");
+    let latest_str = format_ver_label(item.latest_version.as_deref(), "待检查");
+    let checked_age = format_relative_secs(item.checked_at, now);
+
+    let latest_color = match item.phase {
+        UpdateCheckPhase::UpdateAvailable => p.badge_warn.text,
+        UpdateCheckPhase::UpToDate => p.badge_pass.text,
+        UpdateCheckPhase::Failed => p.badge_fail.text,
+        _ => p.text_primary,
+    };
+
+    let note_text = if item.note.trim().is_empty() {
+        "点击「检查」通过受管代理通道获取官方最新版本".to_string()
+    } else {
+        item.note.clone()
+    };
+
+    let source_label = if item.repo.trim().is_empty() {
+        "官方发布渠道"
+    } else {
+        item.repo.as_str()
+    };
+
+    bento_card(p)
+        .flex_1()
+        .flex_basis(px(0.))
+        .min_w(px(0.))
+        .p(px(14.))
+        .gap(px(9.))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(p.text_primary))
+                                .child(item.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(rgb(p.text_muted))
+                                .child(subtitle),
+                        ),
+                )
+                .child(status_pill(
+                    item.phase.label(),
+                    update_phase_tone(item.phase),
+                    p,
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .w_full()
+                .min_w(px(0.))
+                .gap(px(8.))
+                .child(
+                    inset_box(p)
+                        .flex_1()
+                        .flex_basis(px(0.))
+                        .min_w(px(0.))
+                        .px(px(10.))
+                        .py(px(7.))
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(p.text_muted))
+                                .child("本机已装"),
+                        )
+                        .child(
+                            mono_tabular(installed_str)
+                                .truncate()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(if item.installed_version.is_some() {
+                                    p.text_primary
+                                } else {
+                                    p.text_muted
+                                })),
+                        ),
+                )
+                .child(
+                    inset_box(p)
+                        .flex_1()
+                        .flex_basis(px(0.))
+                        .min_w(px(0.))
+                        .px(px(10.))
+                        .py(px(7.))
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(p.text_muted))
+                                .child("官方最新"),
+                        )
+                        .child(
+                            mono_tabular(latest_str)
+                                .truncate()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(latest_color)),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .text_size(px(11.5))
+                .line_height(px(16.))
+                .text_color(rgb(match item.phase {
+                    UpdateCheckPhase::UpdateAvailable => p.badge_warn.text,
+                    UpdateCheckPhase::Failed => p.badge_fail.text,
+                    _ => p.text_secondary,
+                }))
+                .child(note_text),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(
+                    mono_tabular(format!("来源：{source_label} · {checked_age}"))
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_size(px(10.5))
+                        .text_color(rgb(p.text_muted)),
+                )
+                .child(
+                    action_button(
+                        gpui::ElementId::Name(format!("upd-check-{}", item.id).into()),
+                        "↻ 检查",
+                        if item.phase == UpdateCheckPhase::UpdateAvailable {
+                            ButtonKind::Primary
+                        } else {
+                            ButtonKind::Secondary
+                        },
+                        can_check,
+                        p,
+                    )
+                    .when(can_check, |b| {
+                        b.on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                ctrl.update(cx, |c, cx| {
+                                    c.send_request(
+                                        PipeRequest::CheckUpdates {
+                                            component: Some(comp_id.clone()),
+                                        },
+                                        Some(toast_msg),
+                                        cx,
+                                    );
+                                });
+                            }),
+                        )
+                    }),
+                ),
+        )
+}
+
 /// Sub-view: `客户端更新`
 pub fn render_updates_page(
     ctrl: Entity<AppController>,
@@ -1680,7 +1886,7 @@ pub fn render_updates_page(
     let cg_cur = format_ver_label(cg_upd.installed_version.as_deref().or(Some(&ver)), "v4.0.0");
     let cg_latest = format_ver_label(cg_upd.latest_version.as_deref(), "待检查");
     let cg_note = if cg_upd.note.trim().is_empty() {
-        "已启用 Ed25519 清单验签 + Authenticode 发布者校验 + NetworkPolicy 代理通道".to_string()
+        "已启用官方发布签名校验，仅通过受管代理通道静默检查新版本".to_string()
     } else {
         cg_upd.note.clone()
     };
@@ -1742,18 +1948,56 @@ pub fn render_updates_page(
     };
     let ag_checked_age = format_relative_secs(ag_upd.checked_at, now);
 
-    let claude_msix_label = updates
-        .claude_msix_version
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|v| format!("MSIX v{}", v.trim_start_matches(['v', 'V'])))
-        .unwrap_or_else(|| "MSIX 未检出".into());
-    let codex_msix_label = updates
-        .codex_msix_version
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|v| format!("MSIX v{}", v.trim_start_matches(['v', 'V'])))
-        .unwrap_or_else(|| "MSIX 未检出".into());
+    // Count how many of the 5 tracked AI clients have updates available
+    let client_specs: [(&ComponentUpdateStatus, &'static str); 5] = [
+        (
+            &updates.claude_desktop,
+            "Anthropic 官方桌面端（含后台子进程与升级后自动续保）",
+        ),
+        (
+            &updates.claude_code,
+            "Anthropic 官方命令行终端（@anthropic-ai/claude-code）",
+        ),
+        (
+            &updates.codex_desktop,
+            "OpenAI 官方桌面端（支持升级后自动续保与隔离路径同步）",
+        ),
+        (
+            &updates.codex_cli,
+            "OpenAI 官方命令行终端（@openai/codex）",
+        ),
+        (
+            &updates.antigravity_ide,
+            "Google Antigravity 桌面客户端（自动核验升级后代理注入状态）",
+        ),
+    ];
+    let avail_clients = client_specs
+        .iter()
+        .filter(|(s, _)| s.phase == UpdateCheckPhase::UpdateAvailable)
+        .count();
+    let installed_clients = client_specs
+        .iter()
+        .filter(|(s, _)| s.installed_version.is_some())
+        .count();
+
+    let client_cards: Vec<Div> = client_specs
+        .iter()
+        .map(|(slot, subtitle)| {
+            render_client_update_card(ctrl.clone(), slot, subtitle, can_check, now, p, cx)
+        })
+        .collect();
+
+    let mut client_rows: Vec<Div> = Vec::new();
+    let mut iter = client_cards.into_iter();
+    while let Some(first) = iter.next() {
+        let mut row = div().flex().w_full().min_w(px(0.)).gap(px(12.)).child(first);
+        if let Some(second) = iter.next() {
+            row = row.child(second);
+        } else {
+            row = row.child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)));
+        }
+        client_rows.push(row);
+    }
 
     let ctrl_auto = ctrl.clone();
     let ctrl_check_all = ctrl.clone();
@@ -1762,14 +2006,19 @@ pub fn render_updates_page(
     div()
         .flex()
         .flex_col()
+        .w_full()
+        .min_w(px(0.))
         .gap(px(14.))
+        // Card 1: ClaudeGuard Self + Global Refresh
         .child(
             bento_card(p)
+                .w_full()
                 .p(px(16.))
                 .gap(px(10.))
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
                         .gap(px(8.))
@@ -1778,11 +2027,12 @@ pub fn render_updates_page(
                                 .text_size(px(13.5))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(p.text_primary))
-                                .child("ClaudeGuard 自身与组件更新巡检"),
+                                .child("ClaudeGuard 守护端与全局版本巡检"),
                         )
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .gap(px(8.))
                                 .child(
@@ -1800,7 +2050,7 @@ pub fn render_updates_page(
                 .child(switch_row(
                     "upd-auto",
                     "自动静默检查新版本",
-                    "每 6 小时经代理网络策略检查签名清单，保护隔离期间禁止应用更新",
+                    "每 6 小时经代理通道静默检查全部 7 项组件版本；触发隔离期间禁止更新",
                     cfg.auto_upd_check,
                     p,
                     cx.listener(move |_, _, _, cx| {
@@ -1816,6 +2066,7 @@ pub fn render_updates_page(
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
                         .gap(px(10.))
@@ -1824,11 +2075,12 @@ pub fn render_updates_page(
                                 .flex()
                                 .flex_col()
                                 .flex_1()
-                                .min_w(px(0.))
+                                .min_w(px(240.))
                                 .gap(px(2.))
                                 .child(
                                     div()
                                         .text_size(px(12.))
+                                        .line_height(px(17.))
                                         .text_color(rgb(p.text_secondary))
                                         .child(cg_note),
                                 )
@@ -1844,7 +2096,7 @@ pub fn render_updates_page(
                             action_button(
                                 "upd-check-btn",
                                 if tripped {
-                                    "隔离期间禁止更新"
+                                    "隔离期间禁止检查"
                                 } else {
                                     "↻ 立即检查全部更新"
                                 },
@@ -1859,7 +2111,7 @@ pub fn render_updates_page(
                                         ctrl_check_all.update(cx, |c, cx| {
                                             c.send_request(
                                                 PipeRequest::CheckUpdates { component: None },
-                                                Some("已完成全部组件更新巡检"),
+                                                Some("已完成全部 7 项组件与客户端版本检查"),
                                                 cx,
                                             );
                                         });
@@ -1869,22 +2121,40 @@ pub fn render_updates_page(
                         ),
                 ),
         )
+        // Card 2: antigravity-proxy with user's exact description
         .child(
             bento_card(p)
+                .w_full()
                 .p(px(16.))
                 .gap(px(10.))
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
                         .gap(px(8.))
                         .child(
                             div()
-                                .text_size(px(13.5))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(p.text_primary))
-                                .child("antigravity-proxy 注入仓库版本检测 · yuaotian/antigravity-proxy"),
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w(px(220.))
+                                .gap(px(3.))
+                                .child(
+                                    div()
+                                        .text_size(px(13.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(p.text_primary))
+                                        .child("antigravity-proxy 透明代理注入器 · yuaotian/antigravity-proxy"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .line_height(px(17.))
+                                        .text_color(rgb(p.text_secondary))
+                                        .child(ANTIGRAVITY_PROXY_INTRO),
+                                ),
                         )
                         .child(status_pill(
                             ag_upd.phase.label(),
@@ -1895,6 +2165,8 @@ pub fn render_updates_page(
                 .child(
                     div()
                         .flex()
+                        .w_full()
+                        .min_w(px(0.))
                         .gap(px(10.))
                         .child(ag_diag_tile(
                             "本地已注入版本",
@@ -1924,6 +2196,7 @@ pub fn render_updates_page(
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
                         .gap(px(10.))
@@ -1932,11 +2205,12 @@ pub fn render_updates_page(
                                 .flex()
                                 .flex_col()
                                 .flex_1()
-                                .min_w(px(0.))
+                                .min_w(px(240.))
                                 .gap(px(2.))
                                 .child(
                                     div()
                                         .text_size(px(12.))
+                                        .line_height(px(17.))
                                         .text_color(rgb(if ag_upd.phase == UpdateCheckPhase::UpdateAvailable {
                                             p.badge_warn.text
                                         } else if ag_upd.phase == UpdateCheckPhase::Failed {
@@ -1983,88 +2257,44 @@ pub fn render_updates_page(
                         ),
                 ),
         )
+        // Card 3: 5 Tracked AI Clients Official Version Radar
         .child(
             div()
                 .flex()
-                .gap(px(14.))
+                .flex_col()
+                .w_full()
+                .min_w(px(0.))
+                .gap(px(10.))
                 .child(
-                    bento_card(p)
-                        .flex_1()
-                        .flex_basis(px(0.))
-                        .min_w(px(0.))
-                        .p(px(16.))
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
                         .gap(px(8.))
-                        .child(card_header(
-                            "Claude 桌面端 & Claude Code",
-                            claude_msix_label.clone(),
-                            p,
-                        ))
+                        .px(px(2.))
                         .child(
                             div()
-                                .text_size(px(12.))
-                                .text_color(rgb(p.text_secondary))
-                                .child("全覆盖 depth-12 MSIX 子进程树（含 github-mcp-server.exe / cowork-svc.exe）与 @anthropic-ai/claude-code CLI 会话；更新后自动追加 INetFwRule 并回读核验，杜绝升级脱保。"),
+                                .text_size(px(13.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(p.text_primary))
+                                .child("受管 AI 客户端官方版本追踪"),
                         )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .child(status_pill(
-                                    claude_msix_label,
-                                    if updates.claude_msix_version.is_some() {
-                                        BadgeTone::Pass
-                                    } else {
-                                        BadgeTone::Muted
-                                    },
-                                    p,
-                                ))
-                                .child(status_pill(
-                                    "COM 防火墙 + CLI 覆盖",
-                                    BadgeTone::Pass,
-                                    p,
-                                )),
-                        ),
+                        .child(status_pill(
+                            if avail_clients > 0 {
+                                format!("已装 {installed_clients}/5 · {avail_clients} 项可更新")
+                            } else {
+                                format!("已装 {installed_clients}/5 · 均已对齐最新")
+                            },
+                            if avail_clients > 0 {
+                                BadgeTone::Warn
+                            } else {
+                                BadgeTone::Pass
+                            },
+                            p,
+                        )),
                 )
-                .child(
-                    bento_card(p)
-                        .flex_1()
-                        .flex_basis(px(0.))
-                        .min_w(px(0.))
-                        .p(px(16.))
-                        .gap(px(8.))
-                        .child(card_header(
-                            "ChatGPT / Codex 桌面端 & CLI",
-                            codex_msix_label.clone(),
-                            p,
-                        ))
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(rgb(p.text_secondary))
-                                .child("全覆盖 ChatGPT.exe + Codex.exe + cua_node 与 depth-11 codex-computer-use 子树及 @openai/codex CLI；经代理通道校验签名并在运行进程安全交接后绑定隔离路径。"),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .child(status_pill(
-                                    codex_msix_label,
-                                    if updates.codex_msix_version.is_some() {
-                                        BadgeTone::Pass
-                                    } else {
-                                        BadgeTone::Muted
-                                    },
-                                    p,
-                                ))
-                                .child(status_pill(
-                                    "代理通道 + CLI 覆盖",
-                                    BadgeTone::Pass,
-                                    p,
-                                )),
-                        ),
-                ),
+                .children(client_rows),
         )
 }
 
@@ -2085,7 +2315,7 @@ pub fn render_notify_page(
     let fs_note = ctrl_r
         .feishu_status_note
         .clone()
-        .unwrap_or_else(|| "凭据由 Windows DPAPI CryptProtectData 加密存储于当前用户".into());
+        .unwrap_or_else(|| "凭据由 Windows 系统本机安全加密存储，绝不以明文落盘".into());
 
     let ctrl_en = ctrl.clone();
     let ctrl_trip = ctrl.clone();
@@ -2104,11 +2334,11 @@ pub fn render_notify_page(
             bento_card(p)
                 .p(px(16.))
                 .gap(px(10.))
-                .child(card_header("原生 WinRT Toast 通知", "零 PowerShell", p))
+                .child(card_header("系统桌面通知", "Windows 原生提醒", p))
                 .child(switch_row(
                     "nt-enabled",
-                    "启用桌面 Toast 通知",
-                    "通过 WinRT ToastNotificationManager 原生推送",
+                    "启用桌面弹窗通知",
+                    "发生关键防护事件时在系统右下角即时弹窗提醒",
                     n.enabled,
                     p,
                     cx.listener(move |_, _, _, cx| {
@@ -2133,8 +2363,8 @@ pub fn render_notify_page(
                 ))
                 .child(switch_row(
                     "nt-recover",
-                    "流程 A/B 安全恢复通知",
-                    "网络恢复或撤防核验完成后提示结果",
+                    "安全解封与恢复通知",
+                    "出口复检通过或撤防核验完成后提示结果",
                     n.recover,
                     p,
                     cx.listener(move |_, _, _, cx| {
@@ -2147,7 +2377,7 @@ pub fn render_notify_page(
                 .child(switch_row(
                     "nt-egress",
                     "通知正文附带出口 IP 与地区（默认脱敏关闭）",
-                    "CONTRACT §D5：关闭时外发通知仅含目标别名、状态与原因码，绝不泄露出口 IP 或主机名",
+                    "默认关闭：外发通知仅含目标名称、状态与异常原因，绝不泄露出口 IP 或主机名",
                     n.include_egress,
                     p,
                     cx.listener(move |_, _, _, cx| {
@@ -2166,7 +2396,7 @@ pub fn render_notify_page(
             bento_card(p)
                 .p(px(16.))
                 .gap(px(10.))
-                .child(card_header("飞书群机器人 Webhook", "经 NetworkPolicy 外发", p))
+                .child(card_header("飞书群机器人 Webhook", "受管代理通道外发", p))
                 .child(switch_row(
                     "fs-en-sw",
                     "启用飞书群机器人推送",
@@ -2185,7 +2415,7 @@ pub fn render_notify_page(
                 .child(switch_row(
                     "fs-clr-sw",
                     "保存时清除已存储的旧密钥",
-                    "勾选后将抹除 DPAPI 中保存的加签密钥",
+                    "勾选后将清除本机已保存的加签密钥",
                     clear_secret,
                     p,
                     cx.listener(move |_, _, _, cx| {

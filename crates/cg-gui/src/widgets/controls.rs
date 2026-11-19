@@ -25,6 +25,7 @@ pub fn bento_card(p: &ThemePalette) -> Div {
     div()
         .flex()
         .flex_col()
+        .min_w(px(0.))
         .rounded(px(layout::RADIUS_BENTO))
         .bg(rgb(p.card_bg))
         .border_1()
@@ -39,6 +40,7 @@ pub fn inset_box(p: &ThemePalette) -> Div {
     div()
         .flex()
         .flex_col()
+        .min_w(px(0.))
         .rounded(px(layout::RADIUS_INSET))
         .bg(rgb(p.inset_bg))
         .border_1()
@@ -48,6 +50,8 @@ pub fn inset_box(p: &ThemePalette) -> Div {
 /// Compact `.cc` country pill badge (e.g., `US`, `HK`, `SG`).
 pub fn cc_badge(code: &str, p: &ThemePalette) -> Div {
     div()
+        .flex_shrink_0()
+        .whitespace_nowrap()
         .px(px(7.))
         .py(px(2.))
         .rounded(px(6.))
@@ -64,6 +68,8 @@ pub fn status_pill(label: impl Into<gpui::SharedString>, tone: BadgeTone, p: &Th
     let b = p.badge(tone);
     div()
         .flex()
+        .flex_shrink_0()
+        .whitespace_nowrap()
         .items_center()
         .gap(px(5.))
         .px(px(8.))
@@ -83,6 +89,8 @@ pub fn status_pill(label: impl Into<gpui::SharedString>, tone: BadgeTone, p: &Th
 /// Latency / metadata chip (`54ms` tabular numeral).
 pub fn latency_pill(label: impl Into<gpui::SharedString>, p: &ThemePalette) -> Div {
     div()
+        .flex_shrink_0()
+        .whitespace_nowrap()
         .px(px(7.))
         .py(px(2.))
         .rounded(px(6.))
@@ -127,6 +135,8 @@ pub fn action_button(
     let mut btn = div()
         .id(id)
         .flex()
+        .flex_shrink_0()
+        .whitespace_nowrap()
         .items_center()
         .justify_center()
         .gap(px(6.))
@@ -242,6 +252,7 @@ pub fn card_header(
 ) -> Div {
     div()
         .flex()
+        .flex_wrap()
         .items_center()
         .justify_between()
         .gap(px(8.))

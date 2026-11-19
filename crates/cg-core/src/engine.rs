@@ -338,7 +338,7 @@ pub enum EngineEvent {
         status: AntigravityProxyStatus,
     },
     UpdatesChecked {
-        summary: UpdateSummary,
+        summary: Box<UpdateSummary>,
     },
 }
 
@@ -603,7 +603,7 @@ impl GuardEngine {
                 handle_antigravity_proxy_updated(&mut state, status, now_secs, &mut cmds);
             }
             EngineEvent::UpdatesChecked { summary } => {
-                handle_updates_checked(&mut state, summary, now_secs, &mut cmds);
+                handle_updates_checked(&mut state, *summary, now_secs, &mut cmds);
             }
         }
 
@@ -3808,7 +3808,7 @@ mod tests {
         let (st1, cmds1) = GuardEngine::step(
             state,
             EngineEvent::UpdatesChecked {
-                summary: summary1.clone(),
+                summary: Box::new(summary1.clone()),
             },
             110,
         );
@@ -3844,7 +3844,7 @@ mod tests {
         let (st2, cmds2) = GuardEngine::step(
             st1,
             EngineEvent::UpdatesChecked {
-                summary: summary1.clone(),
+                summary: Box::new(summary1.clone()),
             },
             120,
         );
@@ -3859,8 +3859,13 @@ mod tests {
         let mut summary2 = summary1;
         summary2.antigravity_proxy.latest_version = Some("2.6.4".into());
         summary2.antigravity_proxy.note = "antigravity-proxy 2.6.0 -> 2.6.4".into();
-        let (st3, cmds3) =
-            GuardEngine::step(st2, EngineEvent::UpdatesChecked { summary: summary2 }, 130);
+        let (st3, cmds3) = GuardEngine::step(
+            st2,
+            EngineEvent::UpdatesChecked {
+                summary: Box::new(summary2),
+            },
+            130,
+        );
         assert!(cmds3.iter().any(|c| matches!(
             c,
             EffectCommand::Notify { class, body, .. }

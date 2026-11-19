@@ -118,38 +118,38 @@ fn demo_self_check(now: u64, tripped: bool) -> DefenseSelfCheck {
         items: vec![
             DefenseCheckItem {
                 id: "daemon".into(),
-                name: "Guardian 服务".into(),
+                name: "守护服务".into(),
                 status: SelfCheckStatus::Healthy,
-                detail: "LocalSystem 常驻 · Named Pipe \\\\.\\pipe\\ClaudeGuardV4 响应 <1ms".into(),
+                detail: "系统守护常驻运行 · 本地状态通道响应 <1ms".into(),
             },
             DefenseCheckItem {
                 id: "firewall".into(),
-                name: "Win32 COM 防火墙".into(),
+                name: "应用级防火墙".into(),
                 status: SelfCheckStatus::Healthy,
                 detail: if tripped {
-                    "INetFwPolicy2 已核验 6 条 Block 隔离规则生效中".into()
+                    "已核验 6 条应用隔离规则生效中".into()
                 } else {
-                    "INetFwPolicy2 就绪 · 零 PowerShell 零延迟".into()
+                    "防火墙规则引擎就绪 · 零弹窗即时生效".into()
                 },
             },
             DefenseCheckItem {
                 id: "leak".into(),
-                name: "直连防泄露雷达".into(),
+                name: "防直连泄露监测".into(),
                 status: SelfCheckStatus::Healthy,
-                detail: "GetExtendedTcpTable 持续巡检 · 已排除 198.18.0.0/15 TUN 虚拟段".into(),
+                detail: "实时监测外连状态 · 已排除 TUN 虚拟网段干扰".into(),
             },
             DefenseCheckItem {
                 id: "wal".into(),
-                name: "WAL 崩溃恢复账本".into(),
+                name: "断电恢复账本".into(),
                 status: if tripped {
                     SelfCheckStatus::Degraded
                 } else {
                     SelfCheckStatus::Healthy
                 },
                 detail: if tripped {
-                    "存在未提交隔离事务 tx-20261118-quarantine（断电可自动续接/恢复）".into()
+                    "存在未结隔离事务 tx-20261118-quarantine（异常重启可自动续接还原）".into()
                 } else {
-                    "journal.json 状态干净 · 无崩溃残留".into()
+                    "恢复账本状态干净 · 无异常残留".into()
                 },
             },
         ],
@@ -231,7 +231,7 @@ fn demo_logs(now: u64, scenario: DemoScenario) -> Vec<LogEntry> {
             timestamp: now.saturating_sub(3600),
             level: LogLevel::Info,
             category: "service".into(),
-            message: "Guardian 服务完成自检：COM 防火墙与 WAL 恢复执行器均就绪".into(),
+            message: "后台守护服务完成自检：应用防火墙与异常回滚引擎均就绪".into(),
         },
         LogEntry {
             id: 102,
@@ -264,7 +264,7 @@ fn demo_logs(now: u64, scenario: DemoScenario) -> Vec<LogEntry> {
                 timestamp: now.saturating_sub(118),
                 level: LogLevel::Audit,
                 category: "firewall".into(),
-                message: "已终止 3 个受管 GUI 进程并写入 6 条 INetFwRule 隔离规则（COM 回读核验 Verified）".into(),
+                message: "已终止 3 个受管桌面进程并写入 6 条应用级防火墙隔离规则（回读核验通过）".into(),
             });
             entries.push(LogEntry {
                 id: 106,
@@ -371,7 +371,7 @@ fn demo_updates(now: u64, scenario: DemoScenario) -> UpdateSummary {
         release_url: Some("https://github.com/daha1216/ClaudeGuard/releases/tag/v4.0.0".into()),
         asset_url: None,
         checked_at: Some(now.saturating_sub(18)),
-        note: "当前 v4.0.0 已是最新渠道版本（Ed25519 + Authenticode 验签通道就绪）".into(),
+        note: "当前 v4.0.0 已是最新正式版本（官方签名校验已启用）".into(),
     };
     let antigravity_proxy = match scenario {
         DemoScenario::Trip => ComponentUpdateStatus {
@@ -406,9 +406,110 @@ fn demo_updates(now: u64, scenario: DemoScenario) -> UpdateSummary {
             note: "当前 v2.6.3 已是 yuaotian/antigravity-proxy 最新版".into(),
         },
     };
+    let claude_desktop = ComponentUpdateStatus {
+        id: "claude_desktop".into(),
+        name: "Claude 桌面端".into(),
+        repo: "Anthropic MSIX 官方渠道".into(),
+        phase: if scenario == DemoScenario::Trip {
+            UpdateCheckPhase::UpdateAvailable
+        } else {
+            UpdateCheckPhase::UpToDate
+        },
+        installed_version: Some("1.0.200".into()),
+        latest_version: Some(if scenario == DemoScenario::Trip {
+            "1.0.214".into()
+        } else {
+            "1.0.200".into()
+        }),
+        release_url: Some("https://claude.ai/download".into()),
+        asset_url: None,
+        checked_at: Some(now.saturating_sub(18)),
+        note: if scenario == DemoScenario::Trip {
+            "发现新版本：当前 v1.0.200 -> 最新 v1.0.214".into()
+        } else {
+            "当前 v1.0.200 已是最新官方版本".into()
+        },
+    };
+    let claude_code = ComponentUpdateStatus {
+        id: "claude_code".into(),
+        name: "Claude Code CLI".into(),
+        repo: "@anthropic-ai/claude-code".into(),
+        phase: if scenario == DemoScenario::Trip {
+            UpdateCheckPhase::UpdateAvailable
+        } else {
+            UpdateCheckPhase::UpToDate
+        },
+        installed_version: Some("2.1.308".into()),
+        latest_version: Some(if scenario == DemoScenario::Trip {
+            "2.1.320".into()
+        } else {
+            "2.1.308".into()
+        }),
+        release_url: Some("https://www.npmjs.com/package/@anthropic-ai/claude-code".into()),
+        asset_url: None,
+        checked_at: Some(now.saturating_sub(18)),
+        note: if scenario == DemoScenario::Trip {
+            "发现新版本：当前 v2.1.308 -> 最新 v2.1.320".into()
+        } else {
+            "当前 v2.1.308 已是最新官方版本".into()
+        },
+    };
+    let codex_desktop = ComponentUpdateStatus {
+        id: "codex_desktop".into(),
+        name: "ChatGPT / Codex 桌面端".into(),
+        repo: "OpenAI MSIX 官方渠道".into(),
+        phase: UpdateCheckPhase::UpToDate,
+        installed_version: Some("26.1111.2228.0".into()),
+        latest_version: Some("26.1111.2228.0".into()),
+        release_url: Some("https://chatgpt.com/download".into()),
+        asset_url: None,
+        checked_at: Some(now.saturating_sub(18)),
+        note: "当前 v26.1111.2228.0 已是最新官方版本".into(),
+    };
+    let codex_cli = ComponentUpdateStatus {
+        id: "codex_cli".into(),
+        name: "Codex CLI".into(),
+        repo: "@openai/codex".into(),
+        phase: UpdateCheckPhase::UpToDate,
+        installed_version: Some("0.158.0".into()),
+        latest_version: Some("0.158.0".into()),
+        release_url: Some("https://www.npmjs.com/package/@openai/codex".into()),
+        asset_url: None,
+        checked_at: Some(now.saturating_sub(18)),
+        note: "当前 v0.158.0 已是最新官方版本".into(),
+    };
+    let antigravity_ide = ComponentUpdateStatus {
+        id: "antigravity_ide".into(),
+        name: "Antigravity 客户端".into(),
+        repo: "Google 官方更新源".into(),
+        phase: if scenario == DemoScenario::Trip {
+            UpdateCheckPhase::UpdateAvailable
+        } else {
+            UpdateCheckPhase::UpToDate
+        },
+        installed_version: Some("2.33.0".into()),
+        latest_version: Some(if scenario == DemoScenario::Trip {
+            "2.34.0".into()
+        } else {
+            "2.33.0".into()
+        }),
+        release_url: Some("https://antigravity.google".into()),
+        asset_url: None,
+        checked_at: Some(now.saturating_sub(18)),
+        note: if scenario == DemoScenario::Trip {
+            "发现新版本：当前 v2.33.0 -> 最新 v2.34.0".into()
+        } else {
+            "当前 v2.33.0 已是最新官方版本".into()
+        },
+    };
     UpdateSummary {
         claudeguard,
         antigravity_proxy,
+        claude_desktop,
+        claude_code,
+        codex_desktop,
+        codex_cli,
+        antigravity_ide,
         claude_msix_version: Some("5.1231.2.0".into()),
         codex_msix_version: Some("26.1111.2228.0".into()),
     }
@@ -677,14 +778,14 @@ pub fn build_demo_snapshot(scenario: DemoScenario) -> GuardSnapshot {
             status: OperationStatus::Verified,
             items: vec![
                 OperationItemReceipt {
-                    name: "结束受管 GUI 进程".into(),
+                    name: "结束受管桌面进程".into(),
                     status: OperationStatus::Verified,
-                    detail: "已终止 3 个 GUI 进程（PID 身份二次复核通过）".into(),
+                    detail: "已终止 3 个桌面进程（进程身份二次复核通过）".into(),
                 },
                 OperationItemReceipt {
-                    name: "Win32 COM 防火墙出站/入站隔离".into(),
+                    name: "应用级防火墙出站/入站隔离".into(),
                     status: OperationStatus::Verified,
-                    detail: "INetFwPolicy2 回读确认 6 条 ClaudeGuard Block 规则生效".into(),
+                    detail: "回读确认 6 条应用隔离规则已生效".into(),
                 },
             ],
             error: None,
