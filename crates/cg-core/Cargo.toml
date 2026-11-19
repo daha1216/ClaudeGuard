@@ -1,0 +1,11 @@
+[package]
+name = "cg-core"
+version = "4.0.0"
+edition = "2024"
+license = "MIT"
+description = "ClaudeGuard v4 deterministic functional core: state machine, policy, anchors, redaction, onboarding, timeline"
+
+[dependencies]
+cg-protocol = { path = "../cg-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,39 @@
+[package]
+name = "cg-daemon"
+version = "4.0.0"
+edition = "2021"
+license = "MIT"
+description = "ClaudeGuard v4 Windows service daemon, WAL crash recovery journal, Named Pipe IPC, and emergency CLI"
+
+[lib]
+name = "cg_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "claudeguard-daemon"
+path = "src/main.rs"
+
+[[bin]]
+name = "claudeguard-cli"
+path = "src/bin/claudeguard-cli.rs"
+
+[dependencies]
+cg-protocol = { path = "../cg-protocol" }
+cg-core = { path = "../cg-core" }
+cg-platform = { path = "../cg-platform" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Services",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+] }

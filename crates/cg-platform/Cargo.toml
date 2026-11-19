@@ -1,0 +1,36 @@
+[package]
+name = "cg-platform"
+version = "4.0.0"
+edition = "2021"
+license = "MIT"
+description = "ClaudeGuard v4 native OS/platform driver (COM firewall, IpHelper, Toolhelp32, WinRT Toast, DPAPI, HTTP policy)"
+
+[dependencies]
+cg-protocol = { path = "../cg-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "2"
+sysinfo = "0.30"
+base64 = "0.22"
+sha2 = "0.11"
+hmac = "0.13"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "UI_Notifications",
+    "Data_Xml_Dom",
+    "Management_Deployment",
+] }

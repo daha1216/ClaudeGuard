@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cg-protocol",
+    "crates/cg-core",
+    "crates/cg-platform",
+    "crates/cg-daemon",
+]
+exclude = [
+    "crates/cg-gui",
+]

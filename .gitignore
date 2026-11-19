@@ -1,0 +1,20 @@
+# Build outputs
+/target/
+/target-*/
+**/target/
+*.pdb
+*.exp
+*.lib
+
+# Generated installers and release artifacts
+/installer/*.exe
+/installer/*.zip
+/installer/*.sha256
+
+# Local scratch & editor files
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+.vscode/
+.idea/
