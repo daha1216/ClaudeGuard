@@ -17,12 +17,15 @@ pub(crate) mod com;
 pub mod crypto_win;
 pub mod env_win;
 pub mod firewall_com;
+pub mod leak_shield_win;
+pub mod mihomo_win;
 pub mod netwatch_win;
 pub mod notify_win;
 pub mod probe_http;
 pub mod process_win;
 pub mod traits;
 pub mod update_check;
+pub mod zip_util;
 
 pub use cg_protocol;
 pub use update_check::{

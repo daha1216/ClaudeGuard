@@ -14,8 +14,8 @@ use cg_core::CheckPurpose;
 
 use crate::protocol::{
     AccessEvidence, AgentRuntimeStatus, AntigravityProxyStatus, DefenseSelfCheck, EnvCheck,
-    ErrorCode, FeishuStatus, GuardSnapshot, LeakReport, OperationReceipt, PipeRequest,
-    PipeResponse, ProbeResult, UpdateSummary,
+    ErrorCode, FeishuStatus, GuardSnapshot, LeakReport, LeakShieldStatus, MihomoStatus,
+    OperationReceipt, PipeRequest, PipeResponse, ProbeResult, UpdateSummary,
 };
 
 const QUEUE_CAPACITY: usize = 256;
@@ -71,6 +71,8 @@ pub enum ActorControl {
 pub struct TelemetryBundle {
     pub agents: Vec<AgentRuntimeStatus>,
     pub leak: LeakReport,
+    pub leak_shield: LeakShieldStatus,
+    pub mihomo: MihomoStatus,
     pub env: EnvCheck,
     pub antigravity_proxy: AntigravityProxyStatus,
     pub self_check: DefenseSelfCheck,
@@ -104,6 +106,17 @@ pub enum CoordinatorEvent {
     },
     FeishuTestFinished {
         result: Result<FeishuStatus, String>,
+        now_secs: u64,
+        reply: SyncSender<PipeResponse>,
+    },
+    AntigravityRepairFinished {
+        result: Result<String, String>,
+        now_secs: u64,
+        reply: SyncSender<PipeResponse>,
+    },
+    MihomoSwitchFinished {
+        result: Result<String, String>,
+        mihomo: MihomoStatus,
         now_secs: u64,
         reply: SyncSender<PipeResponse>,
     },

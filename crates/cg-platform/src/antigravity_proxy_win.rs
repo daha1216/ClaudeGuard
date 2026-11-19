@@ -441,6 +441,178 @@ pub fn inspect_antigravity_proxy(
     )
 }
 
+/// Outcome of one-click verified `yuaotian/antigravity-proxy` hot re-injection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AntigravityRepairReport {
+    pub install_dir: PathBuf,
+    pub release_tag: String,
+    pub sha256_hex: String,
+    pub proxy_port: u16,
+    pub summary: String,
+}
+
+/// Validates and atomically installs `version.dll` (raw DLL or `.zip` containing `version.dll`)
+/// and synchronizes `config.json` (`proxy.port = proxy_port`, `child_injection = true`).
+pub fn install_verified_proxy_bytes_into_dir(
+    dir: &Path,
+    raw_bytes: &[u8],
+    is_zip: bool,
+    proxy_port: u16,
+    release_tag: &str,
+) -> Result<AntigravityRepairReport, String> {
+    let dll_bytes = if is_zip {
+        let (_name, bytes) = crate::zip_util::extract_file_from_zip(raw_bytes, "version.dll")?;
+        bytes
+    } else {
+        raw_bytes.to_vec()
+    };
+
+    if !validate_antigravity_proxy_dll_bytes(&dll_bytes) {
+        return Err(
+            "下载的 version.dll 未通过 antigravity-proxy 二进制特征校验，已拒绝写入".into(),
+        );
+    }
+
+    // Compute SHA-256 of verified DLL bytes for audit trail
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(&dll_bytes);
+    let mut sha256_hex = String::with_capacity(64);
+    for b in digest {
+        sha256_hex.push_str(&format!("{b:02x}"));
+    }
+
+    // Atomic write `version.dll` via sibling temp file
+    let dll_path = dir.join("version.dll");
+    let tmp_dll = dir.join("version.dll.cg-tmp");
+    std::fs::write(&tmp_dll, &dll_bytes)
+        .map_err(|e| format!("写入临时 version.dll 失败：{e}"))?;
+    if let Err(rename_err) = std::fs::rename(&tmp_dll, &dll_path) {
+        let _ = std::fs::remove_file(&tmp_dll);
+        return Err(format!(
+            "替换 version.dll 失败（请先关闭正在运行的 Antigravity 客户端后重试）：{rename_err}"
+        ));
+    }
+
+    // Preserve existing `config.json` fields while aligning `child_injection: true` & `proxy.port`.
+    let cfg_path = dir.join("config.json");
+    let mut cfg_val: serde_json::Value = std::fs::read_to_string(&cfg_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .filter(|v: &serde_json::Value| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = cfg_val.as_object_mut() {
+        if !release_tag.trim().is_empty() {
+            obj.insert(
+                "_version".into(),
+                serde_json::Value::String(release_tag.trim_start_matches(['v', 'V']).to_string()),
+            );
+        }
+        obj.insert("child_injection".into(), serde_json::Value::Bool(true));
+        let proxy_entry = obj
+            .entry("proxy".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !proxy_entry.is_object() {
+            *proxy_entry = serde_json::json!({});
+        }
+        if let Some(pobj) = proxy_entry.as_object_mut() {
+            pobj.entry("type".to_string())
+                .or_insert_with(|| serde_json::Value::String("socks5".into()));
+            pobj.entry("host".to_string())
+                .or_insert_with(|| serde_json::Value::String("127.0.0.1".into()));
+            pobj.insert(
+                "port".into(),
+                serde_json::Value::Number(serde_json::Number::from(proxy_port)),
+            );
+        }
+    }
+    let cfg_bytes =
+        serde_json::to_vec_pretty(&cfg_val).map_err(|e| format!("序列化 config.json 失败：{e}"))?;
+    let tmp_cfg = dir.join("config.json.cg-tmp");
+    std::fs::write(&tmp_cfg, &cfg_bytes)
+        .map_err(|e| format!("写入临时 config.json 失败：{e}"))?;
+    std::fs::rename(&tmp_cfg, &cfg_path).map_err(|e| format!("替换 config.json 失败：{e}"))?;
+
+    Ok(AntigravityRepairReport {
+        install_dir: dir.to_path_buf(),
+        release_tag: release_tag.to_string(),
+        sha256_hex: sha256_hex.clone(),
+        proxy_port,
+        summary: format!(
+            "已安装并验签 antigravity-proxy {release_tag}（SHA256 {}…），同步代理端口 :{proxy_port}",
+            &sha256_hex[..12]
+        ),
+    })
+}
+
+/// One-click verified hot re-injector: fetches latest `yuaotian/antigravity-proxy` release asset
+/// strictly through `NetworkPolicy` (never falls back to direct when proxy configured), verifies
+/// `version.dll` binary signature, and atomically repairs `<AntigravityDir>\version.dll` + `config.json`.
+pub fn repair_antigravity_proxy(
+    route: &crate::probe_http::ProbeRoute,
+    proxy_port: u16,
+    explicit_dir: Option<&Path>,
+) -> Result<AntigravityRepairReport, String> {
+    let dir = match explicit_dir {
+        Some(d) => d.to_path_buf(),
+        None => {
+            let dirs = process_win::antigravity_covered_dirs();
+            dirs.into_iter()
+                .next()
+                .ok_or_else(|| "本机未检测到 Antigravity 安装目录，无法执行热修复注入".to_string())?
+        }
+    };
+
+    let policy = match route {
+        crate::probe_http::ProbeRoute::Proxy(addr) => {
+            let (host, port) = addr
+                .rsplit_once(':')
+                .and_then(|(h, p)| p.parse::<u16>().ok().map(|port| (h, port)))
+                .unwrap_or(("127.0.0.1", proxy_port));
+            crate::probe_http::NetworkPolicy::with_proxy(host, port)
+        }
+        crate::probe_http::ProbeRoute::Direct => crate::probe_http::NetworkPolicy::direct(),
+        crate::probe_http::ProbeRoute::Skip(reason) => {
+            return Err(format!("当前代理通道不可用，已阻止直连下载：{reason}"));
+        }
+    };
+
+    let release = crate::update_check::fetch_github_latest_release(
+        route,
+        crate::update_check::ANTIGRAVITY_PROXY_REPO,
+        &[".zip", ".dll"],
+        std::time::Duration::from_secs(15),
+    )
+    .map_err(|e| format!("获取 antigravity-proxy 最新版本失败：{e}"))?;
+
+    let asset_url = release
+        .asset_url
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "最新 Release 未包含可下载的 Windows 注入包资产".to_string())?;
+
+    let mut downloaded = Vec::new();
+    crate::probe_http::download_release_asset(
+        &policy,
+        asset_url,
+        None,
+        32 * 1024 * 1024,
+        std::time::Duration::from_secs(45),
+        &mut downloaded,
+        &mut |_, _| {},
+    )
+    .map_err(|e| format!("下载 antigravity-proxy 资产失败：{e}"))?;
+
+    let is_zip = asset_url.to_ascii_lowercase().ends_with(".zip")
+        || downloaded.starts_with(b"PK\x03\x04");
+    install_verified_proxy_bytes_into_dir(
+        &dir,
+        &downloaded,
+        is_zip,
+        proxy_port,
+        &release.version,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

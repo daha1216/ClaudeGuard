@@ -103,6 +103,22 @@ pub enum PipeRequest {
         #[serde(default)]
         secret: Option<String>,
     },
+    SyncLeakShield,
+    SwitchProxyNode {
+        group: String,
+        node: String,
+        #[serde(default = "crate::model::default_true")]
+        close_connections: bool,
+    },
+    RepairAntigravityProxy,
+    ApplyEnvAlignment {
+        #[serde(default = "crate::model::default_true")]
+        align_tz: bool,
+        #[serde(default)]
+        align_location: bool,
+    },
+    RollbackEnvAlignment,
+    ExportDiagnostics,
 }
 
 /// Responses sent from the daemon back to GUI/CLI clients over the Named Pipe.
@@ -394,8 +410,21 @@ mod tests {
                 webhook: None,
                 secret: None,
             },
+            PipeRequest::SyncLeakShield,
+            PipeRequest::SwitchProxyNode {
+                group: "Proxy".into(),
+                node: "US-LAX-01".into(),
+                close_connections: true,
+            },
+            PipeRequest::RepairAntigravityProxy,
+            PipeRequest::ApplyEnvAlignment {
+                align_tz: true,
+                align_location: false,
+            },
+            PipeRequest::RollbackEnvAlignment,
+            PipeRequest::ExportDiagnostics,
         ];
-        assert_eq!(all.len(), 18);
+        assert_eq!(all.len(), 24);
         for req in all {
             let frame = encode_frame(&req).expect("encode");
             let decoded: PipeRequest = decode_frame(&frame).expect("decode");

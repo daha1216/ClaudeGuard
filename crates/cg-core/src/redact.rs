@@ -283,6 +283,7 @@ mod tests {
             agent: "Claude".into(),
             remote: "203.0.113.45".into(),
             port: 443,
+            is_mcp: false,
         });
 
         let masked = mask_snapshot(&snap);

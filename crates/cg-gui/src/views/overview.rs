@@ -91,7 +91,7 @@ fn render_healthy_status_strip(
 ) -> Div {
     let hs = p.hero(proj.hero.tone);
     let ctrl_pause = ctrl.clone();
-    let ctrl_recheck = ctrl;
+    let ctrl_recheck = ctrl.clone();
 
     div()
         .flex()
@@ -152,6 +152,33 @@ fn render_healthy_status_strip(
                                 .font_family("Cascadia Mono")
                                 .text_color(rgb(p.text_secondary))
                                 .child(proj.hero.access_badge.clone()),
+                        )
+                        .when_some(
+                            ctrl.read(cx)
+                                .snapshot
+                                .as_ref()
+                                .filter(|s| s.mihomo.available && !s.mihomo.active_node.is_empty())
+                                .map(|s| match s.mihomo.active_delay_ms {
+                                    Some(ms) => format!("节点 {} · {}ms", s.mihomo.active_node, ms),
+                                    None => format!("节点 {}", s.mihomo.active_node),
+                                }),
+                            |row, node_label| {
+                                row.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .whitespace_nowrap()
+                                        .px(px(8.))
+                                        .py(px(3.))
+                                        .rounded(px(6.))
+                                        .bg(rgb(p.card_bg))
+                                        .border_1()
+                                        .border_color(rgb(p.card_border))
+                                        .text_size(px(10.5))
+                                        .font_family("Cascadia Mono")
+                                        .text_color(rgb(p.text_secondary))
+                                        .child(node_label),
+                                )
+                            },
                         ),
                 )
                 .child(

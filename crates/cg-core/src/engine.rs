@@ -223,6 +223,8 @@ impl EngineState {
             recent_logs: self.logs.clone(),
             recent_toasts: Vec::new(),
             feishu: cg_protocol::FeishuStatus::default(),
+            leak_shield: cg_protocol::LeakShieldStatus::default(),
+            mihomo: cg_protocol::MihomoStatus::default(),
         }
     }
 }

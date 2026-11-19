@@ -125,6 +125,12 @@ pub struct Config {
     #[serde(default)]
     pub leak_trip: bool,
     #[serde(default = "default_true")]
+    pub leak_shield_quic: bool,
+    #[serde(default)]
+    pub leak_shield_dns_doh: bool,
+    #[serde(default)]
+    pub leak_shield_ipv6: bool,
+    #[serde(default = "default_true")]
     pub env_check: bool,
     #[serde(default)]
     pub env_align_tz: bool,
@@ -194,6 +200,9 @@ impl Default for Config {
             sweep_on_exit: true,
             leak_watch: true,
             leak_trip: false,
+            leak_shield_quic: true,
+            leak_shield_dns_doh: false,
+            leak_shield_ipv6: false,
             env_check: true,
             env_align_tz: false,
             env_align_location: false,

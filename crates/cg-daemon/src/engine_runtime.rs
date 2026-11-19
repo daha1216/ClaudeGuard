@@ -19,7 +19,10 @@ use cg_core::onboarding;
 use cg_core::timeline::BUCKETS_48;
 use cg_core::TimelineAggregator;
 use cg_platform::access_win::{self, AccessPath};
+use cg_platform::antigravity_proxy_win;
 use cg_platform::firewall_com;
+use cg_platform::leak_shield_win;
+use cg_platform::mihomo_win;
 use cg_platform::netwatch_win;
 use cg_platform::probe_http::{self, NetworkPolicy, ProbeRoute};
 use cg_platform::process_win::{
@@ -32,6 +35,7 @@ use crate::coordinator::{
     ActorControl, CoordinatorActor, CoordinatorContext, CoordinatorEvent, CoordinatorHandle,
     TelemetryBundle,
 };
+use crate::diagnostics;
 use crate::disarm;
 use crate::feishu::FeishuNotifier;
 use crate::journal::{
@@ -41,10 +45,10 @@ use crate::journal::{
 use crate::protocol::{
     now_unix_secs, AccessEvidence, AccessLevel, AgentKind, AgentRuntimeStatus,
     AntigravityProxyStatus, ComponentUpdateStatus, Config, CutMode, DefenseCheckItem,
-    DefenseSelfCheck, ErrorCode, GuardSnapshot, LeakReport, Lifecycle, LogLevel,
-    OnboardingProbeResult, OperationReceipt, OperationStatus, PipeRequest, PipeResponse,
-    PolicyPreset, ProbeResult, ProtectionState, SelfCheckStatus, Target, ToastNotificationEvent,
-    UpdateCheckPhase, UpdateSummary,
+    DefenseSelfCheck, ErrorCode, GuardSnapshot, LeakReport, LeakShieldStatus, Lifecycle, LogLevel,
+    MihomoStatus, OnboardingProbeResult, OperationReceipt, OperationStatus, PipeRequest,
+    PipeResponse, PolicyPreset, ProbeResult, ProtectionState, SelfCheckStatus, Target,
+    ToastNotificationEvent, UpdateCheckPhase, UpdateSummary,
 };
 
 pub const TIMELINE_FILE: &str = "timeline.json";
@@ -454,6 +458,8 @@ pub struct RealEngineActor {
     feishu: Arc<FeishuNotifier>,
     recent_toasts: VecDeque<ToastNotificationEvent>,
     toast_seq: u64,
+    leak_shield: LeakShieldStatus,
+    mihomo: MihomoStatus,
 }
 
 impl RealEngineActor {
@@ -565,6 +571,14 @@ impl RealEngineActor {
             .expect("failed to spawn probe worker thread");
 
         let feishu = Arc::new(FeishuNotifier::load(&data_dir));
+        if let Some(env_backup) = diagnostics::load_env_backup(&data_dir) {
+            engine.env_applied = Some(env_backup.applied);
+        }
+        let init_shield = if caps.app_quarantine {
+            leak_shield_win::inspect_leak_shield()
+        } else {
+            LeakShieldStatus::default()
+        };
         let mut actor = Self {
             engine,
             driver,
@@ -587,6 +601,8 @@ impl RealEngineActor {
             feishu,
             recent_toasts: VecDeque::new(),
             toast_seq: 0,
+            leak_shield: init_shield,
+            mihomo: MihomoStatus::default(),
         };
 
         actor.step_and_run(
@@ -630,6 +646,8 @@ impl RealEngineActor {
         let mut snap = self.engine.to_snapshot(now, self.cached_agents.clone());
         snap.recent_toasts = self.recent_toasts.iter().cloned().collect();
         snap.feishu = self.feishu.status();
+        snap.leak_shield = self.leak_shield.clone();
+        snap.mihomo = self.mihomo.clone();
         snap
     }
 
@@ -1406,6 +1424,18 @@ impl RealEngineActor {
             .is_some_and(|tx| tx.kind == PendingTxKind::StoppingRestore);
 
         let heal = journal::heal_offline(&self.journal, &*self.recovery_executor);
+        if self.driver.capabilities().app_quarantine {
+            if let Ok(removed) = leak_shield_win::clear_leak_shield() {
+                if removed > 0 {
+                    self.leak_shield = LeakShieldStatus::default();
+                }
+            }
+        }
+        if self.engine.env_applied.is_some()
+            && diagnostics::rollback_env_alignment(&self.data_dir).is_ok()
+        {
+            self.engine.env_applied = None;
+        }
         let mut receipt = OperationReceipt::new(
             tx_id,
             if heal.ok && heal.verified {
@@ -2110,6 +2140,257 @@ impl RealEngineActor {
                     });
                 });
             }
+            PipeRequest::SyncLeakShield => {
+                if !self.driver.capabilities().app_quarantine {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Unsupported,
+                        message: "当前平台不支持防火墙防泄露护盾规则".into(),
+                        receipt: None,
+                    });
+                    return;
+                }
+                let mut exes = Vec::new();
+                for agent in &self.engine.config.guarded_agents {
+                    for p in self.driver.discover_agent_exes(agent).unwrap_or_default() {
+                        if !exes.contains(&p) {
+                            exes.push(p);
+                        }
+                    }
+                }
+                match leak_shield_win::sync_leak_shield(
+                    &exes,
+                    self.engine.config.leak_shield_quic,
+                    self.engine.config.leak_shield_dns_doh,
+                    self.engine.config.leak_shield_ipv6,
+                ) {
+                    Ok(status) => {
+                        let summary = status.summary.clone();
+                        self.leak_shield = status;
+                        let mut receipt = OperationReceipt::new(
+                            format!("shield-sync-{now}"),
+                            OperationStatus::Verified,
+                        );
+                        receipt.verified_scope = "leak_shield".into();
+                        receipt.push_item("leak_shield", OperationStatus::Verified, summary.clone());
+                        self.engine
+                            .push_log(now, LogLevel::Audit, "shield", &format!("同步 4 维防泄露护盾：{summary}"));
+                        self.engine.last_receipt = Some(receipt.clone());
+                        let snap = self.publish_snapshot(snapshot_store, now);
+                        let _ = reply.send(PipeResponse::Ack {
+                            receipt: Some(receipt),
+                            snapshot: Some(Box::new(snap)),
+                        });
+                    }
+                    Err(err) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: format!("同步防泄露护盾规则失败：{err}"),
+                            receipt: None,
+                        });
+                    }
+                }
+            }
+            PipeRequest::SwitchProxyNode {
+                group,
+                node,
+                close_connections,
+            } => {
+                let event_tx = self.event_tx.clone();
+                std::thread::spawn(move || {
+                    let result =
+                        mihomo_win::switch_mihomo_node(&group, &node, close_connections);
+                    let mihomo = mihomo_win::inspect_mihomo();
+                    let _ = event_tx.send(CoordinatorEvent::MihomoSwitchFinished {
+                        result,
+                        mihomo,
+                        now_secs: now_unix_secs(),
+                        reply,
+                    });
+                });
+            }
+            PipeRequest::RepairAntigravityProxy => {
+                if self.engine.is_tripped() {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: "当前处于熔断隔离态，请先切回合规节点并复检解封后再执行热修复下载"
+                            .into(),
+                        receipt: None,
+                    });
+                    return;
+                }
+                let (_access, route) = resolve_access_and_route(
+                    &*self.driver,
+                    &self.engine.config,
+                    self.engine.cfg_rev,
+                    &self.engine.config.targets,
+                    self.engine.config.enforce_access_path,
+                    now,
+                );
+                let proxy_port = self.engine.config.proxy_port;
+                let event_tx = self.event_tx.clone();
+                std::thread::spawn(move || {
+                    let res = antigravity_proxy_win::repair_antigravity_proxy(
+                        &route, proxy_port, None,
+                    )
+                    .map(|r| r.summary);
+                    let _ = event_tx.send(CoordinatorEvent::AntigravityRepairFinished {
+                        result: res,
+                        now_secs: now_unix_secs(),
+                        reply,
+                    });
+                });
+            }
+            PipeRequest::ApplyEnvAlignment {
+                align_tz,
+                align_location,
+            } => {
+                let place = self
+                    .engine
+                    .target_statuses
+                    .iter()
+                    .find(|t| t.state == crate::protocol::TargetState::Pass)
+                    .or_else(|| {
+                        self.engine
+                            .target_statuses
+                            .iter()
+                            .find(|t| t.country.is_some() || t.colo.is_some())
+                    })
+                    .and_then(|t| {
+                        cg_core::geo::resolve(t.colo.as_deref(), t.country.as_deref()).or_else(
+                            || match t.country.as_deref() {
+                                Some("US") => cg_core::geo::by_colo("LAX"),
+                                _ => None,
+                            },
+                        )
+                    });
+                let target_city = place.map(|p| p.city);
+                let target_tz = place.map(|p| p.tz);
+                let target_coords = place.map(|p| (p.lat, p.lon));
+                match diagnostics::apply_env_alignment(
+                    &self.data_dir,
+                    target_city,
+                    target_tz,
+                    target_coords,
+                    align_tz,
+                    align_location,
+                    now,
+                ) {
+                    Ok((applied, detail)) => {
+                        let env_info = self.driver.read_env_info().unwrap_or_default();
+                        let env_check = envcheck::evaluate(
+                            &self.engine.config,
+                            env_info,
+                            &self.engine.target_statuses,
+                        );
+                        self.step_and_run(
+                            EngineEvent::EnvUpdated {
+                                check: env_check,
+                                applied: Some(applied),
+                            },
+                            now,
+                        );
+                        let mut receipt = OperationReceipt::new(
+                            format!("env-align-{now}"),
+                            OperationStatus::Verified,
+                        );
+                        receipt.verified_scope = "env.alignment".into();
+                        receipt.push_item("env_alignment", OperationStatus::Verified, detail.clone());
+                        self.engine
+                            .push_log(now, LogLevel::Audit, "env", &format!("系统环境对齐完成：{detail}"));
+                        self.engine.last_receipt = Some(receipt.clone());
+                        let snap = self.publish_snapshot(snapshot_store, now);
+                        let _ = reply.send(PipeResponse::Ack {
+                            receipt: Some(receipt),
+                            snapshot: Some(Box::new(snap)),
+                        });
+                    }
+                    Err(msg) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: msg,
+                            receipt: None,
+                        });
+                    }
+                }
+            }
+            PipeRequest::RollbackEnvAlignment => {
+                match diagnostics::rollback_env_alignment(&self.data_dir) {
+                    Ok(detail) => {
+                        let env_info = self.driver.read_env_info().unwrap_or_default();
+                        let env_check = envcheck::evaluate(
+                            &self.engine.config,
+                            env_info,
+                            &self.engine.target_statuses,
+                        );
+                        self.step_and_run(
+                            EngineEvent::EnvUpdated {
+                                check: env_check,
+                                applied: None,
+                            },
+                            now,
+                        );
+                        let mut receipt = OperationReceipt::new(
+                            format!("env-rollback-{now}"),
+                            OperationStatus::Verified,
+                        );
+                        receipt.verified_scope = "env.rollback".into();
+                        receipt.push_item("env_rollback", OperationStatus::Verified, detail.clone());
+                        self.engine
+                            .push_log(now, LogLevel::Audit, "env", &format!("系统环境回滚完成：{detail}"));
+                        self.engine.last_receipt = Some(receipt.clone());
+                        let snap = self.publish_snapshot(snapshot_store, now);
+                        let _ = reply.send(PipeResponse::Ack {
+                            receipt: Some(receipt),
+                            snapshot: Some(Box::new(snap)),
+                        });
+                    }
+                    Err(msg) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: msg,
+                            receipt: None,
+                        });
+                    }
+                }
+            }
+            PipeRequest::ExportDiagnostics => {
+                let snap = self.build_snapshot(now);
+                match diagnostics::export_redacted_diagnostics_zip(&self.data_dir, &snap, now, None)
+                {
+                    Ok(path) => {
+                        let path_s = path.to_string_lossy().to_string();
+                        let mut receipt = OperationReceipt::new(
+                            format!("diag-export-{now}"),
+                            OperationStatus::Verified,
+                        );
+                        receipt.verified_scope = path_s.clone();
+                        receipt.push_item(
+                            "diagnostics_zip",
+                            OperationStatus::Verified,
+                            format!("已导出脱敏诊断包：{path_s}"),
+                        );
+                        self.engine.push_log(
+                            now,
+                            LogLevel::Audit,
+                            "diagnostics",
+                            &format!("导出脱敏诊断压缩包：{path_s}"),
+                        );
+                        self.engine.last_receipt = Some(receipt.clone());
+                        let next_snap = self.publish_snapshot(snapshot_store, now);
+                        let _ = reply.send(PipeResponse::Ack {
+                            receipt: Some(receipt),
+                            snapshot: Some(Box::new(next_snap)),
+                        });
+                    }
+                    Err(msg) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: msg,
+                            receipt: None,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -2334,6 +2615,105 @@ impl CoordinatorActor for RealEngineActor {
                     });
                 }
             },
+            CoordinatorEvent::AntigravityRepairFinished {
+                result,
+                now_secs,
+                reply,
+            } => match result {
+                Ok(summary) => {
+                    let procs = if self.driver.capabilities().process_guard {
+                        self.process_scanner.refresh()
+                    } else {
+                        self.process_scanner.cached_snapshot()
+                    };
+                    let ag = self.driver.inspect_antigravity_proxy(
+                        self.engine.config.proxy_port,
+                        self.engine.config.last_seen_antigravity_version.as_deref(),
+                        &procs,
+                        now_secs,
+                    );
+                    self.step_and_run(
+                        EngineEvent::AntigravityProxyUpdated { status: ag },
+                        now_secs,
+                    );
+                    let mut receipt = OperationReceipt::new(
+                        format!("ag-repair-{now_secs}"),
+                        OperationStatus::Verified,
+                    );
+                    receipt.verified_scope = "antigravity_proxy".into();
+                    receipt.push_item("antigravity_proxy", OperationStatus::Verified, summary.clone());
+                    self.engine.push_log(now_secs, LogLevel::Audit, "antigravity", &summary);
+                    self.engine.last_receipt = Some(receipt.clone());
+                    let snap = self.publish_snapshot(ctx.snapshot, now_secs);
+                    let _ = reply.send(PipeResponse::Ack {
+                        receipt: Some(receipt),
+                        snapshot: Some(Box::new(snap)),
+                    });
+                }
+                Err(msg) => {
+                    self.engine.push_log(
+                        now_secs,
+                        LogLevel::Warn,
+                        "antigravity",
+                        &format!("antigravity-proxy 一键热修复失败：{msg}"),
+                    );
+                    let _ = self.publish_snapshot(ctx.snapshot, now_secs);
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IoFailed,
+                        message: msg,
+                        receipt: None,
+                    });
+                }
+            },
+            CoordinatorEvent::MihomoSwitchFinished {
+                result,
+                mihomo,
+                now_secs,
+                reply,
+            } => {
+                self.mihomo = mihomo;
+                match result {
+                    Ok(detail) => {
+                        let mut receipt = OperationReceipt::new(
+                            format!("mihomo-switch-{now_secs}"),
+                            OperationStatus::Verified,
+                        );
+                        receipt.verified_scope = "mihomo.node".into();
+                        receipt.push_item("mihomo_node", OperationStatus::Verified, detail.clone());
+                        self.engine.push_log(now_secs, LogLevel::Audit, "mihomo", &detail);
+                        if self.engine.is_tripped() {
+                            self.step_and_run(EngineEvent::RecoverSafeFlowA, now_secs);
+                        } else if self.engine.lifecycle == Lifecycle::Armed {
+                            self.step_and_run(
+                                EngineEvent::StartRound {
+                                    purpose: CheckPurpose::Manual,
+                                },
+                                now_secs,
+                            );
+                        }
+                        self.engine.last_receipt = Some(receipt.clone());
+                        let snap = self.publish_snapshot(ctx.snapshot, now_secs);
+                        let _ = reply.send(PipeResponse::Ack {
+                            receipt: Some(receipt),
+                            snapshot: Some(Box::new(snap)),
+                        });
+                    }
+                    Err(msg) => {
+                        self.engine.push_log(
+                            now_secs,
+                            LogLevel::Warn,
+                            "mihomo",
+                            &format!("切换 Mihomo 节点失败：{msg}"),
+                        );
+                        let _ = self.publish_snapshot(ctx.snapshot, now_secs);
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: msg,
+                            receipt: None,
+                        });
+                    }
+                }
+            }
             CoordinatorEvent::RoundFinished {
                 cfg_rev,
                 runtime_epoch,
@@ -2363,6 +2743,8 @@ impl CoordinatorActor for RealEngineActor {
             }
             CoordinatorEvent::Telemetry(bundle) => {
                 self.cached_agents = bundle.agents;
+                self.leak_shield = bundle.leak_shield;
+                self.mihomo = bundle.mihomo;
                 self.step_and_run(
                     EngineEvent::LeakUpdated {
                         report: bundle.leak,
@@ -2899,9 +3281,18 @@ impl BackgroundMonitorHandle {
                             &local_clients,
                         );
 
+                        let leak_shield = if driver.capabilities().app_quarantine {
+                            leak_shield_win::inspect_leak_shield()
+                        } else {
+                            LeakShieldStatus::default()
+                        };
+                        let mihomo = mihomo_win::inspect_mihomo();
+
                         coordinator.try_send_telemetry(TelemetryBundle {
                             agents,
                             leak,
+                            leak_shield,
+                            mihomo,
                             env,
                             antigravity_proxy: antigravity_proxy.clone(),
                             self_check,
@@ -3814,6 +4205,8 @@ mod tests {
         coord.try_send_telemetry(TelemetryBundle {
             agents: Vec::new(),
             leak: LeakReport::not_applicable("mock", "mock", 1_700_000_200),
+            leak_shield: LeakShieldStatus::default(),
+            mihomo: MihomoStatus::default(),
             env: EnvCheck::default(),
             antigravity_proxy: healthy_ag.clone(),
             self_check: build_defense_self_check(
@@ -3868,6 +4261,8 @@ mod tests {
         coord.try_send_telemetry(TelemetryBundle {
             agents: Vec::new(),
             leak: LeakReport::not_applicable("mock", "mock", 1_700_000_205),
+            leak_shield: LeakShieldStatus::default(),
+            mihomo: MihomoStatus::default(),
             env: EnvCheck::default(),
             antigravity_proxy: degraded_again.clone(),
             self_check: build_defense_self_check(
@@ -4078,6 +4473,8 @@ mod tests {
         coord.try_send_telemetry(TelemetryBundle {
             agents,
             leak: LeakReport::not_applicable("mock", "mock", 1_700_000_500),
+            leak_shield: LeakShieldStatus::default(),
+            mihomo: MihomoStatus::default(),
             env: EnvCheck::default(),
             antigravity_proxy: healthy_ag.clone(),
             self_check,
@@ -4247,6 +4644,8 @@ mod tests {
         coord.try_send_telemetry(TelemetryBundle {
             agents: Vec::new(),
             leak: LeakReport::not_applicable("mock", "mock", 1_700_000_999),
+            leak_shield: LeakShieldStatus::default(),
+            mihomo: MihomoStatus::default(),
             env: EnvCheck::default(),
             antigravity_proxy: AntigravityProxyStatus::default(),
             self_check: sc,

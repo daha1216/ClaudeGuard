@@ -14,6 +14,7 @@
 pub mod cli;
 pub mod config_store;
 pub mod coordinator;
+pub mod diagnostics;
 pub mod disarm;
 pub mod engine_runtime;
 pub mod feishu;

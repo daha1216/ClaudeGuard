@@ -221,25 +221,59 @@ pub fn render_audit_page(
                         )
                         .child({
                             let can_pull = connected && !logs_loading;
-                            action_button(
-                                "audit-query-refresh",
-                                if logs_loading {
-                                    "查询中…"
-                                } else {
-                                    "↻ 查询最新审计日志"
-                                },
-                                ButtonKind::Secondary,
-                                can_pull,
-                                p,
-                            )
-                            .when(can_pull, |b| {
-                                b.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |_, _, _, cx| {
-                                        ctrl_refresh.update(cx, |c, cx| c.refresh_audit_logs(cx));
+                            let ctrl_export = ctrl.clone();
+                            let can_export = connected && !ctrl.read(cx).busy_action;
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    action_button(
+                                        "audit-export-diag",
+                                        "导出脱敏诊断包 (.zip)",
+                                        ButtonKind::Primary,
+                                        can_export,
+                                        p,
+                                    )
+                                    .when(can_export, |b| {
+                                        b.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _, _, cx| {
+                                                ctrl_export.update(cx, |c, cx| {
+                                                    c.send_request(
+                                                        crate::protocol::PipeRequest::ExportDiagnostics,
+                                                        Some("已导出脱敏诊断包 (.zip) 到桌面/诊断目录"),
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                        )
                                     }),
                                 )
-                            })
+                                .child(
+                                    action_button(
+                                        "audit-query-refresh",
+                                        if logs_loading {
+                                            "查询中…"
+                                        } else {
+                                            "↻ 查询最新审计日志"
+                                        },
+                                        ButtonKind::Secondary,
+                                        can_pull,
+                                        p,
+                                    )
+                                    .when(can_pull, |b| {
+                                        b.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _, _, cx| {
+                                                ctrl_refresh.update(cx, |c, cx| {
+                                                    c.refresh_audit_logs(cx);
+                                                });
+                                            }),
+                                        )
+                                    }),
+                                )
                         }),
                 )
                 .child(list_el),

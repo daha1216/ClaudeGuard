@@ -431,6 +431,111 @@ impl DaemonClient {
                     snapshot: Some(Box::new(snap.clone())),
                 }
             }
+            PipeRequest::SyncLeakShield => {
+                let quic = snap.config.leak_shield_quic;
+                let dns = snap.config.leak_shield_dns_doh;
+                let ipv6 = snap.config.leak_shield_ipv6;
+                let rules = usize::from(quic) * 4 + usize::from(dns) * 12 + usize::from(ipv6) * 4;
+                snap.leak_shield.enabled = rules > 0;
+                snap.leak_shield.quic_blocked = quic;
+                snap.leak_shield.dns_doh_blocked = dns;
+                snap.leak_shield.ipv6_blocked = ipv6;
+                snap.leak_shield.active_rules = rules;
+                snap.leak_shield.summary = if rules == 0 {
+                    "防泄露护盾已关闭".into()
+                } else {
+                    format!("已同步防泄露护盾规则（生效 {rules} 条）")
+                };
+                PipeResponse::Ack {
+                    receipt: None,
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::SwitchProxyNode { group, node, .. } => {
+                snap.mihomo.active_group = group.clone();
+                snap.mihomo.active_node = node.clone();
+                snap.mihomo.active_delay_ms = snap
+                    .mihomo
+                    .candidates
+                    .iter()
+                    .find(|c| c.name == node)
+                    .and_then(|c| c.delay_ms);
+                snap.mihomo.note = format!("Mihomo · 组 [{group}] 已切换至节点：{node}");
+                PipeResponse::Ack {
+                    receipt: None,
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::RepairAntigravityProxy => {
+                snap.antigravity_proxy.state =
+                    crate::protocol::AntigravityProxyState::Healthy;
+                snap.antigravity_proxy.dll_present = true;
+                snap.antigravity_proxy.dll_valid = true;
+                snap.antigravity_proxy.port_matches_guard = true;
+                snap.antigravity_proxy.summary =
+                    "已完成 antigravity-proxy 热修复注入并同步端口".into();
+                PipeResponse::Ack {
+                    receipt: None,
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::ApplyEnvAlignment {
+                align_tz,
+                align_location,
+            } => {
+                snap.env_applied = Some(crate::protocol::AppliedEnv {
+                    at: now,
+                    city: "洛杉矶".into(),
+                    tz_from: "China Standard Time".into(),
+                    tz_to: if align_tz {
+                        "Pacific Standard Time".into()
+                    } else {
+                        String::new()
+                    },
+                    lat_from: None,
+                    lon_from: None,
+                    lat_to: if align_location {
+                        "34.0522".into()
+                    } else {
+                        String::new()
+                    },
+                    lon_to: if align_location {
+                        "-118.2437".into()
+                    } else {
+                        String::new()
+                    },
+                });
+                PipeResponse::Ack {
+                    receipt: None,
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::RollbackEnvAlignment => {
+                snap.env_applied = None;
+                PipeResponse::Ack {
+                    receipt: None,
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::ExportDiagnostics => {
+                let receipt = OperationReceipt {
+                    id: format!("diag-{now}"),
+                    status: OperationStatus::Verified,
+                    items: vec![OperationItemReceipt {
+                        name: "diagnostics_zip".into(),
+                        status: OperationStatus::Verified,
+                        detail: "已生成脱敏诊断包 ClaudeGuard-Diagnostics-demo.zip".into(),
+                    }],
+                    error: None,
+                    verified_scope: "ClaudeGuard-Diagnostics-demo.zip".into(),
+                    remaining: Vec::new(),
+                };
+                snap.last_receipt = Some(receipt.clone());
+                PipeResponse::Ack {
+                    receipt: Some(receipt),
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
         }
     }
 }
@@ -533,10 +638,15 @@ pub fn launch_agent_normal_user(
     use std::process::Command;
 
     if let Some(exe) = install_paths.iter().find(|p| Path::new(p).is_file()) {
-        Command::new(exe)
-            .spawn()
+        let mut cmd = Command::new(exe);
+        // Vector 4 of the 4-Vector Leak Shield: disable UDP QUIC on Electron/Chromium AI apps
+        // so traffic never bypasses HTTP proxies via HTTP/3 UDP:443.
+        if matches!(agent_id, "claude" | "chatgpt" | "antigravity") {
+            cmd.arg("--disable-quic");
+        }
+        cmd.spawn()
             .map_err(|e| format!("启动 {agent_id} 失败：{e}"))?;
-        return Ok(format!("已安全启动 {agent_id}（普通用户权限）"));
+        return Ok(format!("已安全启动 {agent_id}（普通用户权限 · 已禁用 QUIC 泄露）"));
     }
 
     // Fallback: Shell AppsFolder AUMID / Start Menu heuristic

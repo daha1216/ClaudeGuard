@@ -214,6 +214,156 @@ pub fn delete_default_location() -> PlatformResult<()> {
     ))
 }
 
+/// Parses Windows Registry 44-byte `REG_TZI_FORMAT` (`TZI` binary blob under `Time Zones\<Key>`).
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RegTzi {
+    bias: i32,
+    standard_bias: i32,
+    daylight_bias: i32,
+    standard_date: [u16; 8],
+    daylight_date: [u16; 8],
+}
+
+#[cfg(any(windows, test))]
+fn parse_reg_tzi(bytes: &[u8]) -> Option<RegTzi> {
+    if bytes.len() < 44 {
+        return None;
+    }
+    let i32_at = |off: usize| -> i32 {
+        i32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+    };
+    let u16_at = |off: usize| -> u16 { u16::from_le_bytes([bytes[off], bytes[off + 1]]) };
+    let mut std_date = [0u16; 8];
+    let mut dlt_date = [0u16; 8];
+    for i in 0..8 {
+        std_date[i] = u16_at(12 + i * 2);
+        dlt_date[i] = u16_at(28 + i * 2);
+    }
+    Some(RegTzi {
+        bias: i32_at(0),
+        standard_bias: i32_at(4),
+        daylight_bias: i32_at(8),
+        standard_date: std_date,
+        daylight_date: dlt_date,
+    })
+}
+
+/// Sets the Windows system timezone natively via `SetDynamicTimeZoneInformation` (zero subprocesses).
+///
+/// Requires `SE_TIME_ZONE_NAME` privilege (held by Administrators and `LocalSystem` Windows Service).
+#[cfg(windows)]
+pub fn set_windows_timezone(tz_key: &str) -> PlatformResult<String> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID, SYSTEMTIME};
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+        SE_TIME_ZONE_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::Win32::System::Time::{
+        SetDynamicTimeZoneInformation, DYNAMIC_TIME_ZONE_INFORMATION,
+    };
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    let key_name = tz_key.trim();
+    if key_name.is_empty() {
+        return Err(PlatformError::InvalidInput("目标时区键名不能为空".into()));
+    }
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let sub_path = format!(
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Time Zones\{key_name}"
+    );
+    let tz_reg = hklm
+        .open_subkey_with_flags(&sub_path, KEY_READ)
+        .map_err(|e| PlatformError::InvalidInput(format!("系统注册表中未找到时区「{key_name}」：{e}")))?;
+
+    let tzi_raw = tz_reg
+        .get_raw_value("TZI")
+        .map_err(|e| PlatformError::Io(format!("读取时区 TZI 失败：{e}")))?;
+    let tzi = parse_reg_tzi(&tzi_raw.bytes)
+        .ok_or_else(|| PlatformError::Io("时区 TZI 二进制格式无效".into()))?;
+    let std_name: String = tz_reg.get_value("Std").unwrap_or_else(|_| key_name.into());
+    let dlt_name: String = tz_reg.get_value("Dlt").unwrap_or_else(|_| key_name.into());
+
+    // Enable SE_TIME_ZONE_NAME on current process token
+    struct HandleGuard(HANDLE);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+    let mut token = HANDLE::default();
+    unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+    }
+    .map_err(|e| PlatformError::AccessDenied(format!("打开进程令牌失败：{e}")))?;
+    let _token = HandleGuard(token);
+
+    let mut luid = LUID::default();
+    unsafe { LookupPrivilegeValueW(None, SE_TIME_ZONE_NAME, &mut luid) }
+        .map_err(|e| PlatformError::AccessDenied(format!("查询时区特权失败：{e}")))?;
+    let tp = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    unsafe { AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None) }
+        .map_err(|e| PlatformError::AccessDenied(format!("启用时区特权失败：{e}")))?;
+
+    let to_systime = |a: [u16; 8]| SYSTEMTIME {
+        wYear: a[0],
+        wMonth: a[1],
+        wDayOfWeek: a[2],
+        wDay: a[3],
+        wHour: a[4],
+        wMinute: a[5],
+        wSecond: a[6],
+        wMilliseconds: a[7],
+    };
+    let copy_wide = |src: &str, dst: &mut [u16]| {
+        for (i, u) in src.encode_utf16().take(dst.len().saturating_sub(1)).enumerate() {
+            dst[i] = u;
+        }
+    };
+
+    let mut dtzi = DYNAMIC_TIME_ZONE_INFORMATION {
+        Bias: tzi.bias,
+        StandardBias: tzi.standard_bias,
+        DaylightBias: tzi.daylight_bias,
+        StandardDate: to_systime(tzi.standard_date),
+        DaylightDate: to_systime(tzi.daylight_date),
+        DynamicDaylightTimeDisabled: false.into(),
+        ..Default::default()
+    };
+    copy_wide(&std_name, &mut dtzi.StandardName);
+    copy_wide(&dlt_name, &mut dtzi.DaylightName);
+    copy_wide(key_name, &mut dtzi.TimeZoneKeyName);
+
+    unsafe { SetDynamicTimeZoneInformation(&dtzi) }
+        .map_err(|e| PlatformError::AccessDenied(format!("设置系统时区失败（需要管理员或服务权限）：{e}")))?;
+
+    let (verified_key, _) = read_timezone_reg();
+    Ok(verified_key)
+}
+
+#[cfg(not(windows))]
+pub fn set_windows_timezone(_tz_key: &str) -> PlatformResult<String> {
+    Err(PlatformError::unsupported(
+        "env_alignment",
+        "Windows timezone alignment is only supported on Windows",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -94,11 +94,20 @@ pub fn fold(
             RemoteKind::Public => {
                 report.direct_total += 1;
                 if report.direct.len() < MAX_LISTED {
+                    let low = agent.to_ascii_lowercase();
+                    let is_mcp = low.contains("mcp")
+                        || low.contains("cowork")
+                        || low.contains("uvx")
+                        || low.contains("npx")
+                        || low.contains("node")
+                        || low.contains("python")
+                        || low.contains("deno");
                     report.direct.push(LeakConn {
                         pid: c.pid,
                         agent: agent.clone(),
                         remote: c.remote.to_string(),
                         port: c.port,
+                        is_mcp,
                     });
                 }
             }

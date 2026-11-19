@@ -804,9 +804,10 @@ pub fn build_demo_snapshot(scenario: DemoScenario) -> GuardSnapshot {
             local: 1,
             direct: vec![LeakConn {
                 pid: 48210,
-                agent: "claude-helper".into(),
+                agent: "github-mcp-server.exe".into(),
                 remote: "203.0.113.45".into(),
                 port: 443,
+                is_mcp: true,
             }],
             direct_total: 1,
             note: "发现 1 条绕过代理的直连外联，已记录诊断样本".into(),
@@ -897,6 +898,49 @@ pub fn build_demo_snapshot(scenario: DemoScenario) -> GuardSnapshot {
             failed: 0,
             last_sent_at: None,
             last_error: String::new(),
+        },
+        leak_shield: crate::protocol::LeakShieldStatus {
+            enabled: true,
+            quic_blocked: true,
+            dns_doh_blocked: false,
+            ipv6_blocked: false,
+            active_rules: 4,
+            summary: "已拦截 QUIC UDP:443（生效 4 条护盾规则）".into(),
+        },
+        mihomo: crate::protocol::MihomoStatus {
+            available: true,
+            controller_url: "http://127.0.0.1:9090".into(),
+            core_name: "Mihomo v1.19.12".into(),
+            active_group: "Proxy".into(),
+            active_node: if scenario == DemoScenario::Trip {
+                "HK-BGP-02".into()
+            } else {
+                "US-LAX-ISP-01".into()
+            },
+            active_delay_ms: Some(if scenario == DemoScenario::Trip { 188 } else { 58 }),
+            candidates: vec![
+                crate::protocol::MihomoNodeInfo {
+                    name: "US-LAX-ISP-01".into(),
+                    delay_ms: Some(58),
+                },
+                crate::protocol::MihomoNodeInfo {
+                    name: "US-SJC-02".into(),
+                    delay_ms: Some(64),
+                },
+                crate::protocol::MihomoNodeInfo {
+                    name: "SG-01".into(),
+                    delay_ms: Some(42),
+                },
+                crate::protocol::MihomoNodeInfo {
+                    name: "JP-NRT-03".into(),
+                    delay_ms: Some(71),
+                },
+            ],
+            note: if scenario == DemoScenario::Trip {
+                "Mihomo v1.19.12 · 组 [Proxy] 当前节点：HK-BGP-02（188ms）".into()
+            } else {
+                "Mihomo v1.19.12 · 组 [Proxy] 当前节点：US-LAX-ISP-01（58ms）".into()
+            },
         },
     }
 }

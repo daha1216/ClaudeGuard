@@ -100,6 +100,19 @@ pub fn classify(remote: IpAddr, port: u16, proxy_port: u16) -> Remote {
     }
 }
 
+/// Detects whether a guarded agent/process label corresponds to an MCP plugin or helper subprocess
+/// (e.g., `github-mcp-server`, `cowork-svc`, `uvx`, `npx`, `node`, `python`, `deno`).
+pub fn is_mcp_agent_label(label: &str) -> bool {
+    let low = label.to_ascii_lowercase();
+    low.contains("mcp")
+        || low.contains("cowork")
+        || low.contains("uvx")
+        || low.contains("npx")
+        || low.contains("node")
+        || low.contains("python")
+        || low.contains("deno")
+}
+
 /// Fold TCP connections + guarded agent PID map into a `LeakReport`.
 pub fn fold(
     conns: &[TcpConn],
@@ -153,6 +166,7 @@ pub fn fold(
                         agent: agent.clone(),
                         remote: ip.to_string(),
                         port: c.port,
+                        is_mcp: is_mcp_agent_label(agent),
                     });
                 }
             }

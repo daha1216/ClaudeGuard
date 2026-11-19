@@ -31,7 +31,13 @@ pub fn render_environment_page(
         .unwrap_or_default();
     let updates = snap.as_ref().map(|s| s.updates.clone()).unwrap_or_default();
     let leak = snap.as_ref().map(|s| s.leak.clone()).unwrap_or_default();
+    let shield = snap
+        .as_ref()
+        .map(|s| s.leak_shield.clone())
+        .unwrap_or_default();
+    let mihomo = snap.as_ref().map(|s| s.mihomo.clone()).unwrap_or_default();
     let env = snap.as_ref().map(|s| s.env.clone()).unwrap_or_default();
+    let env_applied = snap.as_ref().and_then(|s| s.env_applied.clone());
 
     let ag_card = render_antigravity_proxy_card(
         ctrl.clone(),
@@ -46,13 +52,270 @@ pub fn render_environment_page(
         cx,
     );
 
+    let ctrl_sh_quic = ctrl.clone();
+    let ctrl_sh_dns = ctrl.clone();
+    let ctrl_sh_v6 = ctrl.clone();
+    let ctrl_sh_sync = ctrl.clone();
     let ctrl_lw = ctrl.clone();
     let ctrl_lt = ctrl.clone();
     let ctrl_ec = ctrl.clone();
     let ctrl_tz = ctrl.clone();
     let ctrl_loc = ctrl.clone();
     let ctrl_scan = ctrl.clone();
+    let ctrl_apply_env = ctrl.clone();
+    let ctrl_rollback_env = ctrl.clone();
     let ctrl_align = ctrl.clone();
+
+    let can_act = connected && !busy;
+
+    let shield_card = bento_card(p)
+        .w_full()
+        .p(px(16.))
+        .gap(px(10.))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .text_size(px(13.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(p.text_primary))
+                        .child("4 维防泄露护盾（QUIC / DNS / IPv6）"),
+                )
+                .child(status_pill(
+                    if shield.enabled {
+                        format!("已生效 {} 条规则", shield.active_rules)
+                    } else {
+                        "未启用护盾".into()
+                    },
+                    if shield.enabled {
+                        BadgeTone::Pass
+                    } else {
+                        BadgeTone::Muted
+                    },
+                    p,
+                )),
+        )
+        .child(switch_row(
+            "sh-quic-sw",
+            "阻断 QUIC UDP:443 直连泄露（同步启用安全启动防 QUIC 参数）",
+            "防止受管 AI 桌面客户端通过 HTTP/3 UDP:443 绕过本地代理直连出口",
+            cfg.leak_shield_quic,
+            p,
+            cx.listener(move |_, _, _, cx| {
+                let next = !cfg.leak_shield_quic;
+                ctrl_sh_quic.update(cx, |c, cx| {
+                    c.save_config_patch(move |x| x.leak_shield_quic = next, "已更新护盾配置", cx);
+                });
+            }),
+        ))
+        .child(switch_row(
+            "sh-dns-sw",
+            "阻断明文 DNS:53 与公共 DoH 直连解析",
+            "禁止受管应用绕过代理向运营商 DNS 或公共 DoH 节点发起域名解析",
+            cfg.leak_shield_dns_doh,
+            p,
+            cx.listener(move |_, _, _, cx| {
+                let next = !cfg.leak_shield_dns_doh;
+                ctrl_sh_dns.update(cx, |c, cx| {
+                    c.save_config_patch(
+                        move |x| x.leak_shield_dns_doh = next,
+                        "已更新 DNS/DoH 护盾配置",
+                        cx,
+                    );
+                });
+            }),
+        ))
+        .child(switch_row(
+            "sh-ipv6-sw",
+            "阻断公网 IPv6 直连泄露（2000::/3）",
+            "家庭双栈宽带环境下，若本地代理仅接管 IPv4，可强制阻断受管应用公网 IPv6 直连",
+            cfg.leak_shield_ipv6,
+            p,
+            cx.listener(move |_, _, _, cx| {
+                let next = !cfg.leak_shield_ipv6;
+                ctrl_sh_v6.update(cx, |c, cx| {
+                    c.save_config_patch(move |x| x.leak_shield_ipv6 = next, "已更新 IPv6 护盾配置", cx);
+                });
+            }),
+        ))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(200.))
+                        .text_size(px(11.5))
+                        .text_color(rgb(p.text_secondary))
+                        .child(if shield.summary.is_empty() {
+                            "点击右侧按钮立即将勾选的护盾策略写入系统防火墙规则（撤防/卸载时自动无残留清理）".to_string()
+                        } else {
+                            shield.summary.clone()
+                        }),
+                )
+                .child(
+                    action_button(
+                        "env-shield-sync",
+                        "↻ 立即同步护盾规则",
+                        ButtonKind::Primary,
+                        can_act,
+                        p,
+                    )
+                    .when(can_act, |b| {
+                        b.on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                ctrl_sh_sync.update(cx, |c, cx| {
+                                    c.send_request(
+                                        PipeRequest::SyncLeakShield,
+                                        Some("4 维防泄露护盾规则已同步并生效"),
+                                        cx,
+                                    );
+                                });
+                            }),
+                        )
+                    }),
+                ),
+        );
+
+    // Mihomo / Clash External Controller integration card
+    let mihomo_chips: Vec<Div> = mihomo
+        .candidates
+        .iter()
+        .map(|node| {
+            let is_active = node.name == mihomo.active_node;
+            let clickable = can_act && !is_active && !mihomo.active_group.is_empty();
+            let mut inner = div()
+                .id(gpui::ElementId::Name(
+                    format!("mihomo-chip-{}", node.name).into(),
+                ))
+                .flex_shrink_0()
+                .whitespace_nowrap()
+                .px(px(10.))
+                .py(px(5.))
+                .rounded(px(8.))
+                .border_1()
+                .text_size(px(11.5))
+                .font_weight(if is_active {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .bg(rgb(if is_active {
+                    p.primary_btn_bg
+                } else {
+                    p.inset_bg
+                }))
+                .border_color(rgb(if is_active {
+                    p.primary_btn_bg
+                } else {
+                    p.inset_border
+                }))
+                .text_color(rgb(if is_active {
+                    p.primary_btn_text
+                } else {
+                    p.text_primary
+                }))
+                .child(match node.delay_ms {
+                    Some(ms) => format!("{} · {}ms", node.name, ms),
+                    None => node.name.clone(),
+                });
+            if clickable {
+                let hover = p.sidebar_hover_bg;
+                let ctrl_sw = ctrl.clone();
+                let grp = mihomo.active_group.clone();
+                let target_node = node.name.clone();
+                inner = inner
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(rgb(hover)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            ctrl_sw.update(cx, |c, cx| {
+                                c.send_request(
+                                    PipeRequest::SwitchProxyNode {
+                                        group: grp.clone(),
+                                        node: target_node.clone(),
+                                        close_connections: true,
+                                    },
+                                    Some("已切换代理节点、断开旧连接并自动触发出口复检"),
+                                    cx,
+                                );
+                            });
+                        }),
+                    );
+            }
+            div().flex_shrink_0().child(inner)
+        })
+        .collect();
+
+    let mihomo_card = bento_card(p)
+        .w_full()
+        .p(px(16.))
+        .gap(px(10.))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .text_size(px(13.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(p.text_primary))
+                        .child("代理内核联动（Mihomo / Clash）"),
+                )
+                .child(status_pill(
+                    if mihomo.available {
+                        if mihomo.active_node.is_empty() {
+                            mihomo.core_name.clone()
+                        } else {
+                            format!("{} · {}", mihomo.core_name, mihomo.active_node)
+                        }
+                    } else {
+                        "未检测到控制接口".into()
+                    },
+                    if mihomo.available {
+                        BadgeTone::Pass
+                    } else {
+                        BadgeTone::Muted
+                    },
+                    p,
+                )),
+        )
+        .child(
+            div()
+                .text_size(px(11.5))
+                .line_height(px(16.5))
+                .text_color(rgb(p.text_secondary))
+                .child(if mihomo.note.is_empty() {
+                    "自动发现本机回环控制接口（127.0.0.1），点击下方节点即可一键切换、断开旧连接并复检出口".to_string()
+                } else {
+                    mihomo.note.clone()
+                }),
+        )
+        .when(!mihomo_chips.is_empty(), |card| {
+            card.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .w_full()
+                    .min_w(px(0.))
+                    .gap(px(8.))
+                    .children(mihomo_chips),
+            )
+        });
 
     let direct_rows = leak.direct.iter().map(|c| {
         let remote = if mask {
@@ -61,27 +324,43 @@ pub fn render_environment_page(
             c.remote.clone()
         };
         inset_box(p)
+            .w_full()
             .flex_row()
             .items_center()
             .justify_between()
             .px(px(10.))
             .py(px(6.))
+            .gap(px(8.))
             .child(
                 mono_tabular(format!(
                     "PID {} · {} -> {}:{}",
                     c.pid, c.agent, remote, c.port
                 ))
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
                 .text_size(px(11.5))
                 .text_color(rgb(p.badge_fail.text)),
             )
-            .child(status_pill("绕过代理直连", BadgeTone::Fail, p))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .when(c.is_mcp, |d| d.child(status_pill("MCP 子进程", BadgeTone::Warn, p)))
+                    .child(status_pill("绕过代理直连", BadgeTone::Fail, p)),
+            )
     });
 
     div()
         .flex()
         .flex_col()
+        .w_full()
+        .min_w(px(0.))
         .gap(px(14.))
         .child(ag_card)
+        .child(shield_card)
+        .child(mihomo_card)
         .child(
             bento_card(p)
                 .p(px(16.))
@@ -251,31 +530,115 @@ pub fn render_environment_page(
                 .child(
                     div()
                         .flex()
-                        .justify_end()
-                        .child({
-                            let can_align = connected && !busy;
-                            action_button(
-                                "env-realign-btn",
-                                "↻ 立即校验环境一致性",
-                                ButtonKind::Secondary,
-                                can_align,
-                                p,
-                            )
-                            .when(can_align, |b| {
-                                b.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |_, _, _, cx| {
-                                        ctrl_align.update(cx, |c, cx| {
-                                            c.send_request(
-                                                PipeRequest::RecheckNow { target_id: None },
-                                                Some("环境一致性校验已刷新"),
-                                                cx,
-                                            );
-                                        });
-                                    }),
-                                )
-                            })
-                        }),
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(200.))
+                                .text_size(px(11.5))
+                                .text_color(rgb(if env_applied.is_some() {
+                                    p.badge_pass.text
+                                } else {
+                                    p.text_muted
+                                }))
+                                .child(if let Some(ap) = env_applied.as_ref() {
+                                    format!(
+                                        "已对齐环境（{}）：时区 {} → {}",
+                                        ap.city,
+                                        if ap.tz_from.is_empty() { "原始" } else { &ap.tz_from },
+                                        if ap.tz_to.is_empty() { "未改" } else { &ap.tz_to }
+                                    )
+                                } else {
+                                    "执行对齐前将自动备份原时区与默认定位，撤防或卸载时自动无损还原"
+                                        .to_string()
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(8.))
+                                .child({
+                                    let can_rb = connected && !busy && env_applied.is_some();
+                                    action_button(
+                                        "env-rollback-btn",
+                                        "↩ 一键还原原始环境",
+                                        ButtonKind::Secondary,
+                                        can_rb,
+                                        p,
+                                    )
+                                    .when(can_rb, |b| {
+                                        b.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _, _, cx| {
+                                                ctrl_rollback_env.update(cx, |c, cx| {
+                                                    c.send_request(
+                                                        PipeRequest::RollbackEnvAlignment,
+                                                        Some("已还原原始 Windows 时区与默认定位"),
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                        )
+                                    })
+                                })
+                                .child({
+                                    let can_apply = connected && !busy;
+                                    let do_tz = cfg.env_align_tz || !cfg.env_align_location;
+                                    let do_loc = cfg.env_align_location;
+                                    action_button(
+                                        "env-apply-align-btn",
+                                        "立即对齐出口时区/定位",
+                                        ButtonKind::Primary,
+                                        can_apply,
+                                        p,
+                                    )
+                                    .when(can_apply, |b| {
+                                        b.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _, _, cx| {
+                                                ctrl_apply_env.update(cx, |c, cx| {
+                                                    c.send_request(
+                                                        PipeRequest::ApplyEnvAlignment {
+                                                            align_tz: do_tz,
+                                                            align_location: do_loc,
+                                                        },
+                                                        Some("已将系统时区/定位对齐至当前出口"),
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                        )
+                                    })
+                                })
+                                .child({
+                                    let can_align = connected && !busy;
+                                    action_button(
+                                        "env-realign-btn",
+                                        "↻ 刷新校验",
+                                        ButtonKind::Secondary,
+                                        can_align,
+                                        p,
+                                    )
+                                    .when(can_align, |b| {
+                                        b.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _, _, cx| {
+                                                ctrl_align.update(cx, |c, cx| {
+                                                    c.send_request(
+                                                        PipeRequest::RecheckNow { target_id: None },
+                                                        Some("环境一致性校验已刷新"),
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                        )
+                                    })
+                                }),
+                        ),
                 ),
         )
 }
@@ -297,6 +660,7 @@ fn render_antigravity_proxy_card(
     let can_act = connected && !busy;
     let ctrl_toggle = ctrl.clone();
     let ctrl_to_updates = ctrl.clone();
+    let ctrl_repair = ctrl.clone();
     let ctrl_recheck = ctrl;
     let has_ag_update = updates.antigravity_proxy.phase == UpdateCheckPhase::UpdateAvailable;
     let ag_update_tag = updates
@@ -553,27 +917,61 @@ fn render_antigravity_proxy_card(
                         ),
                 )
                 .child(
-                    action_button(
-                        "env-ag-recheck-btn",
-                        "↻ 立即重检",
-                        ButtonKind::Secondary,
-                        can_act,
-                        p,
-                    )
-                    .when(can_act, |b| {
-                        b.on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(move |_, _, _, cx| {
-                                ctrl_recheck.update(cx, |c, cx| {
-                                    c.send_request(
-                                        PipeRequest::RecheckNow { target_id: None },
-                                        Some("已完成反重力透明代理注入核验"),
-                                        cx,
-                                    );
-                                });
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            action_button(
+                                "env-ag-repair-btn",
+                                "一键下载并热修复注入",
+                                if vm.is_degraded {
+                                    ButtonKind::Primary
+                                } else {
+                                    ButtonKind::Secondary
+                                },
+                                can_act && ag.installed,
+                                p,
+                            )
+                            .when(can_act && ag.installed, |b| {
+                                b.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |_, _, _, cx| {
+                                        ctrl_repair.update(cx, |c, cx| {
+                                            c.send_request(
+                                                PipeRequest::RepairAntigravityProxy,
+                                                Some("已完成 antigravity-proxy 验签热修复注入并同步端口"),
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                                )
                             }),
                         )
-                    }),
+                        .child(
+                            action_button(
+                                "env-ag-recheck-btn",
+                                "↻ 立即重检",
+                                ButtonKind::Secondary,
+                                can_act,
+                                p,
+                            )
+                            .when(can_act, |b| {
+                                b.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |_, _, _, cx| {
+                                        ctrl_recheck.update(cx, |c, cx| {
+                                            c.send_request(
+                                                PipeRequest::RecheckNow { target_id: None },
+                                                Some("已完成反重力透明代理注入核验"),
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                                )
+                            }),
+                        ),
                 ),
         )
 }

@@ -403,6 +403,8 @@ pub struct LeakConn {
     pub agent: String,
     pub remote: String,
     pub port: u16,
+    #[serde(default)]
+    pub is_mcp: bool,
 }
 
 /// Direct-connection leak observation summary.
@@ -874,6 +876,56 @@ pub struct ToastNotificationEvent {
     pub title: String,
     #[serde(default)]
     pub body: String,
+}
+
+/// Active OS-level 4-vector leak shield status (QUIC UDP:443, direct DNS/DoH, global IPv6).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeakShieldStatus {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub quic_blocked: bool,
+    #[serde(default)]
+    pub dns_doh_blocked: bool,
+    #[serde(default)]
+    pub ipv6_blocked: bool,
+    #[serde(default)]
+    pub active_rules: usize,
+    #[serde(default)]
+    pub summary: String,
+}
+
+/// Selectable proxy node reported by local Mihomo / Clash External Controller.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MihomoNodeInfo {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub delay_ms: Option<u32>,
+}
+
+/// Live local Mihomo / Clash External Controller discovery & active node state.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MihomoStatus {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub controller_url: String,
+    #[serde(default)]
+    pub core_name: String,
+    #[serde(default)]
+    pub active_group: String,
+    #[serde(default)]
+    pub active_node: String,
+    #[serde(default)]
+    pub active_delay_ms: Option<u32>,
+    #[serde(default)]
+    pub candidates: Vec<MihomoNodeInfo>,
+    #[serde(default)]
+    pub note: String,
 }
 
 /// Public (credential-free) status of the durable Feishu webhook notifier.
