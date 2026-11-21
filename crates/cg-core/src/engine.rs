@@ -2423,6 +2423,33 @@ fn handle_updates_checked(
             body: summary.claudeguard.note.clone(),
         });
     }
+    let prev_cn = state.updates.antigravity_cn.latest_version.clone();
+    let prev_um = state.updates.ag_usage_monitor.latest_version.clone();
+    let prev_cap = state.updates.ag_capsule.latest_version.clone();
+    for (title, next_slot, prev_ver) in [
+        (
+            "Antigravity 中文汉化引擎发现更新",
+            &summary.antigravity_cn,
+            prev_cn,
+        ),
+        (
+            "antigravity-usage-monitor 发现新版本",
+            &summary.ag_usage_monitor,
+            prev_um,
+        ),
+        ("agy-capsule 发现新版本", &summary.ag_capsule, prev_cap),
+    ] {
+        if next_slot.phase == UpdateCheckPhase::UpdateAvailable
+            && next_slot.latest_version != prev_ver
+        {
+            log_both(state, now_secs, LogLevel::Info, "update", &next_slot.note, cmds);
+            cmds.push(EffectCommand::Notify {
+                class: "client_update".into(),
+                title: title.into(),
+                body: next_slot.note.clone(),
+            });
+        }
+    }
     state.updates = summary;
 }
 

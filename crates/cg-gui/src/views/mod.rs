@@ -5,6 +5,7 @@ pub mod hud;
 pub mod notify;
 pub mod onboarding;
 pub mod overview;
+pub mod plugins_modal;
 pub mod shared;
 pub mod targets;
 pub mod updates;

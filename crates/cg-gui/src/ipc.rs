@@ -265,8 +265,12 @@ impl DaemonClient {
             }
             PipeRequest::CheckUpdates { component } => {
                 let comp = component.as_deref().map(str::trim);
-                let touch = |slot: &mut crate::protocol::ComponentUpdateStatus, key: &str, default_note: &str| {
-                    if comp.is_none() || comp == Some(key) {
+                let is_plugins = matches!(comp, Some("plugins" | "antigravity_plugins"));
+                let touch = |slot: &mut crate::protocol::ComponentUpdateStatus,
+                             key: &str,
+                             in_plugins: bool,
+                             default_note: &str| {
+                    if comp.is_none() || comp == Some(key) || (is_plugins && in_plugins) {
                         slot.checked_at = Some(now);
                         if slot.phase == UpdateCheckPhase::Idle {
                             slot.phase = UpdateCheckPhase::UpToDate;
@@ -279,37 +283,62 @@ impl DaemonClient {
                 touch(
                     &mut snap.updates.claudeguard,
                     "claudeguard",
+                    false,
                     "当前 v4.0.0 已是最新正式版本（官方签名校验已启用）",
                 );
                 touch(
                     &mut snap.updates.antigravity_proxy,
                     "antigravity_proxy",
+                    true,
                     "已完成 antigravity-proxy 版本核验",
                 );
                 touch(
                     &mut snap.updates.claude_desktop,
                     "claude_desktop",
+                    false,
                     "已完成 Claude Desktop 官方最新版本核验",
                 );
                 touch(
                     &mut snap.updates.claude_code,
                     "claude_code",
+                    false,
                     "已完成 Claude Code CLI 官方最新版本核验",
                 );
                 touch(
                     &mut snap.updates.codex_desktop,
                     "codex_desktop",
+                    false,
                     "已完成 ChatGPT / Codex 桌面端版本核验",
                 );
                 touch(
                     &mut snap.updates.codex_cli,
                     "codex_cli",
+                    false,
                     "已完成 Codex CLI 官方最新版本核验",
                 );
                 touch(
                     &mut snap.updates.antigravity_ide,
                     "antigravity_ide",
+                    false,
                     "已完成 Antigravity IDE 官方最新版本核验",
+                );
+                touch(
+                    &mut snap.updates.antigravity_cn,
+                    "antigravity_cn",
+                    true,
+                    "已完成 Silas-02/antigravity-desktop-cn 上游版本核验",
+                );
+                touch(
+                    &mut snap.updates.ag_usage_monitor,
+                    "ag_usage_monitor",
+                    true,
+                    "已完成 yuhuan-dev/antigravity-usage-monitor 上游版本核验",
+                );
+                touch(
+                    &mut snap.updates.ag_capsule,
+                    "ag_capsule",
+                    true,
+                    "已完成 Lumidarin/agy-capsule 上游版本核验",
                 );
                 PipeResponse::Ack {
                     receipt: None,
@@ -672,6 +701,46 @@ pub fn launch_agent_normal_user(
     _install_paths: &[String],
 ) -> Result<String, String> {
     Ok(format!("[demo] 已模拟安全启动 {agent_id}"))
+}
+
+/// Safely opens an `https://` URL in the user's default browser without invoking a shell.
+#[cfg(windows)]
+pub fn open_external_url(url: &str) -> Result<(), String> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::PCWSTR;
+
+    let trimmed = url.trim();
+    if !trimmed.starts_with("https://")
+        || trimmed.bytes().any(|b| b.is_ascii_control() || b == b' ')
+    {
+        return Err("仅允许打开安全的 HTTPS 外部链接".into());
+    }
+    let op: Vec<u16> = "open\0".encode_utf16().collect();
+    let target: Vec<u16> = trimmed.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: Null-terminated UTF-16 buffers outlive ShellExecuteW.
+    let res = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(op.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (res.0 as isize) <= 32 {
+        return Err(format!("打开浏览器失败（错误码 {}）", res.0 as isize));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn open_external_url(url: &str) -> Result<(), String> {
+    if !url.trim().starts_with("https://") {
+        return Err("仅允许打开安全的 HTTPS 外部链接".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -141,6 +141,9 @@ impl PlatformDriver for WindowsPlatformDriver {
             codex_cli: process_win::installed_codex_cli_version(),
             antigravity_ide: ag_ide_ver,
             antigravity_manifest_base: ag_manifest_base,
+            antigravity_cn: process_win::installed_antigravity_cn_version(),
+            ag_usage_monitor: process_win::installed_ag_usage_monitor_version(),
+            ag_capsule: process_win::installed_ag_capsule_version(),
         };
         update_check::check_all_updates_full(
             route,

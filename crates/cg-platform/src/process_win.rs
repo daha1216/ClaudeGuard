@@ -1824,6 +1824,124 @@ pub fn installed_antigravity_ide_info() -> (Option<String>, Option<String>) {
     installed_antigravity_ide_info_in_dirs(&antigravity_covered_dirs())
 }
 
+/// Testable detector reading newest installed Antigravity plugin version from
+/// `<home>\.gemini\config\plugins\<dir>\plugin.json` (or `package.json`).
+pub fn installed_antigravity_plugin_version_in_homes(
+    plugin_dirs: &[&str],
+    homes: &[PathBuf],
+) -> Option<String> {
+    let mut best = None;
+    for home in homes {
+        let base = home.join(".gemini").join("config").join("plugins");
+        for dir_name in plugin_dirs {
+            let root = base.join(dir_name);
+            for manifest in ["plugin.json", "package.json"] {
+                if let Some(v) = read_package_json_version(&root.join(manifest)) {
+                    pick_newer_version(&mut best, &v);
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Detect installed `antigravity-usage-monitor` plugin version across user homes.
+pub fn installed_ag_usage_monitor_version() -> Option<String> {
+    installed_antigravity_plugin_version_in_homes(
+        &["usage-monitor", "antigravity-usage-monitor"],
+        &user_home_dirs(),
+    )
+}
+
+/// Detect installed `agy-capsule` plugin version across user homes.
+pub fn installed_ag_capsule_version() -> Option<String> {
+    installed_antigravity_plugin_version_in_homes(&["agy-capsule"], &user_home_dirs())
+}
+
+fn unix_secs_to_ymd(secs: u64) -> String {
+    // Howard Hinnant's civil-from-days algorithm (UTC YYYY.MM.DD for SemVer-friendly date compare).
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}.{m:02}.{d:02}")
+}
+
+/// Testable detector checking whether `Silas-02/antigravity-desktop-cn` localization patch is
+/// applied inside Antigravity install dirs (returns explicit version or patch date `YYYY.MM.DD`).
+pub fn installed_antigravity_cn_version_in_dirs(dirs: &[PathBuf]) -> Option<String> {
+    let mut best = None;
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        let app_dir = dir.join("resources").join("app");
+        let res_dir = dir.join("resources");
+        for ver_file in [
+            app_dir.join("antigravity-desktop-cn.version"),
+            res_dir.join("antigravity-desktop-cn.version"),
+        ] {
+            if let Ok(raw) = std::fs::read_to_string(&ver_file) {
+                pick_newer_version(&mut best, &raw);
+            }
+        }
+        if best.is_some() {
+            continue;
+        }
+        // Detect injected localization files (`context_monitor.js` or `app.asar.bak` + patched preload)
+        let markers = [
+            app_dir.join("context_monitor.js"),
+            app_dir.join("cn_dict.js"),
+            res_dir.join("app.asar.bak"),
+        ];
+        let mut marker_mtime: Option<u64> = None;
+        for m in &markers {
+            if let Ok(meta) = std::fs::metadata(m) {
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        marker_mtime = Some(marker_mtime.map_or(dur.as_secs(), |p| p.max(dur.as_secs())));
+                    }
+                }
+            }
+        }
+        if marker_mtime.is_none() {
+            let preload = app_dir.join("preload.js");
+            if let Ok(txt) = std::fs::read_to_string(&preload) {
+                if txt.contains("antigravity-desktop-cn")
+                    || txt.contains("context_monitor")
+                    || txt.contains("中文汉化")
+                {
+                    if let Ok(meta) = std::fs::metadata(&preload) {
+                        if let Ok(dur) = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .ok_or(())
+                        {
+                            marker_mtime = Some(dur.as_secs());
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(secs) = marker_mtime {
+            pick_newer_version(&mut best, &unix_secs_to_ymd(secs));
+        }
+    }
+    best
+}
+
+/// Detect installed `Silas-02/antigravity-desktop-cn` patch version/date across Antigravity dirs.
+pub fn installed_antigravity_cn_version() -> Option<String> {
+    installed_antigravity_cn_version_in_dirs(&antigravity_covered_dirs())
+}
+
 // ---------- Cached ProcessScanner (zero scan on UI reads) ----------
 
 /// Immutable process table snapshot served lock-free / RwLock-fast to UI and leak watch.

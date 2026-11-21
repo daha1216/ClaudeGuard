@@ -1,28 +1,47 @@
-//! Mode B — `守护总览磁贴` unified Bento homepage:
-//! 1. Single adaptive status/alert strip (eliminates duplicate Hero + Tripped stacking)
-//! 2. Primary Hero focus: full-width 2x2 Safe Launch Dock
-//! 3. Integrated Managed Process Monitor & Quick Cleanup
-//! 4. Responsive AI Egress Target Matrix (with per-target recheck)
-//! 5. Progressive Disclosure: 24h Protection Timeline + Defense Health Self-Check
+//! Mode B — Frost Ceramic `守护总览` view.
+//!
+//! Layout:
+//! - Upper row: Hero Status Card + Dedicated 2×2 `安全启动台`
+//! - Lower 3-column balanced row: `受管进程治理` | Read-Only `出口实况探测` (no Mihomo) | `四维防漏` + 24h tape
 
-use crate::app::{AppController, ConsoleWindowView};
-use crate::protocol::{Lifecycle, PipeRequest, SelfCheckStatus, TimelineStatus, UiLabelExt};
-use crate::state::{ConsoleProjection, NavSection, TrippedDiagnosticViewModel};
-use crate::theme::{BadgeTone, ThemePalette};
+use crate::app::{AppController, ConsoleWindowView, EnvSubTab};
+use crate::assets::{brand_icon, ui_icon};
+use crate::protocol::{Lifecycle, PipeRequest, TimelineStatus};
+use crate::state::{ConsoleProjection, NavSection};
+use crate::theme::{BadgeTone, HeroTone, ThemePalette};
 use crate::widgets::controls::{
-    ButtonKind, action_button, bento_card, card_header, cc_badge, inset_box, latency_pill,
-    mono_tabular, status_pill,
+    ButtonKind, action_button, bento_card, icon_action_button, inset_box, mono_tabular,
+    toggle_switch,
 };
-use gpui::{Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, rgb, rgba};
+use gpui::{Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, relative, rgb, rgba};
 
 fn cleanup_toast_for_agent(agent_id: &str) -> &'static str {
     match agent_id {
-        "claude" => "已清理 Claude Desktop 进程与孤儿残留",
-        "claude-code" => "已清理 Claude Code CLI 会话进程",
-        "chatgpt" => "已清理 ChatGPT / Codex 桌面端进程",
-        "codex" => "已清理 Codex CLI 会话进程",
-        "antigravity" => "已清理反重力客户端进程与孤儿残留",
-        _ => "已清理所选受管进程",
+        "claude" => "已安静清理 Claude 桌面端及孤儿残留",
+        "claude-code" => "已安静清理 Claude Code CLI 会话及孤儿残留",
+        "chatgpt" => "已安静清理 ChatGPT / Codex 桌面端及孤儿残留",
+        "codex" => "已安静清理 Codex CLI 会话及孤儿残留",
+        "antigravity" => "已安静清理 Antigravity IDE 及孤儿残留",
+        _ => "已清理该受管应用进程",
+    }
+}
+
+fn short_launch_name(agent_id: &str, fallback: &str) -> String {
+    match agent_id {
+        "claude" => "Claude".into(),
+        "claude-code" => "Code CLI".into(),
+        "chatgpt" => "ChatGPT".into(),
+        "antigravity" => "Antigravity".into(),
+        _ => fallback.to_string(),
+    }
+}
+
+fn short_target_name(id: &str, fallback: &str) -> String {
+    match id {
+        "claude" => "Claude 出口".into(),
+        "codex" | "chatgpt" => "Codex / OpenAI".into(),
+        "antigravity" => "Antigravity 后端".into(),
+        _ => fallback.to_string(),
     }
 }
 
@@ -32,373 +51,140 @@ pub fn render_overview(
     p: &'static ThemePalette,
     cx: &mut Context<ConsoleWindowView>,
 ) -> Div {
-    let snap_opt = ctrl.read(cx).snapshot.clone();
-    let is_disarmed = snap_opt
-        .as_ref()
-        .is_some_and(|s| s.lifecycle == Lifecycle::Disarmed);
-    let lockdown_manual = snap_opt.as_ref().is_some_and(|s| s.lockdown_manual);
-    let busy = ctrl.read(cx).busy_action;
+    let ctrl_r = ctrl.read(cx);
+    let snap = ctrl_r.snapshot.clone();
+    let busy = ctrl_r.busy_action;
     let connected = proj.connected;
+    let can_act = connected && !busy;
+    let cfg = snap.as_ref().map(|s| s.config.clone()).unwrap_or_default();
+    let lifecycle = snap
+        .as_ref()
+        .map(|s| s.lifecycle)
+        .unwrap_or(Lifecycle::Unconfigured);
+    let tripped = proj.hero.tone == HeroTone::Tripped;
+    let ag_proxy = snap
+        .as_ref()
+        .map(|s| s.antigravity_proxy.clone())
+        .unwrap_or_default();
+    let ag_degraded = ag_proxy.installed && !ag_proxy.is_ready_for_launch();
+    let shield_status = snap
+        .as_ref()
+        .map(|s| s.leak_shield.clone())
+        .unwrap_or_default();
+    let leak_watch = snap
+        .as_ref()
+        .map(|s| s.leak.clone())
+        .unwrap_or_default();
 
-    // ── Band 1: Single Unified Status / Alert Strip ─────────────────────────────────────────
-    let band1 = if let Some(diag) = proj.tripped_card.as_ref() {
-        render_unified_tripped_strip(ctrl.clone(), proj, diag, connected, busy, p, cx)
-    } else if is_disarmed {
-        render_disarmed_strip(ctrl.clone(), proj, connected, busy, p, cx)
+    // -------------------------------------------------------------------------
+    // Upper Row Left: Hero Status Card
+    // -------------------------------------------------------------------------
+    let hero_surf = p.hero(proj.hero.tone);
+    let total_targets = (proj.hero.pass_count + proj.hero.fail_count + proj.hero.unverified_count).max(1);
+    let status_dot_color = match proj.hero.tone {
+        HeroTone::Healthy => p.badge_pass.dot,
+        HeroTone::Tripped => p.badge_fail.dot,
+        HeroTone::DisarmedOrPaused => p.badge_warn.dot,
+    };
+    let status_kicker = match proj.hero.tone {
+        HeroTone::Healthy => format!("实时守护正常 · {}/{} 出口合规", proj.hero.pass_count, total_targets),
+        HeroTone::Tripped => format!("熔断保护已触发 · {} 项越界", proj.hero.fail_count.max(1)),
+        HeroTone::DisarmedOrPaused => proj.hero.pill_label.clone(),
+    };
+    let hero_title = if !connected {
+        "守护服务未连接"
+    } else if lifecycle == Lifecycle::Unconfigured {
+        "等待完成首启配置"
+    } else if lifecycle == Lifecycle::Disarmed {
+        "保护已撤防放行"
+    } else if tripped {
+        "已隔离受管 AI 出站"
+    } else if proj.hero.is_paused {
+        "已暂停自动拦截"
     } else {
-        render_healthy_status_strip(ctrl.clone(), proj, connected, busy, p, cx)
+        "出口纯净合规"
     };
 
-    // ── Band 2: Primary Visual Focus — Safe Launch 安全启动坞 ───────────────────────────────
-    let band2 = render_safe_launch_dock(ctrl.clone(), proj, connected, busy, p, cx);
-
-    // ── Band 3: Integrated Managed Process Monitor & Quick Cleanup ──────────────────────────
-    let band3 =
-        render_process_monitor_card(ctrl.clone(), proj, connected, busy, lockdown_manual, p, cx);
-
-    // ── Band 4: AI Egress Target Matrix (responsive 3-column chunks) ────────────────────────
-    let band4 = render_target_matrix(ctrl.clone(), proj, connected, busy, p, cx);
-
-    // ── Band 5: Progressive Disclosure — 24h Timeline + Defense Health Self-Check ───────────
-    let band5 = div()
-        .flex()
-        .w_full()
-        .min_w(px(0.))
-        .gap(px(12.))
-        .child(render_timeline_card(ctrl.clone(), proj, p, cx))
-        .child(render_self_check_card(proj, p));
-
-    div()
-        .flex()
-        .flex_col()
-        .w_full()
-        .min_w(px(0.))
-        .gap(px(14.))
-        .child(band1)
-        .child(band2)
-        .child(band3)
-        .child(band4)
-        .child(band5)
-}
-
-fn render_healthy_status_strip(
-    ctrl: Entity<AppController>,
-    proj: &ConsoleProjection,
-    connected: bool,
-    busy: bool,
-    p: &'static ThemePalette,
-    cx: &mut Context<ConsoleWindowView>,
-) -> Div {
-    let hs = p.hero(proj.hero.tone);
-    let ctrl_pause = ctrl.clone();
-    let ctrl_recheck = ctrl.clone();
-
-    div()
-        .flex()
-        .flex_col()
-        .w_full()
-        .min_w(px(0.))
-        .p(px(16.))
-        .gap(px(10.))
-        .rounded(px(16.))
-        .bg(rgba(hs.bg))
-        .border_1()
-        .border_color(rgba(hs.border))
-        .child(
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .justify_between()
-                .gap(px(10.))
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .w(px(9.))
-                                .h(px(9.))
-                                .rounded(px(999.))
-                                .bg(rgba(hs.ring)),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .whitespace_nowrap()
-                                .px(px(9.))
-                                .py(px(3.))
-                                .rounded(px(999.))
-                                .bg(rgba(hs.pill_bg))
-                                .text_size(px(11.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(hs.pill_text))
-                                .child(proj.hero.pill_label.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .whitespace_nowrap()
-                                .px(px(8.))
-                                .py(px(3.))
-                                .rounded(px(6.))
-                                .bg(rgb(p.card_bg))
-                                .border_1()
-                                .border_color(rgb(p.card_border))
-                                .text_size(px(10.5))
-                                .font_family("Cascadia Mono")
-                                .text_color(rgb(p.text_secondary))
-                                .child(proj.hero.access_badge.clone()),
-                        )
-                        .when_some(
-                            ctrl.read(cx)
-                                .snapshot
-                                .as_ref()
-                                .filter(|s| s.mihomo.available && !s.mihomo.active_node.is_empty())
-                                .map(|s| match s.mihomo.active_delay_ms {
-                                    Some(ms) => format!("节点 {} · {}ms", s.mihomo.active_node, ms),
-                                    None => format!("节点 {}", s.mihomo.active_node),
-                                }),
-                            |row, node_label| {
-                                row.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .whitespace_nowrap()
-                                        .px(px(8.))
-                                        .py(px(3.))
-                                        .rounded(px(6.))
-                                        .bg(rgb(p.card_bg))
-                                        .border_1()
-                                        .border_color(rgb(p.card_border))
-                                        .text_size(px(10.5))
-                                        .font_family("Cascadia Mono")
-                                        .text_color(rgb(p.text_secondary))
-                                        .child(node_label),
-                                )
-                            },
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(px(12.))
-                        .child(metric_chip(
-                            "通过",
-                            proj.hero.pass_count,
-                            p.badge_pass.text,
-                            p,
-                        ))
-                        .child(metric_chip(
-                            "异常",
-                            proj.hero.fail_count,
-                            p.badge_fail.text,
-                            p,
-                        ))
-                        .child(metric_chip(
-                            "待核验",
-                            proj.hero.unverified_count,
-                            p.text_muted,
-                            p,
-                        )),
-                ),
+    let tripped_lines: Option<(String, String)> = proj.tripped_card.as_ref().map(|diag| {
+        (
+            format!("期望：{}", diag.expected_summary),
+            format!("实测：{}", diag.observed_summary),
         )
-        .child(
-            div()
-                .flex()
-                .flex_wrap()
-                .items_end()
-                .justify_between()
-                .gap(px(12.))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w(px(260.))
-                        .gap(px(4.))
-                        .child(
-                            div()
-                                .text_size(px(19.))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(hs.title))
-                                .child(proj.hero.title.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .line_height(px(17.5))
-                                .text_color(rgb(hs.subtitle))
-                                .child(format!(
-                                    "{} · 最近核验：{}",
-                                    proj.hero.subtitle, proj.hero.checked_age_text
-                                )),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(px(8.))
-                        .child({
-                            let can_pause = connected && !busy;
-                            action_button(
-                                "hero-pause",
-                                if proj.hero.is_paused {
-                                    "▶ 恢复守护"
-                                } else {
-                                    "II 暂停 30 分钟"
-                                },
-                                ButtonKind::Secondary,
-                                can_pause,
-                                p,
-                            )
-                            .when(can_pause, |b| {
-                                b.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |_, _, _, cx| {
-                                        ctrl_pause.update(cx, |c, cx| c.toggle_pause_30m(cx));
-                                    }),
-                                )
-                            })
-                        })
-                        .child({
-                            let can_recheck = connected && !busy;
-                            action_button(
-                                "hero-recheck",
-                                if connected {
-                                    "↻ 立即重检"
-                                } else {
-                                    "↻ 重试连接"
-                                },
-                                ButtonKind::Primary,
-                                !busy,
-                                p,
-                            )
-                            .when(!busy, |b| {
-                                b.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |_, _, _, cx| {
-                                        ctrl_recheck.update(cx, |c, cx| {
-                                            let req = if can_recheck {
-                                                PipeRequest::RecheckNow { target_id: None }
-                                            } else {
-                                                PipeRequest::GetSnapshot
-                                            };
-                                            let ok_msg = if can_recheck {
-                                                "已完成新一轮出口核验"
-                                            } else {
-                                                "已重新连接后台守护服务"
-                                            };
-                                            c.send_request(req, Some(ok_msg), cx);
-                                        });
-                                    }),
-                                )
-                            })
-                        }),
-                ),
+    });
+    let hero_meta = if let Some(primary) = proj
+        .target_cards
+        .iter()
+        .find(|t| t.id == "claude")
+        .or_else(|| proj.target_cards.first())
+    {
+        format!(
+            "{} · {} · {}",
+            primary.location_display, primary.ip_display, primary.latency_label
         )
-}
+    } else {
+        proj.hero.subtitle.clone()
+    };
 
-fn render_disarmed_strip(
-    ctrl: Entity<AppController>,
-    proj: &ConsoleProjection,
-    connected: bool,
-    busy: bool,
-    p: &'static ThemePalette,
-    cx: &mut Context<ConsoleWindowView>,
-) -> Div {
-    let ds = p.hero_disarmed;
-    let can_rearm = connected && !busy;
-
-    div()
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .justify_between()
-        .w_full()
-        .min_w(px(0.))
-        .gap(px(12.))
-        .p(px(16.))
-        .rounded(px(16.))
-        .bg(rgba(ds.bg))
-        .border_1()
-        .border_color(rgba(ds.border))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w(px(260.))
-                .gap(px(5.))
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .whitespace_nowrap()
-                                .px(px(9.))
-                                .py(px(2.5))
-                                .rounded(px(999.))
-                                .bg(rgba(ds.pill_bg))
-                                .text_size(px(11.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(ds.pill_text))
-                                .child("已撤防 · 保护已停止"),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .whitespace_nowrap()
-                                .px(px(8.))
-                                .py(px(2.5))
-                                .rounded(px(6.))
-                                .bg(rgb(p.card_bg))
-                                .border_1()
-                                .border_color(rgb(p.card_border))
-                                .text_size(px(10.5))
-                                .font_family("Cascadia Mono")
-                                .text_color(rgb(p.text_secondary))
-                                .child(proj.hero.access_badge.clone()),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_size(px(16.))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(ds.title))
-                        .child("当前处于撤防状态，隔离与网络限制已全部解除"),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .line_height(px(17.5))
-                        .text_color(rgb(ds.subtitle))
-                        .child("受管 AI 应用可直接运行；切回合规节点后可随时点击右侧重新布防。"),
-                ),
-        )
-        .child(
-            action_button(
-                "overview-rearm",
-                "🛡 重新布防",
+    let hero_actions = if !connected {
+        let ctrl_conn = ctrl.clone();
+        div().flex().items_center().gap(px(8.)).child(
+            icon_action_button(
+                "ov-reconnect",
+                "icons/ui/refresh.svg",
+                if busy { "重连中…" } else { "重新连接守护" },
                 ButtonKind::Primary,
-                can_rearm,
+                !busy,
                 p,
             )
-            .when(can_rearm, |b| {
+            .when(!busy, |b| {
                 b.on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |_, _, _, cx| {
-                        ctrl.update(cx, |c, cx| {
+                        ctrl_conn.update(cx, |c, cx| {
+                            c.send_request(
+                                PipeRequest::GetSnapshot,
+                                Some("已重新连接后台守护服务"),
+                                cx,
+                            );
+                        });
+                    }),
+                )
+            }),
+        )
+    } else if lifecycle == Lifecycle::Unconfigured {
+        let ctrl_onb = ctrl.clone();
+        div().flex().items_center().gap(px(8.)).child(
+            icon_action_button(
+                "ov-open-onb",
+                "icons/ui/shield.svg",
+                "完成首启向导并布防",
+                ButtonKind::Primary,
+                true,
+                p,
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |_, _, _, cx| {
+                    ctrl_onb.update(cx, |c, cx| c.open_onboarding_modal(cx));
+                }),
+            ),
+        )
+    } else if lifecycle == Lifecycle::Disarmed {
+        let ctrl_rearm = ctrl.clone();
+        div().flex().items_center().gap(px(8.)).child(
+            icon_action_button(
+                "ov-rearm",
+                "icons/ui/shield.svg",
+                "重新布防",
+                ButtonKind::Primary,
+                can_act,
+                p,
+            )
+            .when(can_act, |b| {
+                b.on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |_, _, _, cx| {
+                        ctrl_rearm.update(cx, |c, cx| {
                             c.send_request(
                                 PipeRequest::Rearm,
                                 Some("已重新布防并恢复出口守护"),
@@ -409,578 +195,516 @@ fn render_disarmed_strip(
                 )
             }),
         )
-}
-
-fn render_unified_tripped_strip(
-    ctrl: Entity<AppController>,
-    proj: &ConsoleProjection,
-    diag: &TrippedDiagnosticViewModel,
-    connected: bool,
-    busy: bool,
-    p: &'static ThemePalette,
-    cx: &mut Context<ConsoleWindowView>,
-) -> Div {
-    let can_act = connected && !busy;
-    let tr = p.hero_tripped;
-    let ctrl_a = ctrl.clone();
-    let ctrl_b = ctrl;
-
-    let receipt_items: Vec<Div> = diag
-        .receipt
-        .as_ref()
-        .map(|r| {
-            r.items
-                .iter()
-                .map(|it| {
-                    inset_box(p)
-                        .w_full()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .px(px(10.))
-                        .py(px(6.))
-                        .gap(px(8.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .text_size(px(11.5))
-                                .line_height(px(16.))
-                                .text_color(rgb(p.text_primary))
-                                .child(format!("{} · {}", it.name, it.detail)),
-                        )
-                        .child(status_pill(it.status.label(), BadgeTone::Pass, p))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    div()
-        .flex()
-        .flex_col()
-        .w_full()
-        .min_w(px(0.))
-        .p(px(16.))
-        .gap(px(12.))
-        .rounded(px(16.))
-        .bg(rgba(tr.bg))
-        .border_1()
-        .border_color(rgba(tr.border))
-        // Header: Status pills + metrics on left, wrapped dual-path recovery actions on right
-        .child(
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .justify_between()
-                .gap(px(10.))
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(status_pill("熔断保护已触发", BadgeTone::Fail, p))
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .whitespace_nowrap()
-                                .px(px(8.))
-                                .py(px(2.5))
-                                .rounded(px(6.))
-                                .bg(rgb(p.card_bg))
-                                .border_1()
-                                .border_color(rgb(p.card_border))
-                                .text_size(px(10.5))
-                                .font_family("Cascadia Mono")
-                                .text_color(rgb(p.text_secondary))
-                                .child(proj.hero.access_badge.clone()),
-                        )
-                        .child(metric_chip(
-                            "通过",
-                            proj.hero.pass_count,
-                            p.badge_pass.text,
-                            p,
-                        ))
-                        .child(metric_chip(
-                            "异常",
-                            proj.hero.fail_count,
-                            p.badge_fail.text,
-                            p,
-                        )),
+    } else if tripped {
+        let ctrl_a = ctrl.clone();
+        let ctrl_b = ctrl.clone();
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(8.))
+            .child(
+                icon_action_button(
+                    "ov-trip-flow-a",
+                    "icons/ui/refresh.svg",
+                    "复查并解封",
+                    ButtonKind::Danger,
+                    can_act,
+                    p,
                 )
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(
-                            action_button(
-                                "trip-flow-a",
-                                "↻ 节点已切回 · 立即复检解封",
-                                ButtonKind::Primary,
-                                can_act,
-                                p,
-                            )
-                            .when(can_act, |b| {
-                                b.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |_, _, _, cx| {
-                                        ctrl_a.update(cx, |c, cx| {
-                                            c.send_request(
-                                                PipeRequest::RecoverSafeFlowA,
-                                                Some("复检通过，已安全解封并恢复守护"),
-                                                cx,
-                                            );
-                                        });
-                                    }),
-                                )
-                            }),
-                        )
-                        .child(
-                            action_button(
-                                "trip-flow-b",
-                                "⏹ 暂不用 AI · 停止并解封",
-                                ButtonKind::Secondary,
-                                can_act,
-                                p,
-                            )
-                            .when(can_act, |b| {
-                                b.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |_, _, _, cx| {
-                                        ctrl_b.update(cx, |c, cx| {
-                                            c.send_request(
-                                                PipeRequest::DisarmAndRestoreFlowB {
-                                                    reason: Some("用户从主控台手动停止并解封".into()),
-                                                },
-                                                Some("已撤防并核验解除隔离限制"),
-                                                cx,
-                                            );
-                                        });
-                                    }),
-                                )
-                            }),
-                        ),
-                ),
-        )
-        // Title & wrapped reason
+                .when(can_act, |b| {
+                    b.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            ctrl_a.update(cx, |c, cx| {
+                                c.send_request(
+                                    PipeRequest::RecoverSafeFlowA,
+                                    Some("全链路复查通过，已安全解封放行"),
+                                    cx,
+                                );
+                            });
+                        }),
+                    )
+                }),
+            )
+            .child(
+                action_button(
+                    "ov-trip-flow-b",
+                    "暂不用 AI · 解封",
+                    ButtonKind::Secondary,
+                    can_act,
+                    p,
+                )
+                .when(can_act, |b| {
+                    b.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            ctrl_b.update(cx, |c, cx| {
+                                c.send_request(
+                                    PipeRequest::DisarmAndRestoreFlowB {
+                                        reason: Some("用户从总览手动停止并解封".into()),
+                                    },
+                                    Some("已撤防并解除隔离规则"),
+                                    cx,
+                                );
+                            });
+                        }),
+                    )
+                }),
+            )
+    } else {
+        let ctrl_chk = ctrl.clone();
+        let ctrl_pause = ctrl.clone();
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(8.))
+            .child(
+                icon_action_button(
+                    "ov-recheck-now",
+                    "icons/ui/refresh.svg",
+                    "立即核验",
+                    ButtonKind::Primary,
+                    can_act,
+                    p,
+                )
+                .when(can_act, |b| {
+                    b.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            ctrl_chk.update(cx, |c, cx| {
+                                c.send_request(
+                                    PipeRequest::RecheckNow { target_id: None },
+                                    Some("已完成新一轮全链路出口核验"),
+                                    cx,
+                                );
+                            });
+                        }),
+                    )
+                }),
+            )
+            .child(
+                action_button(
+                    "ov-pause-30m",
+                    if proj.hero.is_paused {
+                        "恢复守护"
+                    } else {
+                        "暂停 30m"
+                    },
+                    ButtonKind::Secondary,
+                    can_act,
+                    p,
+                )
+                .when(can_act, |b| {
+                    b.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            ctrl_pause.update(cx, |c, cx| c.toggle_pause_30m(cx));
+                        }),
+                    )
+                }),
+            )
+    };
+
+    let hero_card = bento_card(p)
+        .w(relative(0.53))
+        .flex_shrink_0()
+        .bg(rgba(hero_surf.bg))
+        .border_color(rgba(hero_surf.border))
+        .px(px(19.))
+        .py(px(17.))
+        .justify_between()
+        .gap(px(14.))
         .child(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(4.))
+                .gap(px(6.))
                 .child(
                     div()
-                        .text_size(px(17.5))
+                        .flex()
+                        .items_center()
+                        .gap(px(7.))
+                        .child(
+                            div()
+                                .w(px(7.5))
+                                .h(px(7.5))
+                                .rounded(px(999.))
+                                .bg(rgb(status_dot_color)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(status_dot_color))
+                                .child(status_kicker),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(22.))
                         .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(tr.title))
-                        .child("检测到出口偏离，已自动隔离受管 AI 应用"),
+                        .line_height(px(27.))
+                        .text_color(rgb(hero_surf.title))
+                        .child(hero_title),
                 )
-                .child(
-                    div()
-                        .w_full()
-                        .text_size(px(12.))
-                        .line_height(px(17.5))
-                        .text_color(rgb(tr.subtitle))
-                        .child(format!(
-                            "触发原因：{} · 最近核验：{}",
-                            diag.reason, proj.hero.checked_age_text
-                        )),
-                ),
-        )
-        // Expected vs Observed diff
-        .child(
-            div()
-                .flex()
-                .w_full()
-                .min_w(px(0.))
-                .gap(px(10.))
-                .child(
-                    inset_box(p)
-                        .flex_1()
-                        .flex_basis(px(0.))
-                        .min_w(px(0.))
-                        .p(px(10.))
-                        .gap(px(3.))
-                        .child(
-                            div()
-                                .text_size(px(10.5))
-                                .text_color(rgb(p.text_muted))
-                                .child("期望出口白名单"),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .text_size(px(12.))
-                                .line_height(px(17.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(p.text_primary))
-                                .child(diag.expected_summary.clone()),
-                        ),
-                )
-                .child(
-                    inset_box(p)
-                        .flex_1()
-                        .flex_basis(px(0.))
-                        .min_w(px(0.))
-                        .p(px(10.))
-                        .gap(px(3.))
-                        .child(
-                            div()
-                                .text_size(px(10.5))
-                                .text_color(rgb(p.text_muted))
-                                .child("当前实测出口"),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .text_size(px(12.))
-                                .line_height(px(17.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(p.badge_fail.text))
-                                .child(diag.observed_summary.clone()),
-                        ),
-                ),
-        )
-        // Compact wrapped execution summary chips
-        .child(
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap(px(8.))
-                .child(status_pill(
-                    format!("已终止 {} 个进程", diag.killed_count),
-                    BadgeTone::Fail,
-                    p,
-                ))
-                .child(status_pill(
-                    format!("防火墙隔离 {} 条", diag.firewall_rules),
-                    BadgeTone::Warn,
-                    p,
-                ))
-                .child(status_pill(diag.network_note.clone(), BadgeTone::Muted, p)),
-        )
-        .when(!receipt_items.is_empty(), |box_el| {
-            box_el.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .min_w(px(0.))
-                    .gap(px(6.))
-                    .children(receipt_items),
-            )
-        })
-}
-
-fn render_safe_launch_dock(
-    ctrl: Entity<AppController>,
-    proj: &ConsoleProjection,
-    connected: bool,
-    busy: bool,
-    p: &'static ThemePalette,
-    cx: &mut Context<ConsoleWindowView>,
-) -> Div {
-    let cards: Vec<Div> = proj
-        .launch_apps
-        .iter()
-        .map(|app| {
-            let ctrl_l = ctrl.clone();
-            let ctrl_env = ctrl.clone();
-            let aid = app.agent_id.clone();
-            let paths = app.install_paths.clone();
-            let is_ag_blocked = connected && app.ag_proxy_blocked;
-            let can_click = connected && !busy && (app.installed || is_ag_blocked);
-
-            let (btn_label, kind) = if !connected {
-                ("守护未连接", ButtonKind::Secondary)
-            } else if is_ag_blocked {
-                ("前往修复注入", ButtonKind::Danger)
-            } else if app.quarantined {
-                ("已隔离拦截", ButtonKind::Danger)
-            } else if !app.installed {
-                ("未安装", ButtonKind::Secondary)
-            } else if proj.hero.can_launch {
-                ("▶ 安全启动", ButtonKind::Primary)
-            } else {
-                ("门禁拦截", ButtonKind::Secondary)
-            };
-
-            let status_text = if !connected {
-                "后台守护未连接，已禁止旁路启动".to_string()
-            } else if is_ag_blocked {
-                "antigravity-proxy 注入异常，已阻止直连启动".to_string()
-            } else if app.quarantined {
-                "当前处于熔断隔离中，切回合规节点并复检后放行".to_string()
-            } else if !app.installed {
-                "本机未检测到安装路径".to_string()
-            } else if app.running_count > 0 && app.orphan_count > 0 {
-                format!(
-                    "运行中 {} 个进程 · 发现 {} 个孤儿残留",
-                    app.running_count, app.orphan_count
-                )
-            } else if app.running_count > 0 {
-                format!("运行中 {} 个进程 · 出口受保护", app.running_count)
-            } else if proj.hero.can_launch {
-                "就绪 · 启动前自动核验出口白名单".to_string()
-            } else {
-                "等待出口核验通过后自动解锁".to_string()
-            };
-
-            let status_color = if is_ag_blocked || app.quarantined {
-                p.badge_fail.text
-            } else if app.orphan_count > 0 {
-                p.badge_warn.text
-            } else if app.running_count > 0 && proj.hero.can_launch {
-                p.badge_pass.text
-            } else {
-                p.text_muted
-            };
-
-            let badge_pill = if is_ag_blocked {
-                status_pill("注入异常", BadgeTone::Fail, p)
-            } else if app.quarantined {
-                status_pill("已隔离", BadgeTone::Fail, p)
-            } else if app.running_count > 0 {
-                status_pill(format!("运行中 {}", app.running_count), BadgeTone::Pass, p)
-            } else if app.installed {
-                status_pill(app.badge.clone(), BadgeTone::Muted, p)
-            } else {
-                status_pill("未安装", BadgeTone::Muted, p)
-            };
-
-            inset_box(p)
-                .flex_1()
-                .flex_basis(px(0.))
-                .min_w(px(0.))
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .p(px(12.))
-                .gap(px(10.))
-                .child(
+                .child(if let Some((exp_line, obs_line)) = tripped_lines {
                     div()
                         .flex()
                         .flex_col()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .gap(px(4.))
+                        .gap(px(2.5))
                         .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .gap(px(6.))
-                                .child(
-                                    div()
-                                        .text_size(px(13.5))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(p.text_primary))
-                                        .child(app.label.clone()),
-                                )
-                                .child(badge_pill),
-                        )
-                        .child(
-                            div()
-                                .w_full()
+                            mono_tabular(exp_line)
                                 .text_size(px(11.))
-                                .line_height(px(15.5))
-                                .text_color(rgb(status_color))
-                                .child(status_text),
-                        ),
-                )
-                .child(
-                    action_button(
-                        gpui::ElementId::Name(format!("launch-btn-{}", app.agent_id).into()),
-                        btn_label,
-                        kind,
-                        can_click,
-                        p,
-                    )
-                    .when(can_click, |b| {
-                        b.on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(move |_, _, _, cx| {
-                                if is_ag_blocked {
-                                    ctrl_env.update(cx, |c, cx| {
-                                        c.set_nav(NavSection::Environment, cx);
-                                    });
-                                } else {
-                                    ctrl_l.update(cx, |c, cx| {
-                                        c.launch_app_with_gate(aid.clone(), paths.clone(), cx);
-                                    });
-                                }
-                            }),
+                                .line_height(px(15.))
+                                .text_color(rgb(hero_surf.subtitle)),
                         )
-                    }),
-                )
-        })
-        .collect();
-
-    let mut rows: Vec<Div> = Vec::new();
-    let mut iter = cards.into_iter();
-    while let Some(first) = iter.next() {
-        let mut row = div().flex().w_full().min_w(px(0.)).gap(px(10.)).child(first);
-        if let Some(second) = iter.next() {
-            row = row.child(second);
-        } else {
-            row = row.child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)));
-        }
-        rows.push(row);
-    }
-
-    bento_card(p)
-        .w_full()
-        .p(px(16.))
-        .gap(px(10.))
-        .child(card_header(
-            "Safe Launch 安全启动坞",
-            if !connected {
-                "守护离线 · 安全闭锁"
-            } else if proj.hero.can_launch {
-                "出口已核验 · 门禁绿色放行"
-            } else {
-                "门禁保护锁定 · 等待合规恢复"
-            },
-            p,
-        ))
+                        .child(
+                            mono_tabular(obs_line)
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .line_height(px(15.5))
+                                .text_color(rgb(p.badge_fail.text)),
+                        )
+                        .into_any_element()
+                } else {
+                    mono_tabular(hero_meta)
+                        .truncate()
+                        .text_size(px(11.5))
+                        .text_color(rgb(hero_surf.subtitle))
+                        .into_any_element()
+                }),
+        )
         .child(
             div()
                 .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(hero_actions)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_shrink_0()
+                        .gap(px(4.))
+                        .text_size(px(11.))
+                        .text_color(rgb(p.text_muted))
+                        .child("代理")
+                        .child(mono_tabular(format!(":{}", cfg.proxy_port))),
+                ),
+        );
+
+    // -------------------------------------------------------------------------
+    // Upper Row Right: Dedicated 2x2 Safe Launch Deck
+    // -------------------------------------------------------------------------
+    let deck_ok = connected && proj.hero.can_launch;
+    let deck_color = if tripped {
+        p.badge_fail.text
+    } else if deck_ok {
+        p.badge_pass.text
+    } else {
+        p.badge_warn.text
+    };
+    let deck_badge = if !connected {
+        "未连接 · 已锁定"
+    } else if tripped {
+        "熔断已锁定"
+    } else if deck_ok {
+        "门禁放行 · 防直连"
+    } else {
+        "待核验 / 已暂停"
+    };
+
+    let mut pad_cards: Vec<Div> = proj
+        .launch_apps
+        .iter()
+        .take(4)
+        .map(|app| {
+            let ctrl_l = ctrl.clone();
+            let aid = app.agent_id.clone();
+            let paths = app.install_paths.clone();
+            let locked = !connected || !proj.hero.can_launch || app.quarantined || app.ag_proxy_blocked;
+            let is_warn = !locked && app.orphan_count > 0;
+            let dot_rgb = if locked {
+                p.badge_fail.dot
+            } else if is_warn {
+                p.badge_warn.dot
+            } else if !app.installed {
+                p.text_muted
+            } else {
+                p.badge_pass.dot
+            };
+            let sub_text = if !app.installed {
+                "未检测到安装".to_string()
+            } else if app.ag_proxy_blocked {
+                "注入缺失".to_string()
+            } else if locked {
+                "禁止启动".to_string()
+            } else if app.agent_id == "antigravity" {
+                "注入健康".to_string()
+            } else if app.orphan_count > 0 {
+                format!("{}运行 · {}孤儿", app.running_count, app.orphan_count)
+            } else {
+                format!("{}运行 · 合规", app.running_count)
+            };
+            let sub_color = if locked {
+                p.badge_fail.text
+            } else if is_warn {
+                p.badge_warn.text
+            } else {
+                p.text_secondary
+            };
+
+            let pill_bg = if locked { p.badge_fail.bg } else { p.card_bg };
+            let pill_txt = if locked { p.badge_fail.text } else { p.text_primary };
+            let hover_bg = p.sidebar_hover_bg;
+            let can_click = connected && !busy && app.installed;
+
+            let mut card = div()
+                .id(gpui::ElementId::Name(format!("ov-launch-{}", app.agent_id).into()))
+                .flex()
                 .flex_col()
-                .w_full()
+                .justify_between()
+                .flex_1()
+                .flex_basis(px(0.))
                 .min_w(px(0.))
-                .gap(px(10.))
-                .children(rows),
+                .p(px(10.))
+                .gap(px(8.))
+                .rounded(px(11.))
+                .bg(rgb(p.inset_bg))
+                .border_1()
+                .border_color(if locked && tripped {
+                    rgba(p.hero_tripped.border)
+                } else {
+                    rgb(p.inset_border)
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(7.))
+                                .min_w(px(0.))
+                                .flex_1()
+                                .child(brand_icon(&app.agent_id, 24.0, 6.5, p.is_dark))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(p.text_primary))
+                                        .child(short_launch_name(&app.agent_id, &app.label)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap(px(3.))
+                                .px(px(7.))
+                                .py(px(2.5))
+                                .rounded(px(999.))
+                                .bg(if locked { rgba(pill_bg) } else { rgb(pill_bg) })
+                                .border_1()
+                                .border_color(rgb(p.card_border))
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(pill_txt))
+                                .child(ui_icon(
+                                    if locked {
+                                        "icons/ui/lock.svg"
+                                    } else {
+                                        "icons/ui/play.svg"
+                                    },
+                                    9.5,
+                                    pill_txt,
+                                ))
+                                .child(if locked { "锁定" } else { "启动" }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.))
+                        .child(
+                            div()
+                                .w(px(5.5))
+                                .h(px(5.5))
+                                .rounded(px(999.))
+                                .flex_shrink_0()
+                                .bg(rgb(dot_rgb)),
+                        )
+                        .child(
+                            mono_tabular(sub_text)
+                                .truncate()
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(sub_color)),
+                        ),
+                );
+
+            if can_click {
+                card = card
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(rgb(hover_bg)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            ctrl_l.update(cx, |c, cx| {
+                                c.launch_app_with_gate(aid.clone(), paths.clone(), cx);
+                            });
+                        }),
+                    );
+            }
+            div().flex_1().flex_basis(px(0.)).min_w(px(0.)).child(card)
+        })
+        .collect();
+
+    let pads_row1 = div()
+        .flex()
+        .w_full()
+        .gap(px(8.))
+        .children(pad_cards.drain(0..pad_cards.len().min(2)));
+    let pads_row2 = div().flex().w_full().gap(px(8.)).children(pad_cards);
+
+    let launch_deck = bento_card(p)
+        .flex_1()
+        .min_w(px(0.))
+        .px(px(16.))
+        .py(px(14.))
+        .gap(px(10.))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(ui_icon(
+                            if tripped {
+                                "icons/ui/shield_alert.svg"
+                            } else {
+                                "icons/ui/shield.svg"
+                            },
+                            14.0,
+                            deck_color,
+                        ))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(p.text_primary))
+                                .child("安全启动台"),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(deck_color))
+                        .child(deck_badge),
+                ),
         )
-}
+        .child(pads_row1)
+        .child(pads_row2);
 
-fn render_process_monitor_card(
-    ctrl: Entity<AppController>,
-    proj: &ConsoleProjection,
-    connected: bool,
-    busy: bool,
-    lockdown_manual: bool,
-    p: &'static ThemePalette,
-    cx: &mut Context<ConsoleWindowView>,
-) -> Div {
-    let ctrl_sweep = ctrl.clone();
+    // -------------------------------------------------------------------------
+    // Lower Row Col 1: Managed Processes
+    // -------------------------------------------------------------------------
+    let total_running: usize = proj.agent_statuses.iter().map(|a| a.running_count).sum();
+    let total_orphans: usize = proj.agent_statuses.iter().map(|a| a.orphan_count).sum();
     let ctrl_kill_all = ctrl.clone();
-    let ctrl_lock = ctrl.clone();
+    let ctrl_sweep = ctrl.clone();
 
-    let total_running: usize = proj.agent_statuses.iter().map(|r| r.running_count).sum();
-    let total_orphans: usize = proj.agent_statuses.iter().map(|r| r.orphan_count).sum();
-    let any_active = total_running + total_orphans > 0;
-
-    let agent_rows = proj.agent_statuses.iter().map(|row| {
-        let ctrl_row = ctrl.clone();
-        let row_id = row.id.clone();
-        let row_is_cli = row.kind.contains("CLI");
-        let can_clean = connected && !busy && (row.running_count > 0 || row.orphan_count > 0);
-        let toast_msg = cleanup_toast_for_agent(&row.id);
-
-        let meta_line = if row.orphan_count > 0 {
-            format!(
-                "运行 {} 个进程 · {} 个孤儿残留 · 隔离规则 {} 条",
-                row.running_count, row.orphan_count, row.firewall_rules
-            )
-        } else if row.running_count > 0 {
-            format!(
-                "运行 {} 个进程 · 隔离规则 {} 条",
-                row.running_count, row.firewall_rules
-            )
-        } else if !row.installed {
-            "本机未检测到安装".to_string()
+    let proc_rows = proj.agent_statuses.iter().take(5).map(|a| {
+        let can_kill = can_act && (a.running_count > 0 || a.orphan_count > 0);
+        let aid = a.id.clone();
+        let toast = cleanup_toast_for_agent(&a.id);
+        let ctrl_k = ctrl.clone();
+        let stat_txt = if a.orphan_count > 0 {
+            format!("{} 运行 · {} 孤儿", a.running_count, a.orphan_count)
         } else {
-            format!("待机中 · 隔离规则 {} 条", row.firewall_rules)
+            format!("{} 运行", a.running_count)
         };
+        let stat_color = if a.orphan_count > 0 {
+            p.badge_warn.text
+        } else {
+            p.text_muted
+        };
+        let hover_bg = p.sidebar_hover_bg;
 
-        inset_box(p)
-            .w_full()
-            .flex_row()
+        div()
+            .flex()
             .items_center()
             .justify_between()
-            .px(px(12.))
-            .py(px(8.))
-            .gap(px(10.))
+            .gap(px(6.))
+            .py(px(5.5))
+            .px(px(4.))
+            .rounded(px(7.))
+            .hover(move |s| s.bg(rgb(hover_bg)))
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .flex_1()
+                    .items_center()
+                    .gap(px(7.))
                     .min_w(px(0.))
-                    .gap(px(2.))
+                    .flex_1()
+                    .child(brand_icon(&a.id, 18.0, 5.0, p.is_dark))
                     .child(
                         div()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap(px(6.))
-                            .child(
-                                div()
-                                    .text_size(px(12.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(p.text_primary))
-                                    .child(row.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(p.text_muted))
-                                    .child(row.kind.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(if row.orphan_count > 0 {
-                                p.badge_warn.text
-                            } else {
-                                p.text_secondary
-                            }))
-                            .child(meta_line),
+                            .truncate()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(p.text_primary))
+                            .child(a.name.clone()),
                     ),
             )
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
-                    .child(if row.quarantined {
-                        status_pill("已隔离", BadgeTone::Fail, p)
-                    } else if row.orphan_count > 0 {
-                        status_pill(format!("{} 孤儿", row.orphan_count), BadgeTone::Warn, p)
-                    } else if row.running_count > 0 {
-                        status_pill(format!("运行 {}", row.running_count), BadgeTone::Pass, p)
-                    } else {
-                        status_pill("未运行", BadgeTone::Muted, p)
-                    })
+                    .flex_shrink_0()
+                    .gap(px(6.))
+                    .child(
+                        mono_tabular(stat_txt)
+                            .text_size(px(10.5))
+                            .text_color(rgb(stat_color)),
+                    )
                     .child(
                         action_button(
-                            gpui::ElementId::Name(format!("overview-kill-{}", row.id).into()),
+                            gpui::ElementId::Name(format!("ov-kill-{}", a.id).into()),
                             "清理",
-                            if can_clean {
-                                ButtonKind::Danger
-                            } else {
-                                ButtonKind::Secondary
-                            },
-                            can_clean,
+                            ButtonKind::Secondary,
+                            can_kill,
                             p,
                         )
-                        .when(can_clean, |b| {
+                        .h(px(22.))
+                        .px(px(7.))
+                        .text_size(px(10.5))
+                        .when(can_kill, |b| {
                             b.on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(move |_, _, _, cx| {
-                                    ctrl_row.update(cx, |c, cx| {
+                                    ctrl_k.update(cx, |c, cx| {
                                         c.send_request(
                                             PipeRequest::ForceKillAgent {
-                                                agent_id: Some(row_id.clone()),
-                                                include_cli: row_is_cli,
+                                                agent_id: Some(aid.clone()),
+                                                include_cli: true,
                                             },
-                                            Some(toast_msg),
+                                            Some(toast),
                                             cx,
                                         );
                                     });
@@ -991,80 +715,47 @@ fn render_process_monitor_card(
             )
     });
 
-    bento_card(p)
-        .w_full()
-        .p(px(16.))
+    let col_procs = bento_card(p)
+        .w(relative(0.355))
+        .flex_shrink_0()
+        .px(px(15.))
+        .py(px(14.))
+        .justify_between()
         .gap(px(10.))
         .child(
             div()
                 .flex()
-                .flex_wrap()
-                .items_center()
-                .justify_between()
+                .flex_col()
                 .gap(px(8.))
                 .child(
                     div()
                         .flex()
-                        .flex_wrap()
                         .items_center()
-                        .gap(px(8.))
+                        .justify_between()
                         .child(
                             div()
-                                .text_size(px(13.5))
+                                .text_size(px(12.5))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(p.text_primary))
-                                .child("受管进程实况与一键清理"),
+                                .child("受管进程治理"),
                         )
-                        .child(status_pill(
-                            format!("运行 {total_running} · 孤儿 {total_orphans}"),
-                            if total_orphans > 0 {
-                                BadgeTone::Warn
-                            } else if total_running > 0 {
-                                BadgeTone::Pass
-                            } else {
-                                BadgeTone::Muted
-                            },
-                            p,
-                        )),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(px(8.))
                         .child(
                             action_button(
-                                "overview-sweep",
-                                "清理孤儿进程",
+                                "ov-kill-all",
+                                "一键全清",
                                 ButtonKind::Secondary,
-                                connected && !busy,
+                                can_act && (total_running > 0 || total_orphans > 0),
                                 p,
                             )
-                            .when(connected && !busy, |b| {
-                                b.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |_, _, _, cx| {
-                                        ctrl_sweep.update(cx, |c, cx| {
-                                            c.send_request(
-                                                PipeRequest::SweepOrphans,
-                                                Some("已完成受管孤儿进程扫描与清理"),
-                                                cx,
-                                            );
-                                        });
-                                    }),
-                                )
-                            }),
-                        )
-                        .child(
-                            action_button(
-                                "overview-kill-all",
-                                "× 一键全清进程",
-                                ButtonKind::Danger,
-                                connected && !busy && any_active,
-                                p,
-                            )
-                            .when(connected && !busy && any_active, |b| {
+                            .h(px(23.))
+                            .px(px(8.))
+                            .text_size(px(10.5))
+                            .text_color(rgb(if can_act && (total_running > 0 || total_orphans > 0) {
+                                p.badge_fail.text
+                            } else {
+                                p.text_muted
+                            }))
+                            .when(can_act && (total_running > 0 || total_orphans > 0), |b| {
                                 b.on_mouse_up(
                                     MouseButton::Left,
                                     cx.listener(move |_, _, _, cx| {
@@ -1074,43 +765,7 @@ fn render_process_monitor_card(
                                                     agent_id: None,
                                                     include_cli: true,
                                                 },
-                                                Some("已终止全部受管桌面端与 CLI 进程"),
-                                                cx,
-                                            );
-                                        });
-                                    }),
-                                )
-                            }),
-                        )
-                        .child(
-                            action_button(
-                                "overview-lockdown-toggle",
-                                if lockdown_manual {
-                                    "解除手动封锁"
-                                } else {
-                                    "紧急封锁出站"
-                                },
-                                if lockdown_manual {
-                                    ButtonKind::Primary
-                                } else {
-                                    ButtonKind::Secondary
-                                },
-                                connected && !busy,
-                                p,
-                            )
-                            .when(connected && !busy, |b| {
-                                b.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |_, _, _, cx| {
-                                        let next = !lockdown_manual;
-                                        ctrl_lock.update(cx, |c, cx| {
-                                            c.send_request(
-                                                PipeRequest::SetManualLockdown { on: next },
-                                                Some(if next {
-                                                    "已开启手动紧急封锁，受管应用出站已阻断"
-                                                } else {
-                                                    "已解除手动封锁"
-                                                }),
+                                                Some("已安全清空全部受管 AI 进程与孤儿残留"),
                                                 cx,
                                             );
                                         });
@@ -1118,337 +773,580 @@ fn render_process_monitor_card(
                                 )
                             }),
                         ),
-                ),
+                )
+                .child(div().flex().flex_col().gap(px(2.)).children(proc_rows)),
         )
         .child(
             div()
                 .flex()
-                .flex_col()
-                .w_full()
-                .min_w(px(0.))
-                .gap(px(6.))
-                .children(agent_rows),
-        )
-}
+                .items_center()
+                .justify_between()
+                .pt(px(9.))
+                .border_t_1()
+                .border_color(rgb(p.card_border))
+                .child(
+                    mono_tabular(format!("{total_running} 运行 · {total_orphans} 孤儿"))
+                        .text_size(px(11.))
+                        .text_color(rgb(p.text_muted)),
+                )
+                .child(if total_orphans > 0 {
+                    div()
+                        .id("ov-sweep-orphans")
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(p.badge_warn.text))
+                        .child("一键清孤儿")
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                ctrl_sweep.update(cx, |c, cx| {
+                                    c.send_request(
+                                        PipeRequest::SweepOrphans,
+                                        Some("已完成受管应用孤儿残留清扫"),
+                                        cx,
+                                    );
+                                });
+                            }),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(p.text_muted))
+                        .child("无孤儿残留")
+                        .into_any_element()
+                }),
+        );
 
-fn render_target_matrix(
-    ctrl: Entity<AppController>,
-    proj: &ConsoleProjection,
-    connected: bool,
-    busy: bool,
-    p: &'static ThemePalette,
-    cx: &mut Context<ConsoleWindowView>,
-) -> Div {
-    if proj.target_cards.is_empty() {
-        return bento_card(p)
-            .w_full()
-            .p(px(14.))
-            .gap(px(6.))
-            .child(card_header(
-                "AI 出口监测实况",
-                if connected { "暂无启用目标" } else { "等待守护连接" },
-                p,
-            ))
+    // -------------------------------------------------------------------------
+    // Lower Row Col 2: Read-Only Live Egress Telemetry (ZERO Mihomo)
+    // -------------------------------------------------------------------------
+    let ctrl_to_targets = ctrl.clone();
+    let egress_rows = proj.target_cards.iter().take(3).map(|t| {
+        let is_fail = t.badge_tone == BadgeTone::Fail;
+        let is_warn = t.badge_tone == BadgeTone::Warn;
+        let status_color = if is_fail {
+            p.badge_fail.text
+        } else if is_warn {
+            p.badge_warn.text
+        } else {
+            p.badge_pass.text
+        };
+        let status_txt = if is_fail {
+            format!("{} · 越界", t.cc_badge)
+        } else if t.cc_badge == "TLS" {
+            "代理连通".to_string()
+        } else {
+            format!("{} · 合规", t.cc_badge)
+        };
+        let tid = t.id.clone();
+        let tname = t.name.clone();
+        let ctrl_rt = ctrl.clone();
+        let hover_bg = p.sidebar_hover_bg;
+
+        inset_box(p)
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px(px(10.))
+            .py(px(8.5))
+            .gap(px(8.))
+            .when(is_fail, |box_d| {
+                box_d
+                    .bg(rgba(p.badge_fail.bg))
+                    .border_color(rgba(p.hero_tripped.border))
+            })
             .child(
                 div()
-                    .text_size(px(12.))
-                    .text_color(rgb(p.text_muted))
-                    .child(if connected {
-                        "当前没有启用的监控目标，请在「目标与白名单」中添加并保存。"
-                    } else {
-                        "后台守护未连接，无法核验各 AI 目标出口；Safe Launch 处于闭锁拦截态。"
-                    }),
-            );
-    }
-
-    let mut grid_rows: Vec<Div> = Vec::new();
-    for chunk in proj.target_cards.chunks(3) {
-        let mut row = div().flex().w_full().min_w(px(0.)).gap(px(12.));
-        for card in chunk {
-            let ctrl_r = ctrl.clone();
-            let tid = card.id.clone();
-            let can_recheck = connected && !busy;
-
-            row = row.child(
-                bento_card(p)
-                    .flex_1()
-                    .flex_basis(px(0.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
                     .min_w(px(0.))
-                    .p(px(13.))
+                    .flex_1()
+                    .child(brand_icon(&t.id, 22.0, 6.0, p.is_dark))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .min_w(px(0.))
+                            .flex_1()
+                            .gap(px(1.5))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(p.text_primary))
+                                    .child(short_target_name(&t.id, &t.name)),
+                            )
+                            .child(
+                                mono_tabular(t.ip_display.clone())
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(p.text_muted)),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
                     .gap(px(7.))
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(6.))
+                            .flex_col()
+                            .items_end()
+                            .gap(px(1.))
                             .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .gap(px(5.))
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .text_size(px(13.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(p.text_primary))
-                                            .child(card.name.clone()),
-                                    )
-                                    .child(cc_badge(&card.cc_badge, p)),
+                                mono_tabular(status_txt)
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(status_color)),
                             )
                             .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(4.))
-                                    .child(status_pill(card.state_label.clone(), card.badge_tone, p))
-                                    .child({
-                                        let mut btn = div()
-                                            .id(gpui::ElementId::Name(
-                                                format!("target-recheck-{}", card.id).into(),
-                                            ))
-                                            .flex_shrink_0()
-                                            .w(px(22.))
-                                            .h(px(22.))
-                                            .rounded(px(6.))
-                                            .bg(rgb(p.inset_bg))
-                                            .border_1()
-                                            .border_color(rgb(p.inset_border))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_size(px(11.))
-                                            .text_color(rgb(if can_recheck {
-                                                p.text_secondary
-                                            } else {
-                                                p.text_muted
-                                            }))
-                                            .child("↻");
-                                        if can_recheck {
-                                            let hover = p.sidebar_hover_bg;
-                                            btn = btn
-                                                .cursor_pointer()
-                                                .hover(move |s| s.bg(rgb(hover)))
-                                                .on_mouse_up(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |_, _, _, cx| {
-                                                        ctrl_r.update(cx, |c, cx| {
-                                                            c.send_request(
-                                                                PipeRequest::RecheckNow {
-                                                                    target_id: Some(tid.clone()),
-                                                                },
-                                                                Some("已触发单目标出口复检"),
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }),
-                                                );
-                                        }
-                                        btn
-                                    }),
+                                mono_tabular(t.latency_label.clone())
+                                    .text_size(px(10.))
+                                    .text_color(rgb(p.text_muted)),
                             ),
                     )
-                    .child(
-                        div()
+                    .child({
+                        let mut btn = div()
+                            .id(gpui::ElementId::Name(format!("ov-recheck-{}", t.id).into()))
                             .flex()
-                            .items_baseline()
-                            .justify_between()
-                            .gap(px(6.))
-                            .child(
-                                mono_tabular(card.ip_display.clone())
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .truncate()
-                                    .text_size(px(15.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(p.text_primary)),
-                            )
-                            .child(latency_pill(card.latency_label.clone(), p)),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(11.5))
-                            .text_color(rgb(p.text_secondary))
-                            .child(card.location_display.clone()),
-                    )
-                    .child(
-                        inset_box(p)
-                            .w_full()
-                            .px(px(8.))
-                            .py(px(5.))
-                            .truncate()
+                            .items_center()
+                            .justify_center()
+                            .w(px(24.))
+                            .h(px(24.))
+                            .rounded(px(7.))
+                            .bg(rgb(p.card_bg))
+                            .border_1()
+                            .border_color(rgb(p.card_border))
+                            .child(ui_icon("icons/ui/refresh.svg", 11.5, p.text_secondary));
+                        if can_act {
+                            btn = btn
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(rgb(hover_bg)))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |_, _, _, cx| {
+                                        let id = tid.clone();
+                                        let msg = format!("已完成单目标重检：{tname}");
+                                        ctrl_rt.update(cx, |c, cx| {
+                                            c.send_request(
+                                                PipeRequest::RecheckNow { target_id: Some(id) },
+                                                None,
+                                                cx,
+                                            );
+                                            c.set_toast(msg, true, cx);
+                                        });
+                                    }),
+                                );
+                        }
+                        btn
+                    }),
+            )
+    });
+
+    let col_egress = bento_card(p)
+        .w(relative(0.365))
+        .flex_shrink_0()
+        .px(px(15.))
+        .py(px(14.))
+        .justify_between()
+        .gap(px(10.))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(9.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(p.text_primary))
+                                .child("出口实况探测"),
+                        )
+                        .child(
+                            mono_tabular(format!("只读核验 · {}", proj.hero.checked_age_text))
+                                .text_size(px(10.5))
+                                .text_color(rgb(p.text_muted)),
+                        ),
+                )
+                .child(div().flex().flex_col().gap(px(8.)).children(egress_rows)),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .pt(px(9.))
+                .border_t_1()
+                .border_color(rgb(p.card_border))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(p.text_muted))
+                        .child("不改动你的代理分流策略"),
+                )
+                .child(
+                    div()
+                        .id("ov-to-targets")
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(p.text_primary))
+                        .child("白名单配置 →")
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                ctrl_to_targets.update(cx, |c, cx| {
+                                    c.set_nav(NavSection::Targets, cx);
+                                });
+                            }),
+                        ),
+                ),
+        );
+
+    // -------------------------------------------------------------------------
+    // Lower Row Col 3: 4-Vector Leak Shield + Antigravity Status + 24h Mini Tape
+    // -------------------------------------------------------------------------
+    let ctrl_to_env = ctrl.clone();
+    let ctrl_to_ag = ctrl.clone();
+    let ctrl_to_audit = ctrl.clone();
+    let ctrl_q = ctrl.clone();
+    let ctrl_d = ctrl.clone();
+    let ctrl_v = ctrl.clone();
+
+    let mut non_empty = 0u32;
+    let mut pass_bars = 0u32;
+    let mini_bars = proj.timeline_bars.iter().map(|b| {
+        let c = match b.status {
+            TimelineStatus::Pass => {
+                non_empty += 1;
+                pass_bars += 1;
+                p.timeline.pass
+            }
+            TimelineStatus::Warn => {
+                non_empty += 1;
+                p.timeline.warn
+            }
+            TimelineStatus::Fail => {
+                non_empty += 1;
+                p.timeline.fail
+            }
+            TimelineStatus::Empty => p.timeline.empty,
+        };
+        div()
+            .flex_1()
+            .min_w(px(2.))
+            .h(px(10.))
+            .rounded(px(1.5))
+            .bg(rgb(c))
+    });
+    let mini_bars_vec: Vec<Div> = mini_bars.collect();
+    let compliance_pct = if non_empty == 0 {
+        "--".to_string()
+    } else {
+        format!("{:.1}%", (pass_bars as f64 / non_empty as f64) * 100.0)
+    };
+
+    let col_shield = bento_card(p)
+        .flex_1()
+        .min_w(px(0.))
+        .px(px(15.))
+        .py(px(14.))
+        .justify_between()
+        .gap(px(10.))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(p.text_primary))
+                                .child("四维防漏"),
+                        )
+                        .child(
+                            div()
+                                .id("ov-to-env")
+                                .cursor_pointer()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(p.text_muted))
+                                .child("详情 →")
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |_, _, _, cx| {
+                                        ctrl_to_env.update(cx, |c, cx| {
+                                            c.env_tab = EnvSubTab::Shield;
+                                            c.set_nav(NavSection::Environment, cx);
+                                        });
+                                    }),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(p.text_secondary))
+                                        .child("阻断 QUIC"),
+                                )
+                                .child(
+                                    toggle_switch("ov-sh-quic", cfg.leak_shield_quic, can_act, p)
+                                        .when(can_act, |sw| {
+                                            sw.on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |_, _, _, cx| {
+                                                    let next = !cfg.leak_shield_quic;
+                                                    ctrl_q.update(cx, |c, cx| {
+                                                        c.save_config_patch(
+                                                            move |x| x.leak_shield_quic = next,
+                                                            "QUIC 防漏开关已更新",
+                                                            cx,
+                                                        );
+                                                    });
+                                                }),
+                                            )
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(p.text_secondary))
+                                        .child("阻断 DNS / DoH"),
+                                )
+                                .child(
+                                    toggle_switch("ov-sh-dns", cfg.leak_shield_dns_doh, can_act, p)
+                                        .when(can_act, |sw| {
+                                            sw.on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |_, _, _, cx| {
+                                                    let next = !cfg.leak_shield_dns_doh;
+                                                    ctrl_d.update(cx, |c, cx| {
+                                                        c.save_config_patch(
+                                                            move |x| x.leak_shield_dns_doh = next,
+                                                            "DNS / DoH 防漏开关已更新",
+                                                            cx,
+                                                        );
+                                                    });
+                                                }),
+                                            )
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(p.text_secondary))
+                                        .child("阻断 IPv6"),
+                                )
+                                .child(
+                                    toggle_switch("ov-sh-ipv6", cfg.leak_shield_ipv6, can_act, p)
+                                        .when(can_act, |sw| {
+                                            sw.on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |_, _, _, cx| {
+                                                    let next = !cfg.leak_shield_ipv6;
+                                                    ctrl_v.update(cx, |c, cx| {
+                                                        c.save_config_patch(
+                                                            move |x| x.leak_shield_ipv6 = next,
+                                                            "IPv6 防漏开关已更新",
+                                                            cx,
+                                                        );
+                                                    });
+                                                }),
+                                            )
+                                        }),
+                                ),
+                        ),
+                )
+                .child(
+                    inset_box(p)
+                        .id("ov-ag-inject-shortcut")
+                        .cursor_pointer()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .px(px(9.))
+                        .py(px(7.))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_secondary))
+                                .child("反重力注入"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(if ag_degraded {
+                                    p.badge_fail.text
+                                } else if ag_proxy.installed {
+                                    p.badge_pass.text
+                                } else {
+                                    p.text_muted
+                                }))
+                                .child(if ag_degraded {
+                                    "● 异常 · 去修复"
+                                } else if ag_proxy.installed {
+                                    "● 正常"
+                                } else {
+                                    "○ 未安装"
+                                }),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                ctrl_to_ag.update(cx, |c, cx| {
+                                    c.env_tab = EnvSubTab::Antigravity;
+                                    c.set_nav(NavSection::Environment, cx);
+                                });
+                            }),
+                        ),
+                )
+                .child(
+                    inset_box(p)
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .px(px(9.))
+                        .py(px(7.))
+                        .child(
+                            mono_tabular(format!("护盾 {} 规则", shield_status.active_rules))
+                                .text_size(px(10.5))
+                                .text_color(rgb(p.text_secondary)),
+                        )
+                        .child(
+                            mono_tabular(if leak_watch.direct_total > 0 {
+                                format!("● {} 直连泄露", leak_watch.direct_total)
+                            } else {
+                                "● 0 直连泄露".into()
+                            })
                             .text_size(px(10.5))
-                            .text_color(rgb(p.text_muted))
-                            .child(format!("命中规则：{}", card.matched_rule)),
-                    ),
-            );
-        }
-        // Keep column width stable when last chunk has < 3 cards
-        for _ in chunk.len()..3 {
-            row = row.child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)));
-        }
-        grid_rows.push(row);
-    }
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(if leak_watch.direct_total > 0 {
+                                p.badge_fail.text
+                            } else {
+                                p.badge_pass.text
+                            })),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .id("ov-mini-timeline")
+                .cursor_pointer()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .pt(px(9.))
+                .border_t_1()
+                .border_color(rgb(p.card_border))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_muted))
+                                .child("24h 轨迹"),
+                        )
+                        .child(
+                            mono_tabular(compliance_pct)
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(if tripped {
+                                    p.badge_fail.text
+                                } else {
+                                    p.badge_pass.text
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(1.5))
+                        .children(mini_bars_vec),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |_, _, _, cx| {
+                        ctrl_to_audit.update(cx, |c, cx| c.set_nav(NavSection::Audit, cx));
+                    }),
+                ),
+        );
 
     div()
         .flex()
         .flex_col()
         .w_full()
-        .min_w(px(0.))
-        .gap(px(12.))
-        .children(grid_rows)
-}
-
-fn render_timeline_card(
-    ctrl: Entity<AppController>,
-    proj: &ConsoleProjection,
-    p: &'static ThemePalette,
-    cx: &mut Context<ConsoleWindowView>,
-) -> Div {
-    let bars = proj.timeline_bars.iter().map(|bar| {
-        let ctrl_b = ctrl.clone();
-        let idx = bar.index;
-        let color = match bar.status {
-            TimelineStatus::Pass => p.badge_pass.dot,
-            TimelineStatus::Warn => p.badge_warn.dot,
-            TimelineStatus::Fail => p.badge_fail.dot,
-            TimelineStatus::Empty => p.inset_border,
-        };
-        let height_px = match bar.status {
-            TimelineStatus::Empty => 10.0,
-            TimelineStatus::Pass => (16.0 + (bar.total_checks.min(12) as f32) * 2.0).min(40.0),
-            TimelineStatus::Warn => 32.0,
-            TimelineStatus::Fail => 42.0,
-        };
-        div()
-            .id(gpui::ElementId::Name(format!("ov-tl-{idx}").into()))
-            .flex_1()
-            .flex_basis(px(0.))
-            .min_w(px(2.))
-            .h(px(height_px))
-            .rounded(px(3.))
-            .bg(rgb(color))
-            .when(bar.selected, |d| d.border_1().border_color(rgb(p.text_primary)))
-            .cursor_pointer()
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |_, _, _, cx| {
-                    ctrl_b.update(cx, |c, cx| {
-                        c.select_timeline_bucket(idx, true, cx);
-                    });
-                }),
-            )
-    });
-
-    bento_card(p)
         .flex_1()
-        .flex_basis(px(0.))
         .min_w(px(0.))
-        .p(px(14.))
-        .gap(px(10.))
-        .child(card_header("24 小时防护轨迹", "点击柱段查看审计", p))
-        .child(
-            inset_box(p)
-                .w_full()
-                .flex_row()
-                .items_end()
-                .h(px(58.))
-                .px(px(8.))
-                .py(px(8.))
-                .gap(px(2.))
-                .children(bars),
-        )
-        .child(
-            div()
-                .w_full()
-                .text_size(px(11.5))
-                .line_height(px(16.))
-                .text_color(rgb(p.text_secondary))
-                .child(proj.selected_bucket_summary.clone()),
-        )
-}
-
-fn render_self_check_card(proj: &ConsoleProjection, p: &ThemePalette) -> Div {
-    let rows = proj.self_checks.iter().map(|item| {
-        let tone = match item.status {
-            SelfCheckStatus::Healthy => BadgeTone::Pass,
-            SelfCheckStatus::Degraded => BadgeTone::Fail,
-            SelfCheckStatus::Disabled | SelfCheckStatus::Unsupported => BadgeTone::Warn,
-            SelfCheckStatus::Unknown => BadgeTone::Muted,
-        };
-        inset_box(p)
-            .w_full()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .px(px(10.))
-            .py(px(7.))
-            .gap(px(8.))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .gap(px(1.))
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(p.text_primary))
-                            .child(item.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .text_size(px(10.5))
-                            .line_height(px(15.))
-                            .text_color(rgb(p.text_muted))
-                            .child(item.detail.clone()),
-                    ),
-            )
-            .child(status_pill(item.status.label(), tone, p))
-    });
-
-    bento_card(p)
-        .flex_1()
-        .flex_basis(px(0.))
-        .min_w(px(0.))
-        .p(px(14.))
-        .gap(px(8.))
-        .child(card_header("防线健康自检", "核心守护链路", p))
+        .gap(px(11.))
         .child(
             div()
                 .flex()
-                .flex_col()
+                .flex_row()
                 .w_full()
                 .min_w(px(0.))
-                .gap(px(6.))
-                .children(rows),
-        )
-}
-
-fn metric_chip(label: &'static str, value: usize, color: u32, p: &ThemePalette) -> Div {
-    div()
-        .flex()
-        .flex_shrink_0()
-        .whitespace_nowrap()
-        .items_baseline()
-        .gap(px(4.))
-        .child(
-            mono_tabular(value.to_string())
-                .text_size(px(15.))
-                .font_weight(FontWeight::BOLD)
-                .text_color(rgb(color)),
+                .gap(px(11.))
+                .child(hero_card)
+                .child(launch_deck),
         )
         .child(
             div()
-                .text_size(px(10.5))
-                .text_color(rgb(p.text_muted))
-                .child(label),
+                .flex()
+                .flex_row()
+                .w_full()
+                .flex_1()
+                .min_w(px(0.))
+                .gap(px(11.))
+                .child(col_procs)
+                .child(col_egress)
+                .child(col_shield),
         )
 }

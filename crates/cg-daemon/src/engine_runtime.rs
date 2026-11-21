@@ -118,6 +118,9 @@ fn local_client_versions() -> update_check::LocalClientVersions {
         codex_cli: process_win::installed_codex_cli_version(),
         antigravity_ide: ag_ide_ver,
         antigravity_manifest_base: ag_manifest_base,
+        antigravity_cn: process_win::installed_antigravity_cn_version(),
+        ag_usage_monitor: process_win::installed_ag_usage_monitor_version(),
+        ag_capsule: process_win::installed_ag_capsule_version(),
     }
 }
 
@@ -159,6 +162,9 @@ fn merge_telemetry_updates(dst: &mut UpdateSummary, incoming: UpdateSummary) {
     merge_slot(&mut dst.codex_desktop, incoming.codex_desktop);
     merge_slot(&mut dst.codex_cli, incoming.codex_cli);
     merge_slot(&mut dst.antigravity_ide, incoming.antigravity_ide);
+    merge_slot(&mut dst.antigravity_cn, incoming.antigravity_cn);
+    merge_slot(&mut dst.ag_usage_monitor, incoming.ag_usage_monitor);
+    merge_slot(&mut dst.ag_capsule, incoming.ag_capsule);
 }
 
 fn parse_update_component_filter(
@@ -184,8 +190,29 @@ fn parse_update_component_filter(
             "antigravity_ide" | "antigravity-ide" | "antigravity" => {
                 Ok((false, false, Some("antigravity_ide".to_string())))
             }
+            "antigravity_cn" | "antigravity-cn" | "antigravity-desktop-cn" => {
+                Ok((false, false, Some("antigravity_cn".to_string())))
+            }
+            "ag_usage_monitor" | "antigravity-usage-monitor" | "usage-monitor" => {
+                Ok((false, false, Some("ag_usage_monitor".to_string())))
+            }
+            "ag_capsule" | "agy-capsule" => Ok((false, false, Some("ag_capsule".to_string()))),
+            "plugins" | "antigravity_plugins" => {
+                Ok((false, true, Some("antigravity_plugins".to_string())))
+            }
             _ => Err(format!("未知的更新检查组件 '{raw}'")),
         },
+    }
+}
+
+fn component_matches_filter(norm: Option<&str>, id: &str) -> bool {
+    match norm {
+        None => true,
+        Some("antigravity_plugins") => matches!(
+            id,
+            "antigravity_cn" | "ag_usage_monitor" | "ag_capsule"
+        ),
+        Some(other) => other == id,
     }
 }
 
@@ -202,7 +229,6 @@ fn build_skipped_update_summary(
     hydrate_local_updates(&mut out, cg_version, ag_proxy, &local);
     let (check_cg, check_ag, norm) =
         parse_update_component_filter(component).unwrap_or((true, true, None));
-    let check_all = norm.is_none();
     if check_cg {
         out.claudeguard.phase = UpdateCheckPhase::Failed;
         out.claudeguard.checked_at = Some(now_secs);
@@ -224,8 +250,11 @@ fn build_skipped_update_summary(
         ("codex_desktop", &mut out.codex_desktop),
         ("codex_cli", &mut out.codex_cli),
         ("antigravity_ide", &mut out.antigravity_ide),
+        ("antigravity_cn", &mut out.antigravity_cn),
+        ("ag_usage_monitor", &mut out.ag_usage_monitor),
+        ("ag_capsule", &mut out.ag_capsule),
     ] {
-        if check_all || norm.as_deref() == Some(id) {
+        if component_matches_filter(norm.as_deref(), id) {
             slot.phase = UpdateCheckPhase::Failed;
             slot.checked_at = Some(now_secs);
             slot.note = format!("当前接入路径受阻，已拒绝直连检查更新：{reason}");
@@ -2806,7 +2835,7 @@ impl CoordinatorActor for RealEngineActor {
                     parse_update_component_filter(component.as_deref())
                         .unwrap_or((true, true, None));
                 let check_client =
-                    |id: &str| normalized.is_none() || normalized.as_deref() == Some(id);
+                    |id: &str| component_matches_filter(normalized.as_deref(), id);
                 if !check_cg {
                     next_summary.claudeguard = self.engine.updates.claudeguard.clone();
                 }
@@ -2827,6 +2856,15 @@ impl CoordinatorActor for RealEngineActor {
                 }
                 if !check_client("antigravity_ide") {
                     next_summary.antigravity_ide = self.engine.updates.antigravity_ide.clone();
+                }
+                if !check_client("antigravity_cn") {
+                    next_summary.antigravity_cn = self.engine.updates.antigravity_cn.clone();
+                }
+                if !check_client("ag_usage_monitor") {
+                    next_summary.ag_usage_monitor = self.engine.updates.ag_usage_monitor.clone();
+                }
+                if !check_client("ag_capsule") {
+                    next_summary.ag_capsule = self.engine.updates.ag_capsule.clone();
                 }
 
                 self.step_and_run(
@@ -2887,6 +2925,21 @@ impl CoordinatorActor for RealEngineActor {
                         "antigravity_ide",
                         check_client("antigravity_ide"),
                         &next_summary.antigravity_ide,
+                    );
+                    record_slot(
+                        "antigravity_cn",
+                        check_client("antigravity_cn"),
+                        &next_summary.antigravity_cn,
+                    );
+                    record_slot(
+                        "ag_usage_monitor",
+                        check_client("ag_usage_monitor"),
+                        &next_summary.ag_usage_monitor,
+                    );
+                    record_slot(
+                        "ag_capsule",
+                        check_client("ag_capsule"),
+                        &next_summary.ag_capsule,
                     );
 
                     receipt.verified_scope = scope_parts.join(", ");

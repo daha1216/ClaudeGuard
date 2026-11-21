@@ -686,9 +686,9 @@ impl Render for DraftTextInput {
             .unwrap_or(&LIGHT_C2);
         let focused = self.focus_handle.is_focused(window);
         let (h, py_pad, text_sz, line_h) = if self.compact {
-            (px(32.), px(6.), px(12.5), px(18.))
+            (px(30.), px(5.), px(12.), px(18.))
         } else {
-            (px(38.), px(8.), px(13.), px(20.))
+            (px(34.), px(6.5), px(12.), px(19.))
         };
 
         let mut box_div = div()

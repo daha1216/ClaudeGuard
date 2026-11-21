@@ -1,19 +1,19 @@
 //! Root GPUI application controller, Dual-Mode window manager (HUD + Console),
 //! zero-VRAM lifecycle, background IPC polling, and Win32 tray integration.
 
+use crate::assets::{EmbeddedAssets, ui_icon};
 use crate::demo::DemoScenario;
 use crate::ipc::{DaemonClient, TransportEndpoint, launch_agent_normal_user};
 use crate::protocol::{
     ANCHOR_KINDS, AnchorKind, Config, DEFAULT_PIPE_NAME, GuardSnapshot, Lifecycle, LogEntry,
-    OnboardingProbeResult, OperationStatus, POLICY_PRESETS, PipeRequest, PipeResponse,
-    PolicyPreset, Target,
+    LogLevel, OnboardingProbeResult, OperationStatus, POLICY_PRESETS, PipeRequest, PipeResponse,
+    PolicyPreset, Target, UpdateCheckPhase,
 };
 use crate::state::{
     DraftStore, NavSection, TargetDraft, project_console, project_hud, split_tokens,
 };
 use crate::theme::{
-    BadgeTone, THEME_MODES, ThemeMode, ThemePalette, layout, resolve_palette,
-    system_prefers_light_theme, theme_mode_label,
+    BadgeTone, ThemeMode, ThemePalette, layout, resolve_palette, system_prefers_light_theme,
 };
 use crate::tray_win::{
     LogicalRect, TrayChannel, TrayEvent, TrayHandle, TrayTone, apply_win11_round_corners,
@@ -23,9 +23,9 @@ use crate::views;
 use crate::widgets::controls::{ButtonKind, action_button, bento_card, status_pill};
 use crate::widgets::text_input::{self, ActivePaletteGlobal, DraftTextInput};
 use gpui::{
-    App, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton, TitlebarOptions,
-    UniformListScrollHandle, Window, WindowBounds, WindowControlArea, WindowKind, WindowOptions,
-    actions, div, point, prelude::*, px, rgb, size,
+    App, Bounds, BoxShadow, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
+    TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowControlArea, WindowKind,
+    WindowOptions, actions, div, point, prelude::*, px, rgb, rgba, size,
 };
 use gpui_platform::application;
 use std::collections::HashMap;
@@ -35,12 +35,50 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 actions!([FocusGlobalSearch, DismissHudWindow]);
 
+/// Sub-tabs for Mode B `熔断` page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BreakerSubTab {
+    #[default]
+    Rules,
+    Live,
+}
+
+/// Sub-tabs for Mode B `防漏` page (no Mihomo proxy-policy mutation).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EnvSubTab {
+    #[default]
+    Shield,
+    Antigravity,
+    Timezone,
+}
+
+/// Sub-tabs for Mode B `通知` page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NotifySubTab {
+    #[default]
+    Events,
+    Feishu,
+}
+
+/// Category filters inside the `Antigravity 精选插件与更新检测` modal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PluginCategory {
+    #[default]
+    All,
+    Monitor,
+    Localization,
+    Proxy,
+}
+
 /// Command-line startup options for `claudeguard-gui.exe`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchArgs {
     pub start_in_tray: bool,
     pub start_hud: bool,
     pub initial_nav: NavSection,
+    pub initial_subtab: Option<String>,
+    pub initial_plugins_modal: bool,
+    pub initial_theme: Option<ThemeMode>,
     pub endpoint: TransportEndpoint,
 }
 
@@ -50,17 +88,23 @@ impl Default for LaunchArgs {
             start_in_tray: false,
             start_hud: false,
             initial_nav: NavSection::Overview,
+            initial_subtab: None,
+            initial_plugins_modal: false,
+            initial_theme: None,
             endpoint: TransportEndpoint::Pipe(DEFAULT_PIPE_NAME.to_string()),
         }
     }
 }
 
 pub const USAGE: &str = concat!(
-    "用法：claudeguard-gui [--tray | --hud] [--nav overview|targets|breaker|env|audit|updates|notify] [--demo pass|trip|disarmed|wizard] [--pipe <端点>]\n",
+    "用法：claudeguard-gui [--tray | --hud] [--nav overview|targets|breaker|env|audit|updates|notify] [--subtab <name>] [--plugins] [--theme light|dark|auto] [--demo pass|trip|disarmed|wizard] [--pipe <端点>]\n",
     "\n",
     "  --tray                    启动后驻留系统托盘（0 窗口、0 VRAM），点击托盘呼出 HUD\n",
-    "  --hud                     启动即打开 Mode A 快捷托盘 HUD (424x590)\n",
+    "  --hud                     启动即打开 Mode A 快捷托盘 HUD (398x432)\n",
     "  --nav <section>           指定主控制台默认打开的页面（默认 overview）\n",
+    "  --subtab <name>           指定子标签（rules|live|shield|antigravity|tz|events|feishu）\n",
+    "  --plugins                 启动后自动打开 Antigravity 精选插件与更新弹窗\n",
+    "  --theme <mode>            初始主题覆盖：light | dark | auto\n",
     "  --demo <scenario>         独立演示模式：pass | trip | disarmed | wizard（不连接真实守护）\n",
     "  --pipe / --guardian-pipe  指定 Windows 命名管道端点（默认 \\\\.\\pipe\\ClaudeGuardV4）\n",
     "  --help                    显示帮助并退出\n",
@@ -79,6 +123,24 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchArgs, 
             "--help" | "-h" => return Err(USAGE.to_string()),
             "--tray" => out.start_in_tray = true,
             "--hud" => out.start_hud = true,
+            "--plugins" => out.initial_plugins_modal = true,
+            "--subtab" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| format!("{arg} 缺少子标签名\n{USAGE}"))?;
+                out.initial_subtab = Some(val.to_ascii_lowercase());
+            }
+            "--theme" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| format!("{arg} 缺少主题名\n{USAGE}"))?;
+                out.initial_theme = Some(match val.to_ascii_lowercase().as_str() {
+                    "light" => ThemeMode::Light,
+                    "dark" => ThemeMode::Dark,
+                    "auto" => ThemeMode::Auto,
+                    _ => return Err(format!("未知 --theme 模式：{val}\n{USAGE}")),
+                });
+            }
             "--nav" => {
                 let val = args
                     .next()
@@ -142,6 +204,15 @@ pub struct AppController {
     pub system_prefers_light: bool,
     pub privacy_mask: bool,
     pub nav_section: NavSection,
+    pub policy_menu_open: bool,
+    pub breaker_tab: BreakerSubTab,
+    pub env_tab: EnvSubTab,
+    pub notify_tab: NotifySubTab,
+    pub open_region_picker_for: Option<String>,
+    pub show_add_target_drawer: bool,
+    pub audit_level_filter: Option<LogLevel>,
+    pub show_plugins_modal: bool,
+    pub plugin_category: PluginCategory,
     pub selected_bucket: Option<usize>,
     pub drafts: DraftStore,
     pub inputs: InputHandles,
@@ -333,18 +404,42 @@ impl AppController {
         });
 
         let system_prefers_light = system_prefers_light_theme();
-        let initial_palette = resolve_palette(ThemeMode::Auto, system_prefers_light);
+        let initial_theme_mode = args.initial_theme.unwrap_or(ThemeMode::Auto);
+        let initial_palette = resolve_palette(initial_theme_mode, system_prefers_light);
         cx.set_global(ActivePaletteGlobal(initial_palette));
+
+        let breaker_tab = match args.initial_subtab.as_deref() {
+            Some("live") => BreakerSubTab::Live,
+            _ => BreakerSubTab::Rules,
+        };
+        let env_tab = match args.initial_subtab.as_deref() {
+            Some("antigravity" | "ag") => EnvSubTab::Antigravity,
+            Some("tz" | "timezone") => EnvSubTab::Timezone,
+            _ => EnvSubTab::Shield,
+        };
+        let notify_tab = match args.initial_subtab.as_deref() {
+            Some("feishu") => NotifySubTab::Feishu,
+            _ => NotifySubTab::Events,
+        };
 
         let mut ctrl = Self {
             client,
             snapshot: None,
             connected: false,
             connection_err: None,
-            theme_mode: ThemeMode::Auto,
+            theme_mode: initial_theme_mode,
             system_prefers_light,
             privacy_mask: false,
             nav_section: args.initial_nav,
+            policy_menu_open: false,
+            breaker_tab,
+            env_tab,
+            notify_tab,
+            open_region_picker_for: None,
+            show_add_target_drawer: false,
+            audit_level_filter: None,
+            show_plugins_modal: args.initial_plugins_modal,
+            plugin_category: PluginCategory::All,
             selected_bucket: None,
             drafts: DraftStore::default(),
             inputs,
@@ -378,6 +473,10 @@ impl AppController {
                 ctrl.client.exchange(PipeRequest::GetSnapshot)
         {
             ctrl.apply_snapshot(*snapshot, cx);
+            if let Some(forced_theme) = args.initial_theme {
+                ctrl.theme_mode = forced_theme;
+                ctrl.refresh_global_palette(cx);
+            }
         }
 
         // Start non-blocking background polling loop.
@@ -428,10 +527,77 @@ impl AppController {
 
     pub fn set_nav(&mut self, section: NavSection, cx: &mut Context<Self>) {
         self.nav_section = section;
+        self.policy_menu_open = false;
+        self.open_region_picker_for = None;
         if section == NavSection::Audit && self.connected {
             self.refresh_audit_logs(cx);
         }
         cx.notify();
+    }
+
+    pub fn close_floating_menus(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        if self.policy_menu_open {
+            self.policy_menu_open = false;
+            changed = true;
+        }
+        if self.open_region_picker_for.is_some() {
+            self.open_region_picker_for = None;
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Toggles a 2-letter ISO region code in a target's visual allowlist draft (or `__new__` drawer).
+    pub fn toggle_target_region(
+        &mut self,
+        target_id: &str,
+        code: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let upper = code.trim().to_ascii_uppercase();
+        if upper.is_empty() {
+            return;
+        }
+        if target_id == "__new__" {
+            let mut list: Vec<String> = split_tokens(&self.drafts.new_target_regions)
+                .into_iter()
+                .map(|s| s.to_ascii_uppercase())
+                .collect();
+            if let Some(pos) = list.iter().position(|c| c == &upper) {
+                list.remove(pos);
+            } else {
+                list.push(upper);
+            }
+            let joined = list.join(", ");
+            self.drafts.new_target_regions = joined.clone();
+            self.inputs.new_target_regions.update(cx, |inp, cx| {
+                inp.set_text_silent(&joined, cx);
+            });
+            cx.notify();
+            return;
+        }
+
+        if let Some(t) = self.drafts.targets.iter_mut().find(|x| x.id == target_id) {
+            let mut list: Vec<String> = split_tokens(&t.expect_regions_text)
+                .into_iter()
+                .map(|s| s.to_ascii_uppercase())
+                .collect();
+            if let Some(pos) = list.iter().position(|c| c == &upper) {
+                list.remove(pos);
+            } else {
+                list.push(upper);
+            }
+            let joined = list.join(", ");
+            t.expect_regions_text = joined.clone();
+            if let Some(inp) = self.inputs.target_regions.get(target_id) {
+                inp.update(cx, |i, cx| i.set_text_silent(&joined, cx));
+            }
+            self.drafts.mark_dirty();
+            cx.notify();
+        }
     }
 
     pub fn select_timeline_bucket(
@@ -1428,9 +1594,10 @@ impl Render for ConsoleWindowView {
         let ctrl_snap = self.ctrl.read(cx);
         let p = ctrl_snap.palette();
         let nav = ctrl_snap.nav_section;
-        let theme_mode = ctrl_snap.theme_mode;
         let privacy_mask = ctrl_snap.privacy_mask;
         let show_onboarding = ctrl_snap.show_onboarding;
+        let show_plugins = ctrl_snap.show_plugins_modal;
+        let policy_menu_open = ctrl_snap.policy_menu_open;
         let snapshot_opt = ctrl_snap.snapshot.clone();
         let connected = ctrl_snap.connected;
         let conn_err = ctrl_snap.connection_err.clone();
@@ -1438,7 +1605,6 @@ impl Render for ConsoleWindowView {
         let search_query = ctrl_snap.drafts.search_query.clone();
         let queried_logs = ctrl_snap.queried_logs.clone();
         let toast = ctrl_snap.toast.clone();
-        let is_demo = ctrl_snap.client.is_demo();
         let busy = ctrl_snap.busy_action;
 
         let proj = project_console(
@@ -1453,9 +1619,37 @@ impl Render for ConsoleWindowView {
 
         let is_maximized = window.is_maximized();
         let ctrl_entity = self.ctrl.clone();
+        let tripped = snapshot_opt.as_ref().is_some_and(|s| s.is_tripped());
+        let ag_issue = snapshot_opt.as_ref().is_some_and(|s| {
+            s.antigravity_proxy.installed && !s.antigravity_proxy.is_ready_for_launch()
+        });
+        let has_any_update = snapshot_opt.as_ref().is_some_and(|s| {
+            [
+                &s.updates.claudeguard,
+                &s.updates.antigravity_proxy,
+                &s.updates.claude_desktop,
+                &s.updates.claude_code,
+                &s.updates.codex_desktop,
+                &s.updates.codex_cli,
+                &s.updates.antigravity_ide,
+                &s.updates.antigravity_cn,
+                &s.updates.ag_usage_monitor,
+                &s.updates.ag_capsule,
+            ]
+            .iter()
+            .any(|slot| slot.phase == UpdateCheckPhase::UpdateAvailable)
+        });
 
-        let sidebar = render_sidebar(ctrl_entity.clone(), nav, theme_mode, is_demo, p, cx);
-        let topbar = render_topbar(ctrl_entity.clone(), is_maximized, p, cx);
+        let header = render_ceramic_header(ctrl_entity.clone(), tripped, is_maximized, p, cx);
+        let dock = render_ceramic_dock(
+            ctrl_entity.clone(),
+            nav,
+            tripped,
+            tripped || ag_issue,
+            has_any_update,
+            p,
+            cx,
+        );
 
         let body_scroll = div()
             .id("console-scroll")
@@ -1466,15 +1660,16 @@ impl Render for ConsoleWindowView {
             .min_w(px(0.))
             .min_h(px(0.))
             .overflow_y_scroll()
-            .p(px(16.))
-            .gap(px(14.))
+            .gap(px(11.))
             .when_some(proj.connection_banner.clone(), |root, banner| {
                 let _ = ctrl_entity.read(cx).client.endpoint();
                 root.child(
                     bento_card(p)
                         .w_full()
-                        .p(px(14.))
-                        .gap(px(10.))
+                        .flex_shrink_0()
+                        .px(px(14.))
+                        .py(px(10.))
+                        .gap(px(6.))
                         .child(
                             div()
                                 .flex()
@@ -1490,20 +1685,21 @@ impl Render for ConsoleWindowView {
                                         .child(status_pill("未连接 · 安全闭锁", BadgeTone::Warn, p))
                                         .child(
                                             div()
-                                                .text_size(px(13.5))
+                                                .text_size(px(12.5))
                                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                                 .text_color(rgb(p.text_primary))
-                                                .child("后台守护服务未连接"),
+                                                .child(format!("后台守护服务未连接：{banner}")),
                                         ),
                                 )
                                 .child(
                                     action_button(
                                         "banner-retry-conn",
-                                        if busy { "重连中…" } else { "↻ 立即重连" },
+                                        if busy { "重连中…" } else { "立即重连" },
                                         ButtonKind::Primary,
                                         !busy,
                                         p,
                                     )
+                                    .h(px(27.))
                                     .when(!busy, |b| {
                                         b.on_mouse_up(
                                             MouseButton::Left,
@@ -1519,14 +1715,6 @@ impl Render for ConsoleWindowView {
                                         )
                                     }),
                                 ),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(rgb(p.text_secondary))
-                                .child(format!(
-                                    "{banner}。未连接期间严格保持安全闭锁，不假报通过且禁止启动 AI 应用。"
-                                )),
                         ),
                 )
             })
@@ -1535,15 +1723,23 @@ impl Render for ConsoleWindowView {
                 root.child(
                     div()
                         .flex()
+                        .flex_shrink_0()
                         .items_center()
                         .justify_between()
                         .px(px(12.))
-                        .py(px(8.))
+                        .py(px(7.))
                         .rounded(px(10.))
-                        .bg(gpui::rgba(b.bg))
-                        .text_size(px(12.))
+                        .bg(rgba(b.bg))
+                        .text_size(px(11.5))
                         .text_color(rgb(b.text))
-                        .child(msg)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(7.))
+                                .child(div().w(px(6.)).h(px(6.)).rounded(px(999.)).bg(rgb(b.dot)))
+                                .child(msg),
+                        )
                         .child(
                             div()
                                 .id("toast-dismiss")
@@ -1586,259 +1782,76 @@ impl Render for ConsoleWindowView {
                 }
             });
 
-        let workspace = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w(px(0.))
-            .h_full()
-            .child(topbar)
-            .child(body_scroll);
-
+        let ctrl_root_click = ctrl_entity.clone();
         let mut root = div()
             .id("console-root")
             .key_context("ConsoleWindow")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_focus_search))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |_, _, _, cx| {
+                    ctrl_root_click.update(cx, |c, cx| c.close_floating_menus(cx));
+                }),
+            )
             .relative()
             .flex()
-            .flex_row()
+            .flex_col()
             .size_full()
             .bg(rgb(p.frame_bg))
             .border_1()
             .border_color(rgb(p.frame_border))
             .font_family("Segoe UI Variable Text")
             .text_color(rgb(p.text_primary))
-            .p(px(10.))
-            .gap(px(12.))
-            .child(sidebar)
-            .child(workspace);
+            .px(px(18.))
+            .pt(px(14.))
+            .pb(px(13.))
+            .gap(px(11.))
+            .child(header)
+            .child(body_scroll)
+            .child(dock);
 
+        if policy_menu_open {
+            root = root.child(render_policy_dropdown_overlay(ctrl_entity.clone(), p, cx));
+        }
+        if show_plugins {
+            root = root.child(views::plugins_modal::render_plugins_modal(
+                ctrl_entity.clone(),
+                p,
+                cx,
+            ));
+        }
         if show_onboarding {
-            root = root.child(views::onboarding::render_onboarding_modal(ctrl_entity, p, cx));
+            root = root.child(views::onboarding::render_onboarding_modal(
+                ctrl_entity,
+                p,
+                cx,
+            ));
         }
         root
     }
 }
 
-fn render_sidebar(
-    ctrl: Entity<AppController>,
-    active_nav: NavSection,
-    theme_mode: ThemeMode,
-    is_demo: bool,
-    p: &'static ThemePalette,
-    cx: &mut Context<ConsoleWindowView>,
-) -> gpui::Div {
-    let nav_items = NavSection::ALL.into_iter().map(|sec| {
-        let active = sec == active_nav;
-        let ctrl_c = ctrl.clone();
-        let mut pill = div()
-            .id(gpui::ElementId::Name(
-                format!("nav-{}", sec.short_tag()).into(),
-            ))
-            .flex()
-            .items_center()
-            .justify_between()
-            .h(px(32.))
-            .px(px(11.))
-            .rounded(px(9.))
-            .cursor_pointer()
-            .text_size(px(12.))
-            .font_weight(if active {
-                gpui::FontWeight::SEMIBOLD
-            } else {
-                gpui::FontWeight::MEDIUM
-            })
-            .text_color(rgb(if active {
-                p.sidebar_active_text
-            } else {
-                p.text_secondary
-            }));
-
-        if active {
-            pill = pill
-                .bg(rgb(p.sidebar_active_bg))
-                .border_1()
-                .border_color(rgb(p.sidebar_active_border));
-        } else {
-            let hover_bg = p.sidebar_hover_bg;
-            pill = pill.hover(move |s| s.bg(rgb(hover_bg)));
-        }
-
-        pill.child(sec.label()).on_mouse_up(
-            MouseButton::Left,
-            cx.listener(move |_, _, _, cx| {
-                ctrl_c.update(cx, |c, cx| c.set_nav(sec, cx));
-            }),
-        )
-    });
-
-    let theme_chips = THEME_MODES.into_iter().map(|mode| {
-        let active = mode == theme_mode;
-        let ctrl_t = ctrl.clone();
-        let mode_lbl = theme_mode_label(mode);
-        let mut chip = div()
-            .id(gpui::ElementId::Name(format!("theme-{mode_lbl}").into()))
-            .flex_1()
-            .flex()
-            .items_center()
-            .justify_center()
-            .h(px(26.))
-            .rounded(px(7.))
-            .text_size(px(11.))
-            .cursor_pointer()
-            .font_weight(if active {
-                gpui::FontWeight::SEMIBOLD
-            } else {
-                gpui::FontWeight::NORMAL
-            })
-            .text_color(rgb(if active {
-                p.switcher_active_text
-            } else {
-                p.text_muted
-            }));
-
-        if active {
-            chip = chip.bg(rgb(p.switcher_active_bg));
-        }
-        chip.child(mode_lbl).on_mouse_up(
-            MouseButton::Left,
-            cx.listener(move |_, _, _, cx| {
-                ctrl_t.update(cx, |c, cx| c.set_theme_mode(mode, cx));
-            }),
-        )
-    });
-
-    div()
-        .flex()
-        .flex_col()
-        .justify_between()
-        .w(px(layout::SIDEBAR_WIDTH))
-        .flex_shrink_0()
-        .h_full()
-        .p(px(10.))
-        .rounded(px(layout::RADIUS_BENTO))
-        .bg(rgb(p.sidebar_bg))
-        .border_1()
-        .border_color(rgb(p.card_border))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(10.))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(9.))
-                        .px(px(6.))
-                        .pt(px(2.))
-                        .child(
-                            div()
-                                .w(px(28.))
-                                .h(px(28.))
-                                .rounded(px(8.))
-                                .bg(rgb(p.primary_btn_bg))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_size(px(13.))
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .text_color(rgb(p.primary_btn_text))
-                                .child("CG"),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .text_size(px(14.))
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .text_color(rgb(p.text_primary))
-                                        .child("ClaudeGuard"),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(10.5))
-                                        .text_color(rgb(p.text_muted))
-                                        .child(if is_demo {
-                                            "v4 · 演示沙盒"
-                                        } else {
-                                            "v4 · 出口防线"
-                                        }),
-                                ),
-                        ),
-                )
-                .child(div().flex().flex_col().gap(px(2.)).children(nav_items)),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(5.))
-                .child(
-                    div()
-                        .id("sidebar-open-hud")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .h(px(28.))
-                        .rounded(px(8.))
-                        .bg(rgb(p.inset_bg))
-                        .border_1()
-                        .border_color(rgb(p.inset_border))
-                        .text_size(px(11.5))
-                        .text_color(rgb(p.text_secondary))
-                        .cursor_pointer()
-                        .child("呼出托盘快捷 HUD")
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener({
-                                let ctrl_h = ctrl.clone();
-                                move |_, _, _, cx| {
-                                    open_hud_window(ctrl_h.clone(), cx);
-                                }
-                            }),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("sidebar-open-wizard")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .h(px(24.))
-                        .rounded(px(8.))
-                        .text_size(px(11.))
-                        .text_color(rgb(p.link_text))
-                        .cursor_pointer()
-                        .child("打开首启向导")
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener({
-                                let ctrl_w = ctrl.clone();
-                                move |_, _, _, cx| {
-                                    ctrl_w.update(cx, |c, cx| c.open_onboarding_modal(cx));
-                                }
-                            }),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(2.))
-                        .p(px(3.))
-                        .rounded(px(9.))
-                        .bg(rgb(p.switcher_track_bg))
-                        .children(theme_chips),
-                ),
-        )
+fn policy_preset_display(preset: PolicyPreset) -> (&'static str, &'static str) {
+    match preset {
+        PolicyPreset::LooseAntiDirect => (
+            "宽松防直连",
+            "仅拦截本地直连，不校验出口国家/地区",
+        ),
+        PolicyPreset::StandardRegion => (
+            "标准地区白名单",
+            "出口必须落在允许国家列表，越界立即熔断",
+        ),
+        PolicyPreset::StrictStaticIp => (
+            "严格锁定静态 IP",
+            "仅放行已绑定的专属静态出口 IP 或网段",
+        ),
+    }
 }
 
-fn render_topbar(
+fn render_ceramic_header(
     ctrl: Entity<AppController>,
+    tripped: bool,
     is_maximized: bool,
     p: &'static ThemePalette,
     cx: &mut Context<ConsoleWindowView>,
@@ -1849,116 +1862,262 @@ fn render_topbar(
         .as_ref()
         .map(|s| s.preset)
         .unwrap_or(PolicyPreset::StandardRegion);
+    let (preset_name, _) = policy_preset_display(current_preset);
+    let policy_open = ctrl_r.policy_menu_open;
     let privacy_mask = ctrl_r.privacy_mask;
-    let connected = ctrl_r.connected;
-    let busy = ctrl_r.busy_action;
-    let search_entity = ctrl_r.inputs.search.clone();
+    let hud_open = ctrl_r.hud_window.is_some();
+    let is_dark = p.is_dark;
 
-    let preset_items = POLICY_PRESETS.into_iter().map(|preset| {
-        let active = preset == current_preset;
-        let ctrl_p = ctrl.clone();
-        crate::widgets::controls::segmented_capsule_item(
-            gpui::ElementId::Name(format!("preset-{}", preset.label()).into()),
-            preset.label(),
-            active,
-            p,
-        )
-        .when(connected && !busy, |item| {
-            item.on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |_, _, _, cx| {
-                    ctrl_p.update(cx, |c, cx| c.set_preset(preset, cx));
-                }),
-            )
-        })
-    });
+    let ctrl_pol = ctrl.clone();
+    let ctrl_priv = ctrl.clone();
+    let ctrl_hud = ctrl.clone();
+    let ctrl_theme = ctrl.clone();
+    let ctrl_close = ctrl;
+
+    let hover_tile = p.sidebar_hover_bg;
 
     div()
         .flex()
+        .flex_shrink_0()
         .items_center()
-        .gap(px(8.))
-        .h(px(layout::TOPBAR_HEIGHT))
-        .px(px(14.))
-        .child(crate::widgets::controls::segmented_capsule_track(p).children(preset_items))
-        .child(div().w(px(200.)).flex_shrink_0().child(search_entity))
+        .justify_between()
+        .h(px(32.))
+        .px(px(2.))
+        .gap(px(10.))
+        // Left: Brand + Policy selector button
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(9.))
+                .child(
+                    div()
+                        .w(px(26.))
+                        .h(px(26.))
+                        .rounded(px(8.))
+                        .bg(rgb(p.primary_btn_bg))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(ui_icon(
+                            if tripped {
+                                "icons/ui/shield_alert.svg"
+                            } else {
+                                "icons/ui/shield.svg"
+                            },
+                            15.0,
+                            p.primary_btn_text,
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(rgb(p.text_primary))
+                        .child("ClaudeGuard"),
+                )
+                .child(
+                    div()
+                        .id("header-policy-select")
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .h(px(28.))
+                        .px(px(10.))
+                        .rounded(px(8.))
+                        .bg(rgb(p.card_bg))
+                        .border_1()
+                        .border_color(rgb(if policy_open {
+                            p.primary_btn_bg
+                        } else {
+                            p.line_strong
+                        }))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(rgb(hover_tile)))
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(rgb(p.text_muted))
+                                .child("策略"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(p.text_primary))
+                                .child(preset_name),
+                        )
+                        .child(ui_icon("icons/ui/chevrons.svg", 12.5, p.text_muted))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                ctrl_pol.update(cx, |c, cx| {
+                                    c.policy_menu_open = !c.policy_menu_open;
+                                    c.open_region_picker_for = None;
+                                    cx.notify();
+                                });
+                            }),
+                        ),
+                ),
+        )
+        // Center draggable window titlebar area
         .child(
             div()
                 .flex_1()
                 .h_full()
                 .window_control_area(WindowControlArea::Drag),
         )
-        .child(
-            div()
-                .id("privacy-mask-toggle")
-                .flex()
-                .items_center()
-                .gap(px(5.))
-                .h(px(32.))
-                .px(px(10.))
-                .rounded(px(9.))
-                .bg(rgb(if privacy_mask {
-                    p.sidebar_active_bg
-                } else {
-                    p.card_bg
-                }))
-                .border_1()
-                .border_color(rgb(if privacy_mask {
-                    p.sidebar_active_border
-                } else {
-                    p.card_border
-                }))
-                .text_size(px(11.5))
-                .text_color(rgb(if privacy_mask {
-                    p.sidebar_active_text
-                } else {
-                    p.text_secondary
-                }))
-                .cursor_pointer()
-                .child(if privacy_mask {
-                    "● 已打码 198.51.*.*"
-                } else {
-                    "○ 隐私打码"
-                })
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener({
-                        let ctrl_m = ctrl.clone();
-                        move |_, _, _, cx| {
-                            ctrl_m.update(cx, |c, cx| c.toggle_privacy_mask(cx));
-                        }
-                    }),
-                ),
-        )
+        // Right utility chips + theme icon + compact window controls
         .child(
             div()
                 .flex()
                 .items_center()
-                .gap(px(4.))
-                .child(win_ctrl_btn("win-min", "—", false, p).on_mouse_up(
+                .gap(px(6.))
+                .child(
+                    div()
+                        .id("privacy-mask-toggle")
+                        .flex()
+                        .items_center()
+                        .gap(px(5.))
+                        .h(px(28.))
+                        .px(px(10.))
+                        .rounded(px(999.))
+                        .bg(rgb(p.card_bg))
+                        .border_1()
+                        .border_color(rgb(if privacy_mask {
+                            p.line_strong
+                        } else {
+                            p.card_border
+                        }))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(rgb(hover_tile)))
+                        .text_size(px(11.5))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(if privacy_mask {
+                            p.text_primary
+                        } else {
+                            p.text_secondary
+                        }))
+                        .child(ui_icon(
+                            "icons/ui/eye.svg",
+                            13.0,
+                            if privacy_mask {
+                                p.text_primary
+                            } else {
+                                p.text_secondary
+                            },
+                        ))
+                        .child(if privacy_mask { "已脱敏" } else { "隐私打码" })
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                ctrl_priv.update(cx, |c, cx| c.toggle_privacy_mask(cx));
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("header-open-hud")
+                        .flex()
+                        .items_center()
+                        .h(px(28.))
+                        .px(px(10.))
+                        .rounded(px(999.))
+                        .bg(rgb(p.card_bg))
+                        .border_1()
+                        .border_color(rgb(if hud_open {
+                            p.line_strong
+                        } else {
+                            p.card_border
+                        }))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(rgb(hover_tile)))
+                        .text_size(px(11.5))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(if hud_open {
+                            p.text_primary
+                        } else {
+                            p.text_secondary
+                        }))
+                        .child("托盘 HUD")
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                toggle_hud_window(ctrl_hud.clone(), cx);
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("header-theme-toggle")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(28.))
+                        .h(px(28.))
+                        .rounded(px(999.))
+                        .bg(rgb(p.card_bg))
+                        .border_1()
+                        .border_color(rgb(p.card_border))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(rgb(hover_tile)))
+                        .child(ui_icon(
+                            if is_dark {
+                                "icons/ui/sun.svg"
+                            } else {
+                                "icons/ui/moon.svg"
+                            },
+                            14.0,
+                            p.text_secondary,
+                        ))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                let next = if is_dark {
+                                    ThemeMode::Light
+                                } else {
+                                    ThemeMode::Dark
+                                };
+                                ctrl_theme.update(cx, |c, cx| c.set_theme_mode(next, cx));
+                            }),
+                        ),
+                )
+                .child(div().w(px(1.)).h(px(14.)).bg(rgb(p.card_border)).mx(px(2.)))
+                .child(win_ctrl_btn("win-min", "icons/ui/win_min.svg", false, p).on_mouse_up(
                     MouseButton::Left,
                     cx.listener(|_, _, window, _| {
                         window.minimize_window();
                     }),
                 ))
                 .child(
-                    win_ctrl_btn("win-max", if is_maximized { "❐" } else { "□" }, false, p)
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|_, _, window, _| {
-                                window.zoom_window();
-                            }),
-                        ),
+                    win_ctrl_btn(
+                        "win-max",
+                        if is_maximized {
+                            "icons/ui/win_restore.svg"
+                        } else {
+                            "icons/ui/win_max.svg"
+                        },
+                        false,
+                        p,
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|_, _, window, _| {
+                            window.zoom_window();
+                        }),
+                    ),
                 )
-                .child(win_ctrl_btn("win-close", "✕", true, p).on_mouse_up(
+                .child(win_ctrl_btn("win-close", "icons/ui/close.svg", true, p).on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |_, _, window, cx| {
-                        let close_to_tray = ctrl
+                        let close_to_tray = ctrl_close
                             .read(cx)
                             .snapshot
                             .as_ref()
                             .map(|s| s.config.close_to_tray)
                             .unwrap_or(true);
-                        ctrl.update(cx, |c, _| c.console_window = None);
+                        ctrl_close.update(cx, |c, _| c.console_window = None);
                         window.remove_window();
                         if !close_to_tray {
                             cx.quit();
@@ -1968,30 +2127,267 @@ fn render_topbar(
         )
 }
 
+fn render_policy_dropdown_overlay(
+    ctrl: Entity<AppController>,
+    p: &'static ThemePalette,
+    cx: &mut Context<ConsoleWindowView>,
+) -> gpui::Stateful<gpui::Div> {
+    let ctrl_r = ctrl.read(cx);
+    let current_preset = ctrl_r
+        .snapshot
+        .as_ref()
+        .map(|s| s.preset)
+        .unwrap_or(PolicyPreset::StandardRegion);
+    let can_switch = ctrl_r.connected && !ctrl_r.busy_action;
+
+    let options: Vec<_> = POLICY_PRESETS.into_iter().map(|preset| {
+        let active = preset == current_preset;
+        let (title, desc) = policy_preset_display(preset);
+        let ctrl_p = ctrl.clone();
+        let hover = p.sidebar_hover_bg;
+        div()
+            .id(gpui::ElementId::Name(format!("pol-opt-{preset:?}").into()))
+            .flex()
+            .items_start()
+            .justify_between()
+            .gap(px(10.))
+            .w_full()
+            .px(px(10.))
+            .py(px(8.))
+            .rounded(px(9.))
+            .cursor_pointer()
+            .bg(rgb(if active { p.inset_bg } else { p.card_bg }))
+            .hover(move |s| s.bg(rgb(hover)))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(p.text_primary))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .line_height(px(15.))
+                            .text_color(rgb(p.text_muted))
+                            .child(desc),
+                    ),
+            )
+            .when(active, |row| {
+                row.child(div().pt(px(2.)).child(ui_icon(
+                    "icons/ui/check.svg",
+                    14.0,
+                    p.text_primary,
+                )))
+            })
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    ctrl_p.update(cx, |c, cx| {
+                        c.policy_menu_open = false;
+                        if can_switch {
+                            c.set_preset(preset, cx);
+                        } else {
+                            cx.notify();
+                        }
+                    });
+                }),
+            )
+    }).collect();
+
+    let ctrl_bg = ctrl;
+    div()
+        .id("policy-dropdown-backdrop")
+        .absolute()
+        .inset_0()
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |_, _, _, cx| {
+                ctrl_bg.update(cx, |c, cx| {
+                    c.policy_menu_open = false;
+                    cx.notify();
+                });
+            }),
+        )
+        .child(
+            div()
+                .id("policy-dropdown-menu")
+                .absolute()
+                .top(px(52.))
+                .left(px(140.))
+                .w(px(296.))
+                .p(px(5.))
+                .gap(px(2.))
+                .flex()
+                .flex_col()
+                .rounded(px(13.))
+                .bg(rgb(p.card_bg))
+                .border_1()
+                .border_color(rgb(p.line_strong))
+                .shadow(vec![
+                    BoxShadow::new(px(0.), px(14.), rgba(0x0F172A2B).into()).blur_radius(px(34.)),
+                ])
+                .on_mouse_up(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .children(options),
+        )
+}
+
+fn render_ceramic_dock(
+    ctrl: Entity<AppController>,
+    active_nav: NavSection,
+    targets_alert: bool,
+    env_alert: bool,
+    has_update: bool,
+    p: &'static ThemePalette,
+    cx: &mut Context<ConsoleWindowView>,
+) -> gpui::Div {
+    let items: [(NavSection, &'static str, &'static str, Option<u32>); 7] = [
+        (NavSection::Overview, "总览", "icons/ui/home.svg", None),
+        (
+            NavSection::Targets,
+            "目标",
+            "icons/ui/globe.svg",
+            targets_alert.then_some(p.badge_fail.dot),
+        ),
+        (NavSection::Breaker, "熔断", "icons/ui/flame.svg", None),
+        (
+            NavSection::Environment,
+            "防漏",
+            "icons/ui/radar.svg",
+            env_alert.then_some(p.badge_fail.dot),
+        ),
+        (NavSection::Audit, "审计", "icons/ui/clock.svg", None),
+        (
+            NavSection::Updates,
+            "更新",
+            "icons/ui/download.svg",
+            has_update.then_some(p.badge_warn.dot),
+        ),
+        (NavSection::Notify, "通知", "icons/ui/bell.svg", None),
+    ];
+
+    let dock_btns = items.into_iter().map(|(sec, label, icon_path, dot)| {
+        let active = sec == active_nav;
+        let ctrl_n = ctrl.clone();
+        let fg = if active {
+            p.sidebar_active_text
+        } else {
+            p.text_secondary
+        };
+        let hover_bg = p.sidebar_hover_bg;
+        let hover_txt = p.text_primary;
+
+        let mut btn = div()
+            .id(gpui::ElementId::Name(format!("dock-{sec:?}").into()))
+            .relative()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(6.))
+            .h(px(32.))
+            .px(px(12.))
+            .rounded(px(10.5))
+            .cursor_pointer()
+            .text_size(px(12.))
+            .font_weight(if active {
+                gpui::FontWeight::SEMIBOLD
+            } else {
+                gpui::FontWeight::MEDIUM
+            })
+            .text_color(rgb(fg))
+            .child(ui_icon(icon_path, 14.0, fg))
+            .child(label);
+
+        if active {
+            btn = btn.bg(rgb(p.sidebar_active_bg));
+        } else {
+            btn = btn.hover(move |s| s.bg(rgb(hover_bg)).text_color(rgb(hover_txt)));
+            if let Some(dot_rgb) = dot {
+                btn = btn.child(
+                    div()
+                        .absolute()
+                        .top(px(5.))
+                        .right(px(5.))
+                        .w(px(5.5))
+                        .h(px(5.5))
+                        .rounded(px(999.))
+                        .bg(rgb(dot_rgb)),
+                );
+            }
+        }
+
+        btn.on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |_, _, _, cx| {
+                cx.stop_propagation();
+                ctrl_n.update(cx, |c, cx| c.set_nav(sec, cx));
+            }),
+        )
+    });
+
+    div()
+        .flex()
+        .flex_shrink_0()
+        .w_full()
+        .justify_center()
+        .pt(px(1.))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(3.))
+                .p(px(4.))
+                .rounded(px(14.5))
+                .bg(rgb(p.sidebar_bg))
+                .border_1()
+                .border_color(rgb(p.card_border))
+                .shadow(vec![
+                    BoxShadow::new(px(0.), px(6.), rgba(p.shadow_rgba).into()).blur_radius(px(20.)),
+                ])
+                .children(dock_btns),
+        )
+}
+
 fn win_ctrl_btn(
     id: &'static str,
-    glyph: &'static str,
+    icon_path: &'static str,
     danger: bool,
     p: &'static ThemePalette,
 ) -> gpui::Stateful<gpui::Div> {
-    let hover_bg = if danger { 0xEF4444 } else { p.sidebar_hover_bg };
-    let hover_txt = if danger { 0xFFFFFF } else { p.text_primary };
+    let icon_color = if danger {
+        p.badge_fail.text
+    } else {
+        p.text_secondary
+    };
+    let hover_bg = if danger {
+        rgba(p.badge_fail.bg)
+    } else {
+        rgb(p.sidebar_hover_bg)
+    };
     div()
         .id(id)
         .flex()
         .items_center()
         .justify_center()
-        .w(px(30.))
-        .h(px(30.))
-        .rounded(px(8.))
+        .w(px(26.))
+        .h(px(26.))
+        .rounded(px(7.))
         .bg(rgb(p.card_bg))
         .border_1()
         .border_color(rgb(p.card_border))
-        .text_size(px(12.))
-        .text_color(rgb(p.text_secondary))
         .cursor_pointer()
-        .hover(move |s| s.bg(rgb(hover_bg)).text_color(rgb(hover_txt)))
-        .child(glyph)
+        .hover(move |s| s.bg(hover_bg))
+        .child(ui_icon(icon_path, 12.0, icon_color))
 }
 
 /// Launches the GPUI desktop application + Win32 tray loop.
@@ -2011,6 +2407,7 @@ pub fn run(args: LaunchArgs) {
     };
 
     application()
+        .with_assets(EmbeddedAssets)
         .with_quit_mode(gpui::QuitMode::Explicit)
         .run(move |cx: &mut App| {
             text_input::bind_keys(cx);

@@ -1,13 +1,23 @@
-//! Mode B — `客户端更新` view (7-component local + remote official update tracker).
+//! Mode B — Frost Ceramic `客户端更新` view.
+//!
+//! Tracks all 10 components (strictly read-only through managed proxy):
+//! - Band 1: `ClaudeGuard 守护端` + 6h auto-check switch + `立即巡检全部 (10)`
+//! - Band 2: `antigravity-proxy 透明代理注入器` + `检测` + `去热修复 →`
+//! - Band 3: Symmetrical 2×3 grid (`Claude Desktop`, `Claude Code CLI`, `ChatGPT / Codex 桌面端`,
+//!   `Codex CLI`, `Antigravity IDE` [with `插件推荐` button opening the 4-plugin update modal],
+//!   `Antigravity 中文汉化引擎` [Silas-02/antigravity-desktop-cn]).
 
-use crate::app::{AppController, ConsoleWindowView};
+use crate::app::{AppController, ConsoleWindowView, EnvSubTab};
+use crate::assets::{brand_icon, ui_icon};
 use crate::demo::now_unix_secs;
+use crate::ipc::open_external_url;
 use crate::protocol::{ComponentUpdateStatus, PipeRequest, UiLabelExt, UpdateCheckPhase};
-use crate::state::format_relative_secs;
+use crate::state::{NavSection, format_relative_secs};
 use crate::theme::{BadgeTone, ThemePalette};
-use crate::views::shared::{ag_diag_tile, switch_row};
+use crate::views::plugins_modal::count_plugin_updates;
 use crate::widgets::controls::{
-    ButtonKind, action_button, bento_card, inset_box, mono_tabular, status_pill,
+    ButtonKind, action_button, bento_card, icon_action_button, mono_tabular, toggle_switch,
+    tone_tag,
 };
 use gpui::{Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, rgb};
 
@@ -22,216 +32,285 @@ fn update_phase_tone(phase: UpdateCheckPhase) -> BadgeTone {
     }
 }
 
-fn format_ver_label(ver: Option<&str>, fallback: &str) -> String {
-    ver.map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|v| format!("v{}", v.trim_start_matches(['v', 'V'])))
-        .unwrap_or_else(|| fallback.to_string())
-}
-
-const ANTIGRAVITY_PROXY_INTRO: &str =
-    "专为 Antigravity 打造的免 TUN 强制代理工具，支持 DLL 注入与进程流量劫持。";
-
-fn client_update_toast(component_id: &str) -> &'static str {
-    match component_id {
-        "claude_desktop" => "已完成 Claude Desktop 官方最新版本检查",
-        "claude_code" => "已完成 Claude Code CLI 官方最新版本检查",
-        "codex_desktop" => "已完成 ChatGPT / Codex 桌面端官方版本检查",
-        "codex_cli" => "已完成 Codex CLI 官方最新版本检查",
-        "antigravity_ide" => "已完成 Antigravity IDE 官方最新版本检查",
-        _ => "已完成组件版本检查",
+fn fmt_ver(ver: Option<&str>, is_repo_track: bool, fallback: &str) -> String {
+    match ver.map(str::trim).filter(|s| !s.is_empty()) {
+        None => fallback.to_string(),
+        Some(v) if is_repo_track => v.trim_start_matches(['v', 'V']).to_string(),
+        Some(v) => format!("v{}", v.trim_start_matches(['v', 'V'])),
     }
 }
 
-fn render_client_update_card(
-    ctrl: Entity<AppController>,
-    item: &ComponentUpdateStatus,
+fn component_toast(id: &str) -> &'static str {
+    match id {
+        "claude_desktop" => "已完成 Claude Desktop 最新版本检测",
+        "claude_code" => "已完成 Claude Code CLI 最新版本检测",
+        "codex_desktop" => "已完成 ChatGPT / Codex 桌面端最新版本检测",
+        "codex_cli" => "已完成 Codex CLI 最新版本检测",
+        "antigravity_ide" => "已完成 Antigravity IDE 最新版本检测",
+        "antigravity_cn" => "已完成 Antigravity 中文汉化引擎仓库更新检测",
+        _ => "已完成组件版本检测",
+    }
+}
+
+struct GridCardSpec<'a> {
+    item: &'a ComponentUpdateStatus,
+    icon_key: &'static str,
+    title: &'static str,
     subtitle: &'static str,
+    source: &'static str,
+    is_repo_track: bool,
+    repo_url: Option<&'static str>,
+    has_plugins_btn: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_grid_card(
+    ctrl: Entity<AppController>,
+    spec: GridCardSpec<'_>,
+    plugin_updates_count: usize,
     can_check: bool,
-    now: u64,
     p: &'static ThemePalette,
     cx: &mut Context<ConsoleWindowView>,
 ) -> Div {
+    let item = spec.item;
+    let has_up = item.phase == UpdateCheckPhase::UpdateAvailable;
+    let phase_label = if spec.is_repo_track && has_up {
+        "仓库有更新"
+    } else {
+        item.phase.label()
+    };
+
+    let cur = fmt_ver(
+        item.installed_version.as_deref(),
+        spec.is_repo_track,
+        if spec.is_repo_track { "未检测" } else { "未安装" },
+    );
+    let lat = fmt_ver(item.latest_version.as_deref(), spec.is_repo_track, "待检查");
+
+    let ver_line = if spec.is_repo_track {
+        if has_up {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .min_w(px(0.))
+                .child(
+                    mono_tabular(format!("本地 {cur} →"))
+                        .text_size(px(11.5))
+                        .text_color(rgb(p.text_secondary)),
+                )
+                .child(
+                    mono_tabular(format!("上游 {lat}"))
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(p.badge_warn.text)),
+                )
+        } else {
+            mono_tabular(format!("本地 {cur} · {}", spec.source))
+                .truncate()
+                .text_size(px(11.5))
+                .text_color(rgb(p.text_secondary))
+        }
+    } else if has_up {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .min_w(px(0.))
+            .child(
+                mono_tabular(format!("本机 {cur} →"))
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(p.text_primary)),
+            )
+            .child(
+                mono_tabular(lat)
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(p.badge_warn.text)),
+            )
+    } else {
+        mono_tabular(format!("本机 {cur} · {}", spec.source))
+            .truncate()
+            .text_size(px(11.5))
+            .text_color(rgb(p.text_secondary))
+    };
+
     let comp_id = item.id.clone();
-    let toast_msg = client_update_toast(&item.id);
-    let installed_str = format_ver_label(item.installed_version.as_deref(), "未检测到");
-    let latest_str = format_ver_label(item.latest_version.as_deref(), "待检查");
-    let checked_age = format_relative_secs(item.checked_at, now);
+    let toast_msg = component_toast(&item.id);
+    let ctrl_chk = ctrl.clone();
+    let ctrl_plug = ctrl.clone();
+    let ctrl_repo = ctrl;
 
-    let latest_color = match item.phase {
-        UpdateCheckPhase::UpdateAvailable => p.badge_warn.text,
-        UpdateCheckPhase::UpToDate => p.badge_pass.text,
-        UpdateCheckPhase::Failed => p.badge_fail.text,
-        _ => p.text_primary,
-    };
-
-    let note_text = if item.note.trim().is_empty() {
-        "点击「检查」通过受管代理通道获取官方最新版本".to_string()
-    } else {
-        item.note.clone()
-    };
-
-    let source_label = if item.repo.trim().is_empty() {
-        "官方发布渠道"
-    } else {
-        item.repo.as_str()
-    };
+    let hover_bg = p.sidebar_hover_bg;
 
     bento_card(p)
         .flex_1()
         .flex_basis(px(0.))
         .min_w(px(0.))
-        .p(px(14.))
-        .gap(px(9.))
+        .px(px(14.))
+        .py(px(11.))
+        .justify_between()
+        .gap(px(8.))
         .child(
             div()
                 .flex()
-                .flex_wrap()
                 .items_center()
                 .justify_between()
-                .gap(px(6.))
+                .gap(px(8.))
                 .child(
                     div()
                         .flex()
-                        .flex_col()
-                        .flex_1()
+                        .items_center()
+                        .gap(px(9.))
                         .min_w(px(0.))
-                        .gap(px(2.))
+                        .flex_1()
+                        .child(brand_icon(spec.icon_key, 24.0, 6.0, p.is_dark))
                         .child(
                             div()
-                                .text_size(px(13.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(p.text_primary))
-                                .child(item.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(10.5))
-                                .text_color(rgb(p.text_muted))
-                                .child(subtitle),
+                                .flex()
+                                .flex_col()
+                                .min_w(px(0.))
+                                .flex_1()
+                                .gap(px(1.))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(p.text_primary))
+                                        .child(spec.title),
+                                )
+                                .child(
+                                    mono_tabular(spec.subtitle)
+                                        .truncate()
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(p.text_muted)),
+                                ),
                         ),
                 )
-                .child(status_pill(
-                    item.phase.label(),
-                    update_phase_tone(item.phase),
-                    p,
-                )),
+                .child(tone_tag(phase_label, update_phase_tone(item.phase), p)),
         )
         .child(
             div()
                 .flex()
-                .w_full()
-                .min_w(px(0.))
-                .gap(px(8.))
-                .child(
-                    inset_box(p)
-                        .flex_1()
-                        .flex_basis(px(0.))
-                        .min_w(px(0.))
-                        .px(px(10.))
-                        .py(px(7.))
-                        .gap(px(2.))
-                        .child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(rgb(p.text_muted))
-                                .child("本机已装"),
-                        )
-                        .child(
-                            mono_tabular(installed_str)
-                                .truncate()
-                                .text_size(px(13.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(if item.installed_version.is_some() {
-                                    p.text_primary
-                                } else {
-                                    p.text_muted
-                                })),
-                        ),
-                )
-                .child(
-                    inset_box(p)
-                        .flex_1()
-                        .flex_basis(px(0.))
-                        .min_w(px(0.))
-                        .px(px(10.))
-                        .py(px(7.))
-                        .gap(px(2.))
-                        .child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(rgb(p.text_muted))
-                                .child("官方最新"),
-                        )
-                        .child(
-                            mono_tabular(latest_str)
-                                .truncate()
-                                .text_size(px(13.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(latest_color)),
-                        ),
-                ),
-        )
-        .child(
-            div()
-                .w_full()
-                .text_size(px(11.5))
-                .line_height(px(16.))
-                .text_color(rgb(match item.phase {
-                    UpdateCheckPhase::UpdateAvailable => p.badge_warn.text,
-                    UpdateCheckPhase::Failed => p.badge_fail.text,
-                    _ => p.text_secondary,
-                }))
-                .child(note_text),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_wrap()
                 .items_center()
                 .justify_between()
                 .gap(px(8.))
+                .pt(px(6.))
+                .border_t_1()
+                .border_color(rgb(p.card_border))
+                .child(div().flex_1().min_w(px(0.)).child(ver_line))
                 .child(
-                    mono_tabular(format!("来源：{source_label} · {checked_age}"))
-                        .flex_1()
-                        .min_w(px(0.))
-                        .truncate()
-                        .text_size(px(10.5))
-                        .text_color(rgb(p.text_muted)),
-                )
-                .child(
-                    action_button(
-                        gpui::ElementId::Name(format!("upd-check-{}", item.id).into()),
-                        "↻ 检查",
-                        if item.phase == UpdateCheckPhase::UpdateAvailable {
-                            ButtonKind::Primary
-                        } else {
-                            ButtonKind::Secondary
-                        },
-                        can_check,
-                        p,
-                    )
-                    .when(can_check, |b| {
-                        b.on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(move |_, _, _, cx| {
-                                ctrl.update(cx, |c, cx| {
-                                    c.send_request(
-                                        PipeRequest::CheckUpdates {
-                                            component: Some(comp_id.clone()),
-                                        },
-                                        Some(toast_msg),
-                                        cx,
-                                    );
-                                });
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_shrink_0()
+                        .gap(px(6.))
+                        .when(spec.has_plugins_btn, |row| {
+                            row.child(
+                                div()
+                                    .id("upd-open-plugins-modal")
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.5))
+                                    .h(px(24.))
+                                    .px(px(9.))
+                                    .rounded(px(7.))
+                                    .bg(rgb(p.secondary_btn_bg))
+                                    .border_1()
+                                    .border_color(rgb(p.line_strong))
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(rgb(hover_bg)))
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(p.text_primary))
+                                    .child(ui_icon("icons/ui/puzzle.svg", 11.0, p.text_primary))
+                                    .child("插件推荐")
+                                    .when(plugin_updates_count > 0, |btn| {
+                                        btn.child(
+                                            div()
+                                                .w(px(5.5))
+                                                .h(px(5.5))
+                                                .rounded(px(999.))
+                                                .bg(rgb(p.badge_warn.dot)),
+                                        )
+                                    })
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            cx.stop_propagation();
+                                            ctrl_plug.update(cx, |c, cx| {
+                                                c.show_plugins_modal = true;
+                                                cx.notify();
+                                            });
+                                        }),
+                                    ),
+                            )
+                        })
+                        .when_some(spec.repo_url, |row, url| {
+                            row.child(
+                                icon_action_button(
+                                    gpui::ElementId::Name(format!("upd-repo-{}", item.id).into()),
+                                    "icons/ui/ext.svg",
+                                    "仓库",
+                                    ButtonKind::Secondary,
+                                    true,
+                                    p,
+                                )
+                                .h(px(24.))
+                                .px(px(8.))
+                                .text_size(px(11.))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |_, _, _, cx| {
+                                        let res = open_external_url(url);
+                                        ctrl_repo.update(cx, |c, cx| match res {
+                                            Ok(()) => c.set_toast(
+                                                "已在浏览器中打开 Silas-02/antigravity-desktop-cn",
+                                                true,
+                                                cx,
+                                            ),
+                                            Err(err) => c.set_toast(err, false, cx),
+                                        });
+                                    }),
+                                ),
+                            )
+                        })
+                        .child(
+                            icon_action_button(
+                                gpui::ElementId::Name(format!("upd-check-{}", item.id).into()),
+                                "icons/ui/refresh.svg",
+                                "检查",
+                                ButtonKind::Secondary,
+                                can_check,
+                                p,
+                            )
+                            .h(px(24.))
+                            .px(px(8.))
+                            .text_size(px(11.))
+                            .when(can_check, |b| {
+                                b.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |_, _, _, cx| {
+                                        let id = comp_id.clone();
+                                        ctrl_chk.update(cx, |c, cx| {
+                                            c.send_request(
+                                                PipeRequest::CheckUpdates {
+                                                    component: Some(id),
+                                                },
+                                                Some(toast_msg),
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                                )
                             }),
-                        )
-                    }),
+                        ),
                 ),
         )
 }
 
-/// Sub-view: `客户端更新`
 pub fn render_updates_page(
     ctrl: Entity<AppController>,
     p: &'static ThemePalette,
@@ -255,228 +334,241 @@ pub fn render_updates_page(
     let now = now_unix_secs();
     let can_check = connected && !busy && !tripped;
 
-    let cg_upd = &updates.claudeguard;
-    let cg_cur = format_ver_label(cg_upd.installed_version.as_deref().or(Some(&ver)), "v4.0.0");
-    let cg_latest = format_ver_label(cg_upd.latest_version.as_deref(), "待检查");
-    let cg_note = if cg_upd.note.trim().is_empty() {
-        "已启用官方发布签名校验，仅通过受管代理通道静默检查新版本".to_string()
-    } else {
-        cg_upd.note.clone()
-    };
-    let cg_checked_age = format_relative_secs(cg_upd.checked_at, now);
-    let cg_repo = if cg_upd.repo.is_empty() {
-        "daha1216/ClaudeGuard"
-    } else {
-        cg_upd.repo.as_str()
-    };
+    let cg = &updates.claudeguard;
+    let cg_cur = fmt_ver(cg.installed_version.as_deref().or(Some(&ver)), false, "v4.0.0");
+    let cg_age = format_relative_secs(cg.checked_at, now);
 
-    let ag_upd = &updates.antigravity_proxy;
-    let ag_repo = if ag_upd.repo.is_empty() {
-        "yuaotian/antigravity-proxy"
+    let ag = &updates.antigravity_proxy;
+    let ag_has_up = ag.phase == UpdateCheckPhase::UpdateAvailable;
+    let ag_local = if !ag_proxy.installed {
+        "未安装".into()
     } else {
-        ag_upd.repo.as_str()
-    };
-    let ag_local_ver = if !ag_proxy.installed {
-        "未安装反重力".into()
-    } else {
-        format_ver_label(
-            ag_upd
-                .installed_version
+        fmt_ver(
+            ag.installed_version
                 .as_deref()
                 .or(ag_proxy.injector_version.as_deref()),
-            "未注入/已丢失",
+            false,
+            "未注入",
         )
     };
-    let ag_local_sub = if !ag_proxy.installed {
-        "本机未检测到 Antigravity 客户端".into()
-    } else if !ag_proxy.dll_valid {
-        "! version.dll 缺失或签名异常".into()
-    } else {
-        "version.dll 已注入且特征有效".into()
-    };
-    let ag_local_color = if !ag_proxy.installed {
-        p.text_muted
-    } else if !ag_proxy.dll_valid
-        || ag_upd.installed_version.is_none() && ag_proxy.injector_version.is_none()
-    {
-        p.badge_fail.text
-    } else {
-        p.text_primary
-    };
-    let ag_latest_ver = format_ver_label(ag_upd.latest_version.as_deref(), "待检查");
-    let ag_latest_color = match ag_upd.phase {
-        UpdateCheckPhase::UpdateAvailable => p.badge_warn.text,
-        UpdateCheckPhase::UpToDate => p.badge_pass.text,
-        UpdateCheckPhase::Failed => p.badge_fail.text,
-        _ => p.text_primary,
-    };
-    let ag_latest_sub = ag_upd
-        .release_url
-        .clone()
-        .unwrap_or_else(|| "GitHub Releases 最新版元数据".into());
-    let ag_note = if ag_upd.note.trim().is_empty() {
-        "点击右侧按钮经代理通道检查 yuaotian/antigravity-proxy 最新版本".to_string()
-    } else {
-        ag_upd.note.clone()
-    };
-    let ag_checked_age = format_relative_secs(ag_upd.checked_at, now);
-
-    // Count how many of the 5 tracked AI clients have updates available
-    let client_specs: [(&ComponentUpdateStatus, &'static str); 5] = [
-        (
-            &updates.claude_desktop,
-            "Anthropic 官方桌面端（含后台子进程与升级后自动续保）",
-        ),
-        (
-            &updates.claude_code,
-            "Anthropic 官方命令行终端（@anthropic-ai/claude-code）",
-        ),
-        (
-            &updates.codex_desktop,
-            "OpenAI 官方桌面端（支持升级后自动续保与隔离路径同步）",
-        ),
-        (
-            &updates.codex_cli,
-            "OpenAI 官方命令行终端（@openai/codex）",
-        ),
-        (
-            &updates.antigravity_ide,
-            "Google Antigravity 桌面客户端（自动核验升级后代理注入状态）",
-        ),
-    ];
-    let avail_clients = client_specs
-        .iter()
-        .filter(|(s, _)| s.phase == UpdateCheckPhase::UpdateAvailable)
-        .count();
-    let installed_clients = client_specs
-        .iter()
-        .filter(|(s, _)| s.installed_version.is_some())
-        .count();
-
-    let client_cards: Vec<Div> = client_specs
-        .iter()
-        .map(|(slot, subtitle)| {
-            render_client_update_card(ctrl.clone(), slot, subtitle, can_check, now, p, cx)
-        })
-        .collect();
-
-    let mut client_rows: Vec<Div> = Vec::new();
-    let mut iter = client_cards.into_iter();
-    while let Some(first) = iter.next() {
-        let mut row = div().flex().w_full().min_w(px(0.)).gap(px(12.)).child(first);
-        if let Some(second) = iter.next() {
-            row = row.child(second);
-        } else {
-            row = row.child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)));
-        }
-        client_rows.push(row);
-    }
+    let ag_latest = fmt_ver(ag.latest_version.as_deref(), false, "待检查");
 
     let ctrl_auto = ctrl.clone();
     let ctrl_check_all = ctrl.clone();
-    let ctrl_check_ag = ctrl;
+    let ctrl_ag_chk = ctrl.clone();
+    let ctrl_ag_fix = ctrl.clone();
+
+    let plugin_ups = count_plugin_updates(&updates);
+    let grid_items = [
+        GridCardSpec {
+            item: &updates.claude_desktop,
+            icon_key: "claude",
+            title: "Claude Desktop",
+            subtitle: "Anthropic 官方桌面端",
+            source: "官方桌面发布源",
+            is_repo_track: false,
+            repo_url: None,
+            has_plugins_btn: false,
+        },
+        GridCardSpec {
+            item: &updates.claude_code,
+            icon_key: "claude-code",
+            title: "Claude Code CLI",
+            subtitle: "@anthropic-ai/claude-code",
+            source: "npm 官方源",
+            is_repo_track: false,
+            repo_url: None,
+            has_plugins_btn: false,
+        },
+        GridCardSpec {
+            item: &updates.codex_desktop,
+            icon_key: "chatgpt",
+            title: "ChatGPT / Codex 桌面端",
+            subtitle: "OpenAI 官方桌面端",
+            source: "官方桌面发布源",
+            is_repo_track: false,
+            repo_url: None,
+            has_plugins_btn: false,
+        },
+        GridCardSpec {
+            item: &updates.codex_cli,
+            icon_key: "codex-cli",
+            title: "Codex CLI",
+            subtitle: "@openai/codex",
+            source: "npm 官方源",
+            is_repo_track: false,
+            repo_url: None,
+            has_plugins_btn: false,
+        },
+        GridCardSpec {
+            item: &updates.antigravity_ide,
+            icon_key: "antigravity",
+            title: "Antigravity IDE",
+            subtitle: "Google Antigravity 桌面客户端",
+            source: "官方更新渠道",
+            is_repo_track: false,
+            repo_url: None,
+            has_plugins_btn: true,
+        },
+        GridCardSpec {
+            item: &updates.antigravity_cn,
+            icon_key: "antigravity_cn",
+            title: "Antigravity 中文汉化引擎",
+            subtitle: "Silas-02/antigravity-desktop-cn",
+            source: "GitHub 仓库",
+            is_repo_track: true,
+            repo_url: Some("https://github.com/Silas-02/antigravity-desktop-cn"),
+            has_plugins_btn: false,
+        },
+    ];
+    let avail_grid = grid_items
+        .iter()
+        .filter(|g| g.item.phase == UpdateCheckPhase::UpdateAvailable)
+        .count();
+
+    let mut cards: Vec<Div> = grid_items
+        .into_iter()
+        .map(|spec| render_grid_card(ctrl.clone(), spec, plugin_ups, can_check, p, cx))
+        .collect();
+    let row1 = div().flex().flex_row().w_full().gap(px(10.)).children(cards.drain(0..2));
+    let row2 = div().flex().flex_row().w_full().gap(px(10.)).children(cards.drain(0..2));
+    let row3 = div().flex().flex_row().w_full().gap(px(10.)).children(cards);
 
     div()
         .flex()
         .flex_col()
         .w_full()
+        .flex_1()
         .min_w(px(0.))
-        .gap(px(14.))
-        // Card 1: ClaudeGuard Self + Global Refresh
+        .gap(px(10.))
+        // Band 1: ClaudeGuard Self + Auto Check + Global Recheck (10)
         .child(
             bento_card(p)
                 .w_full()
-                .p(px(16.))
-                .gap(px(10.))
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .px(px(16.))
+                .py(px(12.))
+                .gap(px(12.))
                 .child(
                     div()
                         .flex()
-                        .flex_wrap()
                         .items_center()
-                        .justify_between()
-                        .gap(px(8.))
-                        .child(
-                            div()
-                                .text_size(px(13.5))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(p.text_primary))
-                                .child("ClaudeGuard 守护端与全局版本巡检"),
-                        )
+                        .gap(px(11.))
+                        .min_w(px(0.))
+                        .flex_1()
                         .child(
                             div()
                                 .flex()
-                                .flex_wrap()
                                 .items_center()
-                                .gap(px(8.))
-                                .child(
-                                    mono_tabular(format!("当前 {cg_cur} / 最新 {cg_latest}"))
-                                        .text_size(px(11.5))
-                                        .text_color(rgb(p.text_secondary)),
-                                )
-                                .child(status_pill(
-                                    cg_upd.phase.label(),
-                                    update_phase_tone(cg_upd.phase),
-                                    p,
-                                )),
-                        ),
-                )
-                .child(switch_row(
-                    "upd-auto",
-                    "自动静默检查新版本",
-                    "每 6 小时经代理通道静默检查全部 7 项组件版本；触发隔离期间禁止更新",
-                    cfg.auto_upd_check,
-                    p,
-                    cx.listener(move |_, _, _, cx| {
-                        if !connected || busy {
-                            return;
-                        }
-                        let next = !cfg.auto_upd_check;
-                        ctrl_auto.update(cx, |c, cx| {
-                            c.save_config_patch(move |x| x.auto_upd_check = next, "已更新", cx);
-                        });
-                    }),
-                ))
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(10.))
+                                .justify_center()
+                                .w(px(30.))
+                                .h(px(30.))
+                                .rounded(px(9.))
+                                .bg(rgb(p.primary_btn_bg))
+                                .flex_shrink_0()
+                                .child(ui_icon("icons/ui/shield.svg", 16.0, p.primary_btn_text)),
+                        )
                         .child(
                             div()
                                 .flex()
                                 .flex_col()
-                                .flex_1()
-                                .min_w(px(240.))
+                                .min_w(px(0.))
                                 .gap(px(2.))
                                 .child(
                                     div()
-                                        .text_size(px(12.))
-                                        .line_height(px(17.))
-                                        .text_color(rgb(p.text_secondary))
-                                        .child(cg_note),
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .child(
+                                            div()
+                                                .text_size(px(13.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(p.text_primary))
+                                                .child("ClaudeGuard 守护端"),
+                                        )
+                                        .child(
+                                            mono_tabular(cg_cur)
+                                                .text_size(px(11.5))
+                                                .text_color(rgb(p.text_secondary)),
+                                        )
+                                        .child(tone_tag(
+                                            cg.phase.label(),
+                                            update_phase_tone(cg.phase),
+                                            p,
+                                        )),
                                 )
                                 .child(
                                     mono_tabular(format!(
-                                        "仓库：{cg_repo} · 最近巡检：{cg_checked_age}"
+                                        "仓库 daha1216/ClaudeGuard · 最近巡检：{cg_age} · 全量仅经代理只读查询"
                                     ))
+                                    .truncate()
                                     .text_size(px(11.))
                                     .text_color(rgb(p.text_muted)),
                                 ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_shrink_0()
+                        .gap(px(12.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(7.))
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(rgb(p.text_secondary))
+                                        .child("每 6h 静默巡检"),
+                                )
+                                .child(
+                                    toggle_switch(
+                                        "upd-auto-check-sw",
+                                        cfg.auto_upd_check,
+                                        connected && !busy,
+                                        p,
+                                    )
+                                    .when(connected && !busy, |sw| {
+                                        sw.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _, _, cx| {
+                                                let next = !cfg.auto_upd_check;
+                                                ctrl_auto.update(cx, |c, cx| {
+                                                    c.save_config_patch(
+                                                        move |x| x.auto_upd_check = next,
+                                                        if next {
+                                                            "已开启每 6 小时静默更新巡检"
+                                                        } else {
+                                                            "已关闭自动静默巡检"
+                                                        },
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                        )
+                                    }),
+                                ),
                         )
                         .child(
-                            action_button(
-                                "upd-check-btn",
+                            icon_action_button(
+                                "upd-check-all-btn",
+                                "icons/ui/refresh.svg",
                                 if tripped {
                                     "隔离期间禁止检查"
                                 } else {
-                                    "↻ 立即检查全部更新"
+                                    "立即巡检全部 (10)"
                                 },
                                 ButtonKind::Primary,
                                 can_check,
                                 p,
                             )
+                            .h(px(29.))
+                            .px(px(12.))
                             .when(can_check, |b| {
                                 b.on_mouse_up(
                                     MouseButton::Left,
@@ -484,7 +576,7 @@ pub fn render_updates_page(
                                         ctrl_check_all.update(cx, |c, cx| {
                                             c.send_request(
                                                 PipeRequest::CheckUpdates { component: None },
-                                                Some("已完成全部 7 项组件与客户端版本检查"),
+                                                Some("已完成全部 10 项客户端、注入器与插件版本巡检"),
                                                 cx,
                                             );
                                         });
@@ -494,181 +586,207 @@ pub fn render_updates_page(
                         ),
                 ),
         )
-        // Card 2: antigravity-proxy with user's exact description
+        // Band 2: antigravity-proxy Featured Injector Module
         .child(
             bento_card(p)
                 .w_full()
-                .p(px(16.))
-                .gap(px(10.))
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .px(px(16.))
+                .py(px(12.))
+                .gap(px(14.))
                 .child(
                     div()
                         .flex()
-                        .flex_wrap()
                         .items_center()
-                        .justify_between()
-                        .gap(px(8.))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_w(px(220.))
-                                .gap(px(3.))
-                                .child(
-                                    div()
-                                        .text_size(px(13.5))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(p.text_primary))
-                                        .child("antigravity-proxy 透明代理注入器 · yuaotian/antigravity-proxy"),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(12.))
-                                        .line_height(px(17.))
-                                        .text_color(rgb(p.text_secondary))
-                                        .child(ANTIGRAVITY_PROXY_INTRO),
-                                ),
-                        )
-                        .child(status_pill(
-                            ag_upd.phase.label(),
-                            update_phase_tone(ag_upd.phase),
-                            p,
-                        )),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .w_full()
+                        .gap(px(11.))
                         .min_w(px(0.))
-                        .gap(px(10.))
-                        .child(ag_diag_tile(
-                            "本地已注入版本",
-                            ag_local_ver,
-                            ag_local_sub,
-                            ag_local_color,
-                            true,
-                            p,
-                        ))
-                        .child(ag_diag_tile(
-                            "GitHub 仓库最新版",
-                            ag_latest_ver,
-                            ag_latest_sub,
-                            ag_latest_color,
-                            true,
-                            p,
-                        ))
-                        .child(ag_diag_tile(
-                            "检测源仓库",
-                            ag_repo.to_string(),
-                            "通过受管代理通道只读核验 Release".into(),
-                            p.text_primary,
-                            true,
-                            p,
-                        )),
+                        .flex_1()
+                        .child(brand_icon("antigravity", 30.0, 8.0, p.is_dark))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .min_w(px(0.))
+                                .flex_1()
+                                .gap(px(2.5))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .child(
+                                            div()
+                                                .text_size(px(13.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(p.text_primary))
+                                                .child("antigravity-proxy 透明代理注入器"),
+                                        )
+                                        .child(
+                                            mono_tabular("yuaotian/antigravity-proxy")
+                                                .text_size(px(11.))
+                                                .text_color(rgb(p.text_muted)),
+                                        )
+                                        .child(tone_tag(
+                                            if ag_has_up {
+                                                format!("发现新版 {ag_latest}")
+                                            } else {
+                                                ag.phase.label().to_string()
+                                            },
+                                            update_phase_tone(ag.phase),
+                                            p,
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(11.5))
+                                        .text_color(rgb(p.text_secondary))
+                                        .child("专为 Antigravity 打造的免 TUN 强制代理工具，支持 DLL 注入与进程流量劫持。"),
+                                ),
+                        ),
                 )
                 .child(
                     div()
                         .flex()
-                        .flex_wrap()
                         .items_center()
-                        .justify_between()
+                        .flex_shrink_0()
                         .gap(px(10.))
                         .child(
                             div()
                                 .flex()
                                 .flex_col()
-                                .flex_1()
-                                .min_w(px(240.))
-                                .gap(px(2.))
+                                .items_end()
+                                .gap(px(1.))
                                 .child(
                                     div()
-                                        .text_size(px(12.))
-                                        .line_height(px(17.))
-                                        .text_color(rgb(if ag_upd.phase == UpdateCheckPhase::UpdateAvailable {
-                                            p.badge_warn.text
-                                        } else if ag_upd.phase == UpdateCheckPhase::Failed {
-                                            p.badge_fail.text
-                                        } else {
-                                            p.text_secondary
-                                        }))
-                                        .child(ag_note),
+                                        .text_size(px(10.))
+                                        .text_color(rgb(p.text_muted))
+                                        .child("本地注入 → 仓库最新"),
                                 )
                                 .child(
-                                    mono_tabular(format!("最近检测：{ag_checked_age}"))
-                                        .text_size(px(11.))
-                                        .text_color(rgb(p.text_muted)),
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(4.))
+                                        .child(
+                                            mono_tabular(format!("{ag_local} →"))
+                                                .text_size(px(12.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(p.text_primary)),
+                                        )
+                                        .child(
+                                            mono_tabular(ag_latest)
+                                                .text_size(px(12.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(if ag_has_up {
+                                                    p.badge_warn.text
+                                                } else {
+                                                    p.badge_pass.text
+                                                })),
+                                        ),
                                 ),
                         )
                         .child(
                             action_button(
-                                "upd-check-ag-proxy-btn",
-                                "↻ 检测 antigravity-proxy 最新版",
-                                if ag_upd.phase == UpdateCheckPhase::UpdateAvailable {
-                                    ButtonKind::Primary
-                                } else {
-                                    ButtonKind::Secondary
-                                },
+                                "upd-ag-check",
+                                "检测",
+                                ButtonKind::Secondary,
                                 can_check,
                                 p,
                             )
+                            .h(px(28.))
+                            .px(px(10.))
                             .when(can_check, |b| {
                                 b.on_mouse_up(
                                     MouseButton::Left,
                                     cx.listener(move |_, _, _, cx| {
-                                        ctrl_check_ag.update(cx, |c, cx| {
+                                        ctrl_ag_chk.update(cx, |c, cx| {
                                             c.send_request(
                                                 PipeRequest::CheckUpdates {
                                                     component: Some("antigravity_proxy".into()),
                                                 },
-                                                Some("已完成 antigravity-proxy 最新版检测"),
+                                                Some("已完成 antigravity-proxy 仓库版本核验"),
                                                 cx,
                                             );
                                         });
                                     }),
                                 )
                             }),
+                        )
+                        .child(
+                            action_button(
+                                "upd-ag-repair-jump",
+                                "去热修复 →",
+                                ButtonKind::Primary,
+                                true,
+                                p,
+                            )
+                            .h(px(28.))
+                            .px(px(10.))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, _, cx| {
+                                    ctrl_ag_fix.update(cx, |c, cx| {
+                                        c.env_tab = EnvSubTab::Antigravity;
+                                        c.set_nav(NavSection::Environment, cx);
+                                    });
+                                }),
+                            ),
                         ),
                 ),
         )
-        // Card 3: 5 Tracked AI Clients Official Version Radar
+        // Band 3: 2x3 Symmetrical Grid
         .child(
             div()
                 .flex()
                 .flex_col()
                 .w_full()
-                .min_w(px(0.))
-                .gap(px(10.))
+                .flex_1()
+                .gap(px(9.))
                 .child(
                     div()
                         .flex()
-                        .flex_wrap()
                         .items_center()
                         .justify_between()
-                        .gap(px(8.))
-                        .px(px(2.))
+                        .px(px(3.))
                         .child(
                             div()
-                                .text_size(px(13.5))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(p.text_primary))
-                                .child("受管 AI 客户端官方版本追踪"),
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(p.text_primary))
+                                        .child("受管 AI 客户端与生态组件版本追踪"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(p.text_muted))
+                                        .child("绝不后台自动覆盖客户端 · 隔离期暂停检查"),
+                                ),
                         )
-                        .child(status_pill(
-                            if avail_clients > 0 {
-                                format!("已装 {installed_clients}/5 · {avail_clients} 项可更新")
+                        .child(
+                            mono_tabular(if avail_grid > 0 {
+                                format!("追踪 6 项 · {avail_grid} 项有更新")
                             } else {
-                                format!("已装 {installed_clients}/5 · 均已对齐最新")
-                            },
-                            if avail_clients > 0 {
-                                BadgeTone::Warn
+                                "追踪 6 项 · 均已对齐最新".into()
+                            })
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(if avail_grid > 0 {
+                                p.badge_warn.text
                             } else {
-                                BadgeTone::Pass
-                            },
-                            p,
-                        )),
+                                p.badge_pass.text
+                            })),
+                        ),
                 )
-                .children(client_rows),
+                .child(row1)
+                .child(row2)
+                .child(row3),
         )
 }
-
-

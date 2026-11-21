@@ -1,6 +1,7 @@
-//! Scheme C (Glass Bento) theme system: C2 Light (`Apple Silver Frost`) + C3 Dark (`Obsidian Emerald`).
+//! Frost Ceramic theme system: pure neutral ceramic Light + obsidian ceramic Dark.
 //!
-//! Supports `Light`, `Dark`, and `Auto` (follows Windows `HKCU\...\Personalize\AppsUseLightTheme`).
+//! Zero color cast, high-contrast charcoal/white ink accents, semantic status dots/pills,
+//! supporting `Light`, `Dark`, and `Auto` (Windows `AppsUseLightTheme`).
 
 pub use cg_protocol::ThemeMode;
 use gpui::{Hsla, Rgba, rgb, rgba};
@@ -17,7 +18,7 @@ pub fn theme_mode_label(mode: ThemeMode) -> &'static str {
     }
 }
 
-/// Visual tone for the Hero Bento card.
+/// Visual tone for the Hero card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeroTone {
     Healthy,
@@ -25,7 +26,7 @@ pub enum HeroTone {
     DisarmedOrPaused,
 }
 
-/// Visual tone for status pills and target badges.
+/// Visual tone for status pills and badges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BadgeTone {
     Pass,
@@ -63,26 +64,28 @@ pub struct TimelinePalette {
     pub empty: u32,
 }
 
-/// Complete resolved Scheme C color palette (`0xRRGGBB` or `0xRRGGBBAA` for alpha surfaces).
+/// Complete resolved Frost Ceramic color palette (`0xRRGGBB` or `0xRRGGBBAA` for alpha surfaces).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThemePalette {
     pub is_dark: bool,
     pub name: &'static str,
 
-    // Outer frame & surfaces (0xRRGGBB)
+    // Outer shell & ceramic surfaces (0xRRGGBB)
     pub frame_bg: u32,
     pub frame_border: u32,
     pub card_bg: u32,
     pub card_border: u32,
     pub inset_bg: u32,
     pub inset_border: u32,
+    pub guide_bg: u32,
+    pub line_strong: u32,
 
     // Typography (0xRRGGBB)
     pub text_primary: u32,
     pub text_secondary: u32,
     pub text_muted: u32,
 
-    // Sidebar & navigation (0xRRGGBB)
+    // Navigation Dock & active pill (0xRRGGBB)
     pub sidebar_bg: u32,
     pub sidebar_active_bg: u32,
     pub sidebar_active_text: u32,
@@ -97,7 +100,7 @@ pub struct ThemePalette {
     pub capsule_active_bg: u32,
     pub capsule_active_text: u32,
 
-    // Interactive buttons & accents (0xRRGGBB)
+    // Interactive buttons & ink accents (0xRRGGBB)
     pub primary_btn_bg: u32,
     pub primary_btn_hover_bg: u32,
     pub primary_btn_text: u32,
@@ -137,224 +140,232 @@ pub struct ThemePalette {
 
     // Ambient shadow (`0xRRGGBBAA`)
     pub shadow_rgba: u32,
+    // Modal / HUD overlay scrim (`0xRRGGBBAA`)
+    pub scrim_rgba: u32,
 }
 
-/// C2 · Apple Silver Frost (Light): pure silver-frost cold white with zero heavy dark slabs.
+/// Frost Ceramic (Light): pure neutral white ceramic with charcoal ink accents and zero rainbow cast.
 pub const LIGHT_C2: ThemePalette = ThemePalette {
     is_dark: false,
-    name: "C2 · Apple Silver Frost",
+    name: "Frost Ceramic Light",
 
-    frame_bg: 0xEEF1F6,
-    frame_border: 0xD8E0EA,
+    frame_bg: 0xF2F4F7,
+    frame_border: 0xDDE1E8,
     card_bg: 0xFFFFFF,
-    card_border: 0xE2E8F0,
-    inset_bg: 0xF8FAFC,
-    inset_border: 0xE2E8F0,
+    card_border: 0xE6E9EF,
+    inset_bg: 0xF4F5F8,
+    inset_border: 0xE6E9EF,
+    guide_bg: 0xF8F9FB,
+    line_strong: 0xD2D7E0,
 
-    text_primary: 0x0F172A,
-    text_secondary: 0x475569,
-    text_muted: 0x64748B,
+    text_primary: 0x111317,
+    text_secondary: 0x4B5260,
+    text_muted: 0x646D7D,
 
     sidebar_bg: 0xFFFFFF,
-    sidebar_active_bg: 0xE8F1FD,
-    sidebar_active_text: 0x0066CC,
-    sidebar_active_border: 0xBFDBFE,
-    sidebar_hover_bg: 0xF1F5F9,
+    sidebar_active_bg: 0x14171F,
+    sidebar_active_text: 0xFFFFFF,
+    sidebar_active_border: 0x14171F,
+    sidebar_hover_bg: 0xECEFF4,
 
-    switcher_track_bg: 0xE2E8F0,
+    switcher_track_bg: 0xECEFF4,
     switcher_active_bg: 0xFFFFFF,
-    switcher_active_text: 0x0F172A,
-    capsule_track_bg: 0xE2E8F0,
+    switcher_active_text: 0x111317,
+    capsule_track_bg: 0xF4F5F8,
     capsule_active_bg: 0xFFFFFF,
-    capsule_active_text: 0x0F172A,
+    capsule_active_text: 0x111317,
 
-    primary_btn_bg: 0x0066CC,
-    primary_btn_hover_bg: 0x0052A3,
+    primary_btn_bg: 0x14171F,
+    primary_btn_hover_bg: 0x272C38,
     primary_btn_text: 0xFFFFFF,
-    secondary_btn_bg: 0xFFFFFF,
-    secondary_btn_border: 0xCBD5E1,
-    secondary_btn_text: 0x0F172A,
+    secondary_btn_bg: 0xF4F5F8,
+    secondary_btn_border: 0xE2E5EC,
+    secondary_btn_text: 0x111317,
     danger_btn_bg: 0xDC2626,
     danger_btn_text: 0xFFFFFF,
-    link_text: 0x0066CC,
+    link_text: 0x14171F,
 
     input_bg: 0xFFFFFF,
-    input_border: 0xCBD5E1,
-    input_focus_border: 0x0066CC,
-    input_selection_rgba: 0x0066CC2E,
-    toggle_track_off: 0xCBD5E1,
-    toggle_track_on: 0x0066CC,
+    input_border: 0xD2D7E0,
+    input_focus_border: 0x14171F,
+    input_selection_rgba: 0x14171F26,
+    toggle_track_off: 0xCFD4DE,
+    toggle_track_on: 0x16A34A,
     toggle_knob: 0xFFFFFF,
 
-    cc_pill_bg: 0xE2E8F0,
-    cc_pill_text: 0x334155,
+    cc_pill_bg: 0xECEFF4,
+    cc_pill_text: 0x111317,
 
     hero_healthy: HeroSurface {
-        bg: 0xF3FDF7FF,
-        border: 0xBBF7D0FF,
-        title: 0x0F172A,
-        subtitle: 0x475569,
-        pill_bg: 0xDCFCE7FF,
-        pill_text: 0x15803D,
+        bg: 0xFFFFFFFF,
+        border: 0xE4E7EEFF,
+        title: 0x111317,
+        subtitle: 0x525866,
+        pill_bg: 0x16A34A18,
+        pill_text: 0x16A34A,
         ring: 0x16A34AFF,
     },
     hero_tripped: HeroSurface {
-        bg: 0xFEF2F2FF,
-        border: 0xFCA5A5FF,
-        title: 0x991B1B,
+        bg: 0xFEF5F5FF,
+        border: 0xDC26263D,
+        title: 0x111317,
         subtitle: 0x7F1D1D,
-        pill_bg: 0xFEE2E2FF,
-        pill_text: 0xB91C1C,
-        ring: 0xEF4444FF,
+        pill_bg: 0xDC262618,
+        pill_text: 0xDC2626,
+        ring: 0xDC2626FF,
     },
     hero_disarmed: HeroSurface {
-        bg: 0xFFFBEBFF,
-        border: 0xFCD34DFF,
-        title: 0x92400E,
+        bg: 0xFFFDF5FF,
+        border: 0xD9770644,
+        title: 0x111317,
         subtitle: 0x78350F,
-        pill_bg: 0xFEF3C7FF,
-        pill_text: 0xB45309,
-        ring: 0xF59E0BFF,
+        pill_bg: 0xD9770618,
+        pill_text: 0xD97706,
+        ring: 0xD97706FF,
     },
 
     badge_pass: BadgeSurface {
-        bg: 0xECFDF5FF,
-        text: 0x15803D,
+        bg: 0x16A34A18,
+        text: 0x16A34A,
         dot: 0x16A34A,
     },
     badge_fail: BadgeSurface {
-        bg: 0xFEF2F2FF,
-        text: 0xB91C1C,
-        dot: 0xEF4444,
+        bg: 0xDC262618,
+        text: 0xDC2626,
+        dot: 0xDC2626,
     },
     badge_warn: BadgeSurface {
-        bg: 0xFFFBEBFF,
-        text: 0xB45309,
-        dot: 0xF59E0B,
+        bg: 0xD9770618,
+        text: 0xD97706,
+        dot: 0xD97706,
     },
     badge_muted: BadgeSurface {
-        bg: 0xF1F5F9FF,
-        text: 0x64748B,
-        dot: 0x94A3B8,
+        bg: 0x1113170F,
+        text: 0x4B5260,
+        dot: 0x646D7D,
     },
 
     timeline: TimelinePalette {
         pass: 0x16A34A,
-        warn: 0xF59E0B,
-        fail: 0xEF4444,
-        empty: 0xE2E8F0,
+        warn: 0xD97706,
+        fail: 0xDC2626,
+        empty: 0xE2E5EC,
     },
 
-    shadow_rgba: 0x0F172A0E,
+    shadow_rgba: 0x0F172A0B,
+    scrim_rgba: 0x0F172A48,
 };
 
-/// C3 · Obsidian Emerald (Dark): OLED eye-care dark obsidian with emerald accents.
+/// Frost Ceramic (Dark): crisp neutral dark graphite tiles with high-contrast white ink accents.
 pub const DARK_C3: ThemePalette = ThemePalette {
     is_dark: true,
-    name: "C3 · Obsidian Emerald",
+    name: "Frost Ceramic Dark",
 
-    frame_bg: 0x0E1117,
-    frame_border: 0x242B3A,
-    card_bg: 0x161A24,
-    card_border: 0x252D3D,
-    inset_bg: 0x10141D,
-    inset_border: 0x202736,
+    frame_bg: 0x141518,
+    frame_border: 0x2B2D35,
+    card_bg: 0x1C1D22,
+    card_border: 0x2A2C34,
+    inset_bg: 0x24262D,
+    inset_border: 0x30333D,
+    guide_bg: 0x18191E,
+    line_strong: 0x3C3F4A,
 
-    text_primary: 0xF1F5F9,
-    text_secondary: 0xCBD5E1,
-    text_muted: 0x94A3B8,
+    text_primary: 0xF3F4F6,
+    text_secondary: 0xB4BCC8,
+    text_muted: 0x8E98A8,
 
-    sidebar_bg: 0x161A24,
-    sidebar_active_bg: 0x21293A,
-    sidebar_active_text: 0x34D399,
-    sidebar_active_border: 0x2F3B52,
-    sidebar_hover_bg: 0x1D2433,
+    sidebar_bg: 0x1E2026,
+    sidebar_active_bg: 0xF3F4F6,
+    sidebar_active_text: 0x111317,
+    sidebar_active_border: 0xF3F4F6,
+    sidebar_hover_bg: 0x2B2D36,
 
-    switcher_track_bg: 0x1D2433,
-    switcher_active_bg: 0x2A3448,
-    switcher_active_text: 0xF8FAFC,
-    capsule_track_bg: 0x161A24,
-    capsule_active_bg: 0x242C3E,
-    capsule_active_text: 0xF8FAFC,
+    switcher_track_bg: 0x23252C,
+    switcher_active_bg: 0x1C1D22,
+    switcher_active_text: 0xF3F4F6,
+    capsule_track_bg: 0x23252C,
+    capsule_active_bg: 0x1C1D22,
+    capsule_active_text: 0xF3F4F6,
 
-    primary_btn_bg: 0x10B981,
-    primary_btn_hover_bg: 0x059669,
-    primary_btn_text: 0x052E16,
-    secondary_btn_bg: 0x1D2433,
-    secondary_btn_border: 0x2F3B52,
-    secondary_btn_text: 0xF1F5F9,
-    danger_btn_bg: 0xEF4444,
+    primary_btn_bg: 0xF3F4F6,
+    primary_btn_hover_bg: 0xE0E3EA,
+    primary_btn_text: 0x111317,
+    secondary_btn_bg: 0x25272F,
+    secondary_btn_border: 0x353844,
+    secondary_btn_text: 0xF3F4F6,
+    danger_btn_bg: 0xDC2626,
     danger_btn_text: 0xFFFFFF,
-    link_text: 0x38BDF8,
+    link_text: 0xF3F4F6,
 
-    input_bg: 0x10141D,
-    input_border: 0x252D3D,
-    input_focus_border: 0x34D399,
-    input_selection_rgba: 0x34D39938,
-    toggle_track_off: 0x2A3448,
-    toggle_track_on: 0x10B981,
-    toggle_knob: 0xF8FAFC,
+    input_bg: 0x1C1D22,
+    input_border: 0x3B3E49,
+    input_focus_border: 0xF3F4F6,
+    input_selection_rgba: 0xF3F4F633,
+    toggle_track_off: 0x3B3E49,
+    toggle_track_on: 0x22C55E,
+    toggle_knob: 0xFFFFFF,
 
-    cc_pill_bg: 0x252D3D,
-    cc_pill_text: 0xCBD5E1,
+    cc_pill_bg: 0x2A2C34,
+    cc_pill_text: 0xF3F4F6,
 
     hero_healthy: HeroSurface {
-        bg: 0x0E2E24FF,
-        border: 0x34D39966, // rgba(52,211,153,0.40)
-        title: 0xF8FAFC,
-        subtitle: 0xCBD5E1,
-        pill_bg: 0x10B98138, // rgba(16,185,129,0.22)
-        pill_text: 0x6EE7B7,
-        ring: 0x34D3998C, // rgba(52,211,153,0.55)
+        bg: 0x1C1D22FF,
+        border: 0x2D3039FF,
+        title: 0xF3F4F6,
+        subtitle: 0xB4BCC8,
+        pill_bg: 0x22C55E24,
+        pill_text: 0x22C55E,
+        ring: 0x22C55EFF,
     },
     hero_tripped: HeroSurface {
-        bg: 0x2D1219FF,
-        border: 0xF8717173, // rgba(248,113,113,0.45)
-        title: 0xFEF2F2,
-        subtitle: 0xFECACA,
-        pill_bg: 0xEF444438,
-        pill_text: 0xFCA5A5,
-        ring: 0xF8717199,
+        bg: 0x281A1DFF,
+        border: 0xEF444457,
+        title: 0xF3F4F6,
+        subtitle: 0xFCA5A5,
+        pill_bg: 0xF8717126,
+        pill_text: 0xF87171,
+        ring: 0xF87171FF,
     },
     hero_disarmed: HeroSurface {
-        bg: 0x2B200EFF,
-        border: 0xFBBF246B, // rgba(251,191,36,0.42)
-        title: 0xFEF3C7,
+        bg: 0x262016FF,
+        border: 0xF59E0B55,
+        title: 0xF3F4F6,
         subtitle: 0xFDE68A,
-        pill_bg: 0xF59E0B38,
-        pill_text: 0xFCD34D,
-        ring: 0xFBBF2494,
+        pill_bg: 0xF59E0B24,
+        pill_text: 0xF59E0B,
+        ring: 0xF59E0BFF,
     },
 
     badge_pass: BadgeSurface {
-        bg: 0x10B98126, // rgba(16,185,129,0.15)
-        text: 0x34D399,
-        dot: 0x10B981,
+        bg: 0x22C55E24,
+        text: 0x22C55E,
+        dot: 0x22C55E,
     },
     badge_fail: BadgeSurface {
-        bg: 0xEF444429,
+        bg: 0xF8717124,
         text: 0xF87171,
         dot: 0xF87171,
     },
     badge_warn: BadgeSurface {
-        bg: 0xF59E0B29,
-        text: 0xFBBF24,
-        dot: 0xFBBF24,
+        bg: 0xF59E0B24,
+        text: 0xF59E0B,
+        dot: 0xF59E0B,
     },
     badge_muted: BadgeSurface {
-        bg: 0x252D3DFF,
-        text: 0x94A3B8,
-        dot: 0x64748B,
+        bg: 0xFFFFFF12,
+        text: 0xB4BCC8,
+        dot: 0x8E98A8,
     },
 
     timeline: TimelinePalette {
-        pass: 0x10B981,
-        warn: 0xFBBF24,
+        pass: 0x22C55E,
+        warn: 0xF59E0B,
         fail: 0xF87171,
-        empty: 0x202736,
+        empty: 0x2C2F38,
     },
 
-    shadow_rgba: 0x00000048,
+    shadow_rgba: 0x00000044,
+    scrim_rgba: 0x00000084,
 };
 
 impl ThemePalette {
@@ -376,7 +387,7 @@ impl ThemePalette {
     }
 }
 
-/// Resolves a [`ThemeMode`] given whether the host OS prefers light mode.
+/// Resolves the active [`ThemePalette`] given user preference and Windows light/dark theme.
 pub fn resolve_palette(mode: ThemeMode, system_prefers_light: bool) -> &'static ThemePalette {
     match mode {
         ThemeMode::Light => &LIGHT_C2,
@@ -391,20 +402,17 @@ pub fn resolve_palette(mode: ThemeMode, system_prefers_light: bool) -> &'static 
     }
 }
 
-/// Reads Windows `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`.
-/// Returns `true` (Light C2) if the key is absent or equals `1`, and `false` (Dark C3) if `0`.
+/// Detects whether Windows currently prefers Light apps (`AppsUseLightTheme != 0`).
 #[cfg(windows)]
 pub fn system_prefers_light_theme() -> bool {
     use winreg::RegKey;
     use winreg::enums::HKEY_CURRENT_USER;
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let Ok(key) = hkcu.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-    else {
-        return true;
-    };
-    let val: u32 = key.get_value("AppsUseLightTheme").unwrap_or(1);
-    val != 0
+    hkcu.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .and_then(|k| k.get_value::<u32, _>("AppsUseLightTheme"))
+        .map(|v| v != 0)
+        .unwrap_or(true)
 }
 
 #[cfg(not(windows))]
@@ -412,39 +420,36 @@ pub fn system_prefers_light_theme() -> bool {
     true
 }
 
-/// Convenience converter from `0xRRGGBB` to GPUI `Rgba`.
-#[inline]
+/// Convenience `0xRRGGBB` -> GPUI `Rgba`.
 pub fn c_rgb(hex: u32) -> Rgba {
     rgb(hex)
 }
 
-/// Convenience converter from `0xRRGGBBAA` to GPUI `Rgba`.
-#[inline]
+/// Convenience `0xRRGGBBAA` -> GPUI `Rgba`.
 pub fn c_rgba(hex: u32) -> Rgba {
     rgba(hex)
 }
 
-/// Convenience converter from `0xRRGGBB` to GPUI `Hsla`.
-#[inline]
+/// Convenience `0xRRGGBB` -> GPUI `Hsla`.
 pub fn c_hsla(hex: u32) -> Hsla {
     rgb(hex).into()
 }
 
-/// Layout constants for Mode A (Tray Quick HUD) and Mode B (Wide Bento Main Console).
+/// Layout constants for Mode A (Tray Quick HUD) and Mode B (Frost Ceramic Main Console).
 pub mod layout {
-    pub const HUD_WIDTH: f32 = 428.0;
-    pub const HUD_HEIGHT: f32 = 648.0;
+    pub const HUD_WIDTH: f32 = 398.0;
+    pub const HUD_HEIGHT: f32 = 432.0;
 
-    pub const CONSOLE_WIDTH: f32 = 1080.0;
-    pub const CONSOLE_HEIGHT: f32 = 800.0;
-    pub const CONSOLE_MIN_WIDTH: f32 = 760.0;
-    pub const CONSOLE_MIN_HEIGHT: f32 = 480.0;
+    pub const CONSOLE_WIDTH: f32 = 944.0;
+    pub const CONSOLE_HEIGHT: f32 = 682.0;
+    pub const CONSOLE_MIN_WIDTH: f32 = 820.0;
+    pub const CONSOLE_MIN_HEIGHT: f32 = 580.0;
 
     pub const SIDEBAR_WIDTH: f32 = 192.0;
-    pub const TOPBAR_HEIGHT: f32 = 46.0;
+    pub const TOPBAR_HEIGHT: f32 = 44.0;
     pub const BENTO_GAP: f32 = 12.0;
-    pub const RADIUS_FRAME: f32 = 16.0;
-    pub const RADIUS_BENTO: f32 = 14.0;
+    pub const RADIUS_FRAME: f32 = 20.0;
+    pub const RADIUS_BENTO: f32 = 16.0;
     pub const RADIUS_INSET: f32 = 11.0;
     pub const RADIUS_CONTROL: f32 = 9.0;
 }
@@ -454,71 +459,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn c2_light_tokens_match_locked_visual_spec() {
+    fn frost_ceramic_light_tokens_match_spec() {
         const { assert!(!LIGHT_C2.is_dark) };
-        assert_eq!(LIGHT_C2.frame_bg, 0xEEF1F6);
-        assert_eq!(LIGHT_C2.frame_border, 0xD8E0EA);
+        assert_eq!(LIGHT_C2.frame_bg, 0xF2F4F7);
         assert_eq!(LIGHT_C2.card_bg, 0xFFFFFF);
-        assert_eq!(LIGHT_C2.card_border, 0xE2E8F0);
-        assert_eq!(LIGHT_C2.inset_bg, 0xF8FAFC);
-        assert_eq!(LIGHT_C2.text_primary, 0x0F172A);
-        assert_eq!(LIGHT_C2.text_muted, 0x64748B);
-        assert_eq!(LIGHT_C2.sidebar_active_bg, 0xE8F1FD);
-        assert_eq!(LIGHT_C2.sidebar_active_text, 0x0066CC);
-        assert_eq!(LIGHT_C2.sidebar_active_border, 0xBFDBFE);
-        assert_eq!(LIGHT_C2.primary_btn_bg, 0x0066CC);
+        assert_eq!(LIGHT_C2.inset_bg, 0xF4F5F8);
+        assert_eq!(LIGHT_C2.text_primary, 0x111317);
+        assert_eq!(LIGHT_C2.text_secondary, 0x4B5260);
+        assert_eq!(LIGHT_C2.text_muted, 0x646D7D);
+        assert_eq!(LIGHT_C2.primary_btn_bg, 0x14171F);
         assert_eq!(LIGHT_C2.primary_btn_text, 0xFFFFFF);
-        assert_eq!(LIGHT_C2.cc_pill_bg, 0xE2E8F0);
-        assert_eq!(LIGHT_C2.cc_pill_text, 0x334155);
-        assert_eq!(LIGHT_C2.hero_healthy.bg, 0xF3FDF7FF);
-        assert_eq!(LIGHT_C2.hero_healthy.border, 0xBBF7D0FF);
-        assert_eq!(LIGHT_C2.hero_healthy.pill_bg, 0xDCFCE7FF);
-        assert_eq!(LIGHT_C2.hero_healthy.pill_text, 0x15803D);
-        assert_eq!(LIGHT_C2.hero_healthy.ring, 0x16A34AFF);
-        assert_eq!(LIGHT_C2.hero_tripped.bg, 0xFEF2F2FF);
-        assert_eq!(LIGHT_C2.hero_tripped.border, 0xFCA5A5FF);
-        assert_eq!(LIGHT_C2.hero_tripped.title, 0x991B1B);
-        assert_eq!(LIGHT_C2.hero_disarmed.bg, 0xFFFBEBFF);
-        assert_eq!(LIGHT_C2.hero_disarmed.border, 0xFCD34DFF);
-        assert_eq!(LIGHT_C2.hero_disarmed.title, 0x92400E);
+        assert_eq!(LIGHT_C2.toggle_track_on, 0x16A34A);
         assert_eq!(LIGHT_C2.timeline.pass, 0x16A34A);
-        assert_eq!(LIGHT_C2.timeline.warn, 0xF59E0B);
-        assert_eq!(LIGHT_C2.timeline.fail, 0xEF4444);
+        assert_eq!(LIGHT_C2.timeline.warn, 0xD97706);
+        assert_eq!(LIGHT_C2.timeline.fail, 0xDC2626);
     }
 
     #[test]
-    fn c3_dark_tokens_match_locked_visual_spec() {
+    fn frost_ceramic_dark_tokens_match_spec() {
         const { assert!(DARK_C3.is_dark) };
-        assert_eq!(DARK_C3.frame_bg, 0x0E1117);
-        assert_eq!(DARK_C3.frame_border, 0x242B3A);
-        assert_eq!(DARK_C3.card_bg, 0x161A24);
-        assert_eq!(DARK_C3.card_border, 0x252D3D);
-        assert_eq!(DARK_C3.inset_bg, 0x10141D);
-        assert_eq!(DARK_C3.inset_border, 0x202736);
-        assert_eq!(DARK_C3.text_primary, 0xF1F5F9);
-        assert_eq!(DARK_C3.text_muted, 0x94A3B8);
-        assert_eq!(DARK_C3.sidebar_active_bg, 0x21293A);
-        assert_eq!(DARK_C3.sidebar_active_text, 0x34D399);
-        assert_eq!(DARK_C3.sidebar_active_border, 0x2F3B52);
-        assert_eq!(DARK_C3.switcher_track_bg, 0x1D2433);
-        assert_eq!(DARK_C3.switcher_active_bg, 0x2A3448);
-        assert_eq!(DARK_C3.capsule_active_bg, 0x242C3E);
-        assert_eq!(DARK_C3.primary_btn_bg, 0x10B981);
-        assert_eq!(DARK_C3.primary_btn_text, 0x052E16);
-        assert_eq!(DARK_C3.link_text, 0x38BDF8);
-        assert_eq!(DARK_C3.cc_pill_bg, 0x252D3D);
-        assert_eq!(DARK_C3.cc_pill_text, 0xCBD5E1);
-        assert_eq!(DARK_C3.hero_healthy.bg, 0x0E2E24FF);
-        assert_eq!(DARK_C3.hero_healthy.border, 0x34D39966);
-        assert_eq!(DARK_C3.hero_healthy.pill_bg, 0x10B98138);
-        assert_eq!(DARK_C3.hero_healthy.pill_text, 0x6EE7B7);
-        assert_eq!(DARK_C3.hero_healthy.ring, 0x34D3998C);
-        assert_eq!(DARK_C3.hero_tripped.bg, 0x2D1219FF);
-        assert_eq!(DARK_C3.hero_tripped.border, 0xF8717173);
-        assert_eq!(DARK_C3.hero_disarmed.bg, 0x2B200EFF);
-        assert_eq!(DARK_C3.hero_disarmed.border, 0xFBBF246B);
-        assert_eq!(DARK_C3.timeline.pass, 0x10B981);
-        assert_eq!(DARK_C3.timeline.warn, 0xFBBF24);
+        assert_eq!(DARK_C3.frame_bg, 0x141518);
+        assert_eq!(DARK_C3.card_bg, 0x1C1D22);
+        assert_eq!(DARK_C3.text_primary, 0xF3F4F6);
+        assert_eq!(DARK_C3.text_secondary, 0xB4BCC8);
+        assert_eq!(DARK_C3.text_muted, 0x8E98A8);
+        assert_eq!(DARK_C3.primary_btn_bg, 0xF3F4F6);
+        assert_eq!(DARK_C3.primary_btn_text, 0x111317);
+        assert_eq!(DARK_C3.toggle_track_on, 0x22C55E);
+        assert_eq!(DARK_C3.timeline.pass, 0x22C55E);
+        assert_eq!(DARK_C3.timeline.warn, 0xF59E0B);
         assert_eq!(DARK_C3.timeline.fail, 0xF87171);
     }
 

@@ -502,6 +502,42 @@ fn demo_updates(now: u64, scenario: DemoScenario) -> UpdateSummary {
             "当前 v2.33.0 已是最新官方版本".into()
         },
     };
+    let antigravity_cn = ComponentUpdateStatus {
+        id: "antigravity_cn".into(),
+        name: "Antigravity 中文汉化引擎".into(),
+        repo: "Silas-02/antigravity-desktop-cn".into(),
+        phase: UpdateCheckPhase::UpdateAvailable,
+        installed_version: Some("2026.03.15".into()),
+        latest_version: Some("2026.03.19".into()),
+        release_url: Some("https://github.com/Silas-02/antigravity-desktop-cn".into()),
+        asset_url: None,
+        checked_at: Some(now.saturating_sub(18)),
+        note: "发现仓库新提交：本地 2026.03.15 -> 上游 2026.03.19".into(),
+    };
+    let ag_usage_monitor = ComponentUpdateStatus {
+        id: "ag_usage_monitor".into(),
+        name: "antigravity-usage-monitor".into(),
+        repo: "yuhuan-dev/antigravity-usage-monitor".into(),
+        phase: UpdateCheckPhase::UpdateAvailable,
+        installed_version: Some("1.5.3".into()),
+        latest_version: Some("1.6.0".into()),
+        release_url: Some("https://github.com/yuhuan-dev/antigravity-usage-monitor".into()),
+        asset_url: None,
+        checked_at: Some(now.saturating_sub(18)),
+        note: "发现新版本：当前 v1.5.3 -> 最新 v1.6.0".into(),
+    };
+    let ag_capsule = ComponentUpdateStatus {
+        id: "ag_capsule".into(),
+        name: "agy-capsule".into(),
+        repo: "Lumidarin/agy-capsule".into(),
+        phase: UpdateCheckPhase::UpToDate,
+        installed_version: Some("1.1.2".into()),
+        latest_version: Some("1.1.2".into()),
+        release_url: Some("https://github.com/Lumidarin/agy-capsule".into()),
+        asset_url: None,
+        checked_at: Some(now.saturating_sub(18)),
+        note: "当前 v1.1.2 已是最新官方版本".into(),
+    };
     UpdateSummary {
         claudeguard,
         antigravity_proxy,
@@ -510,6 +546,9 @@ fn demo_updates(now: u64, scenario: DemoScenario) -> UpdateSummary {
         codex_desktop,
         codex_cli,
         antigravity_ide,
+        antigravity_cn,
+        ag_usage_monitor,
+        ag_capsule,
         claude_msix_version: Some("5.1231.2.0".into()),
         codex_msix_version: Some("26.1111.2228.0".into()),
     }

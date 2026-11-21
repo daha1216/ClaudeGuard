@@ -666,7 +666,7 @@ pub fn project_target_card(target: &TargetStatus, privacy_mask: bool) -> TargetC
         maybe_mask_ip(ip, privacy_mask)
     } else if target.anchor_kind == AnchorKind::Reachability {
         if target.state == TargetState::Pass {
-            "Google 后端直通".into()
+            "Google 后端连通探测".into()
         } else {
             "仅可达性探测".into()
         }
@@ -1326,7 +1326,7 @@ pub fn project_antigravity_proxy_card(
         )
     } else if ag.dll_present && ag.dll_valid {
         let sub = if ag.dll_size > 0 {
-            format!("PE 签名特征通过 · {} KB", ag.dll_size / 1024)
+            format!("模块完整性校验通过 · {} KB", ag.dll_size / 1024)
         } else {
             "antigravity-proxy 模块特征匹配".into()
         };

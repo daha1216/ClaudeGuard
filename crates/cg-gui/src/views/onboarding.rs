@@ -100,13 +100,13 @@ pub fn render_onboarding_modal(
             .rounded(px(12.))
             .cursor_pointer()
             .bg(rgb(if active {
-                p.sidebar_active_bg
+                p.card_bg
             } else {
                 p.inset_bg
             }))
             .border_1()
             .border_color(rgb(if active {
-                p.sidebar_active_border
+                p.primary_btn_bg
             } else {
                 p.inset_border
             }))
@@ -169,7 +169,7 @@ pub fn render_onboarding_modal(
         .inset_0()
         .occlude()
         .on_mouse_down(MouseButton::Left, |_, _, _| {})
-        .bg(rgba(0x0B101ACC))
+        .bg(rgba(p.scrim_rgba))
         .flex()
         .items_center()
         .justify_center()

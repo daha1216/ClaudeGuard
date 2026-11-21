@@ -10,6 +10,7 @@
 /installer/*.exe
 /installer/*.zip
 /installer/*.sha256
+/installer/SHA256SUMS.txt
 
 # Local scratch & editor files
 .DS_Store

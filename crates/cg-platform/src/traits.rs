@@ -399,6 +399,9 @@ pub trait PlatformDriver: Send + Sync {
             codex_cli: crate::process_win::installed_codex_cli_version(),
             antigravity_ide: ag_ide_ver,
             antigravity_manifest_base: ag_manifest_base,
+            antigravity_cn: crate::process_win::installed_antigravity_cn_version(),
+            ag_usage_monitor: crate::process_win::installed_ag_usage_monitor_version(),
+            ag_capsule: crate::process_win::installed_ag_capsule_version(),
         };
         let mut out = prev.clone();
         crate::update_check::hydrate_summary_locals(&mut out, cg_version, ag_proxy, &local);

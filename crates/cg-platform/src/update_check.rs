@@ -16,6 +16,12 @@ use crate::traits::{PlatformError, PlatformResult};
 pub const CLAUDEGUARD_REPO: &str = "daha1216/ClaudeGuard";
 /// Upstream `antigravity-proxy` injector repository.
 pub const ANTIGRAVITY_PROXY_REPO: &str = "yuaotian/antigravity-proxy";
+/// Upstream `antigravity-desktop-cn` Chinese localization repository.
+pub const ANTIGRAVITY_CN_REPO: &str = "Silas-02/antigravity-desktop-cn";
+/// Upstream `antigravity-usage-monitor` plugin repository.
+pub const AG_USAGE_MONITOR_REPO: &str = "yuhuan-dev/antigravity-usage-monitor";
+/// Upstream `agy-capsule` plugin repository.
+pub const AG_CAPSULE_REPO: &str = "Lumidarin/agy-capsule";
 /// Exact user-facing description for `antigravity-proxy`.
 pub const ANTIGRAVITY_PROXY_DESC: &str =
     "专为 Antigravity 打造的免 TUN 强制代理工具，支持 DLL 注入与进程流量劫持。";
@@ -40,6 +46,9 @@ pub struct LocalClientVersions {
     pub codex_cli: Option<String>,
     pub antigravity_ide: Option<String>,
     pub antigravity_manifest_base: Option<String>,
+    pub antigravity_cn: Option<String>,
+    pub ag_usage_monitor: Option<String>,
+    pub ag_capsule: Option<String>,
 }
 
 /// Remote version discovery result for desktop MSIX, npm CLI, and Antigravity clients.
@@ -398,6 +407,102 @@ pub fn fetch_github_latest_release(
     fetch_github_latest_from_url(route, &api_url, preferred_exts, timeout)
 }
 
+/// Pure parser for GitHub `/commits?per_page=1` JSON payload, extracting commit date `YYYY.MM.DD`.
+pub fn parse_github_latest_commit(json_body: &str, repo: &str) -> PlatformResult<GithubReleaseInfo> {
+    let arr: serde_json::Value = serde_json::from_str(json_body)
+        .map_err(|e| PlatformError::Network(format!("GitHub Commits JSON 解析失败：{e}")))?;
+    let first = arr
+        .as_array()
+        .and_then(|items| items.first())
+        .ok_or_else(|| PlatformError::Network("GitHub 仓库提交记录为空".to_string()))?;
+    let date_raw = first
+        .pointer("/commit/committer/date")
+        .or_else(|| first.pointer("/commit/author/date"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| s.len() >= 10)
+        .ok_or_else(|| PlatformError::Network("GitHub 提交记录缺少有效日期".to_string()))?;
+    let ymd = date_raw[..10].replace('-', ".");
+    let sha = first
+        .get("sha")
+        .and_then(|v| v.as_str())
+        .map(|s| s.chars().take(7).collect::<String>())
+        .unwrap_or_default();
+    let html_url = first
+        .get("html_url")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("https://github.com/{}", repo.trim().trim_matches('/')));
+    Ok(GithubReleaseInfo {
+        tag_name: if sha.is_empty() {
+            ymd.clone()
+        } else {
+            format!("{ymd} ({sha})")
+        },
+        version: ymd,
+        html_url,
+        asset_url: None,
+        published_at: Some(date_raw.to_string()),
+    })
+}
+
+/// Fetch GitHub latest Release, falling back to latest default-branch commit date when the repo
+/// ships via source commits without formal GitHub Releases (e.g. `Silas-02/antigravity-desktop-cn`).
+pub fn fetch_github_latest_release_or_commit(
+    route: &ProbeRoute,
+    repo: &str,
+    preferred_exts: &[&str],
+    timeout: Duration,
+) -> PlatformResult<RemoteClientVersion> {
+    match fetch_github_latest_release(route, repo, preferred_exts, timeout) {
+        Ok(rel) => Ok(RemoteClientVersion {
+            version: rel.version,
+            release_url: (!rel.html_url.is_empty())
+                .then_some(rel.html_url)
+                .or_else(|| Some(format!("https://github.com/{}", repo.trim().trim_matches('/')))),
+            asset_url: rel.asset_url,
+        }),
+        Err(rel_err) => {
+            // Only fall back to commits when Releases endpoint returned HTTP 404 (no formal release).
+            if !rel_err.to_string().contains("404") {
+                return Err(rel_err);
+            }
+            let trimmed = repo.trim().trim_matches('/');
+            let commits_url = format!("https://api.github.com/repos/{trimmed}/commits?per_page=1");
+            let agent = build_update_agent(route, timeout, MAX_PROBE_REDIRECTS)?;
+            let resp = match agent
+                .get(&commits_url)
+                .timeout(timeout)
+                .set("User-Agent", PROBE_USER_AGENT)
+                .set("Accept", "application/vnd.github+json")
+                .call()
+            {
+                Ok(r) => r,
+                Err(ureq::Error::Status(code, _)) => {
+                    return Err(PlatformError::Network(format!(
+                        "GitHub 仓库提交查询失败（HTTP {code}）"
+                    )));
+                }
+                Err(err) => return Err(map_transport_err(route, err)),
+            };
+            let mut buf = Vec::new();
+            let _ = resp
+                .into_reader()
+                .take(MAX_PROBE_BODY_BYTES as u64)
+                .read_to_end(&mut buf);
+            let body = String::from_utf8_lossy(&buf);
+            let info = parse_github_latest_commit(&body, trimmed)?;
+            Ok(RemoteClientVersion {
+                version: info.version,
+                release_url: Some(info.html_url),
+                asset_url: None,
+            })
+        }
+    }
+}
+
 /// Parse official Claude Desktop MSIX redirect `Location` URL into semantic version.
 pub fn parse_claude_desktop_redirect(location: &str, arch: &str) -> PlatformResult<String> {
     if !matches!(arch, "x64" | "arm64") {
@@ -715,6 +820,43 @@ pub fn hydrate_summary_locals(
                 .map(normalize_version)
                 .filter(|s| !s.is_empty())
         });
+
+    ensure_slot(
+        &mut summary.antigravity_cn,
+        "antigravity_cn",
+        "Antigravity 中文汉化引擎",
+        ANTIGRAVITY_CN_REPO,
+    );
+    if summary.antigravity_cn.release_url.is_none() {
+        summary.antigravity_cn.release_url =
+            Some(format!("https://github.com/{ANTIGRAVITY_CN_REPO}"));
+    }
+    summary.antigravity_cn.installed_version =
+        local.antigravity_cn.as_deref().map(normalize_version);
+
+    ensure_slot(
+        &mut summary.ag_usage_monitor,
+        "ag_usage_monitor",
+        "antigravity-usage-monitor",
+        AG_USAGE_MONITOR_REPO,
+    );
+    if summary.ag_usage_monitor.release_url.is_none() {
+        summary.ag_usage_monitor.release_url =
+            Some(format!("https://github.com/{AG_USAGE_MONITOR_REPO}"));
+    }
+    summary.ag_usage_monitor.installed_version =
+        local.ag_usage_monitor.as_deref().map(normalize_version);
+
+    ensure_slot(
+        &mut summary.ag_capsule,
+        "ag_capsule",
+        "agy-capsule",
+        AG_CAPSULE_REPO,
+    );
+    if summary.ag_capsule.release_url.is_none() {
+        summary.ag_capsule.release_url = Some(format!("https://github.com/{AG_CAPSULE_REPO}"));
+    }
+    summary.ag_capsule.installed_version = local.ag_capsule.as_deref().map(normalize_version);
 }
 
 fn ensure_component_defaults(summary: &mut UpdateSummary, cg_version: &str) {
@@ -955,7 +1097,7 @@ where
         out.claudeguard =
             apply_claudeguard_check(&out.claudeguard, cg_version, now_secs, &mut gh_fetcher);
     }
-    if matches(&["antigravity_proxy", "antigravity-proxy"]) {
+    if matches(&["antigravity_proxy", "antigravity-proxy", "plugins", "antigravity_plugins"]) {
         out.antigravity_proxy = apply_antigravity_proxy_check(
             &out.antigravity_proxy,
             ag_proxy,
@@ -1018,6 +1160,56 @@ where
             || client_fetcher("antigravity_ide"),
         );
     }
+    if matches(&[
+        "antigravity_cn",
+        "antigravity-cn",
+        "antigravity-desktop-cn",
+        "plugins",
+        "antigravity_plugins",
+    ]) {
+        out.antigravity_cn = apply_client_update_check(
+            &out.antigravity_cn,
+            "antigravity_cn",
+            "Antigravity 中文汉化引擎",
+            ANTIGRAVITY_CN_REPO,
+            out.antigravity_cn.installed_version.as_deref(),
+            now_secs,
+            || client_fetcher("antigravity_cn"),
+        );
+    }
+    if matches(&[
+        "ag_usage_monitor",
+        "antigravity-usage-monitor",
+        "usage-monitor",
+        "plugins",
+        "antigravity_plugins",
+    ]) {
+        out.ag_usage_monitor = apply_client_update_check(
+            &out.ag_usage_monitor,
+            "ag_usage_monitor",
+            "antigravity-usage-monitor",
+            AG_USAGE_MONITOR_REPO,
+            out.ag_usage_monitor.installed_version.as_deref(),
+            now_secs,
+            || client_fetcher("ag_usage_monitor"),
+        );
+    }
+    if matches(&[
+        "ag_capsule",
+        "agy-capsule",
+        "plugins",
+        "antigravity_plugins",
+    ]) {
+        out.ag_capsule = apply_client_update_check(
+            &out.ag_capsule,
+            "ag_capsule",
+            "agy-capsule",
+            AG_CAPSULE_REPO,
+            out.ag_capsule.installed_version.as_deref(),
+            now_secs,
+            || client_fetcher("ag_capsule"),
+        );
+    }
 
     out
 }
@@ -1074,6 +1266,24 @@ pub fn check_all_updates_full(
                 route,
                 ag_manifest_base,
                 arch,
+                DEFAULT_UPDATE_CHECK_TIMEOUT,
+            ),
+            "antigravity_cn" => fetch_github_latest_release_or_commit(
+                route,
+                ANTIGRAVITY_CN_REPO,
+                &[".zip"],
+                DEFAULT_UPDATE_CHECK_TIMEOUT,
+            ),
+            "ag_usage_monitor" => fetch_github_latest_release_or_commit(
+                route,
+                AG_USAGE_MONITOR_REPO,
+                &[".zip", ".vsix"],
+                DEFAULT_UPDATE_CHECK_TIMEOUT,
+            ),
+            "ag_capsule" => fetch_github_latest_release_or_commit(
+                route,
+                AG_CAPSULE_REPO,
+                &[".zip", ".vsix"],
                 DEFAULT_UPDATE_CHECK_TIMEOUT,
             ),
             other => Err(PlatformError::InvalidInput(other.to_string())),
@@ -1485,6 +1695,9 @@ mod tests {
             codex_cli: None,
             antigravity_ide: Some("2.33.0".into()),
             antigravity_manifest_base: None,
+            antigravity_cn: Some("2026.03.15".into()),
+            ag_usage_monitor: Some("1.5.3".into()),
+            ag_capsule: Some("1.1.2".into()),
         };
         let ag_healthy = AntigravityProxyStatus {
             installed: true,
@@ -1519,6 +1732,9 @@ mod tests {
                 "codex_desktop" => Ok(RemoteClientVersion { version: "26.1111.2228.0".into(), release_url: None, asset_url: None }),
                 "codex_cli" => Ok(RemoteClientVersion { version: "0.160.0".into(), release_url: None, asset_url: None }),
                 "antigravity_ide" => Ok(RemoteClientVersion { version: "2.34.0".into(), release_url: None, asset_url: None }),
+                "antigravity_cn" => Ok(RemoteClientVersion { version: "2026.03.19".into(), release_url: None, asset_url: None }),
+                "ag_usage_monitor" => Ok(RemoteClientVersion { version: "1.6.0".into(), release_url: None, asset_url: None }),
+                "ag_capsule" => Ok(RemoteClientVersion { version: "1.1.2".into(), release_url: None, asset_url: None }),
                 other => Err(PlatformError::InvalidInput(other.into())),
             },
         );
@@ -1527,6 +1743,17 @@ mod tests {
         assert_eq!(summary.codex_desktop.phase, UpdateCheckPhase::UpToDate);
         assert_eq!(summary.codex_cli.phase, UpdateCheckPhase::NotInstalled);
         assert_eq!(summary.antigravity_ide.phase, UpdateCheckPhase::UpdateAvailable);
+        assert_eq!(summary.antigravity_cn.phase, UpdateCheckPhase::UpdateAvailable);
+        assert_eq!(summary.ag_usage_monitor.phase, UpdateCheckPhase::UpdateAvailable);
+        assert_eq!(summary.ag_capsule.phase, UpdateCheckPhase::UpToDate);
         assert!(ANTIGRAVITY_PROXY_DESC.contains("免 TUN 强制代理工具"));
+
+        let commit = parse_github_latest_commit(
+            r#"[{"sha":"abcdef123456","html_url":"https://github.com/Silas-02/antigravity-desktop-cn/commit/abcdef1","commit":{"committer":{"date":"2026-03-19T08:30:00Z"}}}]"#,
+            ANTIGRAVITY_CN_REPO,
+        )
+        .unwrap();
+        assert_eq!(commit.version, "2026.03.19");
+        assert!(is_version_newer(&commit.version, "2026.03.15"));
     }
 }

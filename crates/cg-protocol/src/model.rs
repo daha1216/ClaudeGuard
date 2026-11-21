@@ -822,7 +822,37 @@ fn default_antigravity_ide_update_status() -> ComponentUpdateStatus {
     }
 }
 
-/// Aggregated software update and local MSIX / CLI / IDE package version summary.
+fn default_antigravity_cn_update_status() -> ComponentUpdateStatus {
+    ComponentUpdateStatus {
+        id: "antigravity_cn".into(),
+        name: "Antigravity 中文汉化引擎".into(),
+        repo: "Silas-02/antigravity-desktop-cn".into(),
+        release_url: Some("https://github.com/Silas-02/antigravity-desktop-cn".into()),
+        ..ComponentUpdateStatus::default()
+    }
+}
+
+fn default_ag_usage_monitor_update_status() -> ComponentUpdateStatus {
+    ComponentUpdateStatus {
+        id: "ag_usage_monitor".into(),
+        name: "antigravity-usage-monitor".into(),
+        repo: "yuhuan-dev/antigravity-usage-monitor".into(),
+        release_url: Some("https://github.com/yuhuan-dev/antigravity-usage-monitor".into()),
+        ..ComponentUpdateStatus::default()
+    }
+}
+
+fn default_ag_capsule_update_status() -> ComponentUpdateStatus {
+    ComponentUpdateStatus {
+        id: "ag_capsule".into(),
+        name: "agy-capsule".into(),
+        repo: "Lumidarin/agy-capsule".into(),
+        release_url: Some("https://github.com/Lumidarin/agy-capsule".into()),
+        ..ComponentUpdateStatus::default()
+    }
+}
+
+/// Aggregated software update and local MSIX / CLI / IDE / plugin package version summary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSummary {
@@ -840,6 +870,12 @@ pub struct UpdateSummary {
     pub codex_cli: ComponentUpdateStatus,
     #[serde(default = "default_antigravity_ide_update_status")]
     pub antigravity_ide: ComponentUpdateStatus,
+    #[serde(default = "default_antigravity_cn_update_status")]
+    pub antigravity_cn: ComponentUpdateStatus,
+    #[serde(default = "default_ag_usage_monitor_update_status")]
+    pub ag_usage_monitor: ComponentUpdateStatus,
+    #[serde(default = "default_ag_capsule_update_status")]
+    pub ag_capsule: ComponentUpdateStatus,
     #[serde(default)]
     pub claude_msix_version: Option<String>,
     #[serde(default)]
@@ -856,6 +892,9 @@ impl Default for UpdateSummary {
             codex_desktop: default_codex_desktop_update_status(),
             codex_cli: default_codex_cli_update_status(),
             antigravity_ide: default_antigravity_ide_update_status(),
+            antigravity_cn: default_antigravity_cn_update_status(),
+            ag_usage_monitor: default_ag_usage_monitor_update_status(),
+            ag_capsule: default_ag_capsule_update_status(),
             claude_msix_version: None,
             codex_msix_version: None,
         }

@@ -81,6 +81,35 @@ if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
 
 $setup = Join-Path $outDir "ClaudeGuard-v$Ver-setup.exe"
 if (-not (Test-Path $setup)) { throw "setup exe not produced: $setup" }
+
+$portableZip = Join-Path $outDir "ClaudeGuard-v$Ver-portable.zip"
+$portableStage = Join-Path $root "target\portable-stage"
+if (Test-Path $portableStage) { Remove-Item $portableStage -Recurse -Force }
+New-Item -ItemType Directory -Path $portableStage | Out-Null
+try {
+    Copy-Item (Join-Path $stageDir "claudeguard-daemon.exe") $portableStage -Force
+    Copy-Item (Join-Path $stageDir "claudeguard-cli.exe")    $portableStage -Force
+    Copy-Item (Join-Path $stageDir "claudeguard-gui.exe")    $portableStage -Force
+    if (Test-Path $portableZip) { Remove-Item $portableZip -Force }
+    Compress-Archive -Path (Join-Path $portableStage "*") -DestinationPath $portableZip -CompressionLevel Optimal
+} finally {
+    if (Test-Path $portableStage) { Remove-Item $portableStage -Recurse -Force }
+}
+
+$sumsPath = Join-Path $outDir "SHA256SUMS.txt"
+$sumLines = @(
+    $setup,
+    $portableZip
+) | ForEach-Object {
+    $h = (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+    "$h  $([System.IO.Path]::GetFileName($_))"
+}
+[System.IO.File]::WriteAllText($sumsPath, ($sumLines -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
+
 $hash = (Get-FileHash $setup -Algorithm SHA256).Hash
 $len = (Get-Item $setup).Length
-Write-Host ("setup: {0}  sha256={1}  {2:N0} bytes" -f $setup, $hash.Substring(0, 16), $len)
+$zipHash = (Get-FileHash $portableZip -Algorithm SHA256).Hash
+$zipLen = (Get-Item $portableZip).Length
+Write-Host ("setup:    {0}  sha256={1}  {2:N0} bytes" -f $setup, $hash.Substring(0, 16), $len)
+Write-Host ("portable: {0}  sha256={1}  {2:N0} bytes" -f $portableZip, $zipHash.Substring(0, 16), $zipLen)
+Write-Host ("sums:     {0}" -f $sumsPath)
