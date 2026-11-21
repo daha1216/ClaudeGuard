@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 更新日志（CHANGELOG）
+    url: https://github.com/daha1216/ClaudeGuard/blob/master/CHANGELOG.md
+    about: 查看 v4.0.0 与历史版本变更说明
+  - name: 贡献指南（CONTRIBUTING）
+    url: https://github.com/daha1216/ClaudeGuard/blob/master/CONTRIBUTING.md
+    about: 仓库结构、测试门禁与 TEST-NET 夹具约定

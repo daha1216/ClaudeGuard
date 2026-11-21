@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (-D warnings)
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+      - name: Build daemon & CLI release
+        run: cargo build --release --locked --bins
+      - name: Upload daemon & CLI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeGuard-v4-backend-windows
+          path: |
+            target/release/claudeguard-daemon.exe
+            target/release/claudeguard-cli.exe

@@ -1,0 +1,74 @@
+name: Bug 反馈
+description: 报告 ClaudeGuard 运行异常、误熔断、无法恢复或界面问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！提交前请先搜索 [已有 Issues](../../issues) 避免重复。
+        可在主界面「审计」页点击 **「导出脱敏诊断包 (.zip)」**，上传前请再次确认已脱敏真实出口 IP、代理地址与 Webhook。
+  - type: input
+    id: version
+    attributes:
+      label: ClaudeGuard 版本
+      description: `claudeguard-daemon.exe --version` 或「更新」页顶部显示的版本号（如 `4.0.0`）。
+      placeholder: "4.0.0"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      description: 例如 `Windows 11 23H2 (22631)`；按 `Win + R` → `winver` 查看。
+      placeholder: "Windows 11 23H2 (22631)"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: 安装方式
+      options:
+        - 安装版（ClaudeGuard-v4.x.y-setup.exe）
+        - 便携版（ClaudeGuard-v4.x.y-portable.zip）
+        - 从源码构建
+    validations:
+      required: true
+  - type: dropdown
+    id: access
+    attributes:
+      label: 接入方式
+      description: 代理或 TUN 状态（见「防漏 → 防漏护盾与雷达」或 `claudeguard-cli --status`）。
+      options:
+        - 本地 HTTP / SOCKS 代理（如 127.0.0.1:7890）
+        - TUN 虚拟网卡
+        - 两者均未开启（直连风险状态）
+        - 不清楚
+    validations:
+      required: true
+  - type: textarea
+    id: symptom
+    attributes:
+      label: 问题现象
+      description: 发生时机、执行了什么操作、预期行为与实际结果。若为误熔断，请说明当轮未通过的目标。
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: "`--status` / `--check` 输出或日志片段（可选，已脱敏）"
+      description: |
+        可执行 `claudeguard-cli.exe --status` 或 `claudeguard-cli.exe --check` 粘贴脱敏后的 JSON。
+        **请先将真实 IP 替换为 `198.51.100.x` 等测试网段占位符。**
+      render: json
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 已脱敏日志、诊断包与截图中的真实 IP / 节点信息 / Webhook
+          required: true
+        - label: 已搜索现有 Issues，没有重复
+          required: true
