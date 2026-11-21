@@ -1,0 +1,12 @@
+[package]
+name = "cg-v3-bridge"
+version = "4.0.0"
+edition = "2021"
+license = "MIT"
+description = "ClaudeGuard v3 to v4 seamless self-update bridge bootstrapper"
+
+[workspace]
+
+[[bin]]
+name = "claudeguard-v3-bridge"
+path = "src/main.rs"

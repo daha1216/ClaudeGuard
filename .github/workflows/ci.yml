@@ -18,6 +18,10 @@ jobs:
         run: cargo clippy --workspace --locked --all-targets -- -D warnings
       - name: Run workspace tests
         run: cargo test --workspace --locked
+      - name: Check v3 upgrade bridge
+        run: |
+          cargo clippy --manifest-path crates/cg-v3-bridge/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path crates/cg-v3-bridge/Cargo.toml
       - name: Build daemon & CLI release
         run: cargo build --release --locked --bins
       - name: Upload daemon & CLI artifacts

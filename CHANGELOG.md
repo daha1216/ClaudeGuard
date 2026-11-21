@@ -13,7 +13,7 @@
 - **三端解耦与权限分离**：拆分为 `claudeguard-daemon.exe`（`ClaudeGuardService` Session-0 系统服务）、`claudeguard-cli.exe`（脚本化检查与应急恢复 CLI）与 `claudeguard-gui.exe`（`asInvoker` 普通权限原生 GPUI 界面，无 WebView2 依赖）。
 - **安全 Named Pipe IPC**：采用 SDDL ACL（`SY`/`BA` 完全控制、`AU` 读写）与 `PIPE_REJECT_REMOTE_CLIENTS` 绑定 `\\.\pipe\ClaudeGuardV4`，支持 4 MiB 帧长校验与 `Arc<RwLock<_>>` 零阻塞快照读取。
 - **WAL 崩溃回滚账本（`journal.json`）**：所有系统级变更（防火墙隔离、手动封锁、全局断网、时区与位置对齐）均遵循「先持久化 WAL 再操作 OS」，并在服务启动及离线 `--restore` 时幂等自愈回滚。
-- **配置 v4 无损迁移**：兼容迁移 `%APPDATA%\ClaudeGuard` 与 `%ProgramData%\ClaudeGuard` 中的 v2/v3 旧版 `config.json`（首次迁移生成 `config.v{ver}.bak.json` 备份），Inno Setup 沿用同一 `AppId` 自动清理旧版 `ClaudeGuard.exe` 与开机启动残留。
+- **配置 v4 无损迁移与旧版升级引导**：新增 `cg-v3-bridge`（`ClaudeGuard-v4.0.0-upgrade.exe`）对接 `v3.x` 自更新检查与下载流程，自动将 `%APPDATA%\ClaudeGuard\config.json` 迁入 `%ProgramData%\ClaudeGuard\config.json`（首次迁移生成 `config.v3.bak.json` 备份），并在安装完成后清理旧版 `ClaudeGuard.exe` 与开机启动残留。
 
 ### 新功能与界面重塑
 
