@@ -119,7 +119,8 @@ pub fn validate(targets: Vec<Target>) -> Result<Vec<Target>, String> {
 
         target.expect_ips = strict_ips(&target.name, &target.expect_ips)?;
         target.expect_regions = strict_regions(&target.name, &target.expect_regions)?;
-        if target.anchor_kind != AnchorKind::Reachability
+        if target.enabled
+            && target.anchor_kind != AnchorKind::Reachability
             && target.expect_ips.is_empty()
             && target.expect_regions.is_empty()
         {
@@ -181,6 +182,21 @@ mod tests {
         assert!(validate(targets.clone()).is_err());
 
         targets.remove(0);
+        assert!(validate(targets).is_err());
+    }
+
+    #[test]
+    fn validate_allows_disabled_target_with_empty_allowlist_and_rejects_enabled() {
+        let mut targets = default_targets(&[], &["US".into()]);
+        // Built-in `local` is disabled by default; clearing its allowlist while disabled must pass.
+        targets[0].enabled = false;
+        targets[0].expect_ips.clear();
+        targets[0].expect_regions.clear();
+        let validated = validate(targets.clone()).expect("disabled target may have empty allowlist");
+        assert!(!validated[0].enabled);
+
+        // Enabling it with an empty allowlist must still be rejected.
+        targets[0].enabled = true;
         assert!(validate(targets).is_err());
     }
 

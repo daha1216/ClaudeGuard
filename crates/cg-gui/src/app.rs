@@ -221,6 +221,8 @@ pub struct AppController {
     pub onboarding_dismissed: bool,
     pub onboarding_probe: Option<OnboardingProbeResult>,
     pub onboarding_loading: bool,
+    pub onboarding_submitting: bool,
+    pub onboarding_error: Option<String>,
     pub onboarding_proxy_off_sim: bool,
     pub toast: Option<(String, bool)>,
     pub toast_seq: u64,
@@ -448,6 +450,8 @@ impl AppController {
             onboarding_dismissed: false,
             onboarding_probe: None,
             onboarding_loading: false,
+            onboarding_submitting: false,
+            onboarding_error: None,
             onboarding_proxy_off_sim: false,
             toast: None,
             toast_seq: 0,
@@ -758,6 +762,8 @@ impl AppController {
             }
         } else if snapshot.lifecycle != Lifecycle::Unconfigured {
             self.show_onboarding = false;
+            self.onboarding_submitting = false;
+            self.onboarding_error = None;
         }
         // Relay new Session-0 daemon notifications to Session-1 Windows Action Center
         let max_toast_seq = snapshot
@@ -1197,10 +1203,13 @@ impl AppController {
     }
 
     pub fn probe_onboarding(&mut self, cx: &mut Context<Self>) {
+        self.onboarding_error = None;
         if self.client.is_demo() {
             let probe = crate::demo::build_demo_onboarding_probe(!self.onboarding_proxy_off_sim);
             if let Some(rec) = probe.recommended_strategy {
                 self.drafts.onboarding_strategy = rec;
+            } else if let Some(first) = probe.options.first() {
+                self.drafts.onboarding_strategy = first.strategy;
             }
             self.onboarding_probe = Some(probe);
             self.onboarding_loading = false;
@@ -1224,17 +1233,23 @@ impl AppController {
                     Ok(PipeResponse::OnboardingProbe { probe }) => {
                         if let Some(rec) = probe.recommended_strategy {
                             ctrl.drafts.onboarding_strategy = rec;
+                        } else if let Some(first) = probe.options.first() {
+                            ctrl.drafts.onboarding_strategy = first.strategy;
                         }
                         ctrl.onboarding_probe = Some(probe);
                     }
                     Ok(PipeResponse::Error { message, .. }) => {
-                        ctrl.set_toast(format!("向导环境探测失败：{message}"), false, cx);
+                        let msg = format!("向导环境探测失败：{message}");
+                        ctrl.onboarding_error = Some(msg.clone());
+                        ctrl.set_toast(msg, false, cx);
                     }
                     Ok(_) => {}
                     Err(err) => {
+                        let msg = err.to_string();
                         ctrl.connected = false;
-                        ctrl.connection_err = Some(err.to_string());
-                        ctrl.set_toast(err.to_string(), false, cx);
+                        ctrl.connection_err = Some(msg.clone());
+                        ctrl.onboarding_error = Some(msg.clone());
+                        ctrl.set_toast(msg, false, cx);
                     }
                 }
                 cx.notify();
@@ -1244,46 +1259,128 @@ impl AppController {
     }
 
     pub fn complete_onboarding(&mut self, cx: &mut Context<Self>) {
+        if self.onboarding_submitting {
+            return;
+        }
         let base = self
             .snapshot
             .as_ref()
             .map(|s| s.config.clone())
             .unwrap_or_default();
         let Some(probe) = self.onboarding_probe.as_ref() else {
-            self.set_toast("正在探测本机环境，请稍候", false, cx);
+            self.onboarding_error = Some("正在探测本机环境，请稍候".into());
+            cx.notify();
             return;
         };
-        match crate::state::build_onboarding_config(
+        let cfg = match crate::state::build_onboarding_config(
             &base,
             probe,
             self.drafts.onboarding_strategy,
             &self.drafts.onboarding_custom_cidr,
             &self.drafts.onboarding_custom_regions,
         ) {
-            Ok(cfg) => {
-                self.show_onboarding = false;
-                self.onboarding_dismissed = false;
-                self.send_request(
-                    PipeRequest::CompleteOnboarding { config: cfg },
-                    Some("首次配置已完成并开始布防"),
-                    cx,
-                );
-            }
+            Ok(cfg) => cfg,
             Err(err) => {
-                self.set_toast(err, false, cx);
+                self.onboarding_error = Some(err);
+                cx.notify();
+                return;
             }
-        }
+        };
+
+        // Keep modal open until daemon confirms persistence; prevents flicker and
+        // avoids 1s background poll reopening the modal on validation/IPC failure.
+        let client = self.client.clone();
+        self.onboarding_submitting = true;
+        self.onboarding_error = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { client.exchange(PipeRequest::CompleteOnboarding { config: cfg }) })
+                .await;
+
+            let _ = this.update(cx, |ctrl, cx| {
+                ctrl.onboarding_submitting = false;
+                match res {
+                    Ok(PipeResponse::Snapshot { snapshot }) => {
+                        let armed = snapshot.lifecycle != Lifecycle::Unconfigured;
+                        ctrl.apply_snapshot(*snapshot, cx);
+                        if armed {
+                            ctrl.show_onboarding = false;
+                            ctrl.onboarding_dismissed = false;
+                            ctrl.onboarding_error = None;
+                            ctrl.set_toast("首次配置已完成并开始布防", true, cx);
+                        } else {
+                            ctrl.show_onboarding = true;
+                            ctrl.onboarding_error = Some("配置尚未生效，请检查白名单配置后重试".into());
+                        }
+                    }
+                    Ok(PipeResponse::Ack { receipt, snapshot }) => {
+                        if let Some(snap) = snapshot {
+                            ctrl.apply_snapshot(*snap, cx);
+                        }
+                        if let Some(rc) = receipt
+                            && matches!(
+                                rc.status,
+                                OperationStatus::Failed | OperationStatus::Partial
+                            )
+                        {
+                            let detail = rc.error.filter(|s| !s.is_empty()).unwrap_or_else(|| {
+                                format!("首次布防未完全通过：{}", rc.verified_scope)
+                            });
+                            ctrl.show_onboarding = true;
+                            ctrl.onboarding_error = Some(detail);
+                        } else if ctrl
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|s| s.lifecycle == Lifecycle::Unconfigured)
+                        {
+                            ctrl.show_onboarding = true;
+                            ctrl.onboarding_error =
+                                Some("守护服务尚未退出未配置态，请检查配置后重试".into());
+                        } else {
+                            ctrl.show_onboarding = false;
+                            ctrl.onboarding_dismissed = false;
+                            ctrl.onboarding_error = None;
+                            ctrl.set_toast("首次配置已完成并开始布防", true, cx);
+                        }
+                    }
+                    Ok(PipeResponse::Error { message, .. }) => {
+                        ctrl.show_onboarding = true;
+                        ctrl.onboarding_error = Some(message);
+                    }
+                    Ok(_) => {
+                        ctrl.show_onboarding = true;
+                        ctrl.onboarding_error = Some("守护服务返回了非预期的响应，请重试".into());
+                    }
+                    Err(err) => {
+                        let msg = err.to_string();
+                        ctrl.connected = false;
+                        ctrl.connection_err = Some(msg.clone());
+                        ctrl.show_onboarding = true;
+                        ctrl.onboarding_error = Some(msg);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn skip_onboarding(&mut self, cx: &mut Context<Self>) {
         self.show_onboarding = false;
         self.onboarding_dismissed = true;
+        self.onboarding_submitting = false;
+        self.onboarding_error = None;
         self.set_toast("已进入只读未配置态，随时可在顶栏重新打开向导", true, cx);
     }
 
     pub fn open_onboarding_modal(&mut self, cx: &mut Context<Self>) {
         self.show_onboarding = true;
         self.onboarding_dismissed = false;
+        self.onboarding_submitting = false;
+        self.onboarding_error = None;
         self.probe_onboarding(cx);
         cx.notify();
     }

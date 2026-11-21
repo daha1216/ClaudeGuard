@@ -155,16 +155,89 @@ fn remove_file_with_retry(path: &Path) {
     }
 }
 
-fn cleanup_post_install(args: &WaiterArgs, setup_succeeded: bool) {
-    remove_file_with_retry(&args.setup_exe);
-    let gui_installed = args
-        .app_exe
+fn is_v4_installed(app_exe: &Path, program_files: Option<&Path>) -> bool {
+    if app_exe
         .parent()
         .map(|dir| dir.join("claudeguard-gui.exe").is_file())
-        .unwrap_or(false);
-    if setup_succeeded || gui_installed {
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if let Some(pf) = program_files {
+        if pf.join("ClaudeGuard").join("claudeguard-gui.exe").is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+fn cleanup_legacy_v3_shortcuts(user_profile: Option<&Path>, appdata: Option<&Path>) {
+    if let Some(home) = user_profile {
+        remove_file_with_retry(&home.join("Desktop").join("ClaudeGuard.lnk"));
+    }
+    if let Some(roaming) = appdata {
+        remove_file_with_retry(
+            &roaming
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("ClaudeGuard.lnk"),
+        );
+    }
+}
+
+fn cleanup_post_install_with(
+    args: &WaiterArgs,
+    setup_succeeded: bool,
+    program_files: Option<&Path>,
+    user_profile: Option<&Path>,
+    appdata: Option<&Path>,
+) {
+    remove_file_with_retry(&args.setup_exe);
+    let installed = setup_succeeded || is_v4_installed(&args.app_exe, program_files);
+    if installed {
         remove_file_with_retry(&args.app_exe);
         remove_file_with_retry(&args.old_exe);
+        if let Some(app_dir) = args.app_exe.parent() {
+            if !app_dir.join("claudeguard-gui.exe").is_file() {
+                let _ = fs::remove_dir(app_dir);
+            }
+        }
+        cleanup_legacy_v3_shortcuts(user_profile, appdata);
+    }
+}
+
+fn cleanup_post_install(args: &WaiterArgs, setup_succeeded: bool) {
+    let pf = non_empty_env_dir("ProgramFiles");
+    let user_profile = non_empty_env_dir("USERPROFILE");
+    let appdata = non_empty_env_dir("APPDATA");
+    cleanup_post_install_with(
+        args,
+        setup_succeeded,
+        pf.as_deref(),
+        user_profile.as_deref(),
+        appdata.as_deref(),
+    );
+}
+
+fn schedule_waiter_self_cleanup(waiter_exe: &Path) {
+    win_api::schedule_delete_on_reboot(waiter_exe);
+    #[cfg(windows)]
+    {
+        let exe_s = waiter_exe.to_string_lossy().replace('"', "");
+        let dir_s = waiter_exe
+            .parent()
+            .map(|p| p.to_string_lossy().replace('"', ""))
+            .unwrap_or_default();
+        let script = if !dir_s.is_empty() && dir_s.to_ascii_lowercase().ends_with("\\staging") {
+            format!("ping -n 3 127.0.0.1 >nul & del /f /q \"{exe_s}\" >nul 2>&1 & rmdir \"{dir_s}\" >nul 2>&1")
+        } else {
+            format!("ping -n 3 127.0.0.1 >nul & del /f /q \"{exe_s}\" >nul 2>&1")
+        };
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", &script]);
+        let _ = spawn_detached(&mut cmd);
     }
 }
 
@@ -178,6 +251,27 @@ mod win_api {
     const MB_ICONERROR: u32 = 0x0000_0010;
     const MOVEFILE_DELAY_UNTIL_REBOOT: u32 = 0x0000_0004;
     const SW_SHOWNORMAL: i32 = 1;
+    const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
+    const INFINITE: u32 = 0xFFFF_FFFF;
+
+    #[repr(C)]
+    pub(super) struct ShellExecuteInfoW {
+        cb_size: u32,
+        f_mask: u32,
+        hwnd: *mut c_void,
+        lp_verb: *const u16,
+        lp_file: *const u16,
+        lp_parameters: *const u16,
+        lp_directory: *const u16,
+        n_show: i32,
+        h_inst_app: *mut c_void,
+        lp_id_list: *mut c_void,
+        lp_class: *const u16,
+        hkey_class: *mut c_void,
+        dw_hot_key: u32,
+        h_icon_or_monitor: *mut c_void,
+        h_process: *mut c_void,
+    }
 
     #[link(name = "user32")]
     unsafe extern "system" {
@@ -187,18 +281,14 @@ mod win_api {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn MoveFileExW(existing: *const u16, new_name: *const u16, flags: u32) -> i32;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn GetExitCodeProcess(handle: *mut c_void, exit_code: *mut u32) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
     }
 
     #[link(name = "shell32")]
     unsafe extern "system" {
-        fn ShellExecuteW(
-            hwnd: *mut c_void,
-            operation: *const u16,
-            file: *const u16,
-            parameters: *const u16,
-            directory: *const u16,
-            show_cmd: i32,
-        ) -> isize;
+        fn ShellExecuteExW(exec_info: *mut ShellExecuteInfoW) -> i32;
     }
 
     fn wide_null(s: &OsStr) -> Vec<u16> {
@@ -220,28 +310,45 @@ mod win_api {
         }
     }
 
-    pub fn launch_elevated_setup(setup_exe: &Path) -> Result<(), String> {
+    /// Launches setup elevated via UAC and waits for it to finish, returning whether exit code == 0.
+    pub fn run_elevated_setup_and_wait(setup_exe: &Path) -> Result<bool, String> {
         let op = wide_null(OsStr::new("runas"));
         let file = wide_null(setup_exe.as_os_str());
         let params = wide_null(OsStr::new("/SP-"));
-        let res = unsafe {
-            ShellExecuteW(
-                std::ptr::null_mut(),
-                op.as_ptr(),
-                file.as_ptr(),
-                params.as_ptr(),
-                std::ptr::null(),
-                SW_SHOWNORMAL,
-            )
+        let mut sei = ShellExecuteInfoW {
+            cb_size: std::mem::size_of::<ShellExecuteInfoW>() as u32,
+            f_mask: SEE_MASK_NOCLOSEPROCESS,
+            hwnd: std::ptr::null_mut(),
+            lp_verb: op.as_ptr(),
+            lp_file: file.as_ptr(),
+            lp_parameters: params.as_ptr(),
+            lp_directory: std::ptr::null(),
+            n_show: SW_SHOWNORMAL,
+            h_inst_app: std::ptr::null_mut(),
+            lp_id_list: std::ptr::null_mut(),
+            lp_class: std::ptr::null(),
+            hkey_class: std::ptr::null_mut(),
+            dw_hot_key: 0,
+            h_icon_or_monitor: std::ptr::null_mut(),
+            h_process: std::ptr::null_mut(),
         };
-        if res > 32 {
-            Ok(())
-        } else {
-            Err(format!(
-                "无法以管理员权限启动安装程序（ShellExecuteW={res}），请手动运行安装包：{}" ,
+        let ok = unsafe { ShellExecuteExW(&mut sei) };
+        if ok == 0 {
+            return Err(format!(
+                "无法以管理员权限启动安装程序（请确认 UAC 授权或手动运行）：{}",
                 setup_exe.display()
-            ))
+            ));
         }
+        if sei.h_process.is_null() {
+            return Ok(false);
+        }
+        let mut exit_code: u32 = 1;
+        unsafe {
+            WaitForSingleObject(sei.h_process, INFINITE);
+            GetExitCodeProcess(sei.h_process, &mut exit_code);
+            CloseHandle(sei.h_process);
+        }
+        Ok(exit_code == 0)
     }
 }
 
@@ -252,7 +359,7 @@ mod win_api {
         eprintln!("{title}: {msg}");
     }
     pub fn schedule_delete_on_reboot(_path: &Path) {}
-    pub fn launch_elevated_setup(_setup_exe: &Path) -> Result<(), String> {
+    pub fn run_elevated_setup_and_wait(_setup_exe: &Path) -> Result<bool, String> {
         Err("仅支持 Windows 平台".into())
     }
 }
@@ -283,8 +390,11 @@ fn run_waiter(args: WaiterArgs) -> Result<(), String> {
             Ok(())
         }
         Err(err) if err.raw_os_error() == Some(740) => {
-            // Non-elevated manual double-click fallback: prompt UAC via ShellExecuteW("runas").
-            win_api::launch_elevated_setup(&args.setup_exe)
+            // Non-elevated v3 updater: prompt UAC via ShellExecuteExW("runas") and WAIT
+            // for setup to finish so post-install cleanup removes staging + legacy v3 files.
+            let ok = win_api::run_elevated_setup_and_wait(&args.setup_exe)?;
+            cleanup_post_install(&args, ok);
+            Ok(())
         }
         Err(err) => Err(format!(
             "启动安装程序失败（{}）：{err}",
@@ -347,7 +457,11 @@ fn run_primary() -> Result<(), String> {
     // Direct fallback if waiter copy could not be spawned.
     match spawn_detached(Command::new(&setup_path).arg("/SP-")) {
         Ok(_) => Ok(()),
-        Err(err) if err.raw_os_error() == Some(740) => win_api::launch_elevated_setup(&setup_path),
+        Err(err) if err.raw_os_error() == Some(740) => {
+            let _ = win_api::run_elevated_setup_and_wait(&setup_path)?;
+            remove_file_with_retry(&setup_path);
+            Ok(())
+        }
         Err(err) => Err(format!(
             "启动安装程序失败（{}）：{err}",
             setup_path.display()
@@ -360,7 +474,7 @@ fn main() {
     let res = if let Some(waiter) = parse_waiter_args(&args) {
         let r = run_waiter(waiter);
         if let Ok(waiter_exe) = std::env::current_exe() {
-            win_api::schedule_delete_on_reboot(&waiter_exe);
+            schedule_waiter_self_cleanup(&waiter_exe);
         }
         r
     } else {
@@ -444,18 +558,60 @@ mod tests {
             setup_exe: setup_exe.clone(),
         };
 
-        // Canceled install (non-zero status and no claudeguard-gui.exe): delete setup, keep bridge.
-        cleanup_post_install(&waiter_args, false);
+        let fake_pf = base.join("pf");
+        let fake_home = base.join("home");
+        let fake_roaming = base.join("roaming");
+        fs::create_dir_all(fake_home.join("Desktop")).unwrap();
+        fs::create_dir_all(
+            fake_roaming
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs"),
+        )
+        .unwrap();
+        let desktop_lnk = fake_home.join("Desktop").join("ClaudeGuard.lnk");
+        let start_lnk = fake_roaming
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("ClaudeGuard.lnk");
+        fs::write(&desktop_lnk, b"lnk").unwrap();
+        fs::write(&start_lnk, b"lnk").unwrap();
+
+        // Canceled install (non-zero status and no claudeguard-gui.exe): delete setup, keep bridge & shortcuts.
+        cleanup_post_install_with(
+            &waiter_args,
+            false,
+            Some(&fake_pf),
+            Some(&fake_home),
+            Some(&fake_roaming),
+        );
         assert!(!setup_exe.exists());
         assert!(app_exe.is_file());
         assert!(old_exe.is_file());
+        assert!(desktop_lnk.is_file());
+        assert!(start_lnk.is_file());
 
-        // Completed install (setup succeeded or claudeguard-gui.exe present): clean legacy residue.
+        // Completed install (setup succeeded or claudeguard-gui.exe present): clean legacy residue & shortcuts.
         fs::write(&setup_exe, b"setup").unwrap();
-        cleanup_post_install(&waiter_args, true);
+        cleanup_post_install_with(
+            &waiter_args,
+            true,
+            Some(&fake_pf),
+            Some(&fake_home),
+            Some(&fake_roaming),
+        );
         assert!(!setup_exe.exists());
         assert!(!app_exe.exists());
         assert!(!old_exe.exists());
+        assert!(!app.exists());
+        assert!(!desktop_lnk.exists());
+        assert!(!start_lnk.exists());
+
+        #[cfg(all(windows, target_pointer_width = "64"))]
+        assert_eq!(std::mem::size_of::<win_api::ShellExecuteInfoW>(), 112);
 
         let _ = fs::remove_dir_all(&base);
     }

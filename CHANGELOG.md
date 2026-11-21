@@ -4,6 +4,19 @@
 
 日期为实际发布日期（UTC / UTC+8）。更早的历史版本记录见 [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases)。
 
+## [4.0.1] - 2026-11-21
+
+### 修复
+
+- **首启向导「一键保存并立即布防」校验失败并反复重弹**：
+  - `cg-gui` 的 `build_onboarding_config` 补齐默认内置目标 `local`（本机出口）白名单并同步解析代理主机与端口，使用 `clean_guarded_agents` 清洗受管目标。
+  - `cg-core` 的 `targets::validate` 改为仅对已启用（`enabled = true`）的非可达性目标强制要求白名单非空，与目标页前端校验一致。
+  - 弹窗提交期间保持打开并显示「保存并布防中…」，等待守护确认进入 `Armed` 后再关闭，避免 1 秒轮询竞态重弹；若保存或探测失败则在弹窗内直接展示错误条，不再被遮罩遮挡。
+- **脱敏诊断包 `snapshot_redacted.json` 原始 IP 泄露**：
+  - `cg-core::redact::mask_snapshot` 与 `cg-daemon::diagnostics` 补全对 `config.targets[].expect_ips`、`targets[].expect_ips`、`targets[].matched_rule`、`tripped.expected_summary`、`launch_error` 与 `recent_toasts` 的打码/脱敏，确保导出压缩包中所有文件均不含原始外网 IP。
+- **`v3 -> v4` 非提权升级引导残留旧版文件与暂存缓存**：
+  - `cg-v3-bridge` 改用 `ShellExecuteExW`（`SEE_MASK_NOCLOSEPROCESS`）+ `WaitForSingleObject` 等待提权安装器退出并检查退出码，安装完成后自动清理旧版 `%LOCALAPPDATA%\Programs\ClaudeGuard\ClaudeGuard.exe`、`.exe.old`、旧版用户桌面/开始菜单快捷方式及 `%ProgramData%\ClaudeGuard\staging\` 暂存文件。
+
 ## [4.0.0] - 2026-11-21
 
 **ClaudeGuard v4**：从 v3 单体 Tauri 2（WebView2）架构全面演进为 **Windows Service 守护端 + 原生 Rust GPUI 桌面端** 三端解耦架构，实现日常零 UAC 弹窗、崩溃 WAL 零残留自愈、4 维防漏护盾与只读生态巡检。
@@ -61,6 +74,7 @@
 
 ---
 
+[4.0.1]: https://github.com/daha1216/ClaudeGuard/releases/tag/v4.0.1
 [4.0.0]: https://github.com/daha1216/ClaudeGuard/releases/tag/v4.0.0
 [3.12.5]: https://github.com/daha1216/ClaudeGuard/releases/tag/v3.12.5
 [3.12.4]: https://github.com/daha1216/ClaudeGuard/releases/tag/v3.12.4

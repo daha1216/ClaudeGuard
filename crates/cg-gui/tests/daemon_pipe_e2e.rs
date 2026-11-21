@@ -245,3 +245,88 @@ fn gui_daemon_client_roundtrips_live_daemon_over_named_pipe() {
         other => panic!("unexpected QueryLogs response: {other:?}"),
     }
 }
+
+#[test]
+fn onboarding_from_default_config_arms_daemon_without_reprompting() {
+    let daemon_bin = locate_daemon_bin().expect(
+        "claudeguard-daemon.exe must exist at D:\\ClaudeGuard-v4\\target-ws\\debug\\claudeguard-daemon.exe or CG_DAEMON_BIN",
+    );
+    let data_dir = TempDirGuard::new("cg-gui-onboard-e2e");
+    let pipe = unique_pipe();
+
+    let child = Command::new(&daemon_bin)
+        .args([
+            "--console",
+            "--pipe",
+            &pipe,
+            "--data-dir",
+            &data_dir.path().to_string_lossy(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn claudeguard-daemon --console");
+    let _child_guard = ChildGuard(child);
+
+    let client = DaemonClient::new(TransportEndpoint::Pipe(pipe.clone()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let initial_snap = loop {
+        match client.exchange(PipeRequest::GetSnapshot) {
+            Ok(PipeResponse::Snapshot { snapshot }) => break *snapshot,
+            Ok(other) => panic!("unexpected GetSnapshot response: {other:?}"),
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            Err(err) => panic!("timed out connecting to {pipe}: {err}"),
+        }
+    };
+    assert_eq!(initial_snap.lifecycle, Lifecycle::Unconfigured);
+    assert!(initial_snap.config.first_run);
+
+    // Simulate a fresh-install onboarding payload where `local` is disabled and left empty
+    // while enabled `claude`/`codex` carry the selected country allowlist.
+    let mut cfg = initial_snap.config.clone();
+    cfg.first_run = false;
+    cfg.enforce_access_path = false;
+    cfg.kill_on_fail = false;
+    cfg.quarantine_on_fail = false;
+    cfg.lockdown_on_uncovered = false;
+    cfg.sweep_on_exit = false;
+    cfg.leak_watch = false;
+    cfg.env_check = false;
+    cfg.notify.enabled = false;
+    for target in &mut cfg.targets {
+        if matches!(target.id.as_str(), "claude" | "codex") {
+            target.enabled = true;
+            target.expect_regions = vec!["US".into()];
+            target.expect_ips.clear();
+        }
+    }
+
+    match client
+        .exchange(PipeRequest::CompleteOnboarding { config: cfg })
+        .expect("CompleteOnboarding")
+    {
+        PipeResponse::Ack {
+            snapshot: Some(snap),
+            ..
+        } => {
+            assert_eq!(snap.lifecycle, Lifecycle::Armed);
+            assert!(!snap.config.first_run);
+        }
+        other => panic!("unexpected CompleteOnboarding response: {other:?}"),
+    }
+
+    // Subsequent poll must stay Armed so the onboarding modal never re-opens.
+    match client
+        .exchange(PipeRequest::GetSnapshot)
+        .expect("post-onboarding GetSnapshot")
+    {
+        PipeResponse::Snapshot { snapshot } => {
+            assert_eq!(snapshot.lifecycle, Lifecycle::Armed);
+            assert!(!snapshot.config.first_run);
+        }
+        other => panic!("unexpected post-onboarding GetSnapshot response: {other:?}"),
+    }
+}

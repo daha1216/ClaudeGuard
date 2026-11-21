@@ -9,7 +9,7 @@ use crate::protocol::{
     DefenseCheckItem, GuardSnapshot, Lifecycle, LogEntry, LogLevel, OnboardingProbeResult,
     OnboardingStrategy, OperationReceipt, PolicyPreset, ProtectionState, SelfCheckStatus, Target,
     TargetState, TargetStatus, TimelineBucket, TimelineStatus, UiLabelExt, UpdateSummary,
-    mask_ip_str, mask_ips_in_text, region_name,
+    clean_guarded_agents, ensure_builtin_targets, mask_ip_str, mask_ips_in_text, region_name,
 };
 use crate::theme::{BadgeTone, HeroTone};
 
@@ -1518,8 +1518,23 @@ pub fn build_onboarding_config(
 ) -> Result<Config, String> {
     let mut cfg = base.clone();
     cfg.first_run = false;
-    if let Some(port) = probe.detected_proxy_port {
+    if let Some(port) = probe.detected_proxy_port
+        && port > 0
+    {
         cfg.proxy_port = port;
+    }
+    if let Some(addr) = probe.access.proxy_addr.as_deref()
+        && let Some((host, port_str)) = addr.rsplit_once(':')
+    {
+        let host = host.trim();
+        if !host.is_empty() {
+            cfg.proxy_host = host.to_string();
+        }
+        if let Ok(port) = port_str.parse::<u16>()
+            && port > 0
+        {
+            cfg.proxy_port = port;
+        }
     }
 
     let (preset, ips, regions) = match strategy {
@@ -1545,13 +1560,7 @@ pub fn build_onboarding_config(
                 .as_ref()
                 .and_then(|p| p.ip.clone())
                 .ok_or_else(|| "未能探测到当前出口静态 IP，无法启用严格锁定".to_string())?;
-            let reg = probe
-                .probe
-                .as_ref()
-                .and_then(|p| p.country.clone())
-                .into_iter()
-                .collect();
-            (PolicyPreset::StrictStaticIp, vec![ip], reg)
+            (PolicyPreset::StrictStaticIp, vec![ip], Vec::new())
         }
         OnboardingStrategy::CustomCidrOrRegions => {
             let ips = split_tokens(custom_cidr);
@@ -1567,20 +1576,18 @@ pub fn build_onboarding_config(
     };
 
     cfg.preset = preset;
+    cfg.targets = ensure_builtin_targets(cfg.targets, &ips, &regions);
     for target in &mut cfg.targets {
-        if matches!(target.id.as_str(), "claude" | "codex") {
-            target.enabled = true;
+        if matches!(target.id.as_str(), "local" | "claude" | "codex") {
+            if matches!(target.id.as_str(), "claude" | "codex") {
+                target.enabled = true;
+            }
             target.expect_ips = ips.clone();
             target.expect_regions = regions.clone();
         }
     }
     if !probe.installed_agents.is_empty() {
-        cfg.guarded_agents = probe
-            .installed_agents
-            .iter()
-            .filter(|id| matches!(id.as_str(), "claude" | "chatgpt" | "antigravity"))
-            .cloned()
-            .collect();
+        cfg.guarded_agents = clean_guarded_agents(&probe.installed_agents);
     }
     Ok(cfg)
 }
@@ -1680,7 +1687,27 @@ mod tests {
     #[test]
     fn onboarding_strategy_builds_valid_config() {
         let probe = build_demo_onboarding_probe(true);
-        let cfg = build_onboarding_config(
+
+        // 1. Recommended country strategy populates local, claude, and codex (preserving local disabled).
+        let region_cfg = build_onboarding_config(
+            &Config::default(),
+            &probe,
+            OnboardingStrategy::RecommendRegion,
+            "",
+            "",
+        )
+        .expect("recommended region config");
+        assert!(!region_cfg.first_run);
+        assert_eq!(region_cfg.preset, PolicyPreset::StandardRegion);
+        assert!(!region_cfg.targets[0].enabled);
+        for id in ["local", "claude", "codex"] {
+            let t = region_cfg.target(id).expect("builtin target");
+            assert_eq!(t.expect_regions, vec!["US".to_string()], "target {id}");
+            assert!(t.expect_ips.is_empty(), "target {id}");
+        }
+
+        // 2. Strict static IP strategy locks exact IP on local, claude, and codex.
+        let strict_cfg = build_onboarding_config(
             &Config::default(),
             &probe,
             OnboardingStrategy::StrictStaticIp,
@@ -1688,9 +1715,33 @@ mod tests {
             "",
         )
         .expect("strict static IP config");
-        assert!(!cfg.first_run);
-        assert_eq!(cfg.preset, PolicyPreset::StrictStaticIp);
-        assert_eq!(cfg.targets[1].expect_ips, vec!["198.51.100.98".to_string()]);
+        assert!(!strict_cfg.first_run);
+        assert_eq!(strict_cfg.preset, PolicyPreset::StrictStaticIp);
+        for id in ["local", "claude", "codex"] {
+            let t = strict_cfg.target(id).expect("builtin target");
+            assert_eq!(t.expect_ips, vec!["198.51.100.98".to_string()], "target {id}");
+            assert!(t.expect_regions.is_empty(), "target {id}");
+        }
+
+        // 3. Custom CIDR + regions strategy populates local, claude, and codex.
+        let custom_cfg = build_onboarding_config(
+            &Config::default(),
+            &probe,
+            OnboardingStrategy::CustomCidrOrRegions,
+            "198.51.100.0/24",
+            "us, jp",
+        )
+        .expect("custom cidr/region config");
+        assert!(!custom_cfg.first_run);
+        for id in ["local", "claude", "codex"] {
+            let t = custom_cfg.target(id).expect("builtin target");
+            assert_eq!(t.expect_ips, vec!["198.51.100.0/24".to_string()], "target {id}");
+            assert_eq!(
+                t.expect_regions,
+                vec!["US".to_string(), "JP".to_string()],
+                "target {id}"
+            );
+        }
     }
 
     #[test]

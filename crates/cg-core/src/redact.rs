@@ -92,21 +92,42 @@ pub fn mask_text_ips(text: &str) -> String {
     out
 }
 
-/// Returns a screenshot-safe copy of [`GuardSnapshot`] with egress IPs masked.
+/// Returns a screenshot-safe copy of [`GuardSnapshot`] with egress and allowlist IPs masked.
 pub fn mask_snapshot(snapshot: &GuardSnapshot) -> GuardSnapshot {
     let mut out = snapshot.clone();
     for target in &mut out.targets {
         if let Some(ip) = target.ip.as_deref() {
             target.ip = Some(mask_ip(ip));
         }
+        target.expect_ips = target
+            .expect_ips
+            .iter()
+            .map(|ip| mask_text_ips(ip))
+            .collect();
+        if let Some(rule) = target.matched_rule.as_deref() {
+            target.matched_rule = Some(mask_text_ips(rule));
+        }
         target.reason = mask_text_ips(&target.reason);
+    }
+    for target in &mut out.config.targets {
+        target.expect_ips = target
+            .expect_ips
+            .iter()
+            .map(|ip| mask_text_ips(ip))
+            .collect();
     }
     for conn in &mut out.leak.direct {
         conn.remote = mask_ip(&conn.remote);
     }
     if let Some(trip) = &mut out.tripped {
         trip.reason = mask_text_ips(&trip.reason);
+        trip.expected_summary = mask_text_ips(&trip.expected_summary);
         trip.observed_summary = mask_text_ips(&trip.observed_summary);
+    }
+    out.launch_error = mask_text_ips(&out.launch_error);
+    for toast in &mut out.recent_toasts {
+        toast.title = mask_text_ips(&toast.title);
+        toast.body = mask_text_ips(&toast.body);
     }
     for entry in &mut out.recent_logs {
         entry.message = mask_text_ips(&entry.message);
@@ -276,8 +297,9 @@ mod tests {
             checked_at: Some(100),
             reason: "出口 203.0.113.45 不在白名单".into(),
             fail_streak: 2,
-            matched_rule: None,
+            matched_rule: Some("198.51.100.98".into()),
         });
+        snap.config.targets = cg_protocol::default_builtin_targets(&["198.51.100.98".into()], &[]);
         snap.leak.direct.push(cg_protocol::LeakConn {
             pid: 9,
             agent: "Claude".into(),
@@ -288,7 +310,10 @@ mod tests {
 
         let masked = mask_snapshot(&snap);
         assert_eq!(masked.targets[0].ip.as_deref(), Some("203.0.*.*"));
+        assert_eq!(masked.targets[0].expect_ips, vec!["198.51.*.*/24"]);
+        assert_eq!(masked.targets[0].matched_rule.as_deref(), Some("198.51.*.*"));
         assert_eq!(masked.targets[0].reason, "出口 203.0.*.* 不在白名单");
+        assert_eq!(masked.config.targets[1].expect_ips, vec!["198.51.*.*"]);
         assert_eq!(masked.leak.direct[0].remote, "203.0.*.*");
     }
 }

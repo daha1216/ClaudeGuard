@@ -1,6 +1,6 @@
 [package]
 name = "cg-gui"
-version = "4.0.0"
+version = "4.0.1"
 edition = "2024"
 resolver = "2"
 rust-version = "1.98.1"

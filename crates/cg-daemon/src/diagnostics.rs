@@ -164,20 +164,21 @@ pub fn export_redacted_diagnostics_zip(
     now_secs: u64,
     explicit_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
-    let masked = mask_snapshot(snap);
+    let mut masked = mask_snapshot(snap);
+    for t in &mut masked.config.targets {
+        t.expect_ips = t.expect_ips.iter().map(|ip| redact(ip, false)).collect();
+    }
+    for t in &mut masked.targets {
+        t.expect_ips = t.expect_ips.iter().map(|ip| redact(ip, false)).collect();
+        if let Some(rule) = t.matched_rule.as_deref() {
+            t.matched_rule = Some(redact(rule, false));
+        }
+    }
 
     let snap_json = serde_json::to_vec_pretty(&masked)
         .map_err(|e| format!("序列化脱敏快照失败：{e}"))?;
 
-    let mut cfg_redacted = masked.config.clone();
-    for t in &mut cfg_redacted.targets {
-        t.expect_ips = t
-            .expect_ips
-            .iter()
-            .map(|ip| redact(ip, false))
-            .collect();
-    }
-    let cfg_json = serde_json::to_vec_pretty(&cfg_redacted)
+    let cfg_json = serde_json::to_vec_pretty(&masked.config)
         .map_err(|e| format!("序列化脱敏配置失败：{e}"))?;
 
     let self_check_json = serde_json::to_vec_pretty(&masked.self_check)
@@ -232,14 +233,17 @@ mod tests {
             version: "4.0.0".into(),
             ..GuardSnapshot::default()
         };
-        let mut t = cg_protocol::default_builtin_targets(&[], &["US".into()])
+        let mut t = cg_protocol::default_builtin_targets(&["198.51.100.98".into()], &["US".into()])
             .into_iter()
             .next()
             .unwrap();
         t.id = "claude".into();
         let mut ts = TargetStatus::from_target(&t, TargetState::Pass);
         ts.ip = Some("198.51.100.98".into());
+        ts.matched_rule = Some("198.51.100.98".into());
         ts.reason = "出口 198.51.100.98 通过".into();
+        snap.config.targets =
+            cg_protocol::default_builtin_targets(&["198.51.100.98".into()], &["US".into()]);
         snap.targets.push(ts);
         snap.recent_logs.push(LogEntry {
             id: 1,

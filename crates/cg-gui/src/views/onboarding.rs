@@ -17,6 +17,8 @@ pub fn render_onboarding_modal(
     let selected = ctrl_r.drafts.onboarding_strategy;
     let probe = ctrl_r.onboarding_probe.clone();
     let loading = ctrl_r.onboarding_loading;
+    let submitting = ctrl_r.onboarding_submitting;
+    let onboarding_error = ctrl_r.onboarding_error.clone();
     let connected = ctrl_r.connected;
     let is_demo = ctrl_r.client.is_demo();
     let proxy_off_sim = ctrl_r.onboarding_proxy_off_sim;
@@ -157,6 +159,7 @@ pub fn render_onboarding_modal(
                 cx.listener(move |_, _, _, cx| {
                     ctrl_opt.update(cx, |c, cx| {
                         c.drafts.onboarding_strategy = strat;
+                        c.onboarding_error = None;
                         cx.notify();
                     });
                 }),
@@ -258,6 +261,28 @@ pub fn render_onboarding_modal(
                             .child(labeled_field("自定义 IP / CIDR", cidr_in, p)),
                     )
                 })
+                .when_some(onboarding_error, |card, err| {
+                    card.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .p(px(10.))
+                            .rounded(px(10.))
+                            .bg(rgba(p.badge_fail.bg))
+                            .text_size(px(12.))
+                            .text_color(rgb(p.badge_fail.text))
+                            .child(
+                                div()
+                                    .w(px(6.))
+                                    .h(px(6.))
+                                    .flex_shrink_0()
+                                    .rounded(px(999.))
+                                    .bg(rgb(p.badge_fail.dot)),
+                            )
+                            .child(err),
+                    )
+                })
                 .child(
                     div()
                         .flex()
@@ -269,33 +294,53 @@ pub fn render_onboarding_modal(
                                 .flex()
                                 .gap(px(8.))
                                 .child(
-                                    action_button("onb-skip", "暂不布防（保持只读）", ButtonKind::Ghost, true, p)
-                                        .on_mouse_up(
+                                    action_button(
+                                        "onb-skip",
+                                        "暂不布防（保持只读）",
+                                        ButtonKind::Ghost,
+                                        !submitting,
+                                        p,
+                                    )
+                                    .when(!submitting, |b| {
+                                        b.on_mouse_up(
                                             MouseButton::Left,
                                             cx.listener(move |_, _, _, cx| {
                                                 ctrl_skip.update(cx, |c, cx| c.skip_onboarding(cx));
                                             }),
-                                        ),
+                                        )
+                                    }),
                                 )
                                 .child(
-                                    action_button("onb-reprobe", "↻ 重新探测", ButtonKind::Secondary, !loading, p)
-                                        .on_mouse_up(
+                                    action_button(
+                                        "onb-reprobe",
+                                        "↻ 重新探测",
+                                        ButtonKind::Secondary,
+                                        !loading && !submitting,
+                                        p,
+                                    )
+                                    .when(!loading && !submitting, |b| {
+                                        b.on_mouse_up(
                                             MouseButton::Left,
                                             cx.listener(move |_, _, _, cx| {
                                                 ctrl_reprobe.update(cx, |c, cx| c.probe_onboarding(cx));
                                             }),
-                                        ),
+                                        )
+                                    }),
                                 ),
                         )
                         .child({
-                            let can_complete = connected && !loading && probe.is_some();
+                            let can_complete =
+                                connected && !loading && !submitting && probe.is_some();
+                            let complete_label = if !connected {
+                                "守护离线 · 无法完成布防"
+                            } else if submitting {
+                                "保存并布防中…"
+                            } else {
+                                "✓ 一键保存并立即布防"
+                            };
                             action_button(
                                 "onb-complete",
-                                if connected {
-                                    "✓ 一键保存并立即布防"
-                                } else {
-                                    "守护离线 · 无法完成布防"
-                                },
+                                complete_label,
                                 ButtonKind::Primary,
                                 can_complete,
                                 p,
