@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "cg-core"
-version = "4.0.1"
+version = "4.1.0"
 dependencies = [
  "cg-protocol",
  "serde",
@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "cg-protocol"
-version = "4.0.1"
+version = "4.1.0"
 dependencies = [
  "serde",
  "serde_json",
