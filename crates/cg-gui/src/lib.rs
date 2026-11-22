@@ -2,6 +2,7 @@ pub mod app;
 pub mod assets;
 pub mod demo;
 pub mod ipc;
+pub mod motion;
 pub mod protocol;
 pub mod state;
 pub mod theme;

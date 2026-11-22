@@ -1,26 +1,44 @@
-//! Theme-aware Win32 IME-compatible single-line `DraftTextInput` (`EntityInputHandler`).
+//! Theme-aware Win32 IME-compatible single-line `DraftTextInput` (`EntityInputHandler`)
+//! with horizontal viewport auto-scroll, word navigation/selection, spring focus ring,
+//! and typing-aware caret blinking.
 
 use std::ops::Range;
+use std::time::Duration;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, Global, GlobalElementId,
-    InspectorElementId, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, ShapedLine, SharedString,
-    Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point,
-    prelude::*, px, relative, rgb, rgba, size,
+    AnimationExt, App, Bounds, BoxShadow, ClipboardItem, ContentMask, Context, CursorStyle,
+    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
+    Global, GlobalElementId, InspectorElementId, IntoElement, KeyBinding, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, ShapedLine,
+    SharedString, SpringAnimation, Style, Task, TextAlign, TextRun, UTF16Selection, UnderlineStyle,
+    Window, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 
 use super::text_edit::{TextEditState, byte_index_from_utf16, utf16_index_from_byte, utf16_len};
+use crate::motion::{lerp_rgb, rgba_with_alpha_scale, spring_snappy};
 use crate::theme::{LIGHT_C2, ThemePalette};
+
+/// Breathing margin (px) maintained between the caret and viewport edges when scrolled.
+const SCROLL_CARET_MARGIN_PX: f32 = 8.0;
+
+/// Solid-caret grace period after any edit or cursor movement before blinking resumes.
+const CARET_BLINK_HOLD_MS: u64 = 600;
+
+/// Half-cycle blink interval once the caret is idle (matches native Windows/macOS cadence).
+const CARET_BLINK_INTERVAL_MS: u64 = 530;
 
 actions!([
     DraftBackspace,
     DraftDelete,
+    DraftDeleteWordBack,
     DraftLeft,
     DraftRight,
+    DraftWordLeft,
+    DraftWordRight,
     DraftSelectLeft,
     DraftSelectRight,
+    DraftSelectWordLeft,
+    DraftSelectWordRight,
     DraftSelectAll,
     DraftHome,
     DraftEnd,
@@ -28,7 +46,9 @@ actions!([
     DraftSelectEnd,
     DraftPaste,
     DraftCut,
-    DraftCopy
+    DraftCopy,
+    DraftSubmit,
+    DraftCancel
 ]);
 
 /// Global palette snapshot read by `DraftTextInput` during layout/paint.
@@ -41,10 +61,27 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", DraftBackspace, Some("DraftTextInput")),
         KeyBinding::new("delete", DraftDelete, Some("DraftTextInput")),
+        KeyBinding::new(
+            "ctrl-backspace",
+            DraftDeleteWordBack,
+            Some("DraftTextInput"),
+        ),
         KeyBinding::new("left", DraftLeft, Some("DraftTextInput")),
         KeyBinding::new("right", DraftRight, Some("DraftTextInput")),
+        KeyBinding::new("ctrl-left", DraftWordLeft, Some("DraftTextInput")),
+        KeyBinding::new("ctrl-right", DraftWordRight, Some("DraftTextInput")),
         KeyBinding::new("shift-left", DraftSelectLeft, Some("DraftTextInput")),
         KeyBinding::new("shift-right", DraftSelectRight, Some("DraftTextInput")),
+        KeyBinding::new(
+            "ctrl-shift-left",
+            DraftSelectWordLeft,
+            Some("DraftTextInput"),
+        ),
+        KeyBinding::new(
+            "ctrl-shift-right",
+            DraftSelectWordRight,
+            Some("DraftTextInput"),
+        ),
         KeyBinding::new("ctrl-a", DraftSelectAll, Some("DraftTextInput")),
         KeyBinding::new("home", DraftHome, Some("DraftTextInput")),
         KeyBinding::new("end", DraftEnd, Some("DraftTextInput")),
@@ -53,10 +90,150 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-v", DraftPaste, Some("DraftTextInput")),
         KeyBinding::new("ctrl-c", DraftCopy, Some("DraftTextInput")),
         KeyBinding::new("ctrl-x", DraftCut, Some("DraftTextInput")),
+        KeyBinding::new("enter", DraftSubmit, Some("DraftTextInput")),
+        KeyBinding::new("escape", DraftCancel, Some("DraftTextInput")),
     ]);
 }
 
 type ChangeHandler = Box<dyn Fn(&str, &mut Window, &mut App)>;
+type SubmitHandler = Box<dyn Fn(&mut Window, &mut App)>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    Whitespace,
+    Word,
+    Punct,
+}
+
+fn classify_char(ch: char) -> CharClass {
+    if ch.is_whitespace() {
+        CharClass::Whitespace
+    } else if ch.is_alphanumeric() || ch == '_' {
+        CharClass::Word
+    } else {
+        CharClass::Punct
+    }
+}
+
+/// Returns the UTF-16 range of the contiguous word/token surrounding `utf16_offset`.
+fn word_range_at(text: &str, utf16_offset: usize) -> Range<usize> {
+    if text.is_empty() {
+        return 0..0;
+    }
+
+    let mut byte = byte_index_from_utf16(text, utf16_offset).min(text.len());
+    let target_class = if let Some(ch) = text[byte..].chars().next() {
+        classify_char(ch)
+    } else if let Some((prev_idx, ch)) = text[..byte].char_indices().next_back() {
+        byte = prev_idx;
+        classify_char(ch)
+    } else {
+        return 0..0;
+    };
+
+    let mut start_byte = byte;
+    for (idx, ch) in text[..byte].char_indices().rev() {
+        if classify_char(ch) == target_class {
+            start_byte = idx;
+        } else {
+            break;
+        }
+    }
+
+    let mut end_byte = byte;
+    for (rel_idx, ch) in text[byte..].char_indices() {
+        if classify_char(ch) == target_class {
+            end_byte = byte + rel_idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    utf16_index_from_byte(text, start_byte)..utf16_index_from_byte(text, end_byte)
+}
+
+/// Finds the previous UTF-16 word boundary before `utf16_offset` (Windows/VS Code semantics).
+fn prev_word_boundary(text: &str, utf16_offset: usize) -> usize {
+    let mut byte = byte_index_from_utf16(text, utf16_offset).min(text.len());
+    if byte == 0 {
+        return 0;
+    }
+
+    while let Some((idx, ch)) = text[..byte].char_indices().next_back() {
+        if classify_char(ch) == CharClass::Whitespace {
+            byte = idx;
+        } else {
+            break;
+        }
+    }
+
+    if let Some((_, ch)) = text[..byte].char_indices().next_back() {
+        let target_class = classify_char(ch);
+        while let Some((idx, prev_ch)) = text[..byte].char_indices().next_back() {
+            if classify_char(prev_ch) == target_class {
+                byte = idx;
+            } else {
+                break;
+            }
+        }
+    }
+
+    utf16_index_from_byte(text, byte)
+}
+
+/// Finds the next UTF-16 word boundary after `utf16_offset` (Windows/VS Code semantics).
+fn next_word_boundary(text: &str, utf16_offset: usize) -> usize {
+    let mut byte = byte_index_from_utf16(text, utf16_offset).min(text.len());
+    let len = text.len();
+    if byte >= len {
+        return utf16_len(text);
+    }
+
+    while let Some(ch) = text[byte..].chars().next() {
+        if classify_char(ch) == CharClass::Whitespace {
+            byte += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    if let Some(ch) = text[byte..].chars().next() {
+        let target_class = classify_char(ch);
+        while let Some(next_ch) = text[byte..].chars().next() {
+            if classify_char(next_ch) == target_class {
+                byte += next_ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+    }
+
+    utf16_index_from_byte(text, byte)
+}
+
+/// Keeps `caret_x` comfortably visible within `[0, viewport_w]` with a breathing margin.
+fn compute_horizontal_scroll(
+    prev_scroll: f32,
+    caret_x: f32,
+    content_w: f32,
+    viewport_w: f32,
+) -> f32 {
+    if viewport_w <= 1.0 || content_w <= viewport_w - 2.0 {
+        return 0.0;
+    }
+
+    let margin = SCROLL_CARET_MARGIN_PX.min(viewport_w * 0.25);
+    let mut scroll = prev_scroll.max(0.0);
+
+    if caret_x - scroll > viewport_w - margin {
+        scroll = caret_x - (viewport_w - margin);
+    } else if caret_x - scroll < margin {
+        scroll = (caret_x - margin).max(0.0);
+    }
+
+    let max_scroll = (content_w - viewport_w + margin).max(0.0);
+    scroll.clamp(0.0, max_scroll)
+}
 
 pub struct DraftTextInput {
     focus_handle: FocusHandle,
@@ -67,9 +244,15 @@ pub struct DraftTextInput {
     monospace: bool,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    scroll_x: f32,
     is_selecting: bool,
     selection_anchor: Option<usize>,
     on_change: Option<ChangeHandler>,
+    on_submit: Option<SubmitHandler>,
+    caret_visible: bool,
+    was_focused: bool,
+    blink_epoch: u64,
+    blink_task: Option<Task<()>>,
 }
 
 impl DraftTextInput {
@@ -83,9 +266,15 @@ impl DraftTextInput {
             monospace: false,
             last_layout: None,
             last_bounds: None,
+            scroll_x: 0.0,
             is_selecting: false,
             selection_anchor: None,
             on_change: None,
+            on_submit: None,
+            caret_visible: true,
+            was_focused: false,
+            blink_epoch: 0,
+            blink_task: None,
         }
     }
 
@@ -122,6 +311,11 @@ impl DraftTextInput {
         self
     }
 
+    pub fn with_on_submit(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_submit = Some(Box::new(handler));
+        self
+    }
+
     pub fn text(&self) -> &str {
         self.state.text()
     }
@@ -129,6 +323,9 @@ impl DraftTextInput {
     pub fn set_text_silent(&mut self, text: &str, cx: &mut Context<Self>) {
         if self.state.text() != text {
             self.state.set_text(text);
+            if text.is_empty() {
+                self.scroll_x = 0.0;
+            }
             self.selection_anchor = Some(self.state.cursor());
             cx.notify();
         }
@@ -136,11 +333,71 @@ impl DraftTextInput {
 
     pub fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.state.set_text("");
+        self.scroll_x = 0.0;
         self.selection_anchor = Some(0);
         self.changed(window, cx);
     }
 
-    fn changed(&self, window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_caret_blink(&mut self, focused: bool, cx: &mut Context<Self>) {
+        let should_blink = focused && !cx.reduce_motion();
+        if should_blink {
+            if !self.was_focused || self.blink_task.is_none() {
+                self.was_focused = true;
+                self.caret_visible = true;
+                self.restart_caret_blink(cx);
+            }
+        } else {
+            self.was_focused = focused;
+            self.stop_caret_blink();
+        }
+    }
+
+    fn reset_caret_blink(&mut self, cx: &mut Context<Self>) {
+        self.caret_visible = true;
+        if self.was_focused && !cx.reduce_motion() {
+            self.restart_caret_blink(cx);
+        } else {
+            self.blink_epoch = self.blink_epoch.wrapping_add(1);
+            self.blink_task = None;
+        }
+    }
+
+    fn stop_caret_blink(&mut self) {
+        self.caret_visible = true;
+        self.blink_epoch = self.blink_epoch.wrapping_add(1);
+        self.blink_task = None;
+    }
+
+    fn restart_caret_blink(&mut self, cx: &mut Context<Self>) {
+        self.blink_epoch = self.blink_epoch.wrapping_add(1);
+        let epoch = self.blink_epoch;
+        self.blink_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(CARET_BLINK_HOLD_MS))
+                .await;
+            loop {
+                let keep_going = this
+                    .update(cx, |input, cx| {
+                        if input.blink_epoch != epoch || !input.was_focused || cx.reduce_motion() {
+                            return false;
+                        }
+                        input.caret_visible = !input.caret_visible;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(CARET_BLINK_INTERVAL_MS))
+                    .await;
+            }
+        }));
+    }
+
+    fn changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reset_caret_blink(cx);
         window.notify_text_input_changed(&self.focus_handle);
         window.notify_text_selection_changed(&self.focus_handle);
         if let Some(handler) = self.on_change.as_ref() {
@@ -157,6 +414,47 @@ impl DraftTextInput {
     ) {
         mutate(&mut self.state);
         self.selection_anchor = Some(self.state.cursor());
+        self.reset_caret_blink(cx);
+        window.notify_text_selection_changed(&self.focus_handle);
+        cx.notify();
+    }
+
+    fn move_word(
+        &mut self,
+        forward: bool,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = if self.masked {
+            if forward {
+                utf16_len(self.state.text())
+            } else {
+                0
+            }
+        } else if forward {
+            next_word_boundary(self.state.text(), self.state.cursor())
+        } else {
+            prev_word_boundary(self.state.text(), self.state.cursor())
+        };
+
+        if extend {
+            let range = self.state.selected_range();
+            let anchor = if range.is_empty() {
+                self.state.cursor()
+            } else if self.state.cursor() == range.start {
+                range.end
+            } else {
+                range.start
+            };
+            self.selection_anchor = Some(anchor);
+            self.state.select_to(anchor, target);
+        } else {
+            self.selection_anchor = Some(target);
+            self.state.set_cursor(target);
+        }
+
+        self.reset_caret_blink(cx);
         window.notify_text_selection_changed(&self.focus_handle);
         cx.notify();
     }
@@ -175,12 +473,48 @@ impl DraftTextInput {
         }
     }
 
+    fn on_delete_word_back(
+        &mut self,
+        _: &DraftDeleteWordBack,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.state.selected_range().is_empty() {
+            self.state.replace_text_in_range(None, "");
+            self.selection_anchor = Some(self.state.cursor());
+            self.changed(window, cx);
+            return;
+        }
+        let cursor = self.state.cursor();
+        if cursor == 0 {
+            return;
+        }
+        let start = if self.masked {
+            0
+        } else {
+            prev_word_boundary(self.state.text(), cursor)
+        };
+        if start < cursor {
+            self.state.replace_text_in_range(Some(start..cursor), "");
+            self.selection_anchor = Some(self.state.cursor());
+            self.changed(window, cx);
+        }
+    }
+
     fn on_left(&mut self, _: &DraftLeft, window: &mut Window, cx: &mut Context<Self>) {
         self.move_cursor(|s| s.move_left(false), window, cx);
     }
 
     fn on_right(&mut self, _: &DraftRight, window: &mut Window, cx: &mut Context<Self>) {
         self.move_cursor(|s| s.move_right(false), window, cx);
+    }
+
+    fn on_word_left(&mut self, _: &DraftWordLeft, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_word(false, false, window, cx);
+    }
+
+    fn on_word_right(&mut self, _: &DraftWordRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_word(true, false, window, cx);
     }
 
     fn on_select_left(&mut self, _: &DraftSelectLeft, window: &mut Window, cx: &mut Context<Self>) {
@@ -196,9 +530,28 @@ impl DraftTextInput {
         self.move_cursor(|s| s.move_right(true), window, cx);
     }
 
+    fn on_select_word_left(
+        &mut self,
+        _: &DraftSelectWordLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_word(false, true, window, cx);
+    }
+
+    fn on_select_word_right(
+        &mut self,
+        _: &DraftSelectWordRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_word(true, true, window, cx);
+    }
+
     fn on_select_all(&mut self, _: &DraftSelectAll, window: &mut Window, cx: &mut Context<Self>) {
         self.state.select_all();
         self.selection_anchor = Some(0);
+        self.reset_caret_blink(cx);
         window.notify_text_selection_changed(&self.focus_handle);
         cx.notify();
     }
@@ -250,6 +603,22 @@ impl DraftTextInput {
         }
     }
 
+    fn on_submit(&mut self, _: &DraftSubmit, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(handler) = self.on_submit.as_ref() {
+            handler(window, cx);
+        }
+    }
+
+    fn on_cancel(&mut self, _: &DraftCancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_handle.is_focused(window) {
+            self.is_selecting = false;
+            self.was_focused = false;
+            self.stop_caret_blink();
+            window.blur(cx);
+            cx.notify();
+        }
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -257,16 +626,35 @@ impl DraftTextInput {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle, cx);
-        self.is_selecting = true;
         window.request_virtual_keyboard();
         let index = self.index_for_mouse_position(event.position);
-        if event.modifiers.shift {
-            let anchor = self.selection_anchor.unwrap_or(self.state.cursor());
-            self.state.select_to(anchor, index);
+
+        if event.click_count >= 3 {
+            self.is_selecting = false;
+            self.state.select_all();
+            self.selection_anchor = Some(0);
+        } else if event.click_count == 2 {
+            self.is_selecting = false;
+            if self.masked {
+                self.state.select_all();
+                self.selection_anchor = Some(0);
+            } else {
+                let range = word_range_at(self.state.text(), index);
+                self.selection_anchor = Some(range.start);
+                self.state.select_range(range);
+            }
         } else {
-            self.selection_anchor = Some(index);
-            self.state.set_cursor(index);
+            self.is_selecting = true;
+            if event.modifiers.shift {
+                let anchor = self.selection_anchor.unwrap_or(self.state.cursor());
+                self.state.select_to(anchor, index);
+            } else {
+                self.selection_anchor = Some(index);
+                self.state.set_cursor(index);
+            }
         }
+
+        self.reset_caret_blink(cx);
         window.notify_text_selection_changed(&self.focus_handle);
         cx.notify();
     }
@@ -284,9 +672,12 @@ impl DraftTextInput {
         if self.is_selecting {
             let anchor = self.selection_anchor.unwrap_or(self.state.cursor());
             let index = self.index_for_mouse_position(event.position);
-            self.state.select_to(anchor, index);
-            window.notify_text_selection_changed(&self.focus_handle);
-            cx.notify();
+            if index != self.state.cursor() {
+                self.state.select_to(anchor, index);
+                self.reset_caret_blink(cx);
+                window.notify_text_selection_changed(&self.focus_handle);
+                cx.notify();
+            }
         }
     }
 
@@ -301,7 +692,8 @@ impl DraftTextInput {
         if position.y > bounds.bottom() {
             return utf16_len(self.state.text());
         }
-        let byte = line.closest_index_for_x(position.x - bounds.left());
+        let local_x = position.x - bounds.left() + px(self.scroll_x);
+        let byte = line.closest_index_for_x(local_x);
         if self.masked {
             let char_idx = line.text[..byte.min(line.text.len())].chars().count();
             let raw_char_byte = self
@@ -357,6 +749,7 @@ impl EntityInputHandler for DraftTextInput {
     ) {
         self.state.select_range(range_utf16);
         self.selection_anchor = Some(self.state.cursor());
+        self.reset_caret_blink(cx);
         window.notify_text_selection_changed(&self.focus_handle);
         cx.notify();
     }
@@ -431,9 +824,13 @@ impl EntityInputHandler for DraftTextInput {
         } else {
             (last_layout.x_for_index(start), last_layout.x_for_index(end))
         };
+        let scroll = px(self.scroll_x);
+        let max_w = element_bounds.size.width;
+        let vis_sx = (sx - scroll).clamp(px(0.), max_w);
+        let vis_ex = (ex - scroll).clamp(px(0.), max_w);
         Some(Bounds::from_corners(
-            point(element_bounds.left() + sx, element_bounds.top()),
-            point(element_bounds.left() + ex, element_bounds.bottom()),
+            point(element_bounds.left() + vis_sx, element_bounds.top()),
+            point(element_bounds.left() + vis_ex, element_bounds.bottom()),
         ))
     }
 
@@ -457,7 +854,7 @@ impl EntityInputHandler for DraftTextInput {
     ) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
-        let byte = last_layout.closest_index_for_x(line_point.x);
+        let byte = last_layout.closest_index_for_x(line_point.x + px(self.scroll_x));
         if self.masked {
             let char_idx = last_layout.text[..byte.min(last_layout.text.len())]
                 .chars()
@@ -485,6 +882,7 @@ struct PrepaintState {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    scroll_x: f32,
 }
 
 impl IntoElement for TextElement {
@@ -534,6 +932,8 @@ impl Element for TextElement {
         let selected_range = input.state.selected_range();
         let cursor = input.state.cursor();
         let marked_range = input.state.marked_range();
+        let prev_scroll = input.scroll_x;
+        let caret_visible = input.caret_visible;
         let style = window.text_style();
         let p = self.palette;
 
@@ -603,26 +1003,52 @@ impl Element for TextElement {
             }
         };
 
-        let cursor_pos = line.x_for_index(visual_byte(cursor));
+        let cursor_pos = if content.is_empty() {
+            px(0.)
+        } else {
+            line.x_for_index(visual_byte(cursor))
+        };
+        let scroll_x = if content.is_empty() {
+            0.0
+        } else {
+            compute_horizontal_scroll(
+                prev_scroll,
+                cursor_pos.as_f32(),
+                line.width().as_f32(),
+                bounds.size.width.as_f32(),
+            )
+        };
+        let scroll_px = px(scroll_x);
+
         let (selection, cursor_quad) = if selected_range.is_empty() {
-            (
-                None,
+            let caret = if caret_visible {
+                let top = bounds.top() + px(1.);
+                let height = (bounds.bottom() - bounds.top() - px(2.)).max(px(1.));
                 Some(fill(
                     Bounds::new(
-                        point(bounds.left() + cursor_pos, bounds.top()),
-                        size(px(1.8), bounds.bottom() - bounds.top()),
+                        point(bounds.left() + cursor_pos - scroll_px, top),
+                        size(px(1.8), height),
                     ),
                     rgb(p.input_focus_border),
-                )),
-            )
+                ))
+            } else {
+                None
+            };
+            (None, caret)
         } else {
             let start = visual_byte(selected_range.start);
             let end = visual_byte(selected_range.end);
             (
                 Some(fill(
                     Bounds::from_corners(
-                        point(bounds.left() + line.x_for_index(start), bounds.top()),
-                        point(bounds.left() + line.x_for_index(end), bounds.bottom()),
+                        point(
+                            bounds.left() + line.x_for_index(start) - scroll_px,
+                            bounds.top(),
+                        ),
+                        point(
+                            bounds.left() + line.x_for_index(end) - scroll_px,
+                            bounds.bottom(),
+                        ),
                     ),
                     rgba(p.input_selection_rgba),
                 )),
@@ -634,6 +1060,7 @@ impl Element for TextElement {
             line: Some(line),
             cursor: cursor_quad,
             selection,
+            scroll_x,
         }
     }
 
@@ -654,26 +1081,33 @@ impl Element for TextElement {
             cx,
         );
         let line = prepaint.line.take().expect("text line shaped in prepaint");
-        if let Some(selection) = prepaint.selection.take() {
-            window.paint_quad(selection);
-        }
-        line.paint(
-            bounds.origin,
-            window.line_height(),
-            TextAlign::Left,
-            None,
-            window,
-            cx,
-        )
-        .ok();
-        if focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
-        }
+        let scroll_x = prepaint.scroll_x;
+        let selection = prepaint.selection.take();
+        let cursor = prepaint.cursor.take();
+        let is_focused = focus_handle.is_focused(window);
+
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            if let Some(selection) = selection {
+                window.paint_quad(selection);
+            }
+            line.paint(
+                point(bounds.origin.x - px(scroll_x), bounds.origin.y),
+                window.line_height(),
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            )
+            .ok();
+            if is_focused && let Some(cursor) = cursor {
+                window.paint_quad(cursor);
+            }
+        });
+
         self.input.update(cx, |input, _cx| {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
+            input.scroll_x = scroll_x;
         });
     }
 }
@@ -685,11 +1119,17 @@ impl Render for DraftTextInput {
             .map(|g| g.0)
             .unwrap_or(&LIGHT_C2);
         let focused = self.focus_handle.is_focused(window);
+        self.sync_caret_blink(focused, cx);
+
         let (h, py_pad, text_sz, line_h) = if self.compact {
             (px(30.), px(5.), px(12.), px(18.))
         } else {
             (px(34.), px(6.5), px(12.), px(19.))
         };
+
+        let idle_border = p.input_border;
+        let focus_border = p.input_focus_border;
+        let focus_ring_rgba = (focus_border << 8) | 0x36;
 
         let mut box_div = div()
             .h(h)
@@ -698,11 +1138,6 @@ impl Render for DraftTextInput {
             .py(py_pad)
             .bg(rgb(p.input_bg))
             .border_1()
-            .border_color(rgb(if focused {
-                p.input_focus_border
-            } else {
-                p.input_border
-            }))
             .rounded(px(8.))
             .overflow_hidden()
             .child(TextElement {
@@ -713,6 +1148,29 @@ impl Render for DraftTextInput {
             box_div = box_div.font_family("Cascadia Mono");
         }
 
+        let animated_box = box_div.with_spring(
+            "input-focus-ring",
+            SpringAnimation::new(spring_snappy())
+                .to(focused)
+                .with_epsilon(0.002),
+            move |el, phase| {
+                let t = phase.0.clamp(0.0, 1.0);
+                let el = el.border_color(lerp_rgb(idle_border, focus_border, t));
+                if t > 0.01 {
+                    el.shadow(vec![
+                        BoxShadow::new(
+                            px(0.),
+                            px(0.),
+                            rgba_with_alpha_scale(focus_ring_rgba, t).into(),
+                        )
+                        .spread_radius(px(2.5 * t)),
+                    ])
+                } else {
+                    el
+                }
+            },
+        );
+
         div()
             .flex()
             .key_context("DraftTextInput")
@@ -720,10 +1178,15 @@ impl Render for DraftTextInput {
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::on_backspace))
             .on_action(cx.listener(Self::on_delete))
+            .on_action(cx.listener(Self::on_delete_word_back))
             .on_action(cx.listener(Self::on_left))
             .on_action(cx.listener(Self::on_right))
+            .on_action(cx.listener(Self::on_word_left))
+            .on_action(cx.listener(Self::on_word_right))
             .on_action(cx.listener(Self::on_select_left))
             .on_action(cx.listener(Self::on_select_right))
+            .on_action(cx.listener(Self::on_select_word_left))
+            .on_action(cx.listener(Self::on_select_word_right))
             .on_action(cx.listener(Self::on_select_all))
             .on_action(cx.listener(Self::on_home))
             .on_action(cx.listener(Self::on_end))
@@ -732,6 +1195,8 @@ impl Render for DraftTextInput {
             .on_action(cx.listener(Self::on_paste))
             .on_action(cx.listener(Self::on_copy))
             .on_action(cx.listener(Self::on_cut))
+            .on_action(cx.listener(Self::on_submit))
+            .on_action(cx.listener(Self::on_cancel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -739,6 +1204,63 @@ impl Render for DraftTextInput {
             .w_full()
             .line_height(line_h)
             .text_size(text_sz)
-            .child(box_div)
+            .child(animated_box)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn word_range_and_boundaries_handle_cidrs_urls_and_cjk() {
+        let cidr = "203.0.113.0/24, 198.51.100.12";
+        // Clicking inside "113" selects "113"
+        let r = word_range_at(cidr, 7);
+        assert_eq!(&cidr[r.start..r.end], "113");
+
+        // Stepping backwards from end crosses "12", ".", "100"
+        let end = utf16_len(cidr);
+        let b1 = prev_word_boundary(cidr, end);
+        assert_eq!(&cidr[b1..end], "12");
+        let b2 = prev_word_boundary(cidr, b1);
+        assert_eq!(&cidr[b2..b1], ".");
+        let b3 = prev_word_boundary(cidr, b2);
+        assert_eq!(&cidr[b3..b2], "100");
+
+        // Stepping forward across URL tokens
+        let url = "https://example.invalid/hook_01";
+        assert_eq!(next_word_boundary(url, 0), 5); // "https"
+        assert_eq!(next_word_boundary(url, 5), 8); // "://"
+        assert_eq!(next_word_boundary(url, 8), 15); // "example"
+
+        // UTF-16 CJK + emoji surrogate pair safety
+        let mixed = "节点😀 203.0.113.5";
+        let end_mixed = utf16_len(mixed);
+        let prev = prev_word_boundary(mixed, end_mixed);
+        assert!(prev < end_mixed);
+        let word_first = word_range_at(mixed, 1);
+        assert_eq!(word_first, 0..2); // "节点"
+    }
+
+    #[test]
+    fn horizontal_scroll_tracks_caret_and_resets_when_content_fits() {
+        // Content fits inside viewport -> always 0.0
+        assert_eq!(compute_horizontal_scroll(50.0, 120.0, 180.0, 240.0), 0.0);
+
+        // Long webhook URL overflowing a 200px viewport -> scroll right to keep 8px margin
+        let s1 = compute_horizontal_scroll(0.0, 420.0, 420.0, 200.0);
+        assert!((s1 - 228.0).abs() < 1e-4);
+
+        // Caret moving left while still inside visible window keeps scroll steady
+        let s2 = compute_horizontal_scroll(s1, 300.0, 420.0, 200.0);
+        assert_eq!(s2, s1);
+
+        // Caret moving past left margin scrolls left cleanly
+        let s3 = compute_horizontal_scroll(s2, 100.0, 420.0, 200.0);
+        assert!((s3 - 92.0).abs() < 1e-4);
+
+        // Caret at 0 snaps back to 0.0
+        assert_eq!(compute_horizontal_scroll(s3, 0.0, 420.0, 200.0), 0.0);
     }
 }

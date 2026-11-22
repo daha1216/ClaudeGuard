@@ -7,17 +7,19 @@
 //!   static IP/CIDR input, and connectivity-only hint bar
 //! - Bottom 3-column plain-language guide card
 
-use crate::app::{AppController, ConsoleWindowView, EnvSubTab};
-use crate::assets::{brand_icon, ui_icon};
+use crate::app::{ActionScope, AppController, ConsoleWindowView, EnvSubTab};
+use crate::assets::{brand_icon_scaled, ui_icon};
+use crate::motion::PageChoreo;
 use crate::protocol::{AnchorKind, PipeRequest, TargetState, UiLabelExt};
 use crate::state::{NavSection, split_tokens};
 use crate::theme::ThemePalette;
 use crate::views::shared::page_guide_card;
 use crate::widgets::controls::{
-    ButtonKind, action_button, bento_card, icon_action_button, inset_box, mono_tabular,
-    toggle_switch,
+    ButtonKind, action_button, bento_card_bloom, icon_action_button, inset_box, mono_tabular,
+    spinning_ui_icon, status_dot, toggle_switch,
 };
-use gpui::{Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, relative, rgb, rgba};
+use crate::widgets::text_input::DraftTextInput;
+use gpui::{Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, relative, rgb};
 
 const REGION_CATALOG: [(&str, &str); 12] = [
     ("US", "美国"),
@@ -48,11 +50,13 @@ fn render_region_selector(
     ctrl: Entity<AppController>,
     target_id: String,
     selected_codes: Vec<String>,
+    custom_input: Option<Entity<DraftTextInput>>,
     is_open: bool,
     p: &'static ThemePalette,
     cx: &mut Context<ConsoleWindowView>,
 ) -> Div {
     let hover_bg = p.sidebar_hover_bg;
+    let danger_txt = p.badge_fail.text;
     let ctrl_open = ctrl.clone();
     let tid_open = target_id.clone();
 
@@ -67,12 +71,12 @@ fn render_region_selector(
             .h(px(22.))
             .px(px(7.))
             .rounded(px(6.))
-            .bg(rgb(p.inset_bg))
+            .bg(rgb(p.accent_soft_bg))
             .border_1()
-            .border_color(rgb(p.card_border))
+            .border_color(rgb(p.accent_soft_border))
             .text_size(px(11.))
             .font_weight(FontWeight::MEDIUM)
-            .text_color(rgb(p.text_primary))
+            .text_color(rgb(p.accent_soft_text))
             .child(region_chip_label(code))
             .child(
                 div()
@@ -82,7 +86,7 @@ fn render_region_selector(
                     .cursor_pointer()
                     .text_size(px(12.))
                     .text_color(rgb(p.text_muted))
-                    .hover(|s| s.text_color(rgb(0xDC2626)))
+                    .hover(move |s| s.text_color(rgb(danger_txt)))
                     .child("×")
                     .on_mouse_up(
                         MouseButton::Left,
@@ -124,7 +128,9 @@ fn render_region_selector(
         .children(selected_tags)
         .child(
             div()
-                .id(gpui::ElementId::Name(format!("reg-pick-btn-{target_id}").into()))
+                .id(gpui::ElementId::Name(
+                    format!("reg-pick-btn-{target_id}").into(),
+                ))
                 .flex()
                 .items_center()
                 .gap(px(3.))
@@ -170,15 +176,19 @@ fn render_region_selector(
                     let tid_c = target_id.clone();
                     let code_s = (*code).to_string();
                     let ctrl_t = ctrl.clone();
-                    let bg = if on { p.primary_btn_bg } else { p.inset_bg };
+                    let bg = if on { p.accent_soft_bg } else { p.inset_bg };
                     let txt = if on {
-                        p.primary_btn_text
+                        p.accent_soft_text
                     } else {
                         p.text_secondary
                     };
-                    let bdr = if on { p.primary_btn_bg } else { p.card_border };
+                    let bdr = if on {
+                        p.accent_soft_border
+                    } else {
+                        p.card_border
+                    };
                     let hov = if on {
-                        p.primary_btn_hover_bg
+                        p.accent_soft_bg
                     } else {
                         p.sidebar_hover_bg
                     };
@@ -198,9 +208,14 @@ fn render_region_selector(
                         .border_1()
                         .border_color(rgb(bdr))
                         .cursor_pointer()
-                        .hover(move |s| s.bg(rgb(hov)))
+                        .hover(move |s| s.bg(rgb(hov)).opacity(0.92))
+                        .active(|s| s.opacity(0.84))
                         .text_size(px(11.))
-                        .font_weight(FontWeight::MEDIUM)
+                        .font_weight(if on {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::MEDIUM
+                        })
                         .text_color(rgb(txt))
                         .child(*cn)
                         .child(mono_tabular(*code).text_size(px(10.)).text_color(rgb(txt)))
@@ -220,7 +235,9 @@ fn render_region_selector(
 
         wrapper = wrapper.child(
             div()
-                .id(gpui::ElementId::Name(format!("reg-panel-{target_id}").into()))
+                .id(gpui::ElementId::Name(
+                    format!("reg-panel-{target_id}").into(),
+                ))
                 .flex()
                 .flex_col()
                 .gap(px(6.))
@@ -242,15 +259,17 @@ fn render_region_selector(
                                 .text_size(px(11.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(p.text_primary))
-                                .child("勾选允许放行的出口国家 / 地区"),
+                                .child("点选或输入两字母 ISO 代码"),
                         )
                         .child(
                             div()
-                                .id(gpui::ElementId::Name(format!("reg-done-{target_id}").into()))
+                                .id(gpui::ElementId::Name(
+                                    format!("reg-done-{target_id}").into(),
+                                ))
                                 .cursor_pointer()
                                 .text_size(px(11.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(p.text_secondary))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(p.link_text))
                                 .child("完成")
                                 .on_mouse_up(
                                     MouseButton::Left,
@@ -264,7 +283,24 @@ fn render_region_selector(
                                 ),
                         ),
                 )
-                .children(rows),
+                .children(rows)
+                .when_some(custom_input, |panel, inp| {
+                    panel.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .pt(px(3.))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(p.text_muted))
+                                    .child("代码列表"),
+                            )
+                            .child(div().flex_1().child(inp)),
+                    )
+                }),
         );
     }
 
@@ -273,13 +309,13 @@ fn render_region_selector(
 
 pub fn render_targets_page(
     ctrl: Entity<AppController>,
+    choreo: PageChoreo,
     p: &'static ThemePalette,
     cx: &mut Context<ConsoleWindowView>,
 ) -> Div {
     let ctrl_r = ctrl.read(cx);
     let snap = ctrl_r.snapshot.clone();
     let dirty = ctrl_r.drafts.dirty;
-    let err = ctrl_r.drafts.validation_error.clone();
     let targets = ctrl_r.drafts.targets.clone();
     let show_drawer = ctrl_r.show_add_target_drawer;
     let open_picker = ctrl_r.open_region_picker_for.clone();
@@ -298,7 +334,17 @@ pub fn render_targets_page(
     let new_name = ctrl_r.inputs.new_target_name.clone();
     let new_url = ctrl_r.inputs.new_target_url.clone();
     let new_ips = ctrl_r.inputs.new_target_ips.clone();
+    let new_reg_input = ctrl_r.inputs.new_target_regions.clone();
     let ip_map = ctrl_r.inputs.target_ips.clone();
+    let reg_map = ctrl_r.inputs.target_regions.clone();
+    let busy_targets: std::collections::HashSet<String> = ctrl_r
+        .in_flight
+        .iter()
+        .filter_map(|scope| match scope {
+            ActionScope::RecheckTarget(id) => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
 
     let ctrl_toggle_drawer = ctrl.clone();
     let ctrl_close_drawer = ctrl.clone();
@@ -309,14 +355,12 @@ pub fn render_targets_page(
     // -------------------------------------------------------------------------
     // Top Global Params Bar
     // -------------------------------------------------------------------------
-    let global_bar = bento_card(p)
-        .w_full()
+    let global_bar = bento_card_bloom(p, 16.0, 10.0, choreo.tile(0, 0))
+        .flex_1()
         .flex_row()
         .flex_wrap()
         .items_center()
         .justify_between()
-        .px(px(16.))
-        .py(px(10.))
         .gap(px(10.))
         .child(
             div()
@@ -430,7 +474,11 @@ pub fn render_targets_page(
                 .child(
                     action_button(
                         "tgt-save-btn",
-                        if connected { "保存配置" } else { "守护离线" },
+                        if connected {
+                            "保存配置"
+                        } else {
+                            "守护离线"
+                        },
                         ButtonKind::Primary,
                         can_act,
                         p,
@@ -457,10 +505,8 @@ pub fn render_targets_page(
         .collect();
 
     let add_drawer = show_drawer.then(|| {
-        bento_card(p)
-            .w_full()
-            .px(px(16.))
-            .py(px(12.))
+        bento_card_bloom(p, 16.0, 12.0, choreo.tile(0, 1))
+            .flex_1()
             .gap(px(9.))
             .border_color(rgb(p.primary_btn_bg))
             .child(
@@ -473,13 +519,13 @@ pub fn render_targets_page(
                             .text_size(px(12.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(p.text_primary))
-                            .child("新增自定义监控目标"),
+                            .child("新增监控目标"),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(rgb(p.text_muted))
-                            .child("输入探测网址并勾选允许放行的出口地区"),
+                            .child("填写探测网址与放行规则"),
                     ),
             )
             .child(
@@ -501,6 +547,7 @@ pub fn render_targets_page(
                         ctrl.clone(),
                         "__new__".into(),
                         new_reg_codes,
+                        Some(new_reg_input),
                         open_picker.as_deref() == Some("__new__"),
                         p,
                         cx,
@@ -527,7 +574,7 @@ pub fn render_targets_page(
                     .child(
                         action_button(
                             "tgt-drawer-submit",
-                            "添加到列表",
+                            "添加目标",
                             ButtonKind::Primary,
                             true,
                             p,
@@ -551,19 +598,28 @@ pub fn render_targets_page(
     // -------------------------------------------------------------------------
     // Target Cards
     // -------------------------------------------------------------------------
-    let target_cards = targets.into_iter().map(|t| {
+    let target_cards = targets.into_iter().enumerate().map(|(idx, t)| {
         let live = snap
             .as_ref()
             .and_then(|s| s.targets.iter().find(|x| x.id == t.id));
         let is_reach_only = t.anchor_kind == AnchorKind::Reachability;
         let is_fail = live.is_some_and(|s| s.state == TargetState::Fail);
         let is_pass = live.is_some_and(|s| s.state == TargetState::Pass);
+        let status_dot_color = if !t.enabled {
+            p.text_muted
+        } else if is_fail {
+            p.badge_fail.dot
+        } else if is_pass {
+            p.badge_pass.dot
+        } else {
+            p.badge_warn.dot
+        };
         let status_color = if !t.enabled {
             p.text_muted
         } else if is_fail {
             p.badge_fail.text
         } else if is_pass {
-            p.badge_pass.text
+            p.text_primary
         } else {
             p.badge_warn.text
         };
@@ -577,7 +633,7 @@ pub fn render_targets_page(
             };
             if is_reach_only {
                 if is_pass {
-                    format!("● 代理连通正常{ms_txt}")
+                    format!("● 代理连通{ms_txt}")
                 } else {
                     format!("● {}{ms_txt}", ls.state.label())
                 }
@@ -607,16 +663,28 @@ pub fn render_targets_page(
         let ctrl_ag_jump = ctrl.clone();
 
         let ip_input = ip_map.get(&t.id).cloned();
+        let reg_input = reg_map.get(&t.id).cloned();
         let region_codes: Vec<String> = split_tokens(&t.expect_regions_text)
             .into_iter()
             .map(|s| s.to_ascii_uppercase())
             .collect();
         let picker_open = open_picker.as_deref() == Some(t.id.as_str());
+        let saved_on_daemon = live.is_some();
+        let can_recheck = can_act && t.enabled && saved_on_daemon;
+        let target_busy = busy_targets.contains(&t.id);
+        let fail_reason = live
+            .filter(|ls| matches!(ls.state, TargetState::Fail | TargetState::Unverified))
+            .map(|ls| ls.reason.trim().to_string())
+            .filter(|r| !r.is_empty());
+        let del_hover_bg = p.danger_soft_bg;
+        let del_hover_bdr = p.danger_soft_border;
+        let del_hover_fg = p.danger_soft_text;
 
-        bento_card(p)
-            .w_full()
-            .px(px(14.))
-            .py(px(8.))
+        let card_pose = choreo.tile(1 + (idx / 2).min(2), idx % 2);
+        let icon_scale = choreo.icon_scale(0, idx);
+
+        let card = bento_card_bloom(p, 14.0, 9.0, card_pose)
+            .flex_1()
             .gap(px(6.))
             .when(!t.enabled, |c| c.bg(rgb(p.guide_bg)))
             .child(
@@ -648,7 +716,7 @@ pub fn render_targets_page(
                                     }),
                                 ),
                             )
-                            .child(brand_icon(&t.id, 24.0, 6.0, p.is_dark))
+                            .child(brand_icon_scaled(&t.id, 24.0, 6.5, p.is_dark, icon_scale))
                             .child(
                                 div()
                                     .flex()
@@ -683,43 +751,90 @@ pub fn render_targets_page(
                             .flex_shrink_0()
                             .gap(px(8.))
                             .child(
-                                mono_tabular(status_summary)
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(status_color)),
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.))
+                                    .when(t.enabled, |r| r.child(status_dot(status_dot_color, 5.5)))
+                                    .child(
+                                        mono_tabular(
+                                            status_summary.trim_start_matches("● ").to_string(),
+                                        )
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(status_color)),
+                                    ),
                             )
-                            .child(
-                                icon_action_button(
-                                    gpui::ElementId::Name(format!("tgt-recheck-{}", t.id).into()),
-                                    "icons/ui/refresh.svg",
-                                    "重检",
-                                    ButtonKind::Secondary,
-                                    can_act,
-                                    p,
-                                )
-                                .h(px(25.))
-                                .px(px(9.))
-                                .text_size(px(11.))
-                                .when(can_act, |b| {
-                                    b.on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |_, _, _, cx| {
-                                            let id = tid_recheck.clone();
-                                            let msg = format!("单目标重检 {tname_rc} 已触发");
-                                            ctrl_rc.update(cx, |c, cx| {
-                                                c.send_request(
-                                                    PipeRequest::RecheckNow {
-                                                        target_id: Some(id),
-                                                    },
-                                                    None,
-                                                    cx,
-                                                );
-                                                c.set_toast(msg, true, cx);
-                                            });
-                                        }),
-                                    )
-                                }),
-                            )
+                            .child({
+                                let rc_fg = if can_recheck {
+                                    p.secondary_btn_text
+                                } else {
+                                    p.text_muted
+                                };
+                                let rc_bg = if can_recheck {
+                                    p.secondary_btn_bg
+                                } else {
+                                    p.inset_bg
+                                };
+                                let rc_bdr = if can_recheck {
+                                    p.secondary_btn_border
+                                } else {
+                                    p.inset_border
+                                };
+                                let rc_hov = p.sidebar_hover_bg;
+                                div()
+                                    .id(gpui::ElementId::Name(
+                                        format!("tgt-recheck-{}", t.id).into(),
+                                    ))
+                                    .flex()
+                                    .flex_shrink_0()
+                                    .items_center()
+                                    .gap(px(4.5))
+                                    .h(px(25.))
+                                    .px(px(9.))
+                                    .rounded(px(8.))
+                                    .bg(rgb(rc_bg))
+                                    .border_1()
+                                    .border_color(rgb(rc_bdr))
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(rc_fg))
+                                    .child(spinning_ui_icon(
+                                        gpui::ElementId::Name(format!("tgt-spin-{}", t.id).into()),
+                                        "icons/ui/refresh.svg",
+                                        11.0,
+                                        rc_fg,
+                                        target_busy,
+                                    ))
+                                    .child(if target_busy {
+                                        "重检中"
+                                    } else if !saved_on_daemon {
+                                        "待保存"
+                                    } else {
+                                        "重检"
+                                    })
+                                    .when(can_recheck, |b| {
+                                        b.cursor_pointer()
+                                            .hover(move |s| s.bg(rgb(rc_hov)))
+                                            .active(|s| s.opacity(0.88))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |_, _, _, cx| {
+                                                    let id = tid_recheck.clone();
+                                                    let msg = format!("已重检：{tname_rc}");
+                                                    ctrl_rc.update(cx, |c, cx| {
+                                                        c.send_request_msg(
+                                                            PipeRequest::RecheckNow {
+                                                                target_id: Some(id),
+                                                            },
+                                                            Some(msg),
+                                                            cx,
+                                                        );
+                                                    });
+                                                }),
+                                            )
+                                    })
+                            })
                             .when(!t.builtin, |row| {
                                 row.child(
                                     action_button(
@@ -755,8 +870,20 @@ pub fn render_targets_page(
                                         .bg(rgb(p.secondary_btn_bg))
                                         .border_1()
                                         .border_color(rgb(p.secondary_btn_border))
+                                        .text_color(rgb(p.text_muted))
                                         .cursor_pointer()
-                                        .child(ui_icon("icons/ui/trash.svg", 12.0, p.badge_fail.text))
+                                        .hover(move |s| {
+                                            s.bg(rgb(del_hover_bg))
+                                                .border_color(rgb(del_hover_bdr))
+                                                .text_color(rgb(del_hover_fg))
+                                        })
+                                        .active(|s| s.opacity(0.86))
+                                        .child(
+                                            gpui::svg()
+                                                .path("icons/ui/trash.svg")
+                                                .size(px(12.0))
+                                                .flex_shrink_0(),
+                                        )
                                         .on_mouse_up(
                                             MouseButton::Left,
                                             cx.listener(move |_, _, _, cx| {
@@ -769,8 +896,20 @@ pub fn render_targets_page(
                             }),
                     ),
             )
+            .when_some(fail_reason, |card, reason| {
+                card.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(status_color))
+                        .child(format!("探测详情：{reason}")),
+                )
+            })
             .when(t.enabled, |card| {
-                let ip_active = active_preset == crate::protocol::PolicyPreset::StrictStaticIp;
+                let ip_active = matches!(
+                    active_preset,
+                    crate::protocol::PolicyPreset::StrictStaticIp
+                        | crate::protocol::PolicyPreset::StandardRegion
+                );
                 let region_active = active_preset == crate::protocol::PolicyPreset::StandardRegion;
                 card.child(if is_reach_only {
                     inset_box(p)
@@ -786,16 +925,19 @@ pub fn render_targets_page(
                                 .min_w(px(0.))
                                 .text_size(px(11.5))
                                 .text_color(rgb(p.text_secondary))
-                                .child("此目标仅核验经代理访问 Google 后端的连通性与延迟，不限制出口地区或静态 IP。"),
+                                .child("仅核验代理连通与延迟，不限地区或静态 IP。"),
                         )
                         .child(
                             div()
-                                .id(gpui::ElementId::Name(format!("tgt-ag-jump-{}", t.id).into()))
+                                .id(gpui::ElementId::Name(
+                                    format!("tgt-ag-jump-{}", t.id).into(),
+                                ))
                                 .flex_shrink_0()
                                 .cursor_pointer()
                                 .text_size(px(11.5))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(p.text_primary))
+                                .text_color(rgb(p.link_text))
+                                .hover(|s| s.opacity(0.80))
                                 .child("查看代理注入 →")
                                 .on_mouse_up(
                                     MouseButton::Left,
@@ -826,7 +968,7 @@ pub fn render_targets_page(
                                     div()
                                         .text_size(px(10.5))
                                         .text_color(rgb(p.text_muted))
-                                        .child("锁定静态 IP / 网段（仅「严格锁定静态 IP」策略生效）"),
+                                        .child("静态 IP / CIDR（标准 / 严格生效）"),
                                 )
                                 .when_some(ip_input, |d, inp| d.child(inp)),
                         )
@@ -842,36 +984,38 @@ pub fn render_targets_page(
                                     div()
                                         .text_size(px(10.5))
                                         .text_color(rgb(p.text_muted))
-                                        .child("允许放行的出口国家 / 地区（「标准地区白名单」生效）"),
+                                        .child("放行国家 / 地区（标准策略生效）"),
                                 )
                                 .child(render_region_selector(
                                     ctrl.clone(),
                                     t.id.clone(),
                                     region_codes,
+                                    reg_input,
                                     picker_open,
                                     p,
                                     cx,
                                 )),
                         )
                 })
-            })
+            });
+        div().w_full().min_w(px(0.)).flex().child(card)
     });
 
     let guide = page_guide_card(
-        "出口校验与策略生效说明",
-        "修改仅在点击「保存配置」后下发守护，后台刷新绝不覆盖未保存草稿",
+        "策略与校验说明",
+        "点「保存配置」或 Ctrl+S 生效",
         &[
             (
-                "1. 与顶部三档策略联动",
-                "「宽松防直连」只测经代理可达；「标准地区白名单」校验出口落在右侧所选地区；「严格锁定静态 IP」仅放行左侧绑定的 IP 或网段。",
+                "1. 三档策略",
+                "宽松仅测代理可达；标准匹配地区或静态 IP；严格仅放行静态 IP。",
             ),
             (
-                "2. 巡检间隔与防抖阈值",
-                "默认定时经本地代理只读探测；连续失败达到设定次数（默认 2 次）才触发熔断，避免节点偶发波动引起误封锁。",
+                "2. 防抖熔断",
+                "定时只读探测，连续失败达阈值（1–5 次）才熔断，避免偶发抖动误封。",
             ),
             (
-                "3. 内置与自定义目标",
-                "内置目标已预设最优官方探测端点，无需手动配置解析方式；如需扩展其他 AI 站点，点上方「新增目标」即可添加。",
+                "3. 自定义扩展",
+                "内置官方最优端点，可点「新增目标」扩展站点或在地区栏输入代码。",
             ),
         ],
         p,
@@ -883,20 +1027,10 @@ pub fn render_targets_page(
         .w_full()
         .min_w(px(0.))
         .gap(px(10.))
-        .child(global_bar)
-        .when_some(err, |root, msg| {
-            root.child(
-                div()
-                    .px(px(12.))
-                    .py(px(8.))
-                    .rounded(px(9.))
-                    .bg(rgba(p.badge_fail.bg))
-                    .text_size(px(11.5))
-                    .text_color(rgb(p.badge_fail.text))
-                    .child(msg),
-            )
+        .child(div().w_full().min_w(px(0.)).flex().child(global_bar))
+        .when_some(add_drawer, |root, drawer| {
+            root.child(div().w_full().min_w(px(0.)).flex().child(drawer))
         })
-        .when_some(add_drawer, |root, drawer| root.child(drawer))
         .child(div().flex().flex_col().gap(px(7.)).children(target_cards))
-        .child(guide)
+        .child(choreo.slot(4).apply(guide))
 }

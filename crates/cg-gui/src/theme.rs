@@ -1,10 +1,19 @@
-//! Frost Ceramic theme system: pure neutral ceramic Light + obsidian ceramic Dark.
+//! Multi-theme Apple Studio White & Refined Cool Gray visual design system
+//! (`ThemeStyle` × `Light` / `Dark` / `Auto`).
 //!
-//! Zero color cast, high-contrast charcoal/white ink accents, semantic status dots/pills,
-//! supporting `Light`, `Dark`, and `Auto` (Windows `AppsUseLightTheme`).
+//! All five curated styles share the exact same pure optical ceramic white & crisp cool
+//! studio-gray neutral canvas in Light mode (zero warm beige, zero greenish cast) and the
+//! exact same Apple Pro Studio Graphite neutral canvas in Dark mode, paired with five
+//! distinct accent personalities:
+//! - [`ThemeStyle::CrystalGlass`] ("琉璃冰晶", default): Apple Tahoe frosted crystal-ice liquid glass
+//! - [`ThemeStyle::LinearIndigo`] ("线性星靛"): Silicon Valley Linear / Stripe precision periwinkle-indigo
+//! - [`ThemeStyle::MinimalMist`] ("莫兰迪雾"): Quiet low-saturation Giorgio Morandi chalk slate-blue
+//! - [`ThemeStyle::AlpineSapphire`] ("深海蓝宝"): Swiss horology deep sapphire
+//! - [`ThemeStyle::ObsidianInk`] ("曜石极黑"): Classic editorial monochrome obsidian
 
 pub use cg_protocol::ThemeMode;
 use gpui::{Hsla, Rgba, rgb, rgba};
+use std::path::PathBuf;
 
 /// All user-selectable [`ThemeMode`] options in display order.
 pub const THEME_MODES: [ThemeMode; 3] = [ThemeMode::Light, ThemeMode::Dark, ThemeMode::Auto];
@@ -16,6 +25,193 @@ pub fn theme_mode_label(mode: ThemeMode) -> &'static str {
         ThemeMode::Dark => "暗夜",
         ThemeMode::Auto => "自动",
     }
+}
+
+/// Orthogonal visual theme style selectable independently of Light / Dark / Auto polarity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ThemeStyle {
+    /// "琉璃冰晶" — Default: Apple Tahoe frosted crystal-ice liquid glass matching the Celestial Origami Shield.
+    #[default]
+    CrystalGlass,
+    /// "线性星靛" — Silicon Valley Linear / Stripe precision periwinkle-indigo (`#5B69D0`).
+    LinearIndigo,
+    /// "莫兰迪雾" — Preserved Morandi dusty chalk slate-blue (`#6D839B`) on pure crisp White/Gray canvas.
+    MinimalMist,
+    /// "深海蓝宝" — Preserved Swiss horology deep sapphire (`#2B4F8D`) on pure crisp White/Gray canvas.
+    AlpineSapphire,
+    /// "曜石极黑" — Classic v4 monochrome obsidian (`#1E222C`) on pure crisp White/Gray canvas.
+    ObsidianInk,
+}
+
+/// All user-selectable [`ThemeStyle`] options in display order.
+pub const THEME_STYLES: [ThemeStyle; 5] = [
+    ThemeStyle::CrystalGlass,
+    ThemeStyle::LinearIndigo,
+    ThemeStyle::MinimalMist,
+    ThemeStyle::AlpineSapphire,
+    ThemeStyle::ObsidianInk,
+];
+
+impl ThemeStyle {
+    /// Stable serialization key persisted in `ui_style.json`.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::CrystalGlass => "crystal_glass",
+            Self::LinearIndigo => "linear_indigo",
+            Self::MinimalMist => "minimal_mist",
+            Self::AlpineSapphire => "alpine_sapphire",
+            Self::ObsidianInk => "obsidian_ink",
+        }
+    }
+
+    /// Parses a persisted style key back into a [`ThemeStyle`].
+    pub fn from_key(s: &str) -> Option<Self> {
+        match s.trim() {
+            "crystal_glass" => Some(Self::CrystalGlass),
+            "linear_indigo" => Some(Self::LinearIndigo),
+            "minimal_mist" => Some(Self::MinimalMist),
+            "alpine_sapphire" => Some(Self::AlpineSapphire),
+            "obsidian_ink" => Some(Self::ObsidianInk),
+            _ => None,
+        }
+    }
+
+    /// Localized display label for theme switchers and popovers.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CrystalGlass => "琉璃冰晶",
+            Self::LinearIndigo => "线性星靛",
+            Self::MinimalMist => "莫兰迪雾",
+            Self::AlpineSapphire => "深海蓝宝",
+            Self::ObsidianInk => "曜石极黑",
+        }
+    }
+
+    /// Concise localized tagline summarizing the aesthetic mood of the style.
+    pub const fn tagline(self) -> &'static str {
+        match self {
+            Self::CrystalGlass => "默认 · 苹果液态冰晶质感",
+            Self::LinearIndigo => "精工 · Linear 星靛紫蓝",
+            Self::MinimalMist => "柔雅 · 低饱和莫兰迪雾蓝",
+            Self::AlpineSapphire => "典藏 · 瑞士腕表深海蓝",
+            Self::ObsidianInk => "经典 · 极简曜石纯黑",
+        }
+    }
+
+    /// Primary accent swatch color (`0xRRGGBB`) for theme preview dots.
+    pub const fn swatch_accent(self, is_dark: bool) -> u32 {
+        match (self, is_dark) {
+            (Self::CrystalGlass, false) => 0x527CC4,
+            (Self::CrystalGlass, true) => 0x7AA3E8,
+            (Self::LinearIndigo, false) => 0x5B69D0,
+            (Self::LinearIndigo, true) => 0x7E8BF0,
+            (Self::MinimalMist, false) => 0x6E849C,
+            (Self::MinimalMist, true) => 0x8EA6BF,
+            (Self::AlpineSapphire, false) => 0x2B4F8D,
+            (Self::AlpineSapphire, true) => 0x5A83C9,
+            (Self::ObsidianInk, false) => 0x1E222C,
+            (Self::ObsidianInk, true) => 0xDCE1EB,
+        }
+    }
+
+    /// Surface preview swatch color (`0xRRGGBB`) for theme preview cards.
+    pub const fn swatch_surface(self, is_dark: bool) -> u32 {
+        match (self, is_dark) {
+            (Self::CrystalGlass, false) => 0xEAF1FC,
+            (Self::CrystalGlass, true) => 0x1D2B46,
+            (Self::LinearIndigo, false) => 0xF0F1FD,
+            (Self::LinearIndigo, true) => 0x1F2242,
+            (Self::MinimalMist, false) => 0xEEF2F6,
+            (Self::MinimalMist, true) => 0x1E2530,
+            (Self::AlpineSapphire, false) => 0xEDF2FA,
+            (Self::AlpineSapphire, true) => 0x1B2842,
+            (Self::ObsidianInk, false) => 0xEEF0F4,
+            (Self::ObsidianInk, true) => 0x1E2129,
+        }
+    }
+}
+
+/// Path to the local GUI style preference file (`<LOCALAPPDATA>\ClaudeGuard\ui_style.json`).
+pub fn ui_style_config_path() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("APPDATA").filter(|v| !v.is_empty()))?;
+    Some(
+        PathBuf::from(base)
+            .join("ClaudeGuard")
+            .join("ui_style.json"),
+    )
+}
+
+/// Checks whether a persisted `ui_style.json` payload carries schema version 2 (`"v":2`).
+///
+/// Legacy v1 files (missing `"v":2`) are intentionally ignored so existing trial users
+/// automatically upgrade to the new [`ThemeStyle::CrystalGlass`] default on launch.
+fn has_schema_v2(raw: &str) -> bool {
+    if raw.contains("\"v\":2") {
+        // Reject `"v":20` etc. by verifying the character following `"v":2` is not a digit.
+        for (idx, _) in raw.match_indices("\"v\":2") {
+            let tail = &raw[idx + "\"v\":2".len()..];
+            if tail.is_empty() || !tail.as_bytes()[0].is_ascii_digit() {
+                return true;
+            }
+        }
+        return false;
+    }
+    let Some(v_pos) = raw.find("\"v\"") else {
+        return false;
+    };
+    let after_v = &raw[v_pos + "\"v\"".len()..];
+    let Some(colon_pos) = after_v.find(':') else {
+        return false;
+    };
+    let rest = after_v[colon_pos + 1..].trim_start();
+    rest.strip_prefix('2')
+        .is_some_and(|tail| tail.is_empty() || !tail.as_bytes()[0].is_ascii_digit())
+}
+
+fn parse_theme_style_json(raw: &str) -> ThemeStyle {
+    if !has_schema_v2(raw) {
+        return ThemeStyle::CrystalGlass;
+    }
+    let Some(key_pos) = raw.find("\"style\"") else {
+        return ThemeStyle::CrystalGlass;
+    };
+    let after_key = &raw[key_pos + "\"style\"".len()..];
+    let Some(colon_pos) = after_key.find(':') else {
+        return ThemeStyle::CrystalGlass;
+    };
+    let after_colon = after_key[colon_pos + 1..].trim_start();
+    let Some(rest) = after_colon.strip_prefix('"') else {
+        return ThemeStyle::CrystalGlass;
+    };
+    let Some(end_quote) = rest.find('"') else {
+        return ThemeStyle::CrystalGlass;
+    };
+    ThemeStyle::from_key(&rest[..end_quote]).unwrap_or(ThemeStyle::CrystalGlass)
+}
+
+/// Loads the user's locally persisted [`ThemeStyle`], falling back to [`ThemeStyle::CrystalGlass`].
+pub fn load_saved_theme_style() -> ThemeStyle {
+    let Some(path) = ui_style_config_path() else {
+        return ThemeStyle::CrystalGlass;
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return ThemeStyle::CrystalGlass;
+    };
+    parse_theme_style_json(&raw)
+}
+
+/// Persists the chosen [`ThemeStyle`] locally as schema-v2 JSON (best-effort, ignores IO errors).
+pub fn save_theme_style(style: ThemeStyle) {
+    let Some(path) = ui_style_config_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let payload = format!("{{\"v\":2,\"style\":\"{}\"}}\n", style.key());
+    let _ = std::fs::write(path, payload);
 }
 
 /// Visual tone for the Hero card.
@@ -64,7 +260,7 @@ pub struct TimelinePalette {
     pub empty: u32,
 }
 
-/// Complete resolved Frost Ceramic color palette (`0xRRGGBB` or `0xRRGGBBAA` for alpha surfaces).
+/// Complete resolved color palette (`0xRRGGBB`, or `0xRRGGBBAA` for alpha surfaces).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThemePalette {
     pub is_dark: bool,
@@ -75,6 +271,7 @@ pub struct ThemePalette {
     pub frame_border: u32,
     pub card_bg: u32,
     pub card_border: u32,
+    pub card_hover_border: u32,
     pub inset_bg: u32,
     pub inset_border: u32,
     pub guide_bg: u32,
@@ -85,12 +282,14 @@ pub struct ThemePalette {
     pub text_secondary: u32,
     pub text_muted: u32,
 
-    // Navigation Dock & active pill (0xRRGGBB)
+    // Navigation Dock & Liquid Glass active pill (0xRRGGBB)
     pub sidebar_bg: u32,
     pub sidebar_active_bg: u32,
     pub sidebar_active_text: u32,
     pub sidebar_active_border: u32,
     pub sidebar_hover_bg: u32,
+    pub dock_pill_top: u32,
+    pub dock_pill_bottom: u32,
 
     // Switchers & Segmented Capsules (0xRRGGBB)
     pub switcher_track_bg: u32,
@@ -100,16 +299,31 @@ pub struct ThemePalette {
     pub capsule_active_bg: u32,
     pub capsule_active_text: u32,
 
-    // Interactive buttons & ink accents (0xRRGGBB)
+    // Interactive buttons & theme accents (0xRRGGBB)
     pub primary_btn_bg: u32,
+    pub primary_btn_top: u32,
+    pub primary_btn_bottom: u32,
     pub primary_btn_hover_bg: u32,
+    pub primary_btn_hover_top: u32,
+    pub primary_btn_hover_bottom: u32,
     pub primary_btn_text: u32,
+    pub primary_shadow_rgba: u32,
+    pub primary_specular_rgba: u32,
+    pub specular_top_rgba: u32,
+    pub accent_soft_bg: u32,
+    pub accent_soft_border: u32,
+    pub accent_soft_text: u32,
     pub secondary_btn_bg: u32,
     pub secondary_btn_border: u32,
     pub secondary_btn_text: u32,
     pub danger_btn_bg: u32,
+    pub danger_btn_hover_bg: u32,
     pub danger_btn_text: u32,
+    pub danger_soft_bg: u32,
+    pub danger_soft_border: u32,
+    pub danger_soft_text: u32,
     pub link_text: u32,
+    pub link_hover_text: u32,
 
     // Inputs & toggles (0xRRGGBB)
     pub input_bg: u32,
@@ -138,235 +352,610 @@ pub struct ThemePalette {
     // 24h timeline bar colors (`0xRRGGBB`)
     pub timeline: TimelinePalette,
 
-    // Ambient shadow (`0xRRGGBBAA`)
+    // Floating Dynamic-Island toast surfaces (`0xRRGGBBAA`)
+    pub toast_bg_rgba: u32,
+    pub toast_border_rgba: u32,
+
+    // Ambient & floating elevation shadows (`0xRRGGBBAA`)
     pub shadow_rgba: u32,
+    pub shadow_float_rgba: u32,
     // Modal / HUD overlay scrim (`0xRRGGBBAA`)
     pub scrim_rgba: u32,
 }
 
-/// Frost Ceramic (Light): pure neutral white ceramic with charcoal ink accents and zero rainbow cast.
-pub const LIGHT_C2: ThemePalette = ThemePalette {
-    is_dark: false,
-    name: "Frost Ceramic Light",
+/// Per-style Light accent tokens layered onto the unified Pure Crisp White & Cool Silver-Gray canvas.
+struct LightAccent {
+    name: &'static str,
+    sidebar_active_text: u32,
+    sidebar_active_border: u32,
+    primary_btn_bg: u32,
+    primary_btn_top: u32,
+    primary_btn_bottom: u32,
+    primary_btn_hover_bg: u32,
+    primary_btn_hover_top: u32,
+    primary_btn_hover_bottom: u32,
+    primary_btn_text: u32,
+    primary_shadow_rgba: u32,
+    primary_specular_rgba: u32,
+    accent_soft_bg: u32,
+    accent_soft_border: u32,
+    accent_soft_text: u32,
+    link_text: u32,
+    link_hover_text: u32,
+    input_focus_border: u32,
+    input_selection_rgba: u32,
+    toggle_track_on: u32,
+}
 
-    frame_bg: 0xF2F4F7,
-    frame_border: 0xDDE1E8,
-    card_bg: 0xFFFFFF,
-    card_border: 0xE6E9EF,
-    inset_bg: 0xF4F5F8,
-    inset_border: 0xE6E9EF,
-    guide_bg: 0xF8F9FB,
-    line_strong: 0xD2D7E0,
+/// Per-style Dark accent tokens layered onto the unified Apple Pro Studio Graphite canvas.
+struct DarkAccent {
+    name: &'static str,
+    sidebar_active_bg: u32,
+    sidebar_active_text: u32,
+    sidebar_active_border: u32,
+    dock_pill_top: u32,
+    dock_pill_bottom: u32,
+    primary_btn_bg: u32,
+    primary_btn_top: u32,
+    primary_btn_bottom: u32,
+    primary_btn_hover_bg: u32,
+    primary_btn_hover_top: u32,
+    primary_btn_hover_bottom: u32,
+    primary_btn_text: u32,
+    primary_shadow_rgba: u32,
+    primary_specular_rgba: u32,
+    accent_soft_bg: u32,
+    accent_soft_border: u32,
+    accent_soft_text: u32,
+    link_text: u32,
+    link_hover_text: u32,
+    input_focus_border: u32,
+    input_selection_rgba: u32,
+    toggle_track_on: u32,
+}
 
-    text_primary: 0x111317,
-    text_secondary: 0x4B5260,
-    text_muted: 0x646D7D,
+/// Builds a Light [`ThemePalette`] anchored on the exact unified Apple Studio White & Cool Gray canvas.
+const fn build_light_palette(a: LightAccent) -> ThemePalette {
+    ThemePalette {
+        is_dark: false,
+        name: a.name,
 
-    sidebar_bg: 0xFFFFFF,
-    sidebar_active_bg: 0x14171F,
-    sidebar_active_text: 0xFFFFFF,
-    sidebar_active_border: 0x14171F,
-    sidebar_hover_bg: 0xECEFF4,
+        frame_bg: 0xF3F5F8,
+        frame_border: 0xDFE3EC,
+        card_bg: 0xFFFFFF,
+        card_border: 0xE6E9F0,
+        card_hover_border: 0xCFD6E4,
+        inset_bg: 0xF6F8FB,
+        inset_border: 0xE9EDF4,
+        guide_bg: 0xF7F9FC,
+        line_strong: 0xCFD6E4,
 
-    switcher_track_bg: 0xECEFF4,
-    switcher_active_bg: 0xFFFFFF,
-    switcher_active_text: 0x111317,
-    capsule_track_bg: 0xF4F5F8,
-    capsule_active_bg: 0xFFFFFF,
-    capsule_active_text: 0x111317,
+        text_primary: 0x161B24,
+        text_secondary: 0x4C5566,
+        text_muted: 0x828B9C,
 
-    primary_btn_bg: 0x14171F,
-    primary_btn_hover_bg: 0x272C38,
+        sidebar_bg: 0xF8F9FC,
+        sidebar_active_bg: 0xFFFFFF,
+        sidebar_active_text: a.sidebar_active_text,
+        sidebar_active_border: a.sidebar_active_border,
+        sidebar_hover_bg: 0xEDF0F6,
+        dock_pill_top: 0xFFFFFF,
+        dock_pill_bottom: 0xF6F8FC,
+
+        switcher_track_bg: 0xEEF1F6,
+        switcher_active_bg: 0xFFFFFF,
+        switcher_active_text: 0x161B24,
+        capsule_track_bg: 0xEFF2F7,
+        capsule_active_bg: 0xFFFFFF,
+        capsule_active_text: 0x161B24,
+
+        primary_btn_bg: a.primary_btn_bg,
+        primary_btn_top: a.primary_btn_top,
+        primary_btn_bottom: a.primary_btn_bottom,
+        primary_btn_hover_bg: a.primary_btn_hover_bg,
+        primary_btn_hover_top: a.primary_btn_hover_top,
+        primary_btn_hover_bottom: a.primary_btn_hover_bottom,
+        primary_btn_text: a.primary_btn_text,
+        primary_shadow_rgba: a.primary_shadow_rgba,
+        primary_specular_rgba: a.primary_specular_rgba,
+        specular_top_rgba: 0xFFFFFFE6,
+        accent_soft_bg: a.accent_soft_bg,
+        accent_soft_border: a.accent_soft_border,
+        accent_soft_text: a.accent_soft_text,
+        secondary_btn_bg: 0xFFFFFF,
+        secondary_btn_border: 0xDCE1EB,
+        secondary_btn_text: 0x1E2532,
+        danger_btn_bg: 0xBE424F,
+        danger_btn_hover_bg: 0xA83642,
+        danger_btn_text: 0xFFFFFF,
+        danger_soft_bg: 0xFEF6F7,
+        danger_soft_border: 0xECCDD1,
+        danger_soft_text: 0x9C303C,
+        link_text: a.link_text,
+        link_hover_text: a.link_hover_text,
+
+        input_bg: 0xFFFFFF,
+        input_border: 0xD8DEE9,
+        input_focus_border: a.input_focus_border,
+        input_selection_rgba: a.input_selection_rgba,
+        toggle_track_off: 0xD7DCE6,
+        toggle_track_on: a.toggle_track_on,
+        toggle_knob: 0xFFFFFF,
+
+        cc_pill_bg: 0xEFF2F7,
+        cc_pill_text: 0x1E2532,
+
+        hero_healthy: HeroSurface {
+            bg: 0xFFFFFFFF,
+            border: 0xE5E9F1FF,
+            title: 0x161B24,
+            subtitle: 0x4C5566,
+            pill_bg: 0x28846214,
+            pill_text: 0x1F6E50,
+            ring: 0x2F946EFF,
+        },
+        hero_tripped: HeroSurface {
+            bg: 0xFEF9FAFF,
+            border: 0xC44B5836,
+            title: 0x161B24,
+            subtitle: 0x9C303C,
+            pill_bg: 0xBE424F14,
+            pill_text: 0x9C303C,
+            ring: 0xC64956FF,
+        },
+        hero_disarmed: HeroSurface {
+            bg: 0xFFFFFFFF,
+            border: 0xE5E8F0FF,
+            title: 0x161B24,
+            subtitle: 0x4C5566,
+            pill_bg: 0xAD7B2E14,
+            pill_text: 0x8A5F1E,
+            ring: 0xBA8634FF,
+        },
+
+        badge_pass: BadgeSurface {
+            bg: 0x28846214,
+            text: 0x1F6E50,
+            dot: 0x2F946E,
+        },
+        badge_fail: BadgeSurface {
+            bg: 0xBE424F14,
+            text: 0x9C303C,
+            dot: 0xC64956,
+        },
+        badge_warn: BadgeSurface {
+            bg: 0xAD7B2E14,
+            text: 0x8A5F1E,
+            dot: 0xBA8634,
+        },
+        badge_muted: BadgeSurface {
+            bg: 0x161B240D,
+            text: 0x4C5566,
+            dot: 0x828B9C,
+        },
+
+        timeline: TimelinePalette {
+            pass: 0x56A382,
+            warn: 0xCFA05A,
+            fail: 0xCC6872,
+            empty: 0xE7EAF1,
+        },
+
+        toast_bg_rgba: 0xFFFFFFF8,
+        toast_border_rgba: 0xDCE2EEFF,
+
+        shadow_rgba: 0x0F172A0E,
+        shadow_float_rgba: 0x0F172A1E,
+        scrim_rgba: 0x0F172A42,
+    }
+}
+
+/// Builds a Dark [`ThemePalette`] anchored on the exact unified Apple Pro Studio Graphite canvas.
+const fn build_dark_palette(a: DarkAccent) -> ThemePalette {
+    ThemePalette {
+        is_dark: true,
+        name: a.name,
+
+        frame_bg: 0x0E1015,
+        frame_border: 0x212633,
+        card_bg: 0x151820,
+        card_border: 0x232836,
+        card_hover_border: 0x343C4F,
+        inset_bg: 0x1A1E28,
+        inset_border: 0x282F3E,
+        guide_bg: 0x13161E,
+        line_strong: 0x333B4D,
+
+        text_primary: 0xEEF2F9,
+        text_secondary: 0x9BA6B8,
+        text_muted: 0x6D778A,
+
+        sidebar_bg: 0x13161E,
+        sidebar_active_bg: a.sidebar_active_bg,
+        sidebar_active_text: a.sidebar_active_text,
+        sidebar_active_border: a.sidebar_active_border,
+        sidebar_hover_bg: 0x1D222E,
+        dock_pill_top: a.dock_pill_top,
+        dock_pill_bottom: a.dock_pill_bottom,
+
+        switcher_track_bg: 0x181C26,
+        switcher_active_bg: 0x242A38,
+        switcher_active_text: 0xEEF2F9,
+        capsule_track_bg: 0x181C26,
+        capsule_active_bg: 0x242A38,
+        capsule_active_text: 0xEEF2F9,
+
+        primary_btn_bg: a.primary_btn_bg,
+        primary_btn_top: a.primary_btn_top,
+        primary_btn_bottom: a.primary_btn_bottom,
+        primary_btn_hover_bg: a.primary_btn_hover_bg,
+        primary_btn_hover_top: a.primary_btn_hover_top,
+        primary_btn_hover_bottom: a.primary_btn_hover_bottom,
+        primary_btn_text: a.primary_btn_text,
+        primary_shadow_rgba: a.primary_shadow_rgba,
+        primary_specular_rgba: a.primary_specular_rgba,
+        specular_top_rgba: 0xFFFFFF14,
+        accent_soft_bg: a.accent_soft_bg,
+        accent_soft_border: a.accent_soft_border,
+        accent_soft_text: a.accent_soft_text,
+        secondary_btn_bg: 0x1B1F2A,
+        secondary_btn_border: 0x2C3344,
+        secondary_btn_text: 0xE6ECF6,
+        danger_btn_bg: 0xC64D5A,
+        danger_btn_hover_bg: 0xD65B68,
+        danger_btn_text: 0xFFFFFF,
+        danger_soft_bg: 0x26171C,
+        danger_soft_border: 0x4E2B34,
+        danger_soft_text: 0xEA9CA4,
+        link_text: a.link_text,
+        link_hover_text: a.link_hover_text,
+
+        input_bg: 0x11141B,
+        input_border: 0x293040,
+        input_focus_border: a.input_focus_border,
+        input_selection_rgba: a.input_selection_rgba,
+        toggle_track_off: 0x293040,
+        toggle_track_on: a.toggle_track_on,
+        toggle_knob: 0xF4F7FC,
+
+        cc_pill_bg: 0x1E2330,
+        cc_pill_text: 0xE6ECF6,
+
+        hero_healthy: HeroSurface {
+            bg: 0x151820FF,
+            border: 0x252B3AFF,
+            title: 0xEEF2F9,
+            subtitle: 0x9BA6B8,
+            pill_bg: 0x48B58A1A,
+            pill_text: 0x7AD4B0,
+            ring: 0x48B58AFF,
+        },
+        hero_tripped: HeroSurface {
+            bg: 0x1E1519FF,
+            border: 0xD463703C,
+            title: 0xEEF2F9,
+            subtitle: 0xE6A1A9,
+            pill_bg: 0xD463701C,
+            pill_text: 0xEA9CA4,
+            ring: 0xD86874FF,
+        },
+        hero_disarmed: HeroSurface {
+            bg: 0x151820FF,
+            border: 0x2B3140FF,
+            title: 0xEEF2F9,
+            subtitle: 0x9BA6B8,
+            pill_bg: 0xD4A14E1A,
+            pill_text: 0xE0B976,
+            ring: 0xD4A14EFF,
+        },
+
+        badge_pass: BadgeSurface {
+            bg: 0x48B58A1A,
+            text: 0x7AD4B0,
+            dot: 0x48B58A,
+        },
+        badge_fail: BadgeSurface {
+            bg: 0xD463701C,
+            text: 0xEA9CA4,
+            dot: 0xD86874,
+        },
+        badge_warn: BadgeSurface {
+            bg: 0xD4A14E1A,
+            text: 0xE0B976,
+            dot: 0xD4A14E,
+        },
+        badge_muted: BadgeSurface {
+            bg: 0xFFFFFF10,
+            text: 0x9BA6B8,
+            dot: 0x6D778A,
+        },
+
+        timeline: TimelinePalette {
+            pass: 0x52B08A,
+            warn: 0xCFA05A,
+            fail: 0xD16B76,
+            empty: 0x232836,
+        },
+
+        toast_bg_rgba: 0x171B24F6,
+        toast_border_rgba: 0x2E3648FF,
+
+        shadow_rgba: 0x0204084C,
+        shadow_float_rgba: 0x0102067A,
+        scrim_rgba: 0x02040A88,
+    }
+}
+
+/// Crystal Glass (Light — Default, "琉璃冰晶"): Pure Apple Studio White & Cool Silver-Gray canvas
+/// paired with airy sculpted frosted crystal-ice Liquid Glass controls matching the Celestial Origami Shield.
+pub const CRYSTAL_GLASS_LIGHT: ThemePalette = build_light_palette(LightAccent {
+    name: "Crystal Glass Light",
+    sidebar_active_text: 0x1E3D75,
+    sidebar_active_border: 0xCDDDF4,
+    primary_btn_bg: 0xE5EEFC,
+    primary_btn_top: 0xEEF4FE,
+    primary_btn_bottom: 0xDAE6FA,
+    primary_btn_hover_bg: 0xDAE7FB,
+    primary_btn_hover_top: 0xE4EDFD,
+    primary_btn_hover_bottom: 0xCEE0FA,
+    primary_btn_text: 0x1E3D75,
+    primary_shadow_rgba: 0x244A8A1A,
+    primary_specular_rgba: 0xFFFFFFF0,
+    accent_soft_bg: 0xEEF4FD,
+    accent_soft_border: 0xB8CEEF,
+    accent_soft_text: 0x1E3D75,
+    link_text: 0x486492,
+    link_hover_text: 0x1E3D75,
+    input_focus_border: 0x5B84CC,
+    input_selection_rgba: 0x5B84CC24,
+    toggle_track_on: 0x4E78C2,
+});
+
+/// Crystal Glass (Dark — Default, "琉璃冰晶"): Pure Apple Pro Studio Graphite canvas paired with
+/// sculpted frosted dark-crystal Liquid Glass controls and crisp ice-white ink.
+pub const CRYSTAL_GLASS_DARK: ThemePalette = build_dark_palette(DarkAccent {
+    name: "Crystal Glass Dark",
+    sidebar_active_bg: 0x1D283D,
+    sidebar_active_text: 0xD7E6FF,
+    sidebar_active_border: 0x354E7A,
+    dock_pill_top: 0x253452,
+    dock_pill_bottom: 0x1B263D,
+    primary_btn_bg: 0x233659,
+    primary_btn_top: 0x2B4068,
+    primary_btn_bottom: 0x1D2D4C,
+    primary_btn_hover_bg: 0x2C436E,
+    primary_btn_hover_top: 0x344D7D,
+    primary_btn_hover_bottom: 0x253A61,
+    primary_btn_text: 0xECF3FF,
+    primary_shadow_rgba: 0x050D1E5A,
+    primary_specular_rgba: 0xA8C8FF38,
+    accent_soft_bg: 0x1C2840,
+    accent_soft_border: 0x3D5D96,
+    accent_soft_text: 0xC4DCFF,
+    link_text: 0x90B5EE,
+    link_hover_text: 0xD7E6FF,
+    input_focus_border: 0x5B88D4,
+    input_selection_rgba: 0x5B88D438,
+    toggle_track_on: 0x5B88D4,
+});
+
+/// Linear Indigo (Light — "线性星靛"): Pure Apple Studio White & Cool Gray canvas paired with
+/// Silicon Valley Linear / Stripe precision periwinkle-indigo (`#5B69D0`) controls.
+pub const LINEAR_INDIGO_LIGHT: ThemePalette = build_light_palette(LightAccent {
+    name: "Linear Indigo Light",
+    sidebar_active_text: 0x424EB5,
+    sidebar_active_border: 0xD2D6F5,
+    primary_btn_bg: 0x5B69D0,
+    primary_btn_top: 0x6A78DE,
+    primary_btn_bottom: 0x4D5AC0,
+    primary_btn_hover_bg: 0x6674D9,
+    primary_btn_hover_top: 0x7583E6,
+    primary_btn_hover_bottom: 0x5765CC,
     primary_btn_text: 0xFFFFFF,
-    secondary_btn_bg: 0xF4F5F8,
-    secondary_btn_border: 0xE2E5EC,
-    secondary_btn_text: 0x111317,
-    danger_btn_bg: 0xDC2626,
-    danger_btn_text: 0xFFFFFF,
-    link_text: 0x14171F,
+    primary_shadow_rgba: 0x3E4AA828,
+    primary_specular_rgba: 0xFFFFFF40,
+    accent_soft_bg: 0xF0F1FD,
+    accent_soft_border: 0xCED2F5,
+    accent_soft_text: 0x424EB5,
+    link_text: 0x5460B8,
+    link_hover_text: 0x3E49A8,
+    input_focus_border: 0x5B69D0,
+    input_selection_rgba: 0x5B69D026,
+    toggle_track_on: 0x5B69D0,
+});
 
-    input_bg: 0xFFFFFF,
-    input_border: 0xD2D7E0,
-    input_focus_border: 0x14171F,
-    input_selection_rgba: 0x14171F26,
-    toggle_track_off: 0xCFD4DE,
-    toggle_track_on: 0x16A34A,
-    toggle_knob: 0xFFFFFF,
+/// Linear Indigo (Dark — "线性星靛"): Pure Apple Pro Studio Graphite canvas paired with
+/// luminous periwinkle-indigo controls and refined mineral semantics.
+pub const LINEAR_INDIGO_DARK: ThemePalette = build_dark_palette(DarkAccent {
+    name: "Linear Indigo Dark",
+    sidebar_active_bg: 0x202440,
+    sidebar_active_text: 0xD2D8FF,
+    sidebar_active_border: 0x3C437A,
+    dock_pill_top: 0x282D4F,
+    dock_pill_bottom: 0x1E223D,
+    primary_btn_bg: 0x6876DE,
+    primary_btn_top: 0x7A87EA,
+    primary_btn_bottom: 0x5866CC,
+    primary_btn_hover_bg: 0x7481E5,
+    primary_btn_hover_top: 0x8692F0,
+    primary_btn_hover_bottom: 0x6471D4,
+    primary_btn_text: 0xF8F9FF,
+    primary_shadow_rgba: 0x0B0E2E5C,
+    primary_specular_rgba: 0xFFFFFF38,
+    accent_soft_bg: 0x1F2342,
+    accent_soft_border: 0x39407A,
+    accent_soft_text: 0xB8C0FF,
+    link_text: 0x9BA6F2,
+    link_hover_text: 0xD2D8FF,
+    input_focus_border: 0x7481E5,
+    input_selection_rgba: 0x7481E53A,
+    toggle_track_on: 0x6C7AE2,
+});
 
-    cc_pill_bg: 0xECEFF4,
-    cc_pill_text: 0x111317,
+/// Minimal Mist (Light — "莫兰迪雾"): Preserved low-saturation Morandi chalk slate-blue (`#6D839B`)
+/// accents unified onto the pure crisp White & Cool Gray studio canvas.
+pub const MINIMAL_MIST_LIGHT: ThemePalette = build_light_palette(LightAccent {
+    name: "Minimal Mist Light",
+    sidebar_active_text: 0x3D536B,
+    sidebar_active_border: 0xD5DFE9,
+    primary_btn_bg: 0x6D839B,
+    primary_btn_top: 0x798FA7,
+    primary_btn_bottom: 0x60768E,
+    primary_btn_hover_bg: 0x778DA6,
+    primary_btn_hover_top: 0x849AB2,
+    primary_btn_hover_bottom: 0x6A8098,
+    primary_btn_text: 0xFFFFFF,
+    primary_shadow_rgba: 0x4E657D24,
+    primary_specular_rgba: 0xFFFFFF44,
+    accent_soft_bg: 0xEEF2F6,
+    accent_soft_border: 0xD5DFEA,
+    accent_soft_text: 0x496078,
+    link_text: 0x5C7187,
+    link_hover_text: 0x3D536B,
+    input_focus_border: 0x788EA6,
+    input_selection_rgba: 0x6D839B28,
+    toggle_track_on: 0x788EA6,
+});
 
-    hero_healthy: HeroSurface {
-        bg: 0xFFFFFFFF,
-        border: 0xE4E7EEFF,
-        title: 0x111317,
-        subtitle: 0x525866,
-        pill_bg: 0x16A34A18,
-        pill_text: 0x16A34A,
-        ring: 0x16A34AFF,
-    },
-    hero_tripped: HeroSurface {
-        bg: 0xFEF5F5FF,
-        border: 0xDC26263D,
-        title: 0x111317,
-        subtitle: 0x7F1D1D,
-        pill_bg: 0xDC262618,
-        pill_text: 0xDC2626,
-        ring: 0xDC2626FF,
-    },
-    hero_disarmed: HeroSurface {
-        bg: 0xFFFDF5FF,
-        border: 0xD9770644,
-        title: 0x111317,
-        subtitle: 0x78350F,
-        pill_bg: 0xD9770618,
-        pill_text: 0xD97706,
-        ring: 0xD97706FF,
-    },
+/// Minimal Mist (Dark — "莫兰迪雾"): Unified Apple Pro Studio Graphite canvas paired with
+/// luminous chalk slate-blue primary controls.
+pub const MINIMAL_MIST_DARK: ThemePalette = build_dark_palette(DarkAccent {
+    name: "Minimal Mist Dark",
+    sidebar_active_bg: 0x202631,
+    sidebar_active_text: 0xC6D6E8,
+    sidebar_active_border: 0x384355,
+    dock_pill_top: 0x272E3B,
+    dock_pill_bottom: 0x1E232E,
+    primary_btn_bg: 0x849DB7,
+    primary_btn_top: 0x8FA7C0,
+    primary_btn_bottom: 0x7A93AD,
+    primary_btn_hover_bg: 0x90A8C1,
+    primary_btn_hover_top: 0x9BB2CA,
+    primary_btn_hover_bottom: 0x859EB8,
+    primary_btn_text: 0x12161D,
+    primary_shadow_rgba: 0x05070B50,
+    primary_specular_rgba: 0xFFFFFF44,
+    accent_soft_bg: 0x1D2430,
+    accent_soft_border: 0x334054,
+    accent_soft_text: 0xB8CBE0,
+    link_text: 0x9FB5CC,
+    link_hover_text: 0xC6D8EB,
+    input_focus_border: 0x849DB7,
+    input_selection_rgba: 0x849DB736,
+    toggle_track_on: 0x7890A9,
+});
 
-    badge_pass: BadgeSurface {
-        bg: 0x16A34A18,
-        text: 0x16A34A,
-        dot: 0x16A34A,
-    },
-    badge_fail: BadgeSurface {
-        bg: 0xDC262618,
-        text: 0xDC2626,
-        dot: 0xDC2626,
-    },
-    badge_warn: BadgeSurface {
-        bg: 0xD9770618,
-        text: 0xD97706,
-        dot: 0xD97706,
-    },
-    badge_muted: BadgeSurface {
-        bg: 0x1113170F,
-        text: 0x4B5260,
-        dot: 0x646D7D,
-    },
+/// Alpine Sapphire (Light — "深海蓝宝"): Preserved Swiss horology deep sapphire (`#2B4F8D`)
+/// accents unified onto the pure crisp White & Cool Gray studio canvas.
+pub const ALPINE_SAPPHIRE_LIGHT: ThemePalette = build_light_palette(LightAccent {
+    name: "Alpine Sapphire Light",
+    sidebar_active_text: 0x1F3D73,
+    sidebar_active_border: 0xCDD8EB,
+    primary_btn_bg: 0x203E72,
+    primary_btn_top: 0x2B4F8D,
+    primary_btn_bottom: 0x1B3563,
+    primary_btn_hover_bg: 0x284B87,
+    primary_btn_hover_top: 0x345DA3,
+    primary_btn_hover_bottom: 0x224178,
+    primary_btn_text: 0xFFFFFF,
+    primary_shadow_rgba: 0x142A5230,
+    primary_specular_rgba: 0xFFFFFF3A,
+    accent_soft_bg: 0xEDF2FA,
+    accent_soft_border: 0xCFDCEF,
+    accent_soft_text: 0x1F3D73,
+    link_text: 0x465875,
+    link_hover_text: 0x1F3D73,
+    input_focus_border: 0x2B4F8D,
+    input_selection_rgba: 0x2B4F8D26,
+    toggle_track_on: 0x2B4F8D,
+});
 
-    timeline: TimelinePalette {
-        pass: 0x16A34A,
-        warn: 0xD97706,
-        fail: 0xDC2626,
-        empty: 0xE2E5EC,
-    },
+/// Alpine Sapphire (Dark — "深海蓝宝"): Unified Apple Pro Studio Graphite canvas paired with
+/// luminous steel-sapphire primary accents.
+pub const ALPINE_SAPPHIRE_DARK: ThemePalette = build_dark_palette(DarkAccent {
+    name: "Alpine Sapphire Dark",
+    sidebar_active_bg: 0x1D283E,
+    sidebar_active_text: 0xD8E7FF,
+    sidebar_active_border: 0x384B6E,
+    dock_pill_top: 0x25334D,
+    dock_pill_bottom: 0x1B253A,
+    primary_btn_bg: 0x4A72B5,
+    primary_btn_top: 0x5A83C9,
+    primary_btn_bottom: 0x3E62A1,
+    primary_btn_hover_bg: 0x5881C4,
+    primary_btn_hover_top: 0x6891D6,
+    primary_btn_hover_bottom: 0x4A70B2,
+    primary_btn_text: 0xF7FAFF,
+    primary_shadow_rgba: 0x04091660,
+    primary_specular_rgba: 0xFFFFFF30,
+    accent_soft_bg: 0x1B2842,
+    accent_soft_border: 0x304770,
+    accent_soft_text: 0xAEC9F5,
+    link_text: 0x9BB3D8,
+    link_hover_text: 0xCBE0FF,
+    input_focus_border: 0x5A83C9,
+    input_selection_rgba: 0x5A83C938,
+    toggle_track_on: 0x4C75B8,
+});
 
-    shadow_rgba: 0x0F172A0B,
-    scrim_rgba: 0x0F172A48,
-};
+/// Obsidian Ink (Light — "曜石极黑"): Classic v4 monochrome obsidian (`#1E222C`) accents unified
+/// onto the pure crisp White & Cool Gray studio canvas.
+pub const OBSIDIAN_INK_LIGHT: ThemePalette = build_light_palette(LightAccent {
+    name: "Obsidian Ink Light",
+    sidebar_active_text: 0x1B1F27,
+    sidebar_active_border: 0xD4D7DF,
+    primary_btn_bg: 0x1E222C,
+    primary_btn_top: 0x2A2F3B,
+    primary_btn_bottom: 0x171A22,
+    primary_btn_hover_bg: 0x2B303C,
+    primary_btn_hover_top: 0x353B49,
+    primary_btn_hover_bottom: 0x212631,
+    primary_btn_text: 0xFFFFFF,
+    primary_shadow_rgba: 0x0B0D122C,
+    primary_specular_rgba: 0xFFFFFF32,
+    accent_soft_bg: 0xEEF0F4,
+    accent_soft_border: 0xD6D9E0,
+    accent_soft_text: 0x1E222C,
+    link_text: 0x4E5563,
+    link_hover_text: 0x161B24,
+    input_focus_border: 0x2A2F3B,
+    input_selection_rgba: 0x2A2F3B20,
+    toggle_track_on: 0x1E222C,
+});
 
-/// Frost Ceramic (Dark): crisp neutral dark graphite tiles with high-contrast white ink accents.
-pub const DARK_C3: ThemePalette = ThemePalette {
-    is_dark: true,
-    name: "Frost Ceramic Dark",
+/// Obsidian Ink (Dark — "曜石极黑"): Unified Apple Pro Studio Graphite canvas paired with
+/// luminous ivory-platinum monochrome CTA.
+pub const OBSIDIAN_INK_DARK: ThemePalette = build_dark_palette(DarkAccent {
+    name: "Obsidian Ink Dark",
+    sidebar_active_bg: 0x1E222C,
+    sidebar_active_text: 0xF5F7FA,
+    sidebar_active_border: 0x353C4B,
+    dock_pill_top: 0x252A36,
+    dock_pill_bottom: 0x1C2029,
+    primary_btn_bg: 0xDCE1EB,
+    primary_btn_top: 0xEAEEF5,
+    primary_btn_bottom: 0xCFD6E3,
+    primary_btn_hover_bg: 0xE7ECF4,
+    primary_btn_hover_top: 0xF4F6FA,
+    primary_btn_hover_bottom: 0xDAE0EC,
+    primary_btn_text: 0x111318,
+    primary_shadow_rgba: 0x02030658,
+    primary_specular_rgba: 0xFFFFFF58,
+    accent_soft_bg: 0x1E2129,
+    accent_soft_border: 0x343A48,
+    accent_soft_text: 0xDCE0E8,
+    link_text: 0xA2A9B8,
+    link_hover_text: 0xEBEEF4,
+    input_focus_border: 0x8A92A0,
+    input_selection_rgba: 0x8A92A038,
+    toggle_track_on: 0x8A92A0,
+});
 
-    frame_bg: 0x141518,
-    frame_border: 0x2B2D35,
-    card_bg: 0x1C1D22,
-    card_border: 0x2A2C34,
-    inset_bg: 0x24262D,
-    inset_border: 0x30333D,
-    guide_bg: 0x18191E,
-    line_strong: 0x3C3F4A,
+/// Default Light palette alias (preserved for backward compatibility).
+pub const LIGHT_C2: ThemePalette = CRYSTAL_GLASS_LIGHT;
 
-    text_primary: 0xF3F4F6,
-    text_secondary: 0xB4BCC8,
-    text_muted: 0x8E98A8,
-
-    sidebar_bg: 0x1E2026,
-    sidebar_active_bg: 0xF3F4F6,
-    sidebar_active_text: 0x111317,
-    sidebar_active_border: 0xF3F4F6,
-    sidebar_hover_bg: 0x2B2D36,
-
-    switcher_track_bg: 0x23252C,
-    switcher_active_bg: 0x1C1D22,
-    switcher_active_text: 0xF3F4F6,
-    capsule_track_bg: 0x23252C,
-    capsule_active_bg: 0x1C1D22,
-    capsule_active_text: 0xF3F4F6,
-
-    primary_btn_bg: 0xF3F4F6,
-    primary_btn_hover_bg: 0xE0E3EA,
-    primary_btn_text: 0x111317,
-    secondary_btn_bg: 0x25272F,
-    secondary_btn_border: 0x353844,
-    secondary_btn_text: 0xF3F4F6,
-    danger_btn_bg: 0xDC2626,
-    danger_btn_text: 0xFFFFFF,
-    link_text: 0xF3F4F6,
-
-    input_bg: 0x1C1D22,
-    input_border: 0x3B3E49,
-    input_focus_border: 0xF3F4F6,
-    input_selection_rgba: 0xF3F4F633,
-    toggle_track_off: 0x3B3E49,
-    toggle_track_on: 0x22C55E,
-    toggle_knob: 0xFFFFFF,
-
-    cc_pill_bg: 0x2A2C34,
-    cc_pill_text: 0xF3F4F6,
-
-    hero_healthy: HeroSurface {
-        bg: 0x1C1D22FF,
-        border: 0x2D3039FF,
-        title: 0xF3F4F6,
-        subtitle: 0xB4BCC8,
-        pill_bg: 0x22C55E24,
-        pill_text: 0x22C55E,
-        ring: 0x22C55EFF,
-    },
-    hero_tripped: HeroSurface {
-        bg: 0x281A1DFF,
-        border: 0xEF444457,
-        title: 0xF3F4F6,
-        subtitle: 0xFCA5A5,
-        pill_bg: 0xF8717126,
-        pill_text: 0xF87171,
-        ring: 0xF87171FF,
-    },
-    hero_disarmed: HeroSurface {
-        bg: 0x262016FF,
-        border: 0xF59E0B55,
-        title: 0xF3F4F6,
-        subtitle: 0xFDE68A,
-        pill_bg: 0xF59E0B24,
-        pill_text: 0xF59E0B,
-        ring: 0xF59E0BFF,
-    },
-
-    badge_pass: BadgeSurface {
-        bg: 0x22C55E24,
-        text: 0x22C55E,
-        dot: 0x22C55E,
-    },
-    badge_fail: BadgeSurface {
-        bg: 0xF8717124,
-        text: 0xF87171,
-        dot: 0xF87171,
-    },
-    badge_warn: BadgeSurface {
-        bg: 0xF59E0B24,
-        text: 0xF59E0B,
-        dot: 0xF59E0B,
-    },
-    badge_muted: BadgeSurface {
-        bg: 0xFFFFFF12,
-        text: 0xB4BCC8,
-        dot: 0x8E98A8,
-    },
-
-    timeline: TimelinePalette {
-        pass: 0x22C55E,
-        warn: 0xF59E0B,
-        fail: 0xF87171,
-        empty: 0x2C2F38,
-    },
-
-    shadow_rgba: 0x00000044,
-    scrim_rgba: 0x00000084,
-};
+/// Default Dark palette alias (preserved for backward compatibility).
+pub const DARK_C3: ThemePalette = CRYSTAL_GLASS_DARK;
 
 impl ThemePalette {
     pub fn hero(&self, tone: HeroTone) -> HeroSurface {
@@ -387,19 +976,34 @@ impl ThemePalette {
     }
 }
 
-/// Resolves the active [`ThemePalette`] given user preference and Windows light/dark theme.
-pub fn resolve_palette(mode: ThemeMode, system_prefers_light: bool) -> &'static ThemePalette {
-    match mode {
-        ThemeMode::Light => &LIGHT_C2,
-        ThemeMode::Dark => &DARK_C3,
-        ThemeMode::Auto => {
-            if system_prefers_light {
-                &LIGHT_C2
-            } else {
-                &DARK_C3
-            }
-        }
+/// Resolves the active [`ThemePalette`] given [`ThemeStyle`], [`ThemeMode`], and system polarity.
+pub fn resolve_styled_palette(
+    style: ThemeStyle,
+    mode: ThemeMode,
+    system_prefers_light: bool,
+) -> &'static ThemePalette {
+    let is_light = match mode {
+        ThemeMode::Light => true,
+        ThemeMode::Dark => false,
+        ThemeMode::Auto => system_prefers_light,
+    };
+    match (style, is_light) {
+        (ThemeStyle::CrystalGlass, true) => &CRYSTAL_GLASS_LIGHT,
+        (ThemeStyle::CrystalGlass, false) => &CRYSTAL_GLASS_DARK,
+        (ThemeStyle::LinearIndigo, true) => &LINEAR_INDIGO_LIGHT,
+        (ThemeStyle::LinearIndigo, false) => &LINEAR_INDIGO_DARK,
+        (ThemeStyle::MinimalMist, true) => &MINIMAL_MIST_LIGHT,
+        (ThemeStyle::MinimalMist, false) => &MINIMAL_MIST_DARK,
+        (ThemeStyle::AlpineSapphire, true) => &ALPINE_SAPPHIRE_LIGHT,
+        (ThemeStyle::AlpineSapphire, false) => &ALPINE_SAPPHIRE_DARK,
+        (ThemeStyle::ObsidianInk, true) => &OBSIDIAN_INK_LIGHT,
+        (ThemeStyle::ObsidianInk, false) => &OBSIDIAN_INK_DARK,
     }
+}
+
+/// Resolves the default ([`ThemeStyle::CrystalGlass`]) [`ThemePalette`] for `mode` and system polarity.
+pub fn resolve_palette(mode: ThemeMode, system_prefers_light: bool) -> &'static ThemePalette {
+    resolve_styled_palette(ThemeStyle::CrystalGlass, mode, system_prefers_light)
 }
 
 /// Detects whether Windows currently prefers Light apps (`AppsUseLightTheme != 0`).
@@ -435,7 +1039,7 @@ pub fn c_hsla(hex: u32) -> Hsla {
     rgb(hex).into()
 }
 
-/// Layout constants for Mode A (Tray Quick HUD) and Mode B (Frost Ceramic Main Console).
+/// Layout constants for Mode A (Tray Quick HUD) and Mode B (Main Console).
 pub mod layout {
     pub const HUD_WIDTH: f32 = 398.0;
     pub const HUD_HEIGHT: f32 = 432.0;
@@ -459,36 +1063,186 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frost_ceramic_light_tokens_match_spec() {
-        const { assert!(!LIGHT_C2.is_dark) };
-        assert_eq!(LIGHT_C2.frame_bg, 0xF2F4F7);
-        assert_eq!(LIGHT_C2.card_bg, 0xFFFFFF);
-        assert_eq!(LIGHT_C2.inset_bg, 0xF4F5F8);
-        assert_eq!(LIGHT_C2.text_primary, 0x111317);
-        assert_eq!(LIGHT_C2.text_secondary, 0x4B5260);
-        assert_eq!(LIGHT_C2.text_muted, 0x646D7D);
-        assert_eq!(LIGHT_C2.primary_btn_bg, 0x14171F);
-        assert_eq!(LIGHT_C2.primary_btn_text, 0xFFFFFF);
-        assert_eq!(LIGHT_C2.toggle_track_on, 0x16A34A);
-        assert_eq!(LIGHT_C2.timeline.pass, 0x16A34A);
-        assert_eq!(LIGHT_C2.timeline.warn, 0xD97706);
-        assert_eq!(LIGHT_C2.timeline.fail, 0xDC2626);
+    fn theme_style_round_trips_keys_metadata_and_v2_persistence() {
+        assert_eq!(ThemeStyle::default(), ThemeStyle::CrystalGlass);
+        assert_eq!(THEME_STYLES.len(), 5);
+
+        for style in THEME_STYLES {
+            assert_eq!(ThemeStyle::from_key(style.key()), Some(style));
+            assert_eq!(
+                ThemeStyle::from_key(&format!("  {} \n", style.key())),
+                Some(style)
+            );
+            assert!(!style.label().is_empty());
+            assert!(!style.tagline().is_empty());
+            assert_ne!(style.swatch_accent(false), style.swatch_surface(false));
+            assert_ne!(style.swatch_accent(true), style.swatch_surface(true));
+
+            let v2_json = format!("{{\"v\":2,\"style\":\"{}\"}}\n", style.key());
+            assert_eq!(parse_theme_style_json(&v2_json), style);
+
+            // Legacy v1 files without `"v":2` must migrate cleanly to CrystalGlass default
+            let v1_json = format!("{{\"style\":\"{}\"}}\n", style.key());
+            assert_eq!(parse_theme_style_json(&v1_json), ThemeStyle::CrystalGlass);
+        }
+
+        assert_eq!(ThemeStyle::CrystalGlass.label(), "琉璃冰晶");
+        assert_eq!(ThemeStyle::LinearIndigo.label(), "线性星靛");
+        assert_eq!(ThemeStyle::MinimalMist.label(), "莫兰迪雾");
+        assert_eq!(ThemeStyle::AlpineSapphire.label(), "深海蓝宝");
+        assert_eq!(ThemeStyle::ObsidianInk.label(), "曜石极黑");
+
+        assert_eq!(ThemeStyle::from_key("unknown_style"), None);
+        assert_eq!(parse_theme_style_json(""), ThemeStyle::CrystalGlass);
+        assert_eq!(
+            parse_theme_style_json("{\"v\":1,\"style\":\"obsidian_ink\"}"),
+            ThemeStyle::CrystalGlass
+        );
+        assert_eq!(
+            parse_theme_style_json("{\"v\":20,\"style\":\"obsidian_ink\"}"),
+            ThemeStyle::CrystalGlass
+        );
+        assert_eq!(
+            parse_theme_style_json("{ \"v\" : 2 , \"style\" : \"linear_indigo\" }"),
+            ThemeStyle::LinearIndigo
+        );
+        assert_eq!(
+            parse_theme_style_json("{\"v\":2,\"style\":\"bogus\"}"),
+            ThemeStyle::CrystalGlass
+        );
     }
 
     #[test]
-    fn frost_ceramic_dark_tokens_match_spec() {
-        const { assert!(DARK_C3.is_dark) };
-        assert_eq!(DARK_C3.frame_bg, 0x141518);
-        assert_eq!(DARK_C3.card_bg, 0x1C1D22);
-        assert_eq!(DARK_C3.text_primary, 0xF3F4F6);
-        assert_eq!(DARK_C3.text_secondary, 0xB4BCC8);
-        assert_eq!(DARK_C3.text_muted, 0x8E98A8);
-        assert_eq!(DARK_C3.primary_btn_bg, 0xF3F4F6);
-        assert_eq!(DARK_C3.primary_btn_text, 0x111317);
-        assert_eq!(DARK_C3.toggle_track_on, 0x22C55E);
-        assert_eq!(DARK_C3.timeline.pass, 0x22C55E);
-        assert_eq!(DARK_C3.timeline.warn, 0xF59E0B);
-        assert_eq!(DARK_C3.timeline.fail, 0xF87171);
+    fn crystal_glass_default_and_linear_indigo_tokens_match_spec() {
+        assert_eq!(LIGHT_C2, CRYSTAL_GLASS_LIGHT);
+        assert_eq!(DARK_C3, CRYSTAL_GLASS_DARK);
+
+        const { assert!(!CRYSTAL_GLASS_LIGHT.is_dark) };
+        assert_eq!(CRYSTAL_GLASS_LIGHT.frame_bg, 0xF3F5F8);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.card_bg, 0xFFFFFF);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.card_border, 0xE6E9F0);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.primary_btn_top, 0xEEF4FE);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.primary_btn_bg, 0xE5EEFC);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.primary_btn_bottom, 0xDAE6FA);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.primary_btn_text, 0x1E3D75);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.accent_soft_border, 0xB8CEEF);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.toggle_track_on, 0x4E78C2);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.hero_healthy.bg, 0xFFFFFFFF);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.hero_disarmed.bg, 0xFFFFFFFF);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.hero_disarmed.border, 0xE5E8F0FF);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.badge_pass.dot, 0x2F946E);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.badge_warn.dot, 0xBA8634);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.badge_fail.dot, 0xC64956);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.timeline.pass, 0x56A382);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.timeline.warn, 0xCFA05A);
+        assert_eq!(CRYSTAL_GLASS_LIGHT.timeline.fail, 0xCC6872);
+
+        const { assert!(CRYSTAL_GLASS_DARK.is_dark) };
+        assert_eq!(CRYSTAL_GLASS_DARK.frame_bg, 0x0E1015);
+        assert_eq!(CRYSTAL_GLASS_DARK.card_bg, 0x151820);
+        assert_eq!(CRYSTAL_GLASS_DARK.primary_btn_top, 0x2B4068);
+        assert_eq!(CRYSTAL_GLASS_DARK.primary_btn_bg, 0x233659);
+        assert_eq!(CRYSTAL_GLASS_DARK.primary_btn_bottom, 0x1D2D4C);
+        assert_eq!(CRYSTAL_GLASS_DARK.primary_btn_text, 0xECF3FF);
+        assert_eq!(CRYSTAL_GLASS_DARK.toggle_track_on, 0x5B88D4);
+
+        assert_eq!(LINEAR_INDIGO_LIGHT.primary_btn_top, 0x6A78DE);
+        assert_eq!(LINEAR_INDIGO_LIGHT.primary_btn_bg, 0x5B69D0);
+        assert_eq!(LINEAR_INDIGO_LIGHT.primary_btn_bottom, 0x4D5AC0);
+        assert_eq!(LINEAR_INDIGO_LIGHT.primary_btn_text, 0xFFFFFF);
+        assert_eq!(LINEAR_INDIGO_LIGHT.toggle_track_on, 0x5B69D0);
+        assert_eq!(LINEAR_INDIGO_DARK.primary_btn_bg, 0x6876DE);
+        assert_eq!(LINEAR_INDIGO_DARK.primary_btn_text, 0xF8F9FF);
+    }
+
+    #[test]
+    fn all_ten_palettes_share_unified_crisp_canvas_with_distinct_accents() {
+        let pairs = [
+            (
+                ThemeStyle::CrystalGlass,
+                &CRYSTAL_GLASS_LIGHT,
+                &CRYSTAL_GLASS_DARK,
+            ),
+            (
+                ThemeStyle::LinearIndigo,
+                &LINEAR_INDIGO_LIGHT,
+                &LINEAR_INDIGO_DARK,
+            ),
+            (
+                ThemeStyle::MinimalMist,
+                &MINIMAL_MIST_LIGHT,
+                &MINIMAL_MIST_DARK,
+            ),
+            (
+                ThemeStyle::AlpineSapphire,
+                &ALPINE_SAPPHIRE_LIGHT,
+                &ALPINE_SAPPHIRE_DARK,
+            ),
+            (
+                ThemeStyle::ObsidianInk,
+                &OBSIDIAN_INK_LIGHT,
+                &OBSIDIAN_INK_DARK,
+            ),
+        ];
+
+        for (style, light, dark) in pairs {
+            assert!(!light.is_dark);
+            assert!(dark.is_dark);
+            assert_ne!(light.name, dark.name);
+
+            // Unified crisp Studio White & Cool Gray neutral canvas across ALL 5 Light themes
+            assert_eq!(light.frame_bg, 0xF3F5F8);
+            assert_eq!(light.frame_border, 0xDFE3EC);
+            assert_eq!(light.card_bg, 0xFFFFFF);
+            assert_eq!(light.card_border, 0xE6E9F0);
+            assert_eq!(light.inset_bg, 0xF6F8FB);
+            assert_eq!(light.sidebar_bg, 0xF8F9FC);
+            assert_eq!(light.text_primary, 0x161B24);
+            assert_eq!(light.hero_healthy.bg, 0xFFFFFFFF);
+            assert_eq!(light.hero_disarmed.bg, 0xFFFFFFFF);
+            assert_eq!(light.hero_disarmed.border, 0xE5E8F0FF);
+
+            // Unified Apple Pro Studio Graphite neutral canvas across ALL 5 Dark themes
+            assert_eq!(dark.frame_bg, 0x0E1015);
+            assert_eq!(dark.frame_border, 0x212633);
+            assert_eq!(dark.card_bg, 0x151820);
+            assert_eq!(dark.card_border, 0x232836);
+            assert_eq!(dark.inset_bg, 0x1A1E28);
+            assert_eq!(dark.sidebar_bg, 0x13161E);
+            assert_eq!(dark.text_primary, 0xEEF2F9);
+            assert_eq!(dark.hero_healthy.bg, 0x151820FF);
+            assert_eq!(dark.hero_disarmed.bg, 0x151820FF);
+
+            assert_eq!(
+                resolve_styled_palette(style, ThemeMode::Light, false),
+                light
+            );
+            assert_eq!(resolve_styled_palette(style, ThemeMode::Dark, true), dark);
+            assert_eq!(resolve_styled_palette(style, ThemeMode::Auto, true), light);
+            assert_eq!(resolve_styled_palette(style, ThemeMode::Auto, false), dark);
+        }
+
+        // All 5 Light CTA accents and 5 Dark CTA accents must be genuinely distinct
+        let light_accents = [
+            CRYSTAL_GLASS_LIGHT.primary_btn_bg,
+            LINEAR_INDIGO_LIGHT.primary_btn_bg,
+            MINIMAL_MIST_LIGHT.primary_btn_bg,
+            ALPINE_SAPPHIRE_LIGHT.primary_btn_bg,
+            OBSIDIAN_INK_LIGHT.primary_btn_bg,
+        ];
+        let dark_accents = [
+            CRYSTAL_GLASS_DARK.primary_btn_bg,
+            LINEAR_INDIGO_DARK.primary_btn_bg,
+            MINIMAL_MIST_DARK.primary_btn_bg,
+            ALPINE_SAPPHIRE_DARK.primary_btn_bg,
+            OBSIDIAN_INK_DARK.primary_btn_bg,
+        ];
+        for i in 0..light_accents.len() {
+            for j in (i + 1)..light_accents.len() {
+                assert_ne!(light_accents[i], light_accents[j]);
+                assert_ne!(dark_accents[i], dark_accents[j]);
+            }
+        }
     }
 
     #[test]

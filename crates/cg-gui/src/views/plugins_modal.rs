@@ -3,17 +3,21 @@
 //! Tracks all 4 curated Antigravity ecosystem open-source projects with live local vs upstream
 //! version comparison, per-item & batch update check via managed proxy, and direct GitHub links.
 
-use crate::app::{AppController, ConsoleWindowView, PluginCategory};
+use crate::app::{ActionScope, AppController, ConsoleWindowView, PluginCategory};
 use crate::assets::{brand_icon, ui_icon};
 use crate::demo::now_unix_secs;
-use crate::ipc::open_external_url;
+use crate::motion::spring_sheet;
 use crate::protocol::{ComponentUpdateStatus, PipeRequest, UpdateCheckPhase};
 use crate::state::format_relative_secs;
 use crate::theme::{BadgeTone, ThemePalette};
 use crate::widgets::controls::{
-    ButtonKind, action_button, icon_action_button, mono_tabular, tone_tag,
+    ButtonKind, action_button, float_shadow, icon_action_button, mono_tabular,
+    spinning_action_button, spinning_ui_icon, tone_tag,
 };
-use gpui::{BoxShadow, Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, rgb, rgba};
+use gpui::{
+    AnimationExt, BoxShadow, Context, Div, Entity, FontWeight, MouseButton, SpringAnimation, div,
+    prelude::*, px, rgb, rgba,
+};
 
 struct PluginSpec {
     id: &'static str,
@@ -35,9 +39,9 @@ const PLUGINS: [PluginSpec; 4] = [
         name: "antigravity-usage-monitor",
         repo: "yuhuan-dev/antigravity-usage-monitor",
         url: "https://github.com/yuhuan-dev/antigravity-usage-monitor",
-        badge: "用量与上下文",
+        badge: "用量监控",
         is_repo_track: false,
-        desc: "实时监控生成速度（TPS / 首字延迟）、上下文窗口各模块占用明细、子代理消耗以及模型配额重置倒计时。",
+        desc: "实时监测生成速度（TPS / 首字延迟）、上下文各模块占用、子代理消耗与配额重置倒计时。",
     },
     PluginSpec {
         id: "agy-capsule",
@@ -46,9 +50,9 @@ const PLUGINS: [PluginSpec; 4] = [
         name: "agy-capsule",
         repo: "Lumidarin/agy-capsule",
         url: "https://github.com/Lumidarin/agy-capsule",
-        badge: "底部胶囊栏",
+        badge: "底部胶囊",
         is_repo_track: false,
-        desc: "在 Antigravity 底部嵌入轻量胶囊状态栏，一眼查看上下文进度、输入/输出/缓存 Token 明细与模型剩余额度。",
+        desc: "底部嵌入轻量胶囊栏，查看上下文进度、输入/输出/缓存 Token 明细与剩余额度。",
     },
     PluginSpec {
         id: "desktop-cn",
@@ -59,7 +63,7 @@ const PLUGINS: [PluginSpec; 4] = [
         url: "https://github.com/Silas-02/antigravity-desktop-cn",
         badge: "中文汉化",
         is_repo_track: true,
-        desc: "Antigravity 桌面版动态中文汉化引擎，支持一键应用并智能跳过对话正文与代码块，随时可无损还原英文原版。",
+        desc: "桌面端动态中文汉化，一键生效并自动跳过对话正文与代码块，随时无损还原英文。",
     },
     PluginSpec {
         id: "ag-proxy",
@@ -70,7 +74,7 @@ const PLUGINS: [PluginSpec; 4] = [
         url: "https://github.com/yuaotian/antigravity-proxy",
         badge: "免 TUN 代理",
         is_repo_track: false,
-        desc: "专为 Antigravity 打造的免 TUN 强制代理工具，支持 DLL 注入与后台子进程流量接管；ClaudeGuard 已内置状态核验与一键热修复。",
+        desc: "免 TUN 强制代理工具，通过 DLL 注入接管主程序与子进程流量；已内置核验与热修复。",
     },
 ];
 
@@ -116,7 +120,22 @@ pub fn render_plugins_modal(
     let updates = snap.as_ref().map(|s| s.updates.clone()).unwrap_or_default();
     let now = now_unix_secs();
     let can_check = connected && !busy && !tripped;
+    let checking_all = ctrl_r.is_scope_busy(&ActionScope::UpdatesAll)
+        || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("antigravity_plugins".into()));
     let total_up = count_plugin_updates(&updates);
+    let total_failed = PLUGINS
+        .iter()
+        .filter(|spec| slot_for(&updates, spec.comp_key).phase == UpdateCheckPhase::Failed)
+        .count();
+    let total_checked = PLUGINS
+        .iter()
+        .filter(|spec| {
+            !matches!(
+                slot_for(&updates, spec.comp_key).phase,
+                UpdateCheckPhase::Idle | UpdateCheckPhase::Checking
+            )
+        })
+        .count();
 
     let cats = [
         (PluginCategory::All, "全部"),
@@ -128,6 +147,7 @@ pub fn render_plugins_modal(
     let cat_chips = cats.into_iter().map(|(cat, label)| {
         let is_on = cat == active_cat;
         let ctrl_c = ctrl.clone();
+        let hover_bg = p.sidebar_hover_bg;
         div()
             .id(gpui::ElementId::Name(format!("plugin-cat-{cat:?}").into()))
             .flex()
@@ -137,11 +157,16 @@ pub fn render_plugins_modal(
             .px(px(10.))
             .rounded(px(7.))
             .cursor_pointer()
-            .bg(rgb(if is_on {
-                p.sidebar_active_bg
-            } else {
-                p.inset_bg
-            }))
+            .when(is_on, |d| {
+                d.bg(rgb(p.card_bg))
+                    .border_1()
+                    .border_color(rgb(p.card_border))
+                    .shadow(vec![
+                        BoxShadow::new(px(0.), px(1.), rgba(p.shadow_rgba).into())
+                            .blur_radius(px(4.)),
+                    ])
+            })
+            .when(!is_on, |d| d.hover(move |s| s.bg(rgb(hover_bg))))
             .text_size(px(11.5))
             .font_weight(if is_on {
                 FontWeight::SEMIBOLD
@@ -149,7 +174,7 @@ pub fn render_plugins_modal(
                 FontWeight::MEDIUM
             })
             .text_color(rgb(if is_on {
-                p.sidebar_active_text
+                p.text_primary
             } else {
                 p.text_secondary
             }))
@@ -171,20 +196,25 @@ pub fn render_plugins_modal(
         .map(|spec| {
             let slot = slot_for(&updates, spec.comp_key);
             let has_up = slot.phase == UpdateCheckPhase::UpdateAvailable;
+            let is_failed = slot.phase == UpdateCheckPhase::Failed;
             let cur_str = fmt_ver(
                 slot.installed_version.as_deref(),
                 spec.is_repo_track,
-                if spec.is_repo_track { "未检测" } else { "未安装" },
+                if spec.is_repo_track {
+                    "未检测"
+                } else {
+                    "未安装"
+                },
             );
-            let lat_str = fmt_ver(slot.latest_version.as_deref(), spec.is_repo_track, "待检查");
+            let lat_str = fmt_ver(slot.latest_version.as_deref(), spec.is_repo_track, "待检测");
             let age_str = format_relative_secs(slot.checked_at, now);
 
             let (pill_label, pill_tone) = match slot.phase {
                 UpdateCheckPhase::UpdateAvailable => (
                     if spec.is_repo_track {
-                        "仓库有更新".to_string()
+                        "有新提交".to_string()
                     } else {
-                        format!("发现新版 {lat_str}")
+                        format!("新版 {lat_str}")
                     },
                     BadgeTone::Warn,
                 ),
@@ -194,20 +224,33 @@ pub fn render_plugins_modal(
                 _ => ("待检测".to_string(), BadgeTone::Muted),
             };
 
-            let ver_line = if has_up {
+            let ver_line = if is_failed {
+                let note = slot.note.trim();
+                if note.is_empty() {
+                    "上游检测失败，请确认本地代理连通后重试".to_string()
+                } else if note.starts_with("检测失败") || note.starts_with("失败") {
+                    note.to_string()
+                } else {
+                    format!("检测失败：{note}")
+                }
+            } else if has_up {
                 if spec.is_repo_track {
                     format!("本地 {cur_str} → 上游 {lat_str}")
                 } else {
                     format!("本机 {cur_str} → 最新 {lat_str}")
                 }
+            } else if slot.phase == UpdateCheckPhase::UpToDate && slot.installed_version.is_some() {
+                format!("本机 {cur_str} · 已是最新")
             } else if slot.installed_version.is_some() {
-                format!("本机 {cur_str} · 已对齐最新")
+                format!("本机 {cur_str} · 待检测")
             } else if slot.latest_version.is_some() {
-                format!("本机未安装 · 上游 {lat_str}")
+                format!("未安装 · 上游 {lat_str}")
             } else {
-                "点击右侧「检查」经代理获取上游版本".to_string()
+                "点「检查」经本地代理获取上游版本".to_string()
             };
 
+            let item_checking = checking_all
+                || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent(spec.comp_key.to_string()));
             let ctrl_chk = ctrl.clone();
             let ctrl_open = ctrl.clone();
             let comp_key = spec.comp_key.to_string();
@@ -219,6 +262,7 @@ pub fn render_plugins_modal(
                 .unwrap_or(spec.url)
                 .to_string();
             let repo_lbl = spec.repo;
+            let chk_hover_bg = p.sidebar_hover_bg;
 
             div()
                 .flex()
@@ -277,38 +321,56 @@ pub fn render_plugins_modal(
                                 .gap(px(6.))
                                 .flex_shrink_0()
                                 .child(
-                                    icon_action_button(
-                                        gpui::ElementId::Name(
+                                    div()
+                                        .id(gpui::ElementId::Name(
                                             format!("plugin-chk-{}", spec.id).into(),
-                                        ),
-                                        "icons/ui/refresh.svg",
-                                        "检查",
-                                        ButtonKind::Secondary,
-                                        can_check,
-                                        p,
-                                    )
-                                    .h(px(26.))
-                                    .px(px(9.))
-                                    .when(can_check, |b| {
-                                        b.on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(move |_, _, _, cx| {
-                                                let key = comp_key.clone();
-                                                let done_msg =
-                                                    format!("已完成 {name_chk} 上游版本检测");
-                                                ctrl_chk.update(cx, |c, cx| {
-                                                    c.send_request(
-                                                        PipeRequest::CheckUpdates {
-                                                            component: Some(key),
-                                                        },
-                                                        None,
-                                                        cx,
-                                                    );
-                                                    c.set_toast(done_msg, true, cx);
-                                                });
-                                            }),
-                                        )
-                                    }),
+                                        ))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap(px(5.))
+                                        .h(px(26.))
+                                        .px(px(9.))
+                                        .rounded(px(9.))
+                                        .bg(rgb(p.secondary_btn_bg))
+                                        .border_1()
+                                        .border_color(rgb(p.secondary_btn_border))
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(p.secondary_btn_text))
+                                        .when(can_check, |b| {
+                                            b.cursor_pointer()
+                                                .hover(move |s| s.bg(rgb(chk_hover_bg)))
+                                                .active(|s| s.opacity(0.86))
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |_, _, _, cx| {
+                                                        let key = comp_key.clone();
+                                                        let done_msg =
+                                                            format!("{name_chk} 版本检测完成");
+                                                        ctrl_chk.update(cx, |c, cx| {
+                                                            c.send_request_msg(
+                                                                PipeRequest::CheckUpdates {
+                                                                    component: Some(key),
+                                                                },
+                                                                Some(done_msg),
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
+                                                )
+                                        })
+                                        .when(!can_check, |b| b.opacity(0.45))
+                                        .child(spinning_ui_icon(
+                                            gpui::ElementId::Name(
+                                                format!("plugin-chk-spin-{}", spec.id).into(),
+                                            ),
+                                            "icons/ui/refresh.svg",
+                                            12.0,
+                                            p.secondary_btn_text,
+                                            item_checking,
+                                        ))
+                                        .child("检查"),
                                 )
                                 .child(
                                     icon_action_button(
@@ -326,18 +388,11 @@ pub fn render_plugins_modal(
                                     .on_mouse_up(
                                         MouseButton::Left,
                                         cx.listener(move |_, _, _, cx| {
-                                            match open_external_url(&url) {
-                                                Ok(()) => ctrl_open.update(cx, |c, cx| {
-                                                    c.set_toast(
-                                                        format!("已打开 {repo_lbl}"),
-                                                        true,
-                                                        cx,
-                                                    );
-                                                }),
-                                                Err(err) => ctrl_open.update(cx, |c, cx| {
-                                                    c.set_toast(err, false, cx);
-                                                }),
-                                            }
+                                            let u = url.clone();
+                                            ctrl_open.update(cx, |c, cx| {
+                                                c.open_url_async(u, cx);
+                                                c.set_toast(format!("已打开 {repo_lbl}"), true, cx);
+                                            });
                                         }),
                                     ),
                                 ),
@@ -348,7 +403,9 @@ pub fn render_plugins_modal(
                     mono_tabular(format!("{ver_line} · {repo_lbl} · {age_str}"))
                         .w_full()
                         .text_size(px(10.5))
-                        .text_color(rgb(if has_up {
+                        .text_color(rgb(if is_failed {
+                            p.badge_fail.text
+                        } else if has_up {
                             p.badge_warn.text
                         } else {
                             p.text_muted
@@ -371,10 +428,21 @@ pub fn render_plugins_modal(
     let ctrl_close = ctrl.clone();
     let ctrl_all = ctrl.clone();
 
+    let (summary_text, summary_color) = if total_up > 0 {
+        (format!("{total_up} 项可更新"), p.badge_warn.text)
+    } else if total_failed > 0 {
+        (format!("{total_failed} 项检测失败"), p.badge_fail.text)
+    } else if total_checked == 0 {
+        ("未检测".into(), p.text_muted)
+    } else {
+        ("全部最新".into(), p.badge_pass.text)
+    };
+
     div()
         .id("plugins-modal-backdrop")
         .absolute()
         .inset_0()
+        .occlude()
         .bg(rgba(p.scrim_rgba))
         .flex()
         .items_center()
@@ -403,9 +471,7 @@ pub fn render_plugins_modal(
                 .bg(rgb(p.card_bg))
                 .border_1()
                 .border_color(rgb(p.line_strong))
-                .shadow(vec![
-                    BoxShadow::new(px(0.), px(20.), rgba(0x00000038).into()).blur_radius(px(48.)),
-                ])
+                .shadow(float_shadow(p))
                 .on_mouse_up(MouseButton::Left, |_, _, cx| {
                     cx.stop_propagation();
                 })
@@ -432,13 +498,13 @@ pub fn render_plugins_modal(
                                                 .text_size(px(14.5))
                                                 .font_weight(FontWeight::BOLD)
                                                 .text_color(rgb(p.text_primary))
-                                                .child("Antigravity 精选插件与更新检测"),
+                                                .child("Antigravity 精选插件"),
                                         )
                                         .child(
                                             div()
                                                 .text_size(px(11.))
                                                 .text_color(rgb(p.text_muted))
-                                                .child("自动识别本机已装插件版本并经受管代理只读检测上游更新"),
+                                                .child("自动识别本机版本，经本地代理只读探测上游更新"),
                                         ),
                                 ),
                         )
@@ -455,6 +521,8 @@ pub fn render_plugins_modal(
                                 .items_center()
                                 .justify_center()
                                 .cursor_pointer()
+                                .hover(|s| s.bg(rgb(p.sidebar_hover_bg)))
+                                .active(|s| s.opacity(0.82))
                                 .child(ui_icon("icons/ui/close.svg", 13.0, p.text_secondary))
                                 .on_mouse_up(
                                     MouseButton::Left,
@@ -479,8 +547,8 @@ pub fn render_plugins_modal(
                                 .flex()
                                 .items_center()
                                 .gap(px(2.))
-                                .p(px(2.))
-                                .rounded(px(8.))
+                                .p(px(2.5))
+                                .rounded(px(9.))
                                 .bg(rgb(p.inset_bg))
                                 .border_1()
                                 .border_color(rgb(p.card_border))
@@ -492,34 +560,28 @@ pub fn render_plugins_modal(
                                 .items_center()
                                 .gap(px(8.))
                                 .child(
-                                    mono_tabular(if total_up > 0 {
-                                        format!("{total_up} 项有更新")
-                                    } else {
-                                        "全部已是最新".into()
-                                    })
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(if total_up > 0 {
-                                        p.badge_warn.text
-                                    } else {
-                                        p.badge_pass.text
-                                    })),
+                                    mono_tabular(summary_text)
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(summary_color)),
                                 )
                                 .child(
-                                    icon_action_button(
+                                    spinning_action_button(
                                         "plugins-check-all",
                                         "icons/ui/refresh.svg",
                                         if tripped {
-                                            "隔离期暂停"
+                                            "熔断期暂停"
                                         } else {
-                                            "全部检查更新"
+                                            "全部检查"
                                         },
                                         ButtonKind::Primary,
                                         can_check,
+                                        checking_all,
                                         p,
                                     )
                                     .h(px(27.))
                                     .px(px(10.))
+                                    .text_size(px(11.5))
                                     .when(can_check, |b| {
                                         b.on_mouse_up(
                                             MouseButton::Left,
@@ -531,7 +593,7 @@ pub fn render_plugins_modal(
                                                                 "antigravity_plugins".into(),
                                                             ),
                                                         },
-                                                        Some("已完成全部 4 项插件与工具版本检测"),
+                                                        Some("4 项插件版本检测完成"),
                                                         cx,
                                                     );
                                                 });
@@ -567,22 +629,38 @@ pub fn render_plugins_modal(
                             div()
                                 .text_size(px(11.))
                                 .text_color(rgb(p.text_muted))
-                                .child("所有更新检测均只读查询 GitHub 上游，绝不自动覆写插件；点击 GitHub 可前往获取新版。"),
+                                .child("仅只读探测 GitHub 上游，不会自动覆写插件；点「GitHub」可手动获取新版。"),
                         )
                         .child(
-                            action_button("plugins-modal-close", "关闭", ButtonKind::Primary, true, p)
-                                .h(px(28.))
-                                .px(px(14.))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |_, _, _, cx| {
-                                        ctrl_close.update(cx, |c, cx| {
-                                            c.show_plugins_modal = false;
-                                            cx.notify();
-                                        });
-                                    }),
-                                ),
+                            action_button(
+                                "plugins-modal-close",
+                                "关闭",
+                                ButtonKind::Secondary,
+                                true,
+                                p,
+                            )
+                            .h(px(28.))
+                            .px(px(14.))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, _, cx| {
+                                    ctrl_close.update(cx, |c, cx| {
+                                        c.show_plugins_modal = false;
+                                        cx.notify();
+                                    });
+                                }),
+                            ),
                         ),
+                )
+                .with_spring(
+                    "plugins-modal-sheet-enter",
+                    SpringAnimation::new(spring_sheet())
+                        .to(1.0_f32)
+                        .from(0.0_f32),
+                    |el, t: f32| {
+                        let t = t.clamp(0.0, 1.0);
+                        el.opacity(t).mt(px((1.0 - t) * 14.0))
+                    },
                 ),
         )
 }

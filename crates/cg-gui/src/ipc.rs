@@ -5,10 +5,9 @@
 
 use crate::demo::{DemoScenario, build_demo_onboarding_probe, build_demo_snapshot, now_unix_secs};
 use crate::protocol::{
-    AgentKind, DEFAULT_PIPE_NAME, ErrorCode, GuardSnapshot, Lifecycle, MAX_FRAME_BYTES,
-    OperationItemReceipt, OperationReceipt, OperationStatus, PipeRequest, PipeResponse,
-    PolicyPreset, ProtectionState, TargetState, UpdateCheckPhase, encode_frame, read_frame,
-    write_frame,
+    AgentKind, DEFAULT_PIPE_NAME, ErrorCode, GuardSnapshot, Lifecycle, OperationItemReceipt,
+    OperationReceipt, OperationStatus, PipeRequest, PipeResponse, PolicyPreset, ProtectionState,
+    TargetState, UpdateCheckPhase,
 };
 use std::sync::{Arc, Mutex};
 
@@ -496,8 +495,7 @@ impl DaemonClient {
                 }
             }
             PipeRequest::RepairAntigravityProxy => {
-                snap.antigravity_proxy.state =
-                    crate::protocol::AntigravityProxyState::Healthy;
+                snap.antigravity_proxy.state = crate::protocol::AntigravityProxyState::Healthy;
                 snap.antigravity_proxy.dll_present = true;
                 snap.antigravity_proxy.dll_valid = true;
                 snap.antigravity_proxy.port_matches_guard = true;
@@ -585,7 +583,9 @@ pub fn validate_pipe_name(pipe_name: &str) -> Result<(), TransportError> {
 /// Synchronous Named Pipe roundtrip (runs on background thread pool).
 #[cfg(windows)]
 fn exchange_named_pipe(pipe_name: &str, req: &PipeRequest) -> Result<PipeResponse, TransportError> {
+    use crate::protocol::{encode_frame, read_frame};
     use std::fs::File;
+    use std::io::Write;
     use std::os::windows::io::FromRawHandle;
     use windows::Win32::Foundation::{
         ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE,
@@ -597,8 +597,8 @@ fn exchange_named_pipe(pipe_name: &str, req: &PipeRequest) -> Result<PipeRespons
     use windows::core::HSTRING;
 
     validate_pipe_name(pipe_name)?;
+    let frame = encode_frame(req).map_err(|e| TransportError::Protocol(e.to_string()))?;
     let wide = HSTRING::from(pipe_name);
-    let _payload_check = encode_frame(req).map_err(|e| TransportError::Protocol(e.to_string()))?;
 
     let mut last_err = String::new();
     let handle = 'connect: {
@@ -638,10 +638,12 @@ fn exchange_named_pipe(pipe_name: &str, req: &PipeRequest) -> Result<PipeRespons
 
     // SAFETY: `handle` is an owned valid Win32 file handle from CreateFileW.
     let mut pipe_file = unsafe { File::from_raw_handle(handle.0) };
-    write_frame(&mut pipe_file, req).map_err(|e| TransportError::Protocol(e.to_string()))?;
+    pipe_file
+        .write_all(&frame)
+        .and_then(|()| pipe_file.flush())
+        .map_err(|e| TransportError::Protocol(e.to_string()))?;
     let resp: PipeResponse =
         read_frame(&mut pipe_file).map_err(|e| TransportError::Protocol(e.to_string()))?;
-    let _ = MAX_FRAME_BYTES;
     Ok(resp)
 }
 
@@ -656,26 +658,73 @@ fn exchange_named_pipe(
     ))
 }
 
-/// Launches an AI desktop application using the normal-user GUI token (`asInvoker`)
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentLaunchPlan {
+    disable_quic: bool,
+    working_dir: Option<std::path::PathBuf>,
+    toast_message: String,
+}
+
+#[cfg(any(windows, test))]
+fn plan_agent_launch(agent_id: &str, user_profile: Option<&std::path::Path>) -> AgentLaunchPlan {
+    if matches!(agent_id, "claude" | "chatgpt" | "antigravity") {
+        AgentLaunchPlan {
+            disable_quic: true,
+            working_dir: None,
+            toast_message: format!("已安全启动 {agent_id}（普通用户权限 · 已禁用 QUIC 泄露）"),
+        }
+    } else if matches!(agent_id, "claude-code" | "codex" | "codex-cli" | "gemini") {
+        let working_dir = user_profile
+            .filter(|p| !p.as_os_str().is_empty() && p.is_dir())
+            .map(std::path::Path::to_path_buf);
+        let toast_message = if let Some(dir) = &working_dir {
+            format!(
+                "已安全启动 CLI {agent_id}（普通用户权限 · 工作目录 {}）",
+                dir.display()
+            )
+        } else {
+            format!("已安全启动 CLI {agent_id}（普通用户权限）")
+        };
+        AgentLaunchPlan {
+            disable_quic: false,
+            working_dir,
+            toast_message,
+        }
+    } else {
+        AgentLaunchPlan {
+            disable_quic: false,
+            working_dir: None,
+            toast_message: format!("已安全启动 {agent_id}（普通用户权限）"),
+        }
+    }
+}
+
+/// Launches an AI desktop or CLI application using the normal-user GUI token (`asInvoker`)
 /// so launched apps preserve standard drag-and-drop and UIPI privileges.
 #[cfg(windows)]
 pub fn launch_agent_normal_user(
     agent_id: &str,
     install_paths: &[String],
 ) -> Result<String, String> {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     if let Some(exe) = install_paths.iter().find(|p| Path::new(p).is_file()) {
+        let user_profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        let plan = plan_agent_launch(agent_id, user_profile.as_deref());
         let mut cmd = Command::new(exe);
         // Vector 4 of the 4-Vector Leak Shield: disable UDP QUIC on Electron/Chromium AI apps
         // so traffic never bypasses HTTP proxies via HTTP/3 UDP:443.
-        if matches!(agent_id, "claude" | "chatgpt" | "antigravity") {
+        if plan.disable_quic {
             cmd.arg("--disable-quic");
+        }
+        if let Some(cwd) = &plan.working_dir {
+            cmd.current_dir(cwd);
         }
         cmd.spawn()
             .map_err(|e| format!("启动 {agent_id} 失败：{e}"))?;
-        return Ok(format!("已安全启动 {agent_id}（普通用户权限 · 已禁用 QUIC 泄露）"));
+        return Ok(plan.toast_message);
     }
 
     // Fallback: Shell AppsFolder AUMID / Start Menu heuristic
@@ -962,5 +1011,39 @@ mod tests {
             }
             other => panic!("unexpected ForceKillAgent(all) response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn agent_launch_plan_distinguishes_gui_quic_and_cli_working_dir() {
+        let existing_dir = std::env::temp_dir();
+        assert!(existing_dir.is_dir());
+
+        for gui_id in ["claude", "chatgpt", "antigravity"] {
+            let plan = plan_agent_launch(gui_id, Some(&existing_dir));
+            assert!(plan.disable_quic, "{gui_id} must pass --disable-quic");
+            assert!(plan.working_dir.is_none());
+            assert!(plan.toast_message.contains("已禁用 QUIC 泄露"));
+        }
+
+        for cli_id in ["claude-code", "codex", "codex-cli", "gemini"] {
+            let plan = plan_agent_launch(cli_id, Some(&existing_dir));
+            assert!(!plan.disable_quic, "{cli_id} must NOT pass --disable-quic");
+            assert_eq!(plan.working_dir.as_deref(), Some(existing_dir.as_path()));
+            assert!(
+                !plan.toast_message.contains("QUIC"),
+                "{cli_id} toast must not falsely claim QUIC disabled: {}",
+                plan.toast_message
+            );
+            assert!(plan.toast_message.contains("CLI"));
+            assert!(plan.toast_message.contains("工作目录"));
+        }
+
+        // Non-existent USERPROFILE falls back cleanly without failing.
+        let missing_dir = existing_dir.join("cg_nonexistent_profile_dir_9f8e7d");
+        let fallback = plan_agent_launch("claude-code", Some(&missing_dir));
+        assert!(!fallback.disable_quic);
+        assert!(fallback.working_dir.is_none());
+        assert!(!fallback.toast_message.contains("QUIC"));
+        assert!(!fallback.toast_message.contains("工作目录"));
     }
 }
