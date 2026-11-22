@@ -665,7 +665,7 @@ impl GuardEngine {
             return LaunchDecision {
                 allowed: false,
                 reason: format!(
-                    "反重力透明代理未就绪（{}）：{}",
+                    "反重力透明代理未就绪（{}）：{}（若使用 antigravity-launcher / TUN / 自定义代理，可在「防漏 → 反重力代理注入」中关闭「反重力注入强制核验」）",
                     state.antigravity_proxy.state.label_zh(),
                     state.antigravity_proxy.summary
                 ),
@@ -1323,9 +1323,11 @@ fn handle_target_rechecked(
                 now_secs,
                 cmds,
             );
-        } else if state.target_statuses.iter().all(|s| {
-            s.state == TargetState::Disabled || s.state == TargetState::Pass
-        }) && !access_uncovered
+        } else if state
+            .target_statuses
+            .iter()
+            .all(|s| s.state == TargetState::Disabled || s.state == TargetState::Pass)
+            && !access_uncovered
             && !access_unknown
         {
             state.protection = ProtectionState::Monitoring;
@@ -2363,7 +2365,10 @@ fn handle_antigravity_proxy_updated(
         }
     }
 
-    if status.state.is_degraded() && prev_state != status.state {
+    if state.config.require_antigravity_proxy
+        && status.state.is_degraded()
+        && prev_state != status.state
+    {
         log_both(
             state,
             now_secs,
@@ -2442,7 +2447,14 @@ fn handle_updates_checked(
         if next_slot.phase == UpdateCheckPhase::UpdateAvailable
             && next_slot.latest_version != prev_ver
         {
-            log_both(state, now_secs, LogLevel::Info, "update", &next_slot.note, cmds);
+            log_both(
+                state,
+                now_secs,
+                LogLevel::Info,
+                "update",
+                &next_slot.note,
+                cmds,
+            );
             cmds.push(EffectCommand::Notify {
                 class: "client_update".into(),
                 title: title.into(),
@@ -3774,7 +3786,9 @@ mod tests {
     fn antigravity_proxy_updated_emits_degraded_warning_once_per_state_transition() {
         use cg_protocol::AntigravityProxyState;
 
-        let state = EngineState::new(armed_config(), true, true, 100);
+        let mut cfg = armed_config();
+        cfg.require_antigravity_proxy = true;
+        let state = EngineState::new(cfg, true, true, 100);
         let missing = AntigravityProxyStatus {
             state: AntigravityProxyState::MissingDll,
             installed: true,
@@ -3858,10 +3872,78 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_proxy_optional_mode_suppresses_degraded_warning_spam() {
+        use cg_protocol::AntigravityProxyState;
+
+        let mut cfg = armed_config();
+        cfg.require_antigravity_proxy = false;
+        let state = EngineState::new(cfg, true, true, 100);
+
+        let missing = AntigravityProxyStatus {
+            state: AntigravityProxyState::MissingDll,
+            installed: true,
+            antigravity_version: Some("44.9.1".into()),
+            summary: "未检测到 version.dll".into(),
+            ..AntigravityProxyStatus::default()
+        };
+
+        let (st1, cmds1) = GuardEngine::step(
+            state,
+            EngineEvent::AntigravityProxyUpdated { status: missing },
+            105,
+        );
+        assert_eq!(
+            st1.antigravity_proxy.state,
+            AntigravityProxyState::MissingDll
+        );
+        assert!(
+            !st1.logs
+                .iter()
+                .any(|l| l.level == LogLevel::Warn && l.category == "ag_proxy"),
+            "require_antigravity_proxy=false must not emit Warn log for MissingDll"
+        );
+        assert!(
+            !cmds1
+                .iter()
+                .any(|c| matches!(c, EffectCommand::Notify { class, .. } if class == "warning")),
+            "require_antigravity_proxy=false must not emit warning notification for MissingDll"
+        );
+
+        let unhooked = AntigravityProxyStatus {
+            state: AntigravityProxyState::RuntimeUnhooked,
+            installed: true,
+            antigravity_version: Some("44.9.1".into()),
+            runtime_running: true,
+            summary: "language_server.exe 未加载 version.dll".into(),
+            ..AntigravityProxyStatus::default()
+        };
+        let (st2, cmds2) = GuardEngine::step(
+            st1,
+            EngineEvent::AntigravityProxyUpdated { status: unhooked },
+            110,
+        );
+        assert_eq!(
+            st2.antigravity_proxy.state,
+            AntigravityProxyState::RuntimeUnhooked
+        );
+        assert!(
+            !st2.logs
+                .iter()
+                .any(|l| l.level == LogLevel::Warn && l.category == "ag_proxy")
+        );
+        assert!(
+            !cmds2
+                .iter()
+                .any(|c| matches!(c, EffectCommand::Notify { class, .. } if class == "warning"))
+        );
+    }
+
+    #[test]
     fn antigravity_proxy_version_upgrade_persists_config_and_notifies_client_update() {
         use cg_protocol::AntigravityProxyState;
 
         let mut cfg = armed_config();
+        cfg.require_antigravity_proxy = true;
         cfg.last_seen_antigravity_version = Some("44.9.1".into());
         let state = EngineState::new(cfg, true, true, 100);
         assert_eq!(state.cfg_rev, 0);
@@ -3919,7 +4001,9 @@ mod tests {
      {
         use cg_protocol::AntigravityProxyState;
 
-        let state = EngineState::new(armed_config(), true, true, 100);
+        let mut cfg = armed_config();
+        cfg.require_antigravity_proxy = true;
+        let state = EngineState::new(cfg, true, true, 100);
         let (mut ready, _) = GuardEngine::step(
             state,
             EngineEvent::RoundCompleted {
@@ -3944,6 +4028,8 @@ mod tests {
         assert!(!blocked_dll.allowed);
         assert!(!blocked_dll.requires_recheck);
         assert!(blocked_dll.reason.contains("注入丢失 (version.dll)"));
+        assert!(blocked_dll.reason.contains("antigravity-launcher"));
+        assert!(blocked_dll.reason.contains("反重力注入强制核验"));
         assert!(evaluate_launch_gate_for_agent(&ready, Some("claude"), 106).allowed);
         assert!(GuardEngine::evaluate_launch_gate(&ready, 106).allowed);
 
