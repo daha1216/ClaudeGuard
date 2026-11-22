@@ -155,8 +155,8 @@ impl Default for DraftStore {
             feishu_clear_secret: false,
             search_query: String::new(),
             onboarding_strategy: OnboardingStrategy::RecommendRegion,
-            onboarding_custom_cidr: "198.51.100.0/24".into(),
-            onboarding_custom_regions: "US, JP".into(),
+            onboarding_custom_cidr: String::new(),
+            onboarding_custom_regions: String::new(),
             validation_error: None,
         }
     }
@@ -212,24 +212,37 @@ impl DraftStore {
             .trim()
             .parse()
             .ok()
-            .filter(|&t| (1..=10).contains(&t))
-            .ok_or_else(|| "连续失败阈值必须在 1–10 次之间".to_string())?;
+            .filter(|&t| (1..=5).contains(&t))
+            .ok_or_else(|| "连续失败阈值必须在 1–5 次之间".to_string())?;
 
         let mut next = base.clone();
         next.proxy_port = port;
         next.interval_secs = interval;
         next.trip_threshold = threshold;
         next.targets = self.targets.iter().map(TargetDraft::to_target).collect();
-        for t in &next.targets {
+        for t in &mut next.targets {
             if t.name.is_empty() {
                 return Err("存在名称为空的监控目标".into());
             }
-            if !t.anchor_url.starts_with("https://") && !t.anchor_url.starts_with("http://") {
-                return Err(format!(
-                    "目标「{}」的探测 URL 必须以 https:// 或 http:// 开头",
-                    t.name
-                ));
+            if t.name.chars().count() > 16 {
+                return Err(format!("目标「{}」的名称不能超过 16 个字符", t.name));
             }
+            if !t.anchor_url.starts_with("https://") {
+                return Err(format!("目标「{}」的探测 URL 必须以 https:// 开头", t.name));
+            }
+            let mut normalized_ips = Vec::with_capacity(t.expect_ips.len());
+            for raw_ip in &t.expect_ips {
+                let Some(norm) = crate::protocol::normalize_ip_or_cidr(raw_ip) else {
+                    return Err(format!(
+                        "目标「{}」包含无效的 IP 或 CIDR：「{}」",
+                        t.name, raw_ip
+                    ));
+                };
+                if !normalized_ips.contains(&norm) {
+                    normalized_ips.push(norm);
+                }
+            }
+            t.expect_ips = normalized_ips;
             if t.enabled
                 && t.anchor_kind != AnchorKind::Reachability
                 && t.expect_ips.is_empty()
@@ -294,6 +307,7 @@ pub struct SafeLaunchAppViewModel {
     pub installed: bool,
     pub quarantined: bool,
     pub ag_proxy_blocked: bool,
+    pub ag_proxy_ready: bool,
     pub running_count: usize,
     pub orphan_count: usize,
     pub install_paths: Vec<String>,
@@ -438,16 +452,30 @@ pub fn format_remaining_secs(until: Option<u64>, now: u64) -> Option<String> {
     }
 }
 
+/// Reads the live OS local UTC offset in seconds (Windows `ActiveTimeBias`, fallback UTC+8).
+pub fn local_utc_offset_secs() -> i64 {
+    #[cfg(windows)]
+    {
+        use winreg::{RegKey, enums::HKEY_LOCAL_MACHINE};
+        if let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey(r"SYSTEM\CurrentControlSet\Control\TimeZoneInformation")
+            && let Ok(bias_u32) = key.get_value::<u32, _>("ActiveTimeBias")
+        {
+            let bias_mins = bias_u32 as i32 as i64;
+            return -bias_mins * 60;
+        }
+    }
+    8 * 3600
+}
+
 pub fn format_unix_hm(ts: u64) -> String {
     if ts == 0 {
         return "--:--".into();
     }
-    // Local UTC+8 fallback formatting without heavy chrono dependency in view model;
-    // displays clean HH:MM:SS relative/day-clock from epoch seconds.
-    let day_secs = (ts + 8 * 3600) % 86_400;
-    let h = day_secs / 3600;
-    let m = (day_secs % 3600) / 60;
-    let s = day_secs % 60;
+    let local_secs = (ts as i64 + local_utc_offset_secs()).rem_euclid(86_400) as u64;
+    let h = local_secs / 3600;
+    let m = (local_secs % 3600) / 60;
+    let s = local_secs % 60;
     format!("{h:02}:{m:02}:{s:02}")
 }
 
@@ -752,6 +780,10 @@ pub fn project_launch_apps(snap: Option<&GuardSnapshot>) -> Vec<SafeLaunchAppVie
                         && s.antigravity_proxy.installed
                         && !s.antigravity_proxy.is_ready_for_launch()
                 });
+            let ag_proxy_ready = id == "antigravity"
+                && snap.is_some_and(|s| {
+                    s.antigravity_proxy.installed && s.antigravity_proxy.is_ready_for_launch()
+                });
             let found = snap.and_then(|s| s.agents.iter().find(|a| a.id == id));
             match found {
                 Some(agent) => SafeLaunchAppViewModel {
@@ -761,6 +793,7 @@ pub fn project_launch_apps(snap: Option<&GuardSnapshot>) -> Vec<SafeLaunchAppVie
                     installed: agent.installed,
                     quarantined: agent.quarantined,
                     ag_proxy_blocked,
+                    ag_proxy_ready,
                     running_count: agent.running_count,
                     orphan_count: agent.orphan_count,
                     install_paths: agent.install_paths.clone(),
@@ -772,6 +805,7 @@ pub fn project_launch_apps(snap: Option<&GuardSnapshot>) -> Vec<SafeLaunchAppVie
                     installed: true,
                     quarantined: snap.is_some_and(GuardSnapshot::is_tripped),
                     ag_proxy_blocked,
+                    ag_proxy_ready,
                     running_count: 0,
                     orphan_count: 0,
                     install_paths: Vec::new(),
@@ -847,8 +881,8 @@ pub fn project_hud(
     .map(|(gui_id, label, cli_id)| {
         let gui = snap.and_then(|s| s.agents.iter().find(|a| a.id == gui_id));
         let cli = cli_id.and_then(|cid| snap.and_then(|s| s.agents.iter().find(|a| a.id == cid)));
-        let running_count = gui.map(|a| a.running_count).unwrap_or(0)
-            + cli.map(|a| a.running_count).unwrap_or(0);
+        let running_count =
+            gui.map(|a| a.running_count).unwrap_or(0) + cli.map(|a| a.running_count).unwrap_or(0);
         let orphan_count =
             gui.map(|a| a.orphan_count).unwrap_or(0) + cli.map(|a| a.orphan_count).unwrap_or(0);
         HudCleanupChipViewModel {
@@ -868,7 +902,7 @@ pub fn project_hud(
     };
 
     let ag_proxy_warning = snap.and_then(|s| {
-        if s.antigravity_proxy.state.is_degraded() {
+        if s.config.require_antigravity_proxy && s.antigravity_proxy.state.is_degraded() {
             let detail = if s.antigravity_proxy.summary.trim().is_empty() {
                 s.antigravity_proxy.state.label().to_string()
             } else {
@@ -896,6 +930,19 @@ pub fn project_hud(
     }
 }
 
+/// Input parameters for projecting [`ConsoleProjection`].
+#[derive(Clone, Copy)]
+pub struct ConsoleProjectionInput<'a> {
+    pub snap: Option<&'a GuardSnapshot>,
+    pub connected: bool,
+    pub connection_err: Option<&'a str>,
+    pub privacy_mask: bool,
+    pub selected_bucket: Option<usize>,
+    pub search_query: &'a str,
+    pub queried_logs: Option<&'a [LogEntry]>,
+    pub include_logs: bool,
+}
+
 pub fn project_console(
     snap: Option<&GuardSnapshot>,
     connected: bool,
@@ -905,13 +952,47 @@ pub fn project_console(
     search_query: &str,
     queried_logs: Option<&[LogEntry]>,
 ) -> ConsoleProjection {
+    project_console_from_input(ConsoleProjectionInput {
+        snap,
+        connected,
+        connection_err,
+        privacy_mask,
+        selected_bucket,
+        search_query,
+        queried_logs,
+        include_logs: true,
+    })
+}
+
+pub fn project_console_from_input(input: ConsoleProjectionInput<'_>) -> ConsoleProjection {
+    let ConsoleProjectionInput {
+        snap,
+        connected,
+        connection_err,
+        privacy_mask,
+        selected_bucket,
+        search_query,
+        queried_logs,
+        include_logs,
+    } = input;
     let now = now_unix_secs();
     let hero = project_hero(snap, connected, privacy_mask, now);
 
     let connection_banner = if !connected {
         Some(
             connection_err
-                .map(|e| format!("守护服务未连接：{e}"))
+                .map(|e| {
+                    let clean = e
+                        .trim()
+                        .trim_start_matches("后台守护服务未连接：")
+                        .trim_start_matches("守护服务未连接：")
+                        .trim();
+                    if clean.is_empty() {
+                        "无法连接后台守护服务".into()
+                    } else {
+                        clean.to_string()
+                    }
+                })
                 .unwrap_or_else(|| "正在连接守护服务 \\\\.\\pipe\\ClaudeGuardV4…".into()),
         )
     } else {
@@ -1013,39 +1094,43 @@ pub fn project_console(
 
     let self_checks = project_self_checks(snap);
 
-    let needle = search_query.trim().to_ascii_lowercase();
-    let log_source: &[LogEntry] = if let Some(live_logs) = queried_logs {
-        live_logs
-    } else if let Some(s) = snap {
-        &s.recent_logs
-    } else {
-        &[]
-    };
-    let filtered_logs = log_source
-        .iter()
-        .filter(|entry| {
-            if let Some((start, end)) = selected_bucket_window
-                && (entry.timestamp < start || entry.timestamp >= end)
-            {
-                return false;
-            }
-            if !needle.is_empty() {
-                let msg_l = entry.message.to_ascii_lowercase();
-                let cat_l = entry.category.to_ascii_lowercase();
-                if !msg_l.contains(&needle) && !cat_l.contains(&needle) {
+    let filtered_logs = if include_logs {
+        let needle = search_query.trim().to_ascii_lowercase();
+        let log_source: &[LogEntry] = if let Some(live_logs) = queried_logs {
+            live_logs
+        } else if let Some(s) = snap {
+            &s.recent_logs
+        } else {
+            &[]
+        };
+        log_source
+            .iter()
+            .filter(|entry| {
+                if let Some((start, end)) = selected_bucket_window
+                    && (entry.timestamp < start || entry.timestamp >= end)
+                {
                     return false;
                 }
-            }
-            true
-        })
-        .map(|entry| LogEntry {
-            id: entry.id,
-            timestamp: entry.timestamp,
-            level: entry.level,
-            category: entry.category.clone(),
-            message: maybe_mask(&entry.message, privacy_mask),
-        })
-        .collect::<Vec<_>>();
+                if !needle.is_empty() {
+                    let msg_l = entry.message.to_ascii_lowercase();
+                    let cat_l = entry.category.to_ascii_lowercase();
+                    if !msg_l.contains(&needle) && !cat_l.contains(&needle) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|entry| LogEntry {
+                id: entry.id,
+                timestamp: entry.timestamp,
+                level: entry.level,
+                category: entry.category.clone(),
+                message: maybe_mask(&entry.message, privacy_mask),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
     let agent_statuses = snap
         .map(|s| {
@@ -1252,15 +1337,23 @@ fn project_self_checks(snap: Option<&GuardSnapshot>) -> Vec<DefenseCheckItem> {
 
     if snap.antigravity_proxy.installed {
         let ag = &snap.antigravity_proxy;
-        let status = if ag.state.is_healthy() {
-            SelfCheckStatus::Healthy
+        let (status, detail) = if !snap.config.require_antigravity_proxy && !ag.state.is_healthy() {
+            (
+                SelfCheckStatus::Disabled,
+                "已关闭强制核验（自定义代理 / 启动器模式）".into(),
+            )
         } else {
-            SelfCheckStatus::Degraded
-        };
-        let detail = if ag.summary.trim().is_empty() {
-            ag.state.label().to_string()
-        } else {
-            ag.summary.clone()
+            let st = if ag.state.is_healthy() {
+                SelfCheckStatus::Healthy
+            } else {
+                SelfCheckStatus::Degraded
+            };
+            let dt = if ag.summary.trim().is_empty() {
+                ag.state.label().to_string()
+            } else {
+                ag.summary.clone()
+            };
+            (st, dt)
         };
         items.push(DefenseCheckItem {
             id: "antigravity_proxy".into(),
@@ -1719,7 +1812,11 @@ mod tests {
         assert_eq!(strict_cfg.preset, PolicyPreset::StrictStaticIp);
         for id in ["local", "claude", "codex"] {
             let t = strict_cfg.target(id).expect("builtin target");
-            assert_eq!(t.expect_ips, vec!["198.51.100.98".to_string()], "target {id}");
+            assert_eq!(
+                t.expect_ips,
+                vec!["198.51.100.98".to_string()],
+                "target {id}"
+            );
             assert!(t.expect_regions.is_empty(), "target {id}");
         }
 
@@ -1735,7 +1832,11 @@ mod tests {
         assert!(!custom_cfg.first_run);
         for id in ["local", "claude", "codex"] {
             let t = custom_cfg.target(id).expect("builtin target");
-            assert_eq!(t.expect_ips, vec!["198.51.100.0/24".to_string()], "target {id}");
+            assert_eq!(
+                t.expect_ips,
+                vec!["198.51.100.0/24".to_string()],
+                "target {id}"
+            );
             assert_eq!(
                 t.expect_regions,
                 vec!["US".to_string(), "JP".to_string()],
@@ -1807,14 +1908,23 @@ mod tests {
             .expect("antigravity_proxy degraded self-check row");
         assert_eq!(ag_deg_check.status, SelfCheckStatus::Degraded);
 
-        // Disabling require_antigravity_proxy unblocks Safe Launch while keeping diagnostic visibility.
+        // Disabling require_antigravity_proxy unblocks Safe Launch, clears HUD warning, and marks self-check healthy.
         snap.config.require_antigravity_proxy = false;
-        let opt_out_apps = project_launch_apps(Some(&snap));
-        let ag_opt_out = opt_out_apps
+        let opt_out_hud = project_hud(Some(&snap), true, None, false);
+        assert!(opt_out_hud.ag_proxy_warning.is_none());
+        let ag_opt_out = opt_out_hud
+            .launch_apps
             .iter()
             .find(|a| a.agent_id == "antigravity")
             .expect("antigravity launch app");
         assert!(!ag_opt_out.ag_proxy_blocked);
+        assert!(!ag_opt_out.ag_proxy_ready);
+        let opt_out_checks = project_self_checks(Some(&snap));
+        let ag_opt_out_check = opt_out_checks
+            .iter()
+            .find(|c| c.name == "反重力代理注入")
+            .expect("antigravity_proxy opt-out self-check row");
+        assert_eq!(ag_opt_out_check.status, SelfCheckStatus::Disabled);
 
         // NotInstalled never blocks Safe Launch even when require_antigravity_proxy == true.
         snap.config.require_antigravity_proxy = true;
@@ -1911,5 +2021,37 @@ mod tests {
             .unwrap();
         assert!(codex_row.installed);
         assert_eq!(codex_row.orphan_count, 1);
+    }
+
+    #[test]
+    fn draft_store_validates_threshold_url_name_and_cidr_bounds() {
+        let base = build_demo_snapshot(DemoScenario::Pass).config;
+        let mut drafts = DraftStore::default();
+        drafts.force_load(&base, 1);
+
+        // Threshold > 5 must be rejected to match daemon bounds.
+        drafts.trip_threshold = "6".into();
+        assert!(drafts.build_updated_config(&base).is_err());
+
+        // Valid threshold 3 passes.
+        drafts.trip_threshold = "3".into();
+        let ok = drafts.build_updated_config(&base).expect("valid threshold");
+        assert_eq!(ok.trip_threshold, 3);
+
+        // Invalid CIDR/IP must fail cleanly.
+        drafts.targets[1].expect_ips_text = "not-an-ip".into();
+        assert!(drafts.build_updated_config(&base).is_err());
+
+        // Valid RFC 5737 TEST-NET CIDR normalizes cleanly.
+        drafts.targets[1].expect_ips_text = "198.51.100.0/24".into();
+        let norm_ok = drafts.build_updated_config(&base).expect("valid cidr");
+        assert_eq!(
+            norm_ok.targets[1].expect_ips,
+            vec!["198.51.100.0/24".to_string()]
+        );
+
+        // Non-HTTPS URL must be rejected.
+        drafts.targets[1].anchor_url = "http://example.com/cdn-cgi/trace".into();
+        assert!(drafts.build_updated_config(&base).is_err());
     }
 }

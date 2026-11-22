@@ -1,31 +1,42 @@
-//! Mode B — Frost Ceramic `时间线与审计` view.
+//! Mode B — Frost Ceramic v2 `时间线与审计` view.
 //!
 //! Features:
-//! - Interactive 48-bar 24h compliance trajectory bucket filter with time scale
-//! - Search input + 5 level filter chips (`全部 / 信息 / 警告 / 错误 / 审计`)
-//! - Virtualized `uniform_list` audit log stream + redacted `.zip` diagnostic bundle export
+//! - Interactive 48-bar 24h compliance trajectory with live hover readout
+//! - Search input with clear `×` button + Enter server-side query + harmonized ceramic filter pills
+//! - Responsive virtualized `uniform_list` audit log stream + expandable full-message bar & click-to-copy
 
-use crate::app::{AppController, ConsoleWindowView};
+use crate::app::{ActionScope, AppController, ConsoleWindowView};
+use crate::assets::ui_icon;
+use crate::motion::PageChoreo;
 use crate::protocol::{LogLevel, PipeRequest, TimelineStatus, UiLabelExt};
 use crate::state::{ConsoleProjection, format_unix_hm};
 use crate::theme::ThemePalette;
 use crate::widgets::controls::{
-    ButtonKind, action_button, bento_card, icon_action_button, inset_box, mono_tabular,
+    ButtonKind, action_button, bento_card_bloom, inset_box, mono_tabular, spinning_ui_icon,
+    status_dot,
 };
-use gpui::{Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, rgb, uniform_list};
+use gpui::{
+    BoxShadow, Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, rgb, rgba,
+    uniform_list,
+};
 
 pub fn render_audit_page(
     ctrl: Entity<AppController>,
     proj: &ConsoleProjection,
+    choreo: PageChoreo,
     p: &'static ThemePalette,
     cx: &mut Context<ConsoleWindowView>,
 ) -> Div {
     let ctrl_r = ctrl.read(cx);
     let scroll_handle = ctrl_r.audit_list_scroll.clone();
     let has_bucket = ctrl_r.selected_bucket.is_some();
+    let hovered_bucket = ctrl_r.hovered_bucket;
     let active_level = ctrl_r.audit_level_filter;
+    let selected_log_id = ctrl_r.selected_log_id;
+    let search_non_empty = !ctrl_r.drafts.search_query.trim().is_empty();
     let search_input = ctrl_r.inputs.search.clone();
     let logs_loading = ctrl_r.logs_loading;
+    let export_busy = ctrl_r.is_scope_busy(&ActionScope::ExportDiagnostics);
     let total_server = ctrl_r.queried_logs_total;
     let connected = ctrl_r.connected;
     let busy = ctrl_r.busy_action;
@@ -34,10 +45,11 @@ pub fn render_audit_page(
     let ctrl_refresh = ctrl.clone();
     let ctrl_export = ctrl.clone();
     let ctrl_reset_all = ctrl.clone();
+    let ctrl_clear_search = ctrl.clone();
 
     let mut non_empty = 0u32;
     let mut pass_bars = 0u32;
-    let bars: Vec<gpui::Stateful<Div>> = proj
+    let bars: Vec<_> = proj
         .timeline_bars
         .iter()
         .map(|bar| {
@@ -58,15 +70,33 @@ pub fn render_audit_page(
                 TimelineStatus::Empty => p.timeline.empty,
             };
             let idx = bar.index;
+            let elevated = bar.selected || hovered_bucket == Some(idx);
             let ctrl_b = ctrl.clone();
+            let ctrl_h = ctrl.clone();
+
             let mut el = div()
-                .id(gpui::ElementId::Name(format!("audit-bar-{idx}").into()))
+                .id(("audit-bar", idx))
                 .flex_1()
                 .min_w(px(3.))
-                .h(px(22.))
-                .rounded(px(2.))
+                .h(px(if elevated { 26.0 } else { 18.0 }))
+                .rounded(px(2.5))
                 .bg(rgb(color))
                 .cursor_pointer()
+                .on_hover(cx.listener(move |_, hovered, _, cx| {
+                    ctrl_h.update(cx, |c, cx| {
+                        let next = if *hovered {
+                            Some(idx)
+                        } else if c.hovered_bucket == Some(idx) {
+                            None
+                        } else {
+                            c.hovered_bucket
+                        };
+                        if c.hovered_bucket != next {
+                            c.hovered_bucket = next;
+                            cx.notify();
+                        }
+                    });
+                }))
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |_, _, _, cx| {
@@ -74,16 +104,52 @@ pub fn render_audit_page(
                     }),
                 );
             if bar.selected {
-                el = el.border_1().border_color(rgb(p.text_primary));
+                el = el.border_1().border_color(rgb(p.primary_btn_bg));
             }
             el
         })
         .collect();
 
-    let compliance_txt = if non_empty == 0 {
-        "暂无采样".to_string()
+    let compliance_ratio = if non_empty == 0 {
+        None
     } else {
-        format!("{:.1}% 合规", (pass_bars as f64 / non_empty as f64) * 100.0)
+        Some((pass_bars as f64 / non_empty as f64) * 100.0)
+    };
+    let (compliance_txt, compliance_color, compliance_dot) = match compliance_ratio {
+        None => ("暂无采样".to_string(), p.text_muted, None),
+        Some(pct) if pct >= 95.0 => (
+            format!("{pct:.1}% 合规"),
+            p.text_primary,
+            Some(p.badge_pass.dot),
+        ),
+        Some(pct) if pct >= 70.0 => (
+            format!("{pct:.1}% 合规"),
+            p.badge_warn.text,
+            Some(p.badge_warn.dot),
+        ),
+        Some(pct) => (
+            format!("{pct:.1}% 合规"),
+            p.badge_fail.text,
+            Some(p.badge_fail.dot),
+        ),
+    };
+
+    let timeline_summary = if let Some(h_idx) = hovered_bucket
+        && let Some(b) = proj.timeline_bars.get(h_idx)
+    {
+        format!(
+            "{} · {} · 通过 {} / 告警 {} / 失败 {} · 均值 {}ms",
+            format_unix_hm(b.bucket_start),
+            b.status.label(),
+            b.pass_count,
+            b.warn_count,
+            b.fail_count,
+            b.avg_latency_ms
+        )
+    } else if has_bucket {
+        proj.selected_bucket_summary.clone()
+    } else {
+        "每格 30 分钟 · 点击柱条按时段筛选".to_string()
     };
 
     let all_count = proj.filtered_logs.len();
@@ -94,13 +160,14 @@ pub fn render_audit_page(
         .cloned()
         .collect();
     let log_count = logs.len();
+    let selected_log = selected_log_id.and_then(|id| logs.iter().find(|l| l.id == id).cloned());
     let palette_for_list = p;
 
     let level_chips = [
         (None, "全部"),
         (Some(LogLevel::Info), "信息"),
-        (Some(LogLevel::Warn), "警告"),
-        (Some(LogLevel::Error), "错误"),
+        (Some(LogLevel::Warn), "告警"),
+        (Some(LogLevel::Error), "熔断"),
         (Some(LogLevel::Audit), "审计"),
     ]
     .into_iter()
@@ -115,8 +182,8 @@ pub fn render_audit_page(
             .items_center()
             .justify_center()
             .h(px(24.))
-            .px(px(8.))
-            .rounded(px(6.))
+            .px(px(9.))
+            .rounded(px(6.5))
             .cursor_pointer()
             .text_size(px(11.))
             .font_weight(if on {
@@ -124,11 +191,8 @@ pub fn render_audit_page(
             } else {
                 FontWeight::MEDIUM
             })
-            .text_color(rgb(if on {
-                p.primary_btn_text
-            } else {
-                p.text_secondary
-            }))
+            .text_color(rgb(if on { p.text_primary } else { p.text_secondary }))
+            .active(|s| s.opacity(0.86))
             .child(label)
             .on_mouse_up(
                 MouseButton::Left,
@@ -140,16 +204,20 @@ pub fn render_audit_page(
                 }),
             );
         if on {
-            chip = chip.bg(rgb(p.primary_btn_bg));
+            chip = chip.bg(rgb(p.card_bg)).shadow(vec![
+                BoxShadow::new(px(0.), px(1.), rgba(p.shadow_rgba).into()).blur_radius(px(3.)),
+            ]);
         } else {
             chip = chip.hover(move |s| s.bg(rgb(hover_bg)).text_color(rgb(hover_txt)));
         }
         chip
     });
 
+    let ctrl_row_sel = ctrl.clone();
     let list_el = if log_count == 0 {
         inset_box(p)
-            .h(px(300.))
+            .flex_1()
+            .min_h(px(260.))
             .items_center()
             .justify_center()
             .gap(px(10.))
@@ -157,28 +225,36 @@ pub fn render_audit_page(
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(p.text_muted))
-                    .child("当前时段或筛选条件下没有匹配的审计日志"),
+                    .child("暂无匹配的审计日志"),
             )
             .child(
-                action_button("audit-reset-filters", "重置全部筛选", ButtonKind::Secondary, true, p)
-                    .h(px(27.))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |_, _, _, cx| {
-                            ctrl_reset_all.update(cx, |c, cx| {
-                                c.audit_level_filter = None;
-                                c.drafts.search_query.clear();
-                                c.inputs
-                                    .search
-                                    .update(cx, |i, cx| i.set_text_silent("", cx));
-                                c.clear_timeline_bucket(cx);
-                            });
-                        }),
-                    ),
+                action_button(
+                    "audit-reset-filters",
+                    "重置筛选",
+                    ButtonKind::Secondary,
+                    true,
+                    p,
+                )
+                .h(px(27.))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |_, _, _, cx| {
+                        ctrl_reset_all.update(cx, |c, cx| {
+                            c.audit_level_filter = None;
+                            c.selected_log_id = None;
+                            c.drafts.search_query.clear();
+                            c.inputs
+                                .search
+                                .update(cx, |i, cx| i.set_text_silent("", cx));
+                            c.clear_timeline_bucket(cx);
+                        });
+                    }),
+                ),
             )
     } else {
         div()
-            .h(px(330.))
+            .flex_1()
+            .min_h(px(260.))
             .w_full()
             .rounded(px(10.))
             .bg(rgb(p.inset_bg))
@@ -191,13 +267,31 @@ pub fn render_audit_page(
                     range
                         .map(|idx| {
                             let entry = &logs[idx];
-                            let lvl_color = match entry.level {
-                                LogLevel::Info => palette_for_list.badge_pass.text,
-                                LogLevel::Warn => palette_for_list.badge_warn.text,
-                                LogLevel::Error => palette_for_list.badge_fail.text,
-                                LogLevel::Audit => palette_for_list.text_muted,
+                            let entry_id = entry.id;
+                            let is_sel = selected_log_id == Some(entry_id);
+                            let ctrl_click = ctrl_row_sel.clone();
+                            let hover_row = palette_for_list.sidebar_hover_bg;
+                            let (lvl_dot_color, lvl_text_color) = match entry.level {
+                                LogLevel::Info => (
+                                    palette_for_list.badge_pass.dot,
+                                    palette_for_list.text_secondary,
+                                ),
+                                LogLevel::Warn => (
+                                    palette_for_list.badge_warn.dot,
+                                    palette_for_list.badge_warn.text,
+                                ),
+                                LogLevel::Error => (
+                                    palette_for_list.badge_fail.dot,
+                                    palette_for_list.badge_fail.text,
+                                ),
+                                LogLevel::Audit => {
+                                    (palette_for_list.text_muted, palette_for_list.text_muted)
+                                }
                             };
                             div()
+                                .id(gpui::ElementId::Name(
+                                    format!("audit-row-{entry_id}").into(),
+                                ))
                                 .flex()
                                 .items_center()
                                 .w_full()
@@ -205,8 +299,22 @@ pub fn render_audit_page(
                                 .gap(px(9.))
                                 .h(px(31.))
                                 .px(px(8.))
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .when(is_sel, |r| r.bg(rgb(palette_for_list.accent_soft_bg)))
+                                .hover(move |s| s.bg(rgb(hover_row)))
                                 .border_b_1()
                                 .border_color(rgb(palette_for_list.card_border))
+                                .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+                                    ctrl_click.update(cx, |c, cx| {
+                                        c.selected_log_id = if c.selected_log_id == Some(entry_id) {
+                                            None
+                                        } else {
+                                            Some(entry_id)
+                                        };
+                                        cx.notify();
+                                    });
+                                })
                                 .child(
                                     mono_tabular(format_unix_hm(entry.timestamp))
                                         .w(px(60.))
@@ -223,14 +331,8 @@ pub fn render_audit_page(
                                         .flex_shrink_0()
                                         .text_size(px(11.))
                                         .font_weight(FontWeight::MEDIUM)
-                                        .text_color(rgb(lvl_color))
-                                        .child(
-                                            div()
-                                                .w(px(5.5))
-                                                .h(px(5.5))
-                                                .rounded(px(999.))
-                                                .bg(rgb(lvl_color)),
-                                        )
+                                        .text_color(rgb(lvl_text_color))
+                                        .child(status_dot(lvl_dot_color, 5.5))
                                         .child(entry.level.label()),
                                 )
                                 .child(
@@ -275,6 +377,371 @@ pub fn render_audit_page(
     };
     let can_pull = connected && !logs_loading;
     let can_export = connected && !busy;
+    let hover_tile = p.sidebar_hover_bg;
+
+    let ctrl_copy_log = ctrl.clone();
+    let ctrl_close_log = ctrl.clone();
+
+    let timeline_card = bento_card_bloom(p, 17.0, 12.0, choreo.tile(0, 0))
+        .flex_1()
+        .gap(px(8.))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .min_w(px(0.))
+                        .flex_1()
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(p.text_primary))
+                                .child("24 小时出口合规轨迹"),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_muted))
+                                .child(timeline_summary),
+                        ),
+                )
+                .child(if has_bucket {
+                    action_button(
+                        "audit-clear-bucket",
+                        "清除时段",
+                        ButtonKind::Secondary,
+                        true,
+                        p,
+                    )
+                    .h(px(24.))
+                    .px(px(9.))
+                    .text_size(px(11.))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            ctrl_clear.update(cx, |c, cx| c.clear_timeline_bucket(cx));
+                        }),
+                    )
+                    .into_any_element()
+                } else {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.5))
+                        .when_some(compliance_dot, |row, dot| row.child(status_dot(dot, 5.5)))
+                        .child(
+                            mono_tabular(compliance_txt)
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(compliance_color)),
+                        )
+                        .into_any_element()
+                }),
+        )
+        .child(
+            div()
+                .flex()
+                .items_end()
+                .h(px(34.))
+                .gap(px(2.))
+                .px(px(6.))
+                .py(px(4.))
+                .rounded(px(9.))
+                .bg(rgb(p.inset_bg))
+                .border_1()
+                .border_color(rgb(p.inset_border))
+                .children(bars),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px(px(2.))
+                .child(
+                    mono_tabular("24 小时前")
+                        .text_size(px(10.))
+                        .text_color(rgb(p.text_muted)),
+                )
+                .child(
+                    mono_tabular("18 小时前")
+                        .text_size(px(10.))
+                        .text_color(rgb(p.text_muted)),
+                )
+                .child(
+                    mono_tabular("12 小时前")
+                        .text_size(px(10.))
+                        .text_color(rgb(p.text_muted)),
+                )
+                .child(
+                    mono_tabular("6 小时前")
+                        .text_size(px(10.))
+                        .text_color(rgb(p.text_muted)),
+                )
+                .child(
+                    mono_tabular("现在")
+                        .text_size(px(10.))
+                        .text_color(rgb(p.text_muted)),
+                ),
+        );
+
+    let logs_card = bento_card_bloom(p, 17.0, 12.0, choreo.tile(0, 1))
+        .flex_1()
+        .gap(px(9.))
+        .justify_between()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.))
+                .gap(px(9.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(div().w(px(210.)).child(search_input))
+                                .when(search_non_empty, |row| {
+                                    row.child(
+                                        div()
+                                            .id("audit-clear-search")
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .w(px(24.))
+                                            .h(px(24.))
+                                            .rounded(px(6.5))
+                                            .bg(rgb(p.secondary_btn_bg))
+                                            .border_1()
+                                            .border_color(rgb(p.secondary_btn_border))
+                                            .cursor_pointer()
+                                            .hover(move |s| s.bg(rgb(hover_tile)))
+                                            .child(ui_icon(
+                                                "icons/ui/close.svg",
+                                                10.5,
+                                                p.text_secondary,
+                                            ))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |_, _, _, cx| {
+                                                    ctrl_clear_search.update(cx, |c, cx| {
+                                                        c.clear_search_query(cx);
+                                                    });
+                                                }),
+                                            ),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(2.))
+                                        .p(px(2.))
+                                        .rounded(px(8.))
+                                        .bg(rgb(p.inset_bg))
+                                        .border_1()
+                                        .border_color(rgb(p.card_border))
+                                        .children(level_chips),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(7.))
+                                .child(
+                                    mono_tabular(count_display)
+                                        .text_size(px(11.))
+                                        .text_color(rgb(p.text_muted)),
+                                )
+                                .child({
+                                    let rf_fg = if can_pull {
+                                        p.secondary_btn_text
+                                    } else {
+                                        p.text_muted
+                                    };
+                                    div()
+                                        .id("audit-refresh-btn")
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(5.))
+                                        .h(px(28.))
+                                        .px(px(9.))
+                                        .rounded(px(8.))
+                                        .bg(rgb(p.secondary_btn_bg))
+                                        .border_1()
+                                        .border_color(rgb(p.secondary_btn_border))
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(rf_fg))
+                                        .child(spinning_ui_icon(
+                                            "audit-rf-spin",
+                                            "icons/ui/refresh.svg",
+                                            11.5,
+                                            rf_fg,
+                                            logs_loading,
+                                        ))
+                                        .child(if logs_loading { "查询中" } else { "刷新" })
+                                        .when(can_pull, |b| {
+                                            b.cursor_pointer()
+                                                .hover(move |s| s.bg(rgb(hover_tile)))
+                                                .active(|s| s.opacity(0.88))
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |_, _, _, cx| {
+                                                        ctrl_refresh.update(cx, |c, cx| {
+                                                            c.refresh_audit_logs(cx);
+                                                        });
+                                                    }),
+                                                )
+                                        })
+                                })
+                                .child(
+                                    action_button(
+                                        "audit-export-diag",
+                                        if export_busy {
+                                            "导出中…"
+                                        } else {
+                                            "导出脱敏诊断包"
+                                        },
+                                        ButtonKind::Primary,
+                                        can_export,
+                                        p,
+                                    )
+                                    .h(px(28.))
+                                    .px(px(11.))
+                                    .when(can_export, |b| {
+                                        b.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _, _, cx| {
+                                                ctrl_export.update(cx, |c, cx| {
+                                                    c.send_request(
+                                                        PipeRequest::ExportDiagnostics,
+                                                        Some("已导出脱敏诊断包"),
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                        )
+                                    }),
+                                ),
+                        ),
+                )
+                .child(list_el)
+                .when_some(selected_log, |col, entry| {
+                    let full_text = format!(
+                        "[{}] [{}] [{}] {}",
+                        format_unix_hm(entry.timestamp),
+                        entry.level.label(),
+                        entry.category,
+                        entry.message
+                    );
+                    let full_copy = full_text.clone();
+                    col.child(
+                        inset_box(p)
+                            .flex_row()
+                            .items_start()
+                            .justify_between()
+                            .gap(px(10.))
+                            .px(px(10.))
+                            .py(px(8.))
+                            .child(
+                                mono_tabular(full_text)
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .text_size(px(11.))
+                                    .line_height(px(16.))
+                                    .text_color(rgb(p.text_primary)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .flex_shrink_0()
+                                    .gap(px(5.))
+                                    .child(
+                                        action_button(
+                                            "audit-copy-selected",
+                                            "复制",
+                                            ButtonKind::Secondary,
+                                            true,
+                                            p,
+                                        )
+                                        .h(px(24.))
+                                        .px(px(8.))
+                                        .text_size(px(10.5))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _, _, cx| {
+                                                let txt = full_copy.clone();
+                                                ctrl_copy_log.update(cx, |c, cx| {
+                                                    c.copy_to_clipboard(txt, "日志", cx);
+                                                });
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("audit-close-selected")
+                                            .cursor_pointer()
+                                            .p(px(3.))
+                                            .rounded(px(5.))
+                                            .hover(move |s| s.bg(rgb(hover_tile)))
+                                            .child(ui_icon(
+                                                "icons/ui/close.svg",
+                                                10.5,
+                                                p.text_muted,
+                                            ))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |_, _, _, cx| {
+                                                    ctrl_close_log.update(cx, |c, cx| {
+                                                        c.selected_log_id = None;
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                            ),
+                                    ),
+                            ),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .pt(px(8.))
+                .border_t_1()
+                .border_color(rgb(p.card_border))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(p.text_muted))
+                        .child("点击日志展开并复制 · 诊断包自动脱敏路径与 IP"),
+                )
+                .child(
+                    mono_tabular("自动轮转保留")
+                        .text_size(px(10.5))
+                        .text_color(rgb(p.text_muted)),
+                ),
+        );
 
     div()
         .flex()
@@ -283,211 +750,14 @@ pub fn render_audit_page(
         .flex_1()
         .min_w(px(0.))
         .gap(px(10.))
+        .child(div().w_full().min_w(px(0.)).flex().child(timeline_card))
         .child(
-            bento_card(p)
-                .w_full()
-                .px(px(17.))
-                .py(px(12.))
-                .gap(px(8.))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(8.))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .min_w(px(0.))
-                                .flex_1()
-                                .child(
-                                    div()
-                                        .text_size(px(12.5))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(p.text_primary))
-                                        .child("24 小时出口合规轨迹"),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_size(px(11.))
-                                        .text_color(rgb(p.text_muted))
-                                        .child(proj.selected_bucket_summary.clone()),
-                                ),
-                        )
-                        .child(if has_bucket {
-                            action_button(
-                                "audit-clear-bucket",
-                                "清除时段筛选",
-                                ButtonKind::Secondary,
-                                true,
-                                p,
-                            )
-                            .h(px(24.))
-                            .px(px(9.))
-                            .text_size(px(11.))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |_, _, _, cx| {
-                                    ctrl_clear.update(cx, |c, cx| c.clear_timeline_bucket(cx));
-                                }),
-                            )
-                            .into_any_element()
-                        } else {
-                            mono_tabular(compliance_txt)
-                                .text_size(px(11.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(p.badge_pass.text))
-                                .into_any_element()
-                        }),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(2.))
-                        .px(px(6.))
-                        .py(px(4.))
-                        .rounded(px(9.))
-                        .bg(rgb(p.inset_bg))
-                        .border_1()
-                        .border_color(rgb(p.inset_border))
-                        .children(bars),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .px(px(2.))
-                        .child(mono_tabular("24 小时前").text_size(px(10.)).text_color(rgb(p.text_muted)))
-                        .child(mono_tabular("18 小时前").text_size(px(10.)).text_color(rgb(p.text_muted)))
-                        .child(mono_tabular("12 小时前").text_size(px(10.)).text_color(rgb(p.text_muted)))
-                        .child(mono_tabular("6 小时前").text_size(px(10.)).text_color(rgb(p.text_muted)))
-                        .child(mono_tabular("现在").text_size(px(10.)).text_color(rgb(p.text_muted))),
-                ),
-        )
-        .child(
-            bento_card(p)
-                .w_full()
+            div()
+                .flex()
                 .flex_1()
-                .px(px(17.))
-                .py(px(12.))
-                .gap(px(9.))
-                .justify_between()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(9.))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .justify_between()
-                                .gap(px(8.))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(8.))
-                                        .child(div().w(px(210.)).child(search_input))
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(2.))
-                                                .p(px(2.))
-                                                .rounded(px(8.))
-                                                .bg(rgb(p.inset_bg))
-                                                .border_1()
-                                                .border_color(rgb(p.card_border))
-                                                .children(level_chips),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(7.))
-                                        .child(
-                                            mono_tabular(count_display)
-                                                .text_size(px(11.))
-                                                .text_color(rgb(p.text_muted)),
-                                        )
-                                        .child(
-                                            icon_action_button(
-                                                "audit-refresh-btn",
-                                                "icons/ui/refresh.svg",
-                                                if logs_loading { "查询中" } else { "刷新" },
-                                                ButtonKind::Secondary,
-                                                can_pull,
-                                                p,
-                                            )
-                                            .h(px(28.))
-                                            .px(px(9.))
-                                            .when(can_pull, |b| {
-                                                b.on_mouse_up(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |_, _, _, cx| {
-                                                        ctrl_refresh.update(cx, |c, cx| {
-                                                            c.refresh_audit_logs(cx);
-                                                        });
-                                                    }),
-                                                )
-                                            }),
-                                        )
-                                        .child(
-                                            action_button(
-                                                "audit-export-diag",
-                                                "导出脱敏诊断包 (.zip)",
-                                                ButtonKind::Primary,
-                                                can_export,
-                                                p,
-                                            )
-                                            .h(px(28.))
-                                            .px(px(11.))
-                                            .when(can_export, |b| {
-                                                b.on_mouse_up(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |_, _, _, cx| {
-                                                        ctrl_export.update(cx, |c, cx| {
-                                                            c.send_request(
-                                                                PipeRequest::ExportDiagnostics,
-                                                                Some("已导出脱敏诊断包 (.zip)"),
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }),
-                                                )
-                                            }),
-                                        ),
-                                ),
-                        )
-                        .child(list_el),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .pt(px(8.))
-                        .border_t_1()
-                        .border_color(rgb(p.card_border))
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(rgb(p.text_muted))
-                                .child("导出脱敏诊断包时会自动隐藏本机用户名、绝对路径及外网 IP 后两段，可放心用于问题排查。"),
-                        )
-                        .child(
-                            mono_tabular("本地日志自动轮转保留")
-                                .text_size(px(10.5))
-                                .text_color(rgb(p.text_muted)),
-                        ),
-                ),
+                .w_full()
+                .min_w(px(0.))
+                .min_h(px(300.))
+                .child(logs_card),
         )
 }

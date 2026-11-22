@@ -1,6 +1,6 @@
 [package]
 name = "cg-protocol"
-version = "4.0.1"
+version = "4.1.0"
 edition = "2024"
 license = "MIT"
 description = "ClaudeGuard v4 shared contract types, config migration, snapshots, and Named Pipe wire protocol"

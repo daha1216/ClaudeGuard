@@ -4,6 +4,34 @@ use crate::theme::ThemePalette;
 use crate::widgets::controls::{guide_card, inset_box, mono_tabular, toggle_switch};
 use gpui::{Div, Entity, FontWeight, MouseButton, div, prelude::*, px, rgb};
 
+/// Stable brand-family sort key so siblings with matching brand icons/colors
+/// (Anthropic: Claude + Claude Code; OpenAI: ChatGPT + Codex CLI; Google: Antigravity)
+/// always stay visually grouped together instead of interleaved across lists.
+pub fn brand_family_rank(id: &str) -> u8 {
+    match id.to_ascii_lowercase().as_str() {
+        "claude" | "claude_desktop" | "claude-desktop" => 0,
+        "claude-code" | "claude_code" => 1,
+        "chatgpt" | "codex_desktop" | "codex-desktop" => 2,
+        "codex" | "codex-cli" | "codex_cli" => 3,
+        "antigravity" | "antigravity_ide" | "antigravity-ide" => 4,
+        "antigravity_cn" | "antigravity-cn" => 5,
+        "local" => 6,
+        _ => 10,
+    }
+}
+
+/// Harmonized display label across Launch Deck, Process Governance, and Breaker views.
+pub fn canonical_agent_label<'a>(id: &str, fallback: &'a str) -> &'a str {
+    match id.to_ascii_lowercase().as_str() {
+        "claude" => "Claude",
+        "claude-code" | "claude_code" => "Claude Code",
+        "chatgpt" => "ChatGPT",
+        "codex" | "codex-cli" | "codex_cli" => "Codex CLI",
+        "antigravity" => "Antigravity",
+        _ => fallback,
+    }
+}
+
 /// Compact diagnostic metric tile (`gd-diag-box`).
 pub fn ag_diag_tile(
     label: &'static str,
@@ -100,6 +128,19 @@ pub fn switch_row(
     p: &ThemePalette,
     on_click: impl Fn(&gpui::MouseUpEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> Div {
+    switch_row_gated(id, title, hint, on, true, p, on_click)
+}
+
+/// Divider-separated switch row with explicit interactive `enabled` gating.
+pub fn switch_row_gated(
+    id: &'static str,
+    title: &'static str,
+    hint: &'static str,
+    on: bool,
+    enabled: bool,
+    p: &ThemePalette,
+    on_click: impl Fn(&gpui::MouseUpEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> Div {
     div()
         .flex()
         .flex_row()
@@ -120,7 +161,11 @@ pub fn switch_row(
                     div()
                         .text_size(px(12.))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(p.text_primary))
+                        .text_color(rgb(if enabled {
+                            p.text_primary
+                        } else {
+                            p.text_muted
+                        }))
                         .child(title),
                 )
                 .child(
@@ -131,7 +176,10 @@ pub fn switch_row(
                         .child(hint),
                 ),
         )
-        .child(toggle_switch(id, on, true, p).on_mouse_up(MouseButton::Left, on_click))
+        .child(
+            toggle_switch(id, on, enabled, p)
+                .when(enabled, |sw| sw.on_mouse_up(MouseButton::Left, on_click)),
+        )
 }
 
 /// Structured 2-column or 3-column plain-language guide card (`gd-guide-card`).
@@ -148,17 +196,18 @@ pub fn page_guide_card(
             .flex_1()
             .flex_basis(px(0.))
             .min_w(px(0.))
-            .gap(px(3.))
+            .gap(px(2.5))
             .child(
                 div()
                     .text_size(px(11.5))
+                    .line_height(px(15.5))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(p.text_primary))
                     .child(*heading),
             )
             .child(
                 div()
-                    .text_size(px(10.5))
+                    .text_size(px(11.))
                     .line_height(px(16.))
                     .text_color(rgb(p.text_secondary))
                     .child(*body),
@@ -168,8 +217,8 @@ pub fn page_guide_card(
     guide_card(p)
         .w_full()
         .px(px(15.))
-        .py(px(12.))
-        .gap(px(8.))
+        .py(px(10.5))
+        .gap(px(7.))
         .when(!title.is_empty() || !subtitle.is_empty(), |card| {
             card.child(
                 div()
@@ -179,14 +228,18 @@ pub fn page_guide_card(
                     .gap(px(8.))
                     .child(
                         div()
+                            .flex_shrink_0()
                             .text_size(px(12.))
+                            .line_height(px(16.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(p.text_primary))
                             .child(title),
                     )
                     .child(
                         div()
+                            .truncate()
                             .text_size(px(10.5))
+                            .line_height(px(15.))
                             .text_color(rgb(p.text_muted))
                             .child(subtitle),
                     ),
@@ -198,7 +251,7 @@ pub fn page_guide_card(
                 .flex_row()
                 .w_full()
                 .min_w(px(0.))
-                .gap(px(14.))
+                .gap(px(16.))
                 .children(cols),
         )
 }

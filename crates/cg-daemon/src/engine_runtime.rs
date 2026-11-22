@@ -208,10 +208,9 @@ fn parse_update_component_filter(
 fn component_matches_filter(norm: Option<&str>, id: &str) -> bool {
     match norm {
         None => true,
-        Some("antigravity_plugins") => matches!(
-            id,
-            "antigravity_cn" | "ag_usage_monitor" | "ag_capsule"
-        ),
+        Some("antigravity_plugins") => {
+            matches!(id, "antigravity_cn" | "ag_usage_monitor" | "ag_capsule")
+        }
         Some(other) => other == id,
     }
 }
@@ -464,6 +463,13 @@ pub struct BootstrappedActor {
     pub process_scanner: Arc<ProcessScanner>,
 }
 
+/// Injection point for synchronizing OS 4-vector leak shield rules (`leak_shield_win::sync_leak_shield` in production).
+type LeakShieldSyncFn = Arc<
+    dyn Fn(&[PathBuf], bool, bool, bool) -> cg_platform::PlatformResult<LeakShieldStatus>
+        + Send
+        + Sync,
+>;
+
 /// Single-writer actor executing `GuardEngine::step` and real OS/WAL/Config side effects.
 pub struct RealEngineActor {
     engine: EngineState,
@@ -488,6 +494,7 @@ pub struct RealEngineActor {
     recent_toasts: VecDeque<ToastNotificationEvent>,
     toast_seq: u64,
     leak_shield: LeakShieldStatus,
+    leak_shield_syncer: LeakShieldSyncFn,
     mihomo: MihomoStatus,
 }
 
@@ -631,6 +638,7 @@ impl RealEngineActor {
             recent_toasts: VecDeque::new(),
             toast_seq: 0,
             leak_shield: init_shield,
+            leak_shield_syncer: Arc::new(leak_shield_win::sync_leak_shield),
             mihomo: MihomoStatus::default(),
         };
 
@@ -669,6 +677,42 @@ impl RealEngineActor {
             heal_report,
             process_scanner,
         }
+    }
+
+    #[cfg(test)]
+    fn with_leak_shield_syncer(mut self, syncer: LeakShieldSyncFn) -> Self {
+        self.leak_shield_syncer = syncer;
+        self
+    }
+
+    fn sync_leak_shield_rules(&mut self, now: u64) -> Result<OperationReceipt, PlatformError> {
+        let mut exes = Vec::new();
+        for agent in &self.engine.config.guarded_agents {
+            for p in self.driver.discover_agent_exes(agent).unwrap_or_default() {
+                if !exes.contains(&p) {
+                    exes.push(p);
+                }
+            }
+        }
+        let status = (self.leak_shield_syncer)(
+            &exes,
+            self.engine.config.leak_shield_quic,
+            self.engine.config.leak_shield_dns_doh,
+            self.engine.config.leak_shield_ipv6,
+        )?;
+        let summary = status.summary.clone();
+        self.leak_shield = status;
+        let mut receipt =
+            OperationReceipt::new(format!("shield-sync-{now}"), OperationStatus::Verified);
+        receipt.verified_scope = "leak_shield".into();
+        receipt.push_item("leak_shield", OperationStatus::Verified, summary.clone());
+        self.engine.push_log(
+            now,
+            LogLevel::Audit,
+            "shield",
+            &format!("同步 4 维防泄露护盾：{summary}"),
+        );
+        Ok(receipt)
     }
 
     fn build_snapshot(&self, now: u64) -> GuardSnapshot {
@@ -1716,7 +1760,41 @@ impl RealEngineActor {
                 self.send_mutation_reply(reply, snap);
             }
             PipeRequest::SaveConfig { config } => {
+                let prev_shield = (
+                    self.engine.config.leak_shield_quic,
+                    self.engine.config.leak_shield_dns_doh,
+                    self.engine.config.leak_shield_ipv6,
+                    self.engine.config.guarded_agents.clone(),
+                );
                 self.step_and_run(EngineEvent::SaveConfig { next: config }, now);
+                let next_shield = (
+                    self.engine.config.leak_shield_quic,
+                    self.engine.config.leak_shield_dns_doh,
+                    self.engine.config.leak_shield_ipv6,
+                    self.engine.config.guarded_agents.clone(),
+                );
+                if self.last_rejected.is_none()
+                    && prev_shield != next_shield
+                    && self.engine.lifecycle == Lifecycle::Armed
+                    && self.driver.capabilities().app_quarantine
+                {
+                    match self.sync_leak_shield_rules(now) {
+                        Ok(receipt) => {
+                            self.engine.last_receipt = Some(receipt);
+                        }
+                        Err(err) => {
+                            let detail = format!("保存配置后自动同步防泄露护盾规则失败：{err}");
+                            self.engine.push_log(now, LogLevel::Warn, "shield", &detail);
+                            let mut receipt = OperationReceipt::new(
+                                format!("shield-sync-{now}"),
+                                OperationStatus::Partial,
+                            );
+                            receipt.verified_scope = "leak_shield".into();
+                            receipt.push_item("leak_shield", OperationStatus::Failed, detail);
+                            self.engine.last_receipt = Some(receipt);
+                        }
+                    }
+                }
                 let snap = self.publish_snapshot(snapshot_store, now);
                 self.flush_superseded_waiters(&snap);
                 self.send_mutation_reply(reply, snap);
@@ -2132,11 +2210,14 @@ impl RealEngineActor {
                     } else {
                         "飞书推送已保存为关闭状态".into()
                     };
-                    let mut receipt =
-                        OperationReceipt::new(format!("feishu-save-{now}"), OperationStatus::Verified);
+                    let mut receipt = OperationReceipt::new(
+                        format!("feishu-save-{now}"),
+                        OperationStatus::Verified,
+                    );
                     receipt.verified_scope = "feishu.config".into();
                     receipt.push_item("feishu_config", OperationStatus::Verified, detail.clone());
-                    self.engine.push_log(now, LogLevel::Audit, "notify", &detail);
+                    self.engine
+                        .push_log(now, LogLevel::Audit, "notify", &detail);
                     self.engine.last_receipt = Some(receipt.clone());
                     let snap = self.publish_snapshot(snapshot_store, now);
                     let _ = reply.send(PipeResponse::Ack {
@@ -2157,11 +2238,7 @@ impl RealEngineActor {
                 let event_tx = self.event_tx.clone();
                 let policy = NetworkPolicy::direct();
                 std::thread::spawn(move || {
-                    let result = feishu.send_test(
-                        &policy,
-                        webhook.as_deref(),
-                        secret.as_deref(),
-                    );
+                    let result = feishu.send_test(&policy, webhook.as_deref(), secret.as_deref());
                     let _ = event_tx.send(CoordinatorEvent::FeishuTestFinished {
                         result,
                         now_secs: now_unix_secs(),
@@ -2178,31 +2255,8 @@ impl RealEngineActor {
                     });
                     return;
                 }
-                let mut exes = Vec::new();
-                for agent in &self.engine.config.guarded_agents {
-                    for p in self.driver.discover_agent_exes(agent).unwrap_or_default() {
-                        if !exes.contains(&p) {
-                            exes.push(p);
-                        }
-                    }
-                }
-                match leak_shield_win::sync_leak_shield(
-                    &exes,
-                    self.engine.config.leak_shield_quic,
-                    self.engine.config.leak_shield_dns_doh,
-                    self.engine.config.leak_shield_ipv6,
-                ) {
-                    Ok(status) => {
-                        let summary = status.summary.clone();
-                        self.leak_shield = status;
-                        let mut receipt = OperationReceipt::new(
-                            format!("shield-sync-{now}"),
-                            OperationStatus::Verified,
-                        );
-                        receipt.verified_scope = "leak_shield".into();
-                        receipt.push_item("leak_shield", OperationStatus::Verified, summary.clone());
-                        self.engine
-                            .push_log(now, LogLevel::Audit, "shield", &format!("同步 4 维防泄露护盾：{summary}"));
+                match self.sync_leak_shield_rules(now) {
+                    Ok(receipt) => {
                         self.engine.last_receipt = Some(receipt.clone());
                         let snap = self.publish_snapshot(snapshot_store, now);
                         let _ = reply.send(PipeResponse::Ack {
@@ -2226,8 +2280,7 @@ impl RealEngineActor {
             } => {
                 let event_tx = self.event_tx.clone();
                 std::thread::spawn(move || {
-                    let result =
-                        mihomo_win::switch_mihomo_node(&group, &node, close_connections);
+                    let result = mihomo_win::switch_mihomo_node(&group, &node, close_connections);
                     let mihomo = mihomo_win::inspect_mihomo();
                     let _ = event_tx.send(CoordinatorEvent::MihomoSwitchFinished {
                         result,
@@ -2258,10 +2311,9 @@ impl RealEngineActor {
                 let proxy_port = self.engine.config.proxy_port;
                 let event_tx = self.event_tx.clone();
                 std::thread::spawn(move || {
-                    let res = antigravity_proxy_win::repair_antigravity_proxy(
-                        &route, proxy_port, None,
-                    )
-                    .map(|r| r.summary);
+                    let res =
+                        antigravity_proxy_win::repair_antigravity_proxy(&route, proxy_port, None)
+                            .map(|r| r.summary);
                     let _ = event_tx.send(CoordinatorEvent::AntigravityRepairFinished {
                         result: res,
                         now_secs: now_unix_secs(),
@@ -2323,9 +2375,17 @@ impl RealEngineActor {
                             OperationStatus::Verified,
                         );
                         receipt.verified_scope = "env.alignment".into();
-                        receipt.push_item("env_alignment", OperationStatus::Verified, detail.clone());
-                        self.engine
-                            .push_log(now, LogLevel::Audit, "env", &format!("系统环境对齐完成：{detail}"));
+                        receipt.push_item(
+                            "env_alignment",
+                            OperationStatus::Verified,
+                            detail.clone(),
+                        );
+                        self.engine.push_log(
+                            now,
+                            LogLevel::Audit,
+                            "env",
+                            &format!("系统环境对齐完成：{detail}"),
+                        );
                         self.engine.last_receipt = Some(receipt.clone());
                         let snap = self.publish_snapshot(snapshot_store, now);
                         let _ = reply.send(PipeResponse::Ack {
@@ -2363,9 +2423,17 @@ impl RealEngineActor {
                             OperationStatus::Verified,
                         );
                         receipt.verified_scope = "env.rollback".into();
-                        receipt.push_item("env_rollback", OperationStatus::Verified, detail.clone());
-                        self.engine
-                            .push_log(now, LogLevel::Audit, "env", &format!("系统环境回滚完成：{detail}"));
+                        receipt.push_item(
+                            "env_rollback",
+                            OperationStatus::Verified,
+                            detail.clone(),
+                        );
+                        self.engine.push_log(
+                            now,
+                            LogLevel::Audit,
+                            "env",
+                            &format!("系统环境回滚完成：{detail}"),
+                        );
                         self.engine.last_receipt = Some(receipt.clone());
                         let snap = self.publish_snapshot(snapshot_store, now);
                         let _ = reply.send(PipeResponse::Ack {
@@ -2670,8 +2738,13 @@ impl CoordinatorActor for RealEngineActor {
                         OperationStatus::Verified,
                     );
                     receipt.verified_scope = "antigravity_proxy".into();
-                    receipt.push_item("antigravity_proxy", OperationStatus::Verified, summary.clone());
-                    self.engine.push_log(now_secs, LogLevel::Audit, "antigravity", &summary);
+                    receipt.push_item(
+                        "antigravity_proxy",
+                        OperationStatus::Verified,
+                        summary.clone(),
+                    );
+                    self.engine
+                        .push_log(now_secs, LogLevel::Audit, "antigravity", &summary);
                     self.engine.last_receipt = Some(receipt.clone());
                     let snap = self.publish_snapshot(ctx.snapshot, now_secs);
                     let _ = reply.send(PipeResponse::Ack {
@@ -2709,7 +2782,8 @@ impl CoordinatorActor for RealEngineActor {
                         );
                         receipt.verified_scope = "mihomo.node".into();
                         receipt.push_item("mihomo_node", OperationStatus::Verified, detail.clone());
-                        self.engine.push_log(now_secs, LogLevel::Audit, "mihomo", &detail);
+                        self.engine
+                            .push_log(now_secs, LogLevel::Audit, "mihomo", &detail);
                         if self.engine.is_tripped() {
                             self.step_and_run(EngineEvent::RecoverSafeFlowA, now_secs);
                         } else if self.engine.lifecycle == Lifecycle::Armed {
@@ -2834,8 +2908,7 @@ impl CoordinatorActor for RealEngineActor {
                 let (check_cg, check_ag, normalized) =
                     parse_update_component_filter(component.as_deref())
                         .unwrap_or((true, true, None));
-                let check_client =
-                    |id: &str| component_matches_filter(normalized.as_deref(), id);
+                let check_client = |id: &str| component_matches_filter(normalized.as_deref(), id);
                 if !check_cg {
                     next_summary.claudeguard = self.engine.updates.claudeguard.clone();
                 }
@@ -2900,7 +2973,11 @@ impl CoordinatorActor for RealEngineActor {
                         };
 
                     record_slot("claudeguard", check_cg, &next_summary.claudeguard);
-                    record_slot("antigravity_proxy", check_ag, &next_summary.antigravity_proxy);
+                    record_slot(
+                        "antigravity_proxy",
+                        check_ag,
+                        &next_summary.antigravity_proxy,
+                    );
                     record_slot(
                         "claude_desktop",
                         check_client("claude_desktop"),
@@ -5162,5 +5239,193 @@ mod tests {
         );
 
         coord.shutdown();
+    }
+
+    #[test]
+    fn save_config_auto_syncs_leak_shield_when_armed_and_skips_when_unchanged_or_disarmed() {
+        type SyncCall = (Vec<PathBuf>, bool, bool, bool);
+        let calls: Arc<Mutex<Vec<SyncCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_hook = calls.clone();
+        let mock_syncer: LeakShieldSyncFn = Arc::new(move |exes, quic, dns, ipv6| {
+            calls_hook
+                .lock()
+                .unwrap()
+                .push((exes.to_vec(), quic, dns, ipv6));
+            let active_rules =
+                exes.len() * (usize::from(quic) + usize::from(dns) * 3 + usize::from(ipv6));
+            Ok(LeakShieldStatus {
+                enabled: active_rules > 0,
+                quic_blocked: quic && active_rules > 0,
+                dns_doh_blocked: dns && active_rules > 0,
+                ipv6_blocked: ipv6 && active_rules > 0,
+                active_rules,
+                summary: format!("mock shield synced ({active_rules})"),
+            })
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(ControllableDriver::new());
+        driver.gui_exes.lock().unwrap().insert(
+            "chatgpt".into(),
+            vec![PathBuf::from(r"C:\Apps\ChatGPT\ChatGPT.exe")],
+        );
+        let runner = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: Arc::new(AtomicBool::new(true)),
+            ip_on_pass: "198.51.100.98".into(),
+        });
+        let recovery = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
+
+        let data_dir = dir.path().to_path_buf();
+        let drv_clone = driver.clone();
+        let syncer_clone = mock_syncer.clone();
+        let (coord, ()) = start_coordinator_with(|event_tx| {
+            let boot = RealEngineActor::bootstrap(data_dir, drv_clone, runner, recovery, event_tx);
+            let actor = boot.actor.with_leak_shield_syncer(syncer_clone);
+            (boot.initial_snapshot, Box::new(actor), ())
+        });
+
+        let mut cfg = make_cfg("US");
+        cfg.guarded_agents = vec!["claude".into()];
+        cfg.leak_shield_quic = false;
+        cfg.leak_shield_dns_doh = false;
+        cfg.leak_shield_ipv6 = false;
+        assert!(matches!(
+            coord.dispatch(PipeRequest::CompleteOnboarding {
+                config: cfg.clone(),
+            }),
+            PipeResponse::Ack { .. }
+        ));
+        assert_eq!(coord.snapshot().lifecycle, Lifecycle::Armed);
+        assert!(calls.lock().unwrap().is_empty());
+
+        // 1) Enabling QUIC while Armed automatically triggers leak shield sync.
+        cfg.leak_shield_quic = true;
+        match coord.dispatch(PipeRequest::SaveConfig {
+            config: cfg.clone(),
+        }) {
+            PipeResponse::Ack {
+                receipt: Some(rcpt),
+                snapshot: Some(snap),
+            } => {
+                assert_eq!(rcpt.status, OperationStatus::Verified);
+                assert_eq!(rcpt.verified_scope, "leak_shield");
+                assert!(snap.leak_shield.enabled);
+                assert!(snap.leak_shield.quic_blocked);
+                assert!(!snap.leak_shield.dns_doh_blocked);
+                assert!(!snap.leak_shield.ipv6_blocked);
+                assert_eq!(snap.leak_shield.active_rules, 1);
+                assert!(snap
+                    .recent_logs
+                    .iter()
+                    .any(|l| l.category == "shield" && l.level == LogLevel::Audit));
+            }
+            other => panic!("expected Ack with leak_shield receipt, got {other:?}"),
+        }
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            calls.lock().unwrap()[0],
+            (
+                vec![PathBuf::from(r"C:\Apps\Claude\claude.exe")],
+                true,
+                false,
+                false
+            )
+        );
+
+        // 2) Saving unrelated config changes does NOT re-trigger leak shield sync.
+        cfg.kill_cli_on_fail = !cfg.kill_cli_on_fail;
+        assert!(matches!(
+            coord.dispatch(PipeRequest::SaveConfig {
+                config: cfg.clone(),
+            }),
+            PipeResponse::Ack { .. }
+        ));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+
+        // 3) Enabling DNS/DoH + IPv6 and adding another guarded agent triggers sync with updated exes.
+        cfg.leak_shield_dns_doh = true;
+        cfg.leak_shield_ipv6 = true;
+        cfg.guarded_agents = vec!["claude".into(), "chatgpt".into()];
+        assert!(matches!(
+            coord.dispatch(PipeRequest::SaveConfig {
+                config: cfg.clone(),
+            }),
+            PipeResponse::Ack { .. }
+        ));
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert_eq!(
+            calls.lock().unwrap()[1],
+            (
+                vec![
+                    PathBuf::from(r"C:\Apps\Claude\claude.exe"),
+                    PathBuf::from(r"C:\Apps\ChatGPT\ChatGPT.exe"),
+                ],
+                true,
+                true,
+                true
+            )
+        );
+        let snap2 = coord.snapshot();
+        assert!(snap2.leak_shield.quic_blocked);
+        assert!(snap2.leak_shield.dns_doh_blocked);
+        assert!(snap2.leak_shield.ipv6_blocked);
+        assert_eq!(snap2.leak_shield.active_rules, 10);
+
+        // 4) Toggling all vectors off triggers idempotent rule removal sync.
+        cfg.leak_shield_quic = false;
+        cfg.leak_shield_dns_doh = false;
+        cfg.leak_shield_ipv6 = false;
+        assert!(matches!(
+            coord.dispatch(PipeRequest::SaveConfig {
+                config: cfg.clone(),
+            }),
+            PipeResponse::Ack { .. }
+        ));
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        assert!(!coord.snapshot().leak_shield.enabled);
+        assert_eq!(coord.snapshot().leak_shield.active_rules, 0);
+
+        coord.shutdown();
+
+        // 5) When Lifecycle::Disarmed, changing leak shield flags in SaveConfig must NOT trigger sync.
+        let disarmed_dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(disarmed_dir.path());
+        store.save_verified(&cfg).unwrap();
+        disarm::mark_disarmed(disarmed_dir.path(), "unit-test").unwrap();
+
+        let disarmed_calls = Arc::new(AtomicUsize::new(0));
+        let dc_hook = disarmed_calls.clone();
+        let disarmed_syncer: LeakShieldSyncFn = Arc::new(move |_, _, _, _| {
+            dc_hook.fetch_add(1, Ordering::AcqRel);
+            Ok(LeakShieldStatus::default())
+        });
+        let runner2 = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: Arc::new(AtomicBool::new(true)),
+            ip_on_pass: "198.51.100.98".into(),
+        });
+        let recovery2 = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
+        let d_path = disarmed_dir.path().to_path_buf();
+        let (coord2, ()) = start_coordinator_with(|event_tx| {
+            let boot = RealEngineActor::bootstrap(d_path, driver, runner2, recovery2, event_tx);
+            let actor = boot.actor.with_leak_shield_syncer(disarmed_syncer);
+            (boot.initial_snapshot, Box::new(actor), ())
+        });
+        assert_eq!(coord2.snapshot().lifecycle, Lifecycle::Disarmed);
+
+        cfg.leak_shield_quic = true;
+        assert!(matches!(
+            coord2.dispatch(PipeRequest::SaveConfig { config: cfg }),
+            PipeResponse::Ack { .. }
+        ));
+        assert_eq!(
+            disarmed_calls.load(Ordering::Acquire),
+            0,
+            "SaveConfig while Disarmed must NOT write firewall leak shield rules"
+        );
+        coord2.shutdown();
     }
 }

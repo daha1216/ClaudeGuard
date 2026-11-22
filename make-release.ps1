@@ -23,8 +23,19 @@ $portableZip = Join-Path $outDir "ClaudeGuard-v$Ver-portable.zip"
 $upgradeBridge = Join-Path $outDir "ClaudeGuard-v$Ver-upgrade.exe"
 
 if (-not $BridgeOnly) {
-    $iscc = "C:\Users\daha\AppData\Local\Programs\Inno Setup 6\ISCC.exe"
-    if (-not (Test-Path $iscc)) { throw "ISCC not found at $iscc" }
+    $isccCmd = Get-Command iscc.exe -ErrorAction SilentlyContinue
+    $isccCandidates = @(
+        $(if ($isccCmd) { $isccCmd.Source }),
+        (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"),
+        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+        "C:\Program Files\Inno Setup 6\ISCC.exe",
+        "C:\Users\daha\AppData\Local\Programs\Inno Setup 6\ISCC.exe"
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $iscc) {
+        throw "ISCC.exe not found. Checked: $($isccCandidates -join '; ')"
+    }
+    Write-Host "Using Inno Setup compiler: $iscc"
 
     $daemonCargoVer = ([regex]::Match((Get-Content (Join-Path $root "crates\cg-daemon\Cargo.toml") -Raw), '(?m)^version\s*=\s*"([^"]+)"')).Groups[1].Value
     $guiCargoVer = ([regex]::Match((Get-Content (Join-Path $root "crates\cg-gui\Cargo.toml") -Raw), '(?m)^version\s*=\s*"([^"]+)"')).Groups[1].Value
@@ -72,7 +83,47 @@ if (-not $BridgeOnly) {
         throw "claudeguard-daemon.exe ProductVersion='$daemonProdVer' does not match '$Ver'"
     }
 
-    $guiBytes = [System.IO.File]::ReadAllBytes((Join-Path $stageDir "claudeguard-gui.exe"))
+    $guiStageExe = Join-Path $stageDir "claudeguard-gui.exe"
+    $guiProdVer = (Get-Item $guiStageExe).VersionInfo.ProductVersion
+    if ($guiProdVer -ne $Ver) {
+        throw "claudeguard-gui.exe ProductVersion='$guiProdVer' does not match '$Ver'"
+    }
+
+    if (-not ("CgPeResourceProbe" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class CgPeResourceProbe {
+    private const uint LOAD_LIBRARY_AS_DATAFILE = 0x00000002;
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr LoadLibraryExW(string lpFileName, IntPtr hFile, uint dwFlags);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr FindResourceW(IntPtr hModule, IntPtr lpName, IntPtr lpType);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint SizeofResource(IntPtr hModule, IntPtr hResInfo);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool FreeLibrary(IntPtr hModule);
+
+    public static bool HasGroupIcon(string exePath, int resourceId) {
+        IntPtr hMod = LoadLibraryExW(exePath, IntPtr.Zero, LOAD_LIBRARY_AS_DATAFILE);
+        if (hMod == IntPtr.Zero) {
+            return false;
+        }
+        try {
+            IntPtr hRes = FindResourceW(hMod, (IntPtr)resourceId, (IntPtr)14);
+            return hRes != IntPtr.Zero && SizeofResource(hMod, hRes) > 0;
+        } finally {
+            FreeLibrary(hMod);
+        }
+    }
+}
+"@
+    }
+    if (-not [CgPeResourceProbe]::HasGroupIcon($guiStageExe, 1)) {
+        throw "claudeguard-gui.exe missing embedded RT_GROUP_ICON (#1)"
+    }
+
+    $guiBytes = [System.IO.File]::ReadAllBytes($guiStageExe)
     $guiAscii = [System.Text.Encoding]::ASCII.GetString($guiBytes)
     if (-not $guiAscii.Contains("asInvoker")) {
         throw "claudeguard-gui.exe manifest missing level='asInvoker'"

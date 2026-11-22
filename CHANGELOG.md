@@ -4,6 +4,30 @@
 
 日期为实际发布日期（UTC / UTC+8）。更早的历史版本记录见 [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases)。
 
+## [4.1.0] - 2026-11-22
+
+**原生 GPUI 精雕重塑版**：全面升级透明蓝宝石折纸晶盾图标体系、5 套高级主题 × 明暗自适应、120Hz 零重排 GPU 动效引擎、Windows 11 原生 DWM 丝滑窗口过渡与全界面精炼中文文案，并同步修复防漏护盾即时同步与反重力可选核验模式告警噪音。
+
+### 新增与视觉精雕
+
+- **全新透明蓝宝石折纸晶盾图标体系**：
+  - 统一重绘 `assets/claude.ico`（6 尺寸 16–256px 全层级）、应用内品牌图标（含全套暗色主题高对比变体）与 UI 矢量图标；`cg-gui/build.rs` 通过 Windows SDK `rc.exe` 无冲突嵌入 `RT_GROUP_ICON #1` 与 `VERSIONINFO` 版本信息，并在 `make-release.ps1` 加入 PE 图标、`ProductVersion` 与 `asInvoker` 清单自动核验。
+  - 重制系统托盘满幅高精折纸盾（64×64 紧裁母版 + 2×2 超采样双线性缩放 + 右下角珍珠描边状态宝石），高 DPI 托盘清晰饱满不显小。
+- **5 套优雅色彩主题 × 浅色 / 暗夜 / 自动**：
+  - 顶栏新增主题风格气泡并持久化至 `%LOCALAPPDATA%\ClaudeGuard\ui_style.json`：默认「琉璃冰晶（CrystalGlass）」、以及「线性星靛（LinearIndigo）」「莫兰迪雾（MinimalMist）」「深海蓝宝（AlpineSapphire）」「曜石极黑（ObsidianInk）」，统一保留高级纯净白与冷瓷灰画布底色。
+- **120Hz 零重排 GPU 动效与 Windows 11 原生 DWM 丝滑过渡**：
+  - 全新 `motion.rs` 临界阻尼弹簧引擎（`ζ = 1.0`，零回弹、零首帧时钟跳变、零拖尾爬行），配合自定义 `OffsetPane`（纯 GPU 偏移零 Taffy 重排）与 `BloomCard`（冻结布局尺寸 + 直接 GPU 绘制对称卡片舒展），实现主界面纯水平切换与逐卡轻盈舒展，消除高刷卡顿与空闲态 30fps 冗余重绘。
+  - 修复 Windows 11 无边框窗口最小化/最大化/还原生硬跳变：通过 `WS_CAPTION` + `DWMWA_TRANSITIONS_FORCEDISABLED = 0` + `WM_SYSCOMMAND` 原生路由恢复系统级丝滑缩入任务栏动画，同时完整支持 Win11 Snap Layouts 与深色标题栏同步。
+- **全界面文案精炼与细节打磨**：
+  - 对 7 大主页面、子标签、托盘 HUD、首启向导、Antigravity 插件弹窗及输入占位提示逐条提炼，大幅压缩冗余长句同时完整保留操作含义；修复「目标」页底部说明裁切与「审计」页搜索框提示截断，并简化「更新」页嵌套网络报错文案。
+
+### 修复与工程优化
+
+- **4 维防漏护盾开关即时同步与可测试性增强**：`cg-daemon` 在保存防漏护盾开关变更时自动触发 OS 防火墙规则同步，避免开关已改但护盾仍滞留「待同步」状态，并补齐单元测试覆盖。
+- **反重力透明代理可选核验模式降噪**：当关闭「反重力注入强制核验」（`require_antigravity_proxy = false`）时，不再反复弹出 `MissingDll` / `RuntimeUnhooked` 告警噪音；强制核验拦截提示明确指引 `antigravity-launcher` / TUN / 自定义代理用户的开关路径。
+- **CLI 安全工作目录启动与本地时区轨迹投影**：优化 `cg-gui` 安全启动台 CLI 启动目录解析与 24 小时合规轨迹的本地时区对齐。
+- **发布脚本跨机兼容**：`make-release.ps1` 自动探测本机 `PATH` 及常见用户/系统目录下的 Inno Setup 6（`ISCC.exe`），不再强绑定单一开发机绝对路径。
+
 ## [4.0.1] - 2026-11-21
 
 ### 修复
@@ -74,6 +98,7 @@
 
 ---
 
+[4.1.0]: https://github.com/daha1216/ClaudeGuard/releases/tag/v4.1.0
 [4.0.1]: https://github.com/daha1216/ClaudeGuard/releases/tag/v4.0.1
 [4.0.0]: https://github.com/daha1216/ClaudeGuard/releases/tag/v4.0.0
 [3.12.5]: https://github.com/daha1216/ClaudeGuard/releases/tag/v3.12.5

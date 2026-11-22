@@ -1,11 +1,29 @@
 //! Mode B — Zero-Input Smart First-Run Onboarding Modal.
 
 use crate::app::{AppController, ConsoleWindowView};
+use crate::motion::spring_sheet;
 use crate::protocol::{OnboardingStrategy, UiLabelExt, mask_ip_str};
 use crate::theme::{BadgeTone, ThemePalette};
 use crate::views::shared::{info_mini_box, labeled_field};
-use crate::widgets::controls::{ButtonKind, action_button, bento_card, status_pill};
-use gpui::{Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, rgb, rgba};
+use crate::widgets::controls::{
+    ButtonKind, action_button, bento_card, float_shadow, spinning_ui_icon, status_dot, status_pill,
+};
+use gpui::{
+    AnimationExt, Context, Div, Entity, FontWeight, MouseButton, SpringAnimation, div, prelude::*,
+    px, rgb, rgba,
+};
+
+fn friendly_agent_name(id: &str) -> &str {
+    match id.to_ascii_lowercase().as_str() {
+        "claude" | "claude_desktop" | "claude-desktop" => "Claude Desktop",
+        "chatgpt" | "codex" | "codex_desktop" => "ChatGPT",
+        "antigravity" | "antigravity_ide" => "Antigravity",
+        "claude-code" | "claude_code" => "Claude Code CLI",
+        "codex-cli" | "codex_cli" => "Codex CLI",
+        _ => id,
+    }
+}
+
 /// Zero-Input Smart First-Run Onboarding Modal.
 pub fn render_onboarding_modal(
     ctrl: Entity<AppController>,
@@ -35,19 +53,29 @@ pub fn render_onboarding_modal(
         .map(|pr| {
             let port = pr
                 .detected_proxy_port
-                .map(|port| format!(":{port} 系统代理"))
+                .map(|port| format!("本地代理 :{port}"))
                 .unwrap_or_else(|| pr.access.level.label().to_string());
             let apps = if pr.installed_agents.is_empty() {
-                "待发现".into()
+                "未发现".into()
             } else {
-                pr.installed_agents.join(" / ")
+                pr.installed_agents
+                    .iter()
+                    .map(|id| friendly_agent_name(id))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
             };
             let exit = pr
                 .probe
                 .as_ref()
                 .map(|p_res| {
-                    let cc = p_res.country.as_deref().unwrap_or("--");
-                    let city = p_res.city.as_deref().unwrap_or("");
+                    let cc = p_res.country.as_deref().map(str::trim).unwrap_or("");
+                    let city = p_res.city.as_deref().map(str::trim).unwrap_or("");
+                    let loc = match (cc.is_empty(), city.is_empty()) {
+                        (false, false) => format!("{cc} · {city}"),
+                        (false, true) => cc.to_string(),
+                        (true, false) => city.to_string(),
+                        (true, true) => "--".to_string(),
+                    };
                     let ip = p_res
                         .ip
                         .as_deref()
@@ -59,16 +87,16 @@ pub fn render_onboarding_modal(
                             }
                         })
                         .unwrap_or_else(|| "--".into());
-                    format!("{cc} · {city} {ip} ({}ms)", p_res.latency_ms)
+                    format!("{loc} · {ip} ({}ms)", p_res.latency_ms)
                 })
-                .unwrap_or_else(|| "未探测到合规出口".into());
+                .unwrap_or_else(|| "未探测到出口".into());
             (port, apps, exit, pr.standby_notice.clone())
         })
         .unwrap_or_else(|| {
             (
                 "探测中…".into(),
-                "扫描本机 AI 应用…".into(),
-                "正在经代理探测当前出口…".into(),
+                "扫描客户端…".into(),
+                "正在探测当前出口…".into(),
                 None,
             )
         });
@@ -82,10 +110,20 @@ pub fn render_onboarding_modal(
         let strat = opt.strategy;
         let active = strat == selected;
         let ctrl_opt = ctrl.clone();
-        let title = if mask {
-            crate::protocol::mask_ips_in_text(&opt.title)
+        let raw_title = if opt.recommended {
+            opt.title
+                .strip_prefix("推荐：")
+                .or_else(|| opt.title.strip_prefix("推荐:"))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&opt.title)
         } else {
-            opt.title.clone()
+            opt.title.as_str()
+        };
+        let title = if mask {
+            crate::protocol::mask_ips_in_text(raw_title)
+        } else {
+            raw_title.to_string()
         };
         let sub = if mask {
             crate::protocol::mask_ips_in_text(&opt.subtitle)
@@ -93,6 +131,7 @@ pub fn render_onboarding_modal(
             opt.subtitle.clone()
         };
 
+        let hover_bg = p.sidebar_hover_bg;
         div()
             .id(gpui::ElementId::Name(format!("onb-opt-{strat:?}").into()))
             .flex()
@@ -101,17 +140,17 @@ pub fn render_onboarding_modal(
             .p(px(12.))
             .rounded(px(12.))
             .cursor_pointer()
-            .bg(rgb(if active {
-                p.card_bg
-            } else {
-                p.inset_bg
-            }))
-            .border_1()
-            .border_color(rgb(if active {
-                p.primary_btn_bg
-            } else {
-                p.inset_border
-            }))
+            .when(active, |d| {
+                d.bg(rgb(p.accent_soft_bg))
+                    .border_1()
+                    .border_color(rgb(p.accent_soft_border))
+            })
+            .when(!active, |d| {
+                d.bg(rgb(p.inset_bg))
+                    .border_1()
+                    .border_color(rgb(p.inset_border))
+                    .hover(move |s| s.bg(rgb(hover_bg)))
+            })
             .child(
                 div()
                     .flex()
@@ -124,16 +163,19 @@ pub fn render_onboarding_modal(
                             .gap(px(8.))
                             .child(
                                 div()
-                                    .w(px(12.))
-                                    .h(px(12.))
+                                    .w(px(14.))
+                                    .h(px(14.))
                                     .rounded(px(999.))
                                     .border_2()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
                                     .border_color(rgb(if active {
                                         p.primary_btn_bg
                                     } else {
-                                        p.text_muted
+                                        p.line_strong
                                     }))
-                                    .when(active, |d| d.bg(rgb(p.primary_btn_bg))),
+                                    .when(active, |d| d.child(status_dot(p.primary_btn_bg, 6.0))),
                             )
                             .child(
                                 div()
@@ -144,13 +186,14 @@ pub fn render_onboarding_modal(
                             ),
                     )
                     .when(opt.recommended, |d| {
-                        d.child(status_pill("推荐方案", BadgeTone::Pass, p))
+                        d.child(status_pill("推荐", BadgeTone::Pass, p))
                     }),
             )
             .child(
                 div()
-                    .pl(px(20.))
+                    .pl(px(22.))
                     .text_size(px(11.5))
+                    .line_height(px(16.5))
                     .text_color(rgb(p.text_secondary))
                     .child(sub),
             )
@@ -186,6 +229,8 @@ pub fn render_onboarding_modal(
                 .overflow_y_scroll()
                 .p(px(18.))
                 .gap(px(10.))
+                .border_color(rgb(p.line_strong))
+                .shadow(float_shadow(p))
                 .child(
                     div()
                         .flex()
@@ -201,20 +246,20 @@ pub fn render_onboarding_modal(
                                         .text_size(px(18.))
                                         .font_weight(FontWeight::BOLD)
                                         .text_color(rgb(p.text_primary))
-                                        .child("零输入智能首启向导"),
+                                        .child("首次配置向导"),
                                 )
                                 .child(
                                     div()
                                         .text_size(px(12.))
                                         .text_color(rgb(p.text_muted))
-                                        .child("已自动探测代理、AI 客户端与当前出口，1 次点击即可完成布防"),
+                                        .child("已自动识别本地代理、受管 AI 客户端与当前出口，确认策略后一键布防"),
                                 ),
                         )
                         .when(is_demo, |d| {
                             d.child(
                                 action_button(
                                     "onb-sim-proxy",
-                                    if proxy_off_sim { "模拟：代理已开启" } else { "模拟：代理关闭" },
+                                    if proxy_off_sim { "模拟：代理已开" } else { "模拟：代理已关" },
                                     ButtonKind::Secondary,
                                     true,
                                     p,
@@ -236,9 +281,9 @@ pub fn render_onboarding_modal(
                     div()
                         .flex()
                         .gap(px(10.))
-                        .child(info_mini_box("接入检测", access_summary.0, p))
-                        .child(info_mini_box("已发现 AI 应用", access_summary.1, p))
-                        .child(info_mini_box("当前出口探测", access_summary.2, p)),
+                        .child(info_mini_box("本地代理", access_summary.0, p))
+                        .child(info_mini_box("受管 AI 客户端", access_summary.1, p))
+                        .child(info_mini_box("当前出口", access_summary.2, p)),
                 )
                 .when_some(access_summary.3, |card, standby| {
                     card.child(
@@ -247,6 +292,7 @@ pub fn render_onboarding_modal(
                             .rounded(px(10.))
                             .bg(rgba(p.badge_warn.bg))
                             .text_size(px(12.))
+                            .line_height(px(17.))
                             .text_color(rgb(p.badge_warn.text))
                             .child(standby),
                     )
@@ -257,8 +303,8 @@ pub fn render_onboarding_modal(
                         div()
                             .flex()
                             .gap(px(10.))
-                            .child(labeled_field("自定义地区（ISO 代码）", reg_in, p))
-                            .child(labeled_field("自定义 IP / CIDR", cidr_in, p)),
+                            .child(labeled_field("允许地区（ISO 代码）", reg_in, p))
+                            .child(labeled_field("允许 IP / CIDR", cidr_in, p)),
                     )
                 })
                 .when_some(onboarding_error, |card, err| {
@@ -296,7 +342,7 @@ pub fn render_onboarding_modal(
                                 .child(
                                     action_button(
                                         "onb-skip",
-                                        "暂不布防（保持只读）",
+                                        "暂不布防 · 仅只读",
                                         ButtonKind::Ghost,
                                         !submitting,
                                         p,
@@ -310,33 +356,59 @@ pub fn render_onboarding_modal(
                                         )
                                     }),
                                 )
-                                .child(
-                                    action_button(
-                                        "onb-reprobe",
-                                        "↻ 重新探测",
-                                        ButtonKind::Secondary,
-                                        !loading && !submitting,
-                                        p,
-                                    )
-                                    .when(!loading && !submitting, |b| {
-                                        b.on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(move |_, _, _, cx| {
-                                                ctrl_reprobe.update(cx, |c, cx| c.probe_onboarding(cx));
-                                            }),
-                                        )
-                                    }),
-                                ),
+                                .child({
+                                    let can_reprobe = !loading && !submitting;
+                                    let hover_bg = p.sidebar_hover_bg;
+                                    div()
+                                        .id("onb-reprobe")
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap(px(5.5))
+                                        .h(px(30.))
+                                        .px(px(12.))
+                                        .rounded(px(9.))
+                                        .bg(rgb(p.secondary_btn_bg))
+                                        .border_1()
+                                        .border_color(rgb(p.secondary_btn_border))
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(p.secondary_btn_text))
+                                        .when(can_reprobe, |b| {
+                                            b.cursor_pointer()
+                                                .hover(move |s| s.bg(rgb(hover_bg)))
+                                                .active(|s| s.opacity(0.86))
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |_, _, _, cx| {
+                                                        ctrl_reprobe.update(cx, |c, cx| {
+                                                            c.probe_onboarding(cx);
+                                                        });
+                                                    }),
+                                                )
+                                        })
+                                        .when(!can_reprobe, |b| b.opacity(0.45))
+                                        .child(spinning_ui_icon(
+                                            "onb-reprobe-spin",
+                                            "icons/ui/refresh.svg",
+                                            12.0,
+                                            p.secondary_btn_text,
+                                            loading,
+                                        ))
+                                        .child(if loading { "探测中…" } else { "重新探测" })
+                                }),
                         )
                         .child({
                             let can_complete =
                                 connected && !loading && !submitting && probe.is_some();
                             let complete_label = if !connected {
-                                "守护离线 · 无法完成布防"
+                                "服务离线"
+                            } else if loading {
+                                "探测中…"
                             } else if submitting {
-                                "保存并布防中…"
+                                "正在布防…"
                             } else {
-                                "✓ 一键保存并立即布防"
+                                "保存并布防"
                             };
                             action_button(
                                 "onb-complete",
@@ -354,7 +426,16 @@ pub fn render_onboarding_modal(
                                 )
                             })
                         }),
+                )
+                .with_spring(
+                    "onboarding-sheet-enter",
+                    SpringAnimation::new(spring_sheet())
+                        .to(1.0_f32)
+                        .from(0.0_f32),
+                    |el, t: f32| {
+                        let t = t.clamp(0.0, 1.0);
+                        el.opacity(t).mt(px((1.0 - t) * 14.0))
+                    },
                 ),
         )
 }
-
