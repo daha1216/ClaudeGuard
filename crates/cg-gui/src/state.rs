@@ -583,6 +583,20 @@ pub fn project_hero(
                 paused_remaining_text.as_deref().unwrap_or("即将恢复")
             ),
         )
+    } else if fail_count > 0 && snap.config.monitor_only {
+        (
+            HeroTone::Tripped,
+            "仅监测 · 出口异常".into(),
+            "检测到出口异常（仅监测）".into(),
+            format!("有 {fail_count} 个目标未通过校验（已开启仅监测，不自动熔断）"),
+        )
+    } else if fail_count > 0 && snap.launch_error.contains("未变") {
+        (
+            HeroTone::DisarmedOrPaused,
+            "IP 未变 · 暂不熔断".into(),
+            "出口波动（IP 未变）".into(),
+            maybe_mask(&snap.launch_error, privacy_mask),
+        )
     } else if fail_count > 0 {
         (
             HeroTone::Tripped,
@@ -614,12 +628,21 @@ pub fn project_hero(
                 format!("{loc} ({ip}) · {}ms", t.latency_ms)
             })
             .unwrap_or_else(|| "全部目标合规".into());
-        (
-            HeroTone::Healthy,
-            "实时守护正常".into(),
-            "出口安全合规".into(),
-            format!("{primary_loc} · 应用防线与进程守护正常"),
-        )
+        if snap.config.monitor_only {
+            (
+                HeroTone::Healthy,
+                "仅监测模式".into(),
+                "出口安全合规".into(),
+                format!("{primary_loc} · 仅监测不自动熔断"),
+            )
+        } else {
+            (
+                HeroTone::Healthy,
+                "实时守护正常".into(),
+                "出口安全合规".into(),
+                format!("{primary_loc} · 应用防线与进程守护正常"),
+            )
+        }
     } else {
         (
             HeroTone::DisarmedOrPaused,
@@ -695,6 +718,8 @@ pub fn project_target_card(target: &TargetStatus, privacy_mask: bool) -> TargetC
     } else if target.anchor_kind == AnchorKind::Reachability {
         if target.state == TargetState::Pass {
             "Google 后端连通探测".into()
+        } else if target.state == TargetState::Unverified {
+            "暂不可达（网络波动）".into()
         } else {
             "仅可达性探测".into()
         }
@@ -2053,5 +2078,29 @@ mod tests {
         // Non-HTTPS URL must be rejected.
         drafts.targets[1].anchor_url = "http://example.com/cdn-cgi/trace".into();
         assert!(drafts.build_updated_config(&base).is_err());
+    }
+
+    #[test]
+    fn projects_monitor_only_ip_unchanged_and_reachability_jitter_clearly() {
+        let mut snap = build_demo_snapshot(DemoScenario::Pass);
+        snap.config.monitor_only = true;
+        let view = project_console(Some(&snap), true, None, false, None, "", None);
+        assert_eq!(view.hero.pill_label, "仅监测模式");
+        assert!(view.hero.subtitle.contains("仅监测不自动熔断"));
+
+        // Reachability Unverified renders as friendly network-jitter warning, not hard fail.
+        snap.config.monitor_only = false;
+        if let Some(ag) = snap.targets.iter_mut().find(|t| t.id == "antigravity") {
+            ag.state = TargetState::Unverified;
+            ag.reason = "经代理暂不可达（网络错误：timeout）".into();
+        }
+        let jitter_view = project_console(Some(&snap), true, None, false, None, "", None);
+        let ag_card = jitter_view
+            .target_cards
+            .iter()
+            .find(|c| c.id == "antigravity")
+            .expect("antigravity card");
+        assert_eq!(ag_card.badge_tone, BadgeTone::Warn);
+        assert_eq!(ag_card.ip_display, "暂不可达（网络波动）");
     }
 }

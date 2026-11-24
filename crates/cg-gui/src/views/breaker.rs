@@ -46,6 +46,9 @@ pub fn render_breaker_page(
     let disarm_armed = ctrl_r.is_confirm_armed("br-disarm");
     let live_kill_armed = ctrl_r.is_confirm_armed("br-live-kill-all");
 
+    let monitor_only = ctrl_r.effective_toggle("br-monitor-only", cfg.monitor_only);
+    let suppress_trip_when_ip_unchanged =
+        ctrl_r.effective_toggle("br-ip-unchanged", cfg.suppress_trip_when_ip_unchanged);
     let kill_on_fail = ctrl_r.effective_toggle("br-kill", cfg.kill_on_fail);
     let kill_cli_on_fail = ctrl_r.effective_toggle("br-kill-cli", cfg.kill_cli_on_fail);
     let quarantine_on_fail = ctrl_r.effective_toggle("br-quar", cfg.quarantine_on_fail);
@@ -442,7 +445,7 @@ pub fn render_breaker_page(
                     .items_center()
                     .justify_between()
                     .gap(px(12.))
-                    .py(px(9.5));
+                    .py(px(7.5));
                 if bottom_border {
                     cell = cell.border_b_1().border_color(rgb(p.card_border));
                 }
@@ -507,8 +510,34 @@ pub fn render_breaker_page(
                                 div()
                                     .text_size(px(11.))
                                     .text_color(rgb(p.text_muted))
-                                    .child("6 项规则 · 即时生效"),
+                                    .child("8 项规则 · 即时生效"),
                             ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(22.))
+                            .child(make_rule_cell(
+                                "br-monitor-only",
+                                "仅监测不熔断",
+                                "只持续巡检与告警，不自动杀进程或封锁",
+                                monitor_only,
+                                true,
+                                ctrl.clone(),
+                                |x, v| x.monitor_only = v,
+                                cx,
+                            ))
+                            .child(make_rule_cell(
+                                "br-ip-unchanged",
+                                "出口 IP 不变时不熔断",
+                                "梯子波动但出口 IP 未变时仅提示，不强杀",
+                                suppress_trip_when_ip_unchanged,
+                                true,
+                                ctrl.clone(),
+                                |x, v| x.suppress_trip_when_ip_unchanged = v,
+                                cx,
+                            )),
                     )
                     .child(
                         div()
@@ -595,12 +624,12 @@ pub fn render_breaker_page(
                 "",
                 &[
                     (
-                        "断网档位区别",
-                        "应用级仅拦截受管 AI 客户端，不影响日常上网；全局断网将暂停除代理内核外全部公网出站。",
+                        "防误杀与仅监测",
+                        "默认开启「出口 IP 不变时不熔断」，梯子波动或反重力超时不会误杀进程；「仅监测不熔断」可只告警不拦截。",
                     ),
                     (
-                        "无损恢复保障",
-                        "自动熔断或手动封锁，均可点「解除防护并还原」秒级恢复全部网络与防火墙规则。",
+                        "档位与无损恢复",
+                        "应用级仅拦截受管 AI 客户端，不影响日常上网；任何自动熔断或手动封锁均支持秒级无损还原。",
                     ),
                 ],
                 p,

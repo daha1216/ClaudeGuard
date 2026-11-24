@@ -298,6 +298,7 @@ impl TargetStatus {
             return match self.state {
                 TargetState::Pass => format!("可达 · {}ms", self.latency_ms),
                 TargetState::Fail => "不可达".into(),
+                TargetState::Unverified => "暂不可达（网络波动）".into(),
                 _ => "待检测".into(),
             };
         }

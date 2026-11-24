@@ -54,6 +54,7 @@ fn compact_target_sub(ip_display: &str) -> &str {
     match ip_display {
         "Google 后端连通探测" => "Google 后端连通",
         "仅可达性探测" => "仅连通探测",
+        "暂不可达（网络波动）" => "暂不可达（波动）",
         other => other,
     }
 }
@@ -118,7 +119,14 @@ pub fn render_overview(
         )
     };
     let ag_degraded = require_ag_proxy && ag_installed && !ag_ready;
-    let pre_trip_fail = !really_tripped && proj.hero.fail_count > 0;
+    let monitor_only = snap.as_deref().is_some_and(|s| s.config.monitor_only);
+    let ip_unchanged_hold = !really_tripped
+        && !monitor_only
+        && proj.hero.fail_count > 0
+        && snap
+            .as_deref()
+            .is_some_and(|s| s.launch_error.contains("未变"));
+    let pre_trip_fail = !really_tripped && proj.hero.fail_count > 0 && !ip_unchanged_hold;
 
     // 24h compliance metrics computed once for both Hero telemetry strip and 24h mini tape.
     let mut non_empty = 0u32;
@@ -174,12 +182,22 @@ pub fn render_overview(
         HeroTone::DisarmedOrPaused => hero_surf.subtitle,
     };
     let status_kicker = match proj.hero.tone {
+        HeroTone::Healthy if monitor_only => format!(
+            "仅监测模式 · {}/{} 出口合规",
+            proj.hero.pass_count, total_targets
+        ),
         HeroTone::Healthy => format!(
             "守护正常 · {}/{} 出口合规",
             proj.hero.pass_count, total_targets
         ),
         HeroTone::Tripped if really_tripped => {
             format!("已触发熔断 · {} 项越界", proj.hero.fail_count.max(1))
+        }
+        HeroTone::Tripped if monitor_only => {
+            format!(
+                "仅监测预警 · {} 项异常（不熔断）",
+                proj.hero.fail_count.max(1)
+            )
         }
         HeroTone::Tripped => format!("出口预警 · {} 项异常", proj.hero.fail_count.max(1)),
         HeroTone::DisarmedOrPaused => {
@@ -191,6 +209,8 @@ pub fn render_overview(
                 "已撤防".into()
             } else if proj.hero.is_paused {
                 "守护已暂停".into()
+            } else if ip_unchanged_hold {
+                "出口波动 · IP 未变暂不熔断".into()
             } else {
                 proj.hero.pill_label.clone()
             }
@@ -204,6 +224,10 @@ pub fn render_overview(
         "保护已撤防放行"
     } else if really_tripped {
         "已隔离受管 AI 客户端"
+    } else if ip_unchanged_hold {
+        "出口波动（IP 未变）"
+    } else if pre_trip_fail && monitor_only {
+        "出口异常（仅监测）"
     } else if pre_trip_fail {
         "检测到出口不合规"
     } else if proj.hero.is_paused {

@@ -6,15 +6,17 @@
 //! Zero OS/network/disk I/O lives in this module; all side effects are emitted as
 //! explicit [`EffectCommand`] values and verified via follow-up completion events.
 
+use std::collections::BTreeMap;
+
 use crate::policy;
 use crate::targets;
 use crate::timeline::{BUCKETS_48, TimelineAggregator};
 use cg_protocol::{
-    AccessEvidence, AgentRuntimeStatus, AntigravityProxyStatus, AppliedEnv, Config, CutMode,
-    DefenseSelfCheck, EnvCheck, ErrorCode, GuardSnapshot, LeakReport, Lifecycle, LogEntry,
+    AccessEvidence, AgentRuntimeStatus, AnchorKind, AntigravityProxyStatus, AppliedEnv, Config,
+    CutMode, DefenseSelfCheck, EnvCheck, ErrorCode, GuardSnapshot, LeakReport, Lifecycle, LogEntry,
     LogLevel, OperationReceipt, OperationStatus, PolicyPreset, PolicyVerdict, ProbeResult,
     ProtectionState, SNAPSHOT_SCHEMA_VERSION, Target, TargetState, TargetStatus, TripInfo,
-    UpdateCheckPhase, UpdateSummary, is_legal_state_pair,
+    UpdateCheckPhase, UpdateSummary, is_legal_state_pair, normalize_ip,
 };
 
 const MAX_LOG_ENTRIES: usize = 500;
@@ -79,6 +81,12 @@ pub struct EngineState {
     pub active_round: Option<RoundToken>,
     pub checked_at: Option<u64>,
     pub target_statuses: Vec<TargetStatus>,
+    /// Last verified compliant egress IP (normalized) per target id under the current `cfg_rev` / epoch.
+    pub last_pass_ips: BTreeMap<String, String>,
+    /// Dedup flag so IP-unchanged trip suppression notifies once per incident until recovered.
+    pub ip_unchanged_hold_notified: bool,
+    /// Dedup flag so `monitor_only` warns once per incident until recovered.
+    pub monitor_only_warn_notified: bool,
     pub access: AccessEvidence,
     pub access_streak: u32,
     pub paused_until: Option<u64>,
@@ -129,6 +137,9 @@ impl EngineState {
             active_round: None,
             checked_at: None,
             target_statuses,
+            last_pass_ips: BTreeMap::new(),
+            ip_unchanged_hold_notified: false,
+            monitor_only_warn_notified: false,
             access: AccessEvidence {
                 observed_at: now_secs,
                 ..AccessEvidence::default()
@@ -822,6 +833,102 @@ fn next_tx_id(prefix: &str, epoch: u64, now_secs: u64) -> String {
     format!("{prefix}-{epoch}-{now_secs}")
 }
 
+fn clear_compliant_ip_baseline(state: &mut EngineState) {
+    state.last_pass_ips.clear();
+    state.ip_unchanged_hold_notified = false;
+    state.monitor_only_warn_notified = false;
+}
+
+fn format_failing_reason(statuses: &[TargetStatus], access_uncovered: bool) -> String {
+    let mut whitelist_names: Vec<&str> = Vec::new();
+    let mut reach_names: Vec<&str> = Vec::new();
+    for st in statuses {
+        if st.state == TargetState::Fail {
+            if st.anchor_kind == AnchorKind::Reachability {
+                reach_names.push(st.name.as_str());
+            } else {
+                whitelist_names.push(st.name.as_str());
+            }
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !whitelist_names.is_empty() {
+        parts.push(format!("{} 出口不在白名单", whitelist_names.join("、")));
+    }
+    if !reach_names.is_empty() {
+        parts.push(format!("{} 经代理不可达", reach_names.join("、")));
+    }
+    if !parts.is_empty() {
+        parts.join("；")
+    } else if access_uncovered {
+        "系统代理未开启且未检测到 TUN 网卡，应用会直连真实出口".into()
+    } else {
+        String::new()
+    }
+}
+
+/// Returns `Some(stable_ips_summary)` when automatic trip should be suppressed because proxy
+/// access is intact and observed egress IPs have NOT changed from the verified compliant baseline.
+///
+/// Safety invariants:
+/// - Never suppresses when `suppress_trip_when_ip_unchanged == false`.
+/// - Never suppresses when `access_uncovered` or `access_unknown` (proxy gone = direct-IP risk).
+/// - Never suppresses before a compliant baseline has been established (`last_pass_ips.is_empty()`),
+///   so starting on a non-compliant/CN IP always trips.
+/// - Never suppresses if ANY enabled target reports a new IP that differs from its compliant baseline.
+fn egress_ip_unchanged_summary(
+    state: &EngineState,
+    statuses: &[TargetStatus],
+    access_uncovered: bool,
+    access_unknown: bool,
+) -> Option<String> {
+    if !state.config.suppress_trip_when_ip_unchanged
+        || access_uncovered
+        || access_unknown
+        || state.last_pass_ips.is_empty()
+    {
+        return None;
+    }
+
+    let mut matched_ips: Vec<String> = Vec::new();
+    let mut any_failing = false;
+
+    for st in statuses {
+        if st.state == TargetState::Disabled {
+            continue;
+        }
+        if st.state == TargetState::Fail {
+            any_failing = true;
+        }
+        if let Some(cur_ip) = st.ip.as_deref().and_then(normalize_ip) {
+            if let Some(base_ip) = state.last_pass_ips.get(&st.id) {
+                if cur_ip != *base_ip {
+                    return None;
+                }
+                if !matched_ips.contains(&cur_ip) {
+                    matched_ips.push(cur_ip);
+                }
+            } else if st.state == TargetState::Fail {
+                // Failing target has never passed with a verified IP under current config -> must trip!
+                return None;
+            }
+        }
+    }
+
+    if !any_failing {
+        return None;
+    }
+
+    if matched_ips.is_empty() {
+        for ip in state.last_pass_ips.values() {
+            if !matched_ips.contains(ip) {
+                matched_ips.push(ip.clone());
+            }
+        }
+    }
+    Some(matched_ips.join("、"))
+}
+
 fn handle_bootstrap(
     state: &mut EngineState,
     wal_pending: bool,
@@ -983,7 +1090,8 @@ fn handle_round_completed(
     let skip_probes = unconfigured || access_uncovered || access_unknown;
 
     if state.network_isolation_supported && armed {
-        let want_auto = access_uncovered && state.config.lockdown_on_uncovered;
+        let want_auto =
+            !state.config.monitor_only && access_uncovered && state.config.lockdown_on_uncovered;
         let want = want_auto || state.lockdown_manual;
         let allowed = !(paused && want && state.lockdown_applied != Some(true));
         if allowed && state.lockdown_applied != Some(want) {
@@ -1040,7 +1148,26 @@ fn handle_round_completed(
         next_statuses.push(slot);
     }
 
-    if armed && !paused && !state.protection.is_isolated() && state.config.trip_threshold > 1 {
+    // Evaluate IP-unchanged hold against the PRIOR verified baseline before recording this round's passes.
+    let ip_unchanged_hold =
+        egress_ip_unchanged_summary(state, &next_statuses, access_uncovered, access_unknown);
+
+    for st in &next_statuses {
+        if st.state == TargetState::Pass
+            && st.anchor_kind != AnchorKind::Reachability
+            && let Some(norm_ip) = st.ip.as_deref().and_then(normalize_ip)
+        {
+            state.last_pass_ips.insert(st.id.clone(), norm_ip);
+        }
+    }
+
+    if armed
+        && !paused
+        && !state.config.monitor_only
+        && ip_unchanged_hold.is_none()
+        && !state.protection.is_isolated()
+        && state.config.trip_threshold > 1
+    {
         for status in &next_statuses {
             if status.state == TargetState::Fail
                 && status.fail_streak == state.config.trip_threshold - 1
@@ -1059,11 +1186,6 @@ fn handle_round_completed(
         }
     }
 
-    let failing_names: Vec<String> = next_statuses
-        .iter()
-        .filter(|s| s.state == TargetState::Fail)
-        .map(|s| s.name.clone())
-        .collect();
     let failing_ids: Vec<String> = next_statuses
         .iter()
         .filter(|s| s.state == TargetState::Fail)
@@ -1092,11 +1214,16 @@ fn handle_round_completed(
         enabled_count > 0 && passed_count == enabled_count && !access_uncovered && !access_unknown;
 
     state.target_statuses = next_statuses;
+    if all_pass {
+        state.ip_unchanged_hold_notified = false;
+        state.monitor_only_warn_notified = false;
+    }
 
     if armed {
         if access_uncovered {
             state.access_streak = state.access_streak.saturating_add(1);
             if !paused
+                && !state.config.monitor_only
                 && !state.protection.is_isolated()
                 && state.config.trip_threshold > 1
                 && state.access_streak == state.config.trip_threshold - 1
@@ -1135,13 +1262,7 @@ fn handle_round_completed(
         return;
     }
 
-    let fail_reason = if !failing_names.is_empty() {
-        format!("{} 出口不在白名单", failing_names.join("、"))
-    } else if access_uncovered {
-        "系统代理未开启且未检测到 TUN 网卡，应用会直连真实出口".into()
-    } else {
-        String::new()
-    };
+    let fail_reason = format_failing_reason(&state.target_statuses, access_uncovered);
 
     match state.protection {
         ProtectionState::NetworkReadyAppHeld => {
@@ -1160,7 +1281,7 @@ fn handle_round_completed(
                 });
             } else if !failing_ids.is_empty() || access_uncovered {
                 state.launch_error = fail_reason.clone();
-                if !paused && state.config.kill_on_fail {
+                if !paused && !state.config.monitor_only && state.config.kill_on_fail {
                     cmds.push(EffectCommand::KillGuardedAgents {
                         runtime_epoch: state.runtime_epoch,
                         agents: state.config.guarded_agents.clone(),
@@ -1173,7 +1294,10 @@ fn handle_round_completed(
             }
         }
         ProtectionState::Quarantined | ProtectionState::GlobalCut => {
-            if (!failing_ids.is_empty() || access_uncovered) && !paused && state.config.kill_on_fail
+            if (!failing_ids.is_empty() || access_uncovered)
+                && !paused
+                && !state.config.monitor_only
+                && state.config.kill_on_fail
             {
                 cmds.push(EffectCommand::KillGuardedAgents {
                     runtime_epoch: state.runtime_epoch,
@@ -1190,10 +1314,52 @@ fn handle_round_completed(
             let access_trip = access_uncovered
                 && (purpose == CheckPurpose::Launch
                     || state.access_streak >= state.config.trip_threshold);
-            let should_trip = !paused && (target_trip || access_trip);
 
-            if should_trip {
+            if state.config.monitor_only {
+                state.protection = ProtectionState::Monitoring;
+                if !failing_ids.is_empty() || access_uncovered {
+                    state.launch_error = format!("{fail_reason}（仅监测模式，已跳过自动熔断）");
+                    if (target_trip || access_trip) && !state.monitor_only_warn_notified {
+                        state.monitor_only_warn_notified = true;
+                        let msg = format!(
+                            "仅监测模式预警：{fail_reason}，已按设置跳过自动熔断与进程终止。"
+                        );
+                        log_both(state, now_secs, LogLevel::Warn, "probe", &msg, cmds);
+                        cmds.push(EffectCommand::Notify {
+                            class: "warning".into(),
+                            title: "ClaudeGuard 出口预警（仅监测）".into(),
+                            body: msg,
+                        });
+                    }
+                } else if access_unknown {
+                    state.launch_error = format!("无法确认应用接入路径：{}", access.note);
+                } else if all_pass {
+                    state.launch_error.clear();
+                } else {
+                    state.launch_error = "部分目标无法确认，暂不允许启动".into();
+                }
+            } else if !paused && access_trip {
                 begin_isolation(state, fail_reason, failing_ids, now_secs, cmds);
+            } else if !paused && target_trip {
+                if let Some(stable_ips) = ip_unchanged_hold {
+                    state.protection = ProtectionState::Monitoring;
+                    state.launch_error =
+                        format!("{fail_reason}（出口 IP {stable_ips} 未变，已按策略暂不熔断）");
+                    if !state.ip_unchanged_hold_notified {
+                        state.ip_unchanged_hold_notified = true;
+                        let msg = format!(
+                            "{fail_reason}，但当前出口 IP（{stable_ips}）与已核验合规基线一致，已按策略跳过熔断（仅告警不杀进程）。"
+                        );
+                        log_both(state, now_secs, LogLevel::Warn, "probe", &msg, cmds);
+                        cmds.push(EffectCommand::Notify {
+                            class: "warning".into(),
+                            title: "ClaudeGuard 出口波动（IP 未变，未熔断）".into(),
+                            body: msg,
+                        });
+                    }
+                } else {
+                    begin_isolation(state, fail_reason, failing_ids, now_secs, cmds);
+                }
             } else {
                 state.protection = ProtectionState::Monitoring;
                 if !failing_ids.is_empty() || access_uncovered {
@@ -1267,6 +1433,12 @@ fn handle_target_rechecked(
             PolicyVerdict::Fail => prev_streak.saturating_add(1),
             PolicyVerdict::Pass | PolicyVerdict::Unverified => 0,
         };
+        if ev.verdict == PolicyVerdict::Pass
+            && target.anchor_kind != AnchorKind::Reachability
+            && let Some(norm_ip) = probe.ip.as_deref().and_then(normalize_ip)
+        {
+            state.last_pass_ips.insert(target.id.clone(), norm_ip);
+        }
         slot.apply_at(&probe, &ev, streak, now_secs);
         Some(ev)
     };
@@ -1316,13 +1488,35 @@ fn handle_target_rechecked(
         )
     {
         if slot.state == TargetState::Fail && slot.fail_streak >= state.config.trip_threshold {
-            begin_isolation(
+            let reason = format_failing_reason(&[slot.clone()], false);
+            if state.config.monitor_only {
+                state.protection = ProtectionState::Monitoring;
+                state.launch_error = format!("{reason}（仅监测模式，已跳过自动熔断）");
+            } else if let Some(stable_ips) = egress_ip_unchanged_summary(
                 state,
-                format!("{} 出口不在白名单", slot.name),
-                vec![slot.id],
-                now_secs,
-                cmds,
-            );
+                &state.target_statuses,
+                access_uncovered,
+                access_unknown,
+            ) {
+                state.protection = ProtectionState::Monitoring;
+                state.launch_error =
+                    format!("{reason}（出口 IP {stable_ips} 未变，已按策略暂不熔断）");
+                if !state.ip_unchanged_hold_notified {
+                    state.ip_unchanged_hold_notified = true;
+                    log_both(
+                        state,
+                        now_secs,
+                        LogLevel::Warn,
+                        "probe",
+                        format!(
+                            "{reason}，但当前出口 IP（{stable_ips}）未变化，已按策略跳过熔断。"
+                        ),
+                        cmds,
+                    );
+                }
+            } else {
+                begin_isolation(state, reason, vec![slot.id], now_secs, cmds);
+            }
         } else if state
             .target_statuses
             .iter()
@@ -1332,6 +1526,8 @@ fn handle_target_rechecked(
         {
             state.protection = ProtectionState::Monitoring;
             state.launch_error.clear();
+            state.ip_unchanged_hold_notified = false;
+            state.monitor_only_warn_notified = false;
         }
     }
 }
@@ -1343,6 +1539,7 @@ fn begin_isolation(
     now_secs: u64,
     cmds: &mut Vec<EffectCommand>,
 ) {
+    clear_compliant_ip_baseline(state);
     state.runtime_epoch = state.runtime_epoch.saturating_add(1);
     let epoch = state.runtime_epoch;
     state.protection = ProtectionState::Isolating;
@@ -1812,6 +2009,8 @@ fn handle_flow_a_app_release_completed(
         state.protection = ProtectionState::Monitoring;
         state.tripped = None;
         state.access_streak = 0;
+        state.ip_unchanged_hold_notified = false;
+        state.monitor_only_warn_notified = false;
         for st in &mut state.target_statuses {
             st.fail_streak = 0;
         }
@@ -1925,6 +2124,7 @@ fn handle_flow_b_completed(
         state.lockdown_manual = false;
         state.lockdown_applied = Some(false);
         state.access_streak = 0;
+        clear_compliant_ip_baseline(state);
         for st in &mut state.target_statuses {
             st.fail_streak = 0;
         }
@@ -2004,6 +2204,7 @@ fn handle_rearm_persisted(
     state.protection = ProtectionState::Pending;
     state.disarmed_reason.clear();
     state.last_error.clear();
+    clear_compliant_ip_baseline(state);
     state.runtime_epoch = state.runtime_epoch.saturating_add(1);
     log_both(
         state,
@@ -2085,14 +2286,31 @@ fn handle_config_persisted(
         return;
     };
     let was_unconfigured = state.lifecycle == Lifecycle::Unconfigured;
+    let prev_monitor_only = state.config.monitor_only;
     state.config = cfg;
     state.cfg_rev = state.cfg_rev.saturating_add(1);
     state.runtime_epoch = state.runtime_epoch.saturating_add(1);
     state.target_statuses = initial_target_statuses(&state.config);
     state.access_streak = 0;
+    clear_compliant_ip_baseline(state);
     state.checking = false;
     state.active_round = None;
     state.last_error.clear();
+
+    if !was_unconfigured && state.config.monitor_only != prev_monitor_only {
+        log_both(
+            state,
+            now_secs,
+            LogLevel::Audit,
+            "config",
+            if state.config.monitor_only {
+                "已开启仅监测模式：继续只读巡检与告警，不自动熔断或终止进程"
+            } else {
+                "已关闭仅监测模式：恢复自动熔断隔离保护"
+            },
+            cmds,
+        );
+    }
 
     if was_unconfigured && !state.config.first_run {
         state.lifecycle = Lifecycle::Armed;
@@ -2189,6 +2407,7 @@ fn handle_exit_maintenance(
         if !state.protection.is_isolated() {
             state.protection = ProtectionState::Pending;
         }
+        clear_compliant_ip_baseline(state);
         state.last_error.clear();
         log_both(
             state,
@@ -2287,6 +2506,7 @@ fn handle_leak_updated(
     state.leak = report.clone();
     if state.lifecycle == Lifecycle::Armed
         && !state.is_paused(now_secs)
+        && !state.config.monitor_only
         && state.protection == ProtectionState::Monitoring
         && state.config.leak_trip
         && report.applicable
@@ -4262,6 +4482,474 @@ mod tests {
             c,
             EffectCommand::KillGuardedAgents {
                 include_claude_cli: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn ip_unchanged_suppresses_trip_on_same_ip_geo_blip_and_no_ip_target_fail() {
+        let mut cfg = armed_config();
+        cfg.trip_threshold = 2;
+        cfg.suppress_trip_when_ip_unchanged = true;
+        // Region-only allowlist (US) so a GeoIP blip on the SAME IP triggers PolicyVerdict::Fail.
+        for t in &mut cfg.targets {
+            t.expect_ips.clear();
+        }
+        // Add a region-only custom target (no IP returned) to verify non-IP failure while IP stays stable.
+        cfg.targets.push(Target {
+            id: "gemini".into(),
+            name: "Gemini 地区".into(),
+            builtin: false,
+            enabled: true,
+            anchor_url: "https://gemini.google.com/".into(),
+            anchor_kind: AnchorKind::GeminiRegion,
+            expect_ips: Vec::new(),
+            expect_regions: vec!["US".into()],
+            timeout_secs: 12,
+            bind_agent: None,
+        });
+        let state = EngineState::new(cfg, true, true, 100);
+
+        // Round 1: establish verified compliant baseline IPs (claude=198.51.100.98, codex=198.51.100.99).
+        let mut pass = pass_probes();
+        pass.push((
+            "gemini".into(),
+            ProbeResult {
+                reachable: true,
+                status: Some(200),
+                ip: None,
+                country: Some("US".into()),
+                raw_region: Some("USA".into()),
+                latency_ms: 40,
+                parsed_as: "gemini_region".into(),
+                ..ProbeResult::default()
+            },
+        ));
+        let (state, _) = GuardEngine::step(
+            state,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: pass,
+            },
+            110,
+        );
+        assert_eq!(
+            state.last_pass_ips.get("claude").map(String::as_str),
+            Some("198.51.100.98")
+        );
+        assert_eq!(
+            state.last_pass_ips.get("codex").map(String::as_str),
+            Some("198.51.100.99")
+        );
+
+        // Round 2 & 3: codex suffers a GeoIP blip (reports SG) while keeping EXACT SAME IP 198.51.100.99,
+        // and gemini reports wrong page region (ip: None) -> MUST NOT trip or kill!
+        let mut same_ip_blip = pass_probes();
+        for (id, p) in &mut same_ip_blip {
+            if id == "codex" {
+                p.ip = Some("198.51.100.99".into());
+                p.country = Some("SG".into());
+                p.raw_region = Some("SG".into());
+            }
+        }
+        same_ip_blip.push((
+            "gemini".into(),
+            ProbeResult {
+                reachable: true,
+                status: Some(200),
+                ip: None,
+                country: Some("HK".into()),
+                raw_region: Some("HK".into()),
+                latency_ms: 45,
+                parsed_as: "gemini_region".into(),
+                ..ProbeResult::default()
+            },
+        ));
+
+        let (state, cmds2) = GuardEngine::step(
+            state,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: same_ip_blip.clone(),
+            },
+            125,
+        );
+        assert_eq!(state.protection, ProtectionState::Monitoring);
+        assert!(
+            !cmds2
+                .iter()
+                .any(|c| matches!(c, EffectCommand::ExecuteIsolation { .. }))
+        );
+
+        let (state, cmds3) = GuardEngine::step(
+            state,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: same_ip_blip,
+            },
+            140,
+        );
+        assert_eq!(state.protection, ProtectionState::Monitoring);
+        assert!(
+            !cmds3
+                .iter()
+                .any(|c| matches!(c, EffectCommand::ExecuteIsolation { .. }))
+        );
+        assert!(state.launch_error.contains("未变"));
+        assert!(
+            !GuardEngine::evaluate_launch_gate(&state, 140).allowed,
+            "launch gate must stay closed until all targets pass"
+        );
+    }
+
+    #[test]
+    fn ip_changed_to_non_compliant_and_never_passed_ip_still_trip() {
+        let mut cfg = armed_config();
+        cfg.trip_threshold = 1;
+        cfg.suppress_trip_when_ip_unchanged = true;
+        let state = EngineState::new(cfg.clone(), true, true, 100);
+
+        // Starting on a non-compliant CN IP (never passed -> no baseline) MUST trip immediately.
+        let (st_never_passed, cmds_np) = GuardEngine::step(
+            state,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: fail_probes(),
+            },
+            105,
+        );
+        assert_eq!(st_never_passed.protection, ProtectionState::Isolating);
+        assert!(
+            cmds_np
+                .iter()
+                .any(|c| matches!(c, EffectCommand::ExecuteIsolation { .. }))
+        );
+
+        // Passing first on 198.51.100.10 then drifting to a DIFFERENT CN IP 203.0.113.55 MUST trip.
+        let state2 = EngineState::new(cfg, true, true, 100);
+        let (state2, _) = GuardEngine::step(
+            state2,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: pass_probes(),
+            },
+            110,
+        );
+        let (state2, cmds_drift) = GuardEngine::step(
+            state2,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: fail_probes(), // 203.0.113.55 != 198.51.100.10
+            },
+            125,
+        );
+        assert_eq!(state2.protection, ProtectionState::Isolating);
+        assert!(
+            cmds_drift
+                .iter()
+                .any(|c| matches!(c, EffectCommand::ExecuteIsolation { .. }))
+        );
+    }
+
+    #[test]
+    fn access_uncovered_always_trips_even_when_ip_unchanged_guard_on() {
+        let mut cfg = armed_config();
+        cfg.trip_threshold = 1;
+        cfg.suppress_trip_when_ip_unchanged = true;
+        let state = EngineState::new(cfg, true, true, 100);
+
+        // Establish compliant IP baseline first.
+        let (state, _) = GuardEngine::step(
+            state,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: pass_probes(),
+            },
+            110,
+        );
+        assert!(!state.last_pass_ips.is_empty());
+
+        // Proxy turned off (access_uncovered) -> MUST trip immediately regardless of baseline!
+        let (state, cmds) = GuardEngine::step(
+            state,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: uncovered_access(),
+                probes: Vec::new(),
+            },
+            125,
+        );
+        assert_eq!(state.protection, ProtectionState::Isolating);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, EffectCommand::ExecuteIsolation { .. }))
+        );
+    }
+
+    #[test]
+    fn config_change_clears_ip_baseline_and_disabling_guard_trips_same_ip() {
+        let mut cfg = armed_config();
+        cfg.trip_threshold = 1;
+        cfg.suppress_trip_when_ip_unchanged = true;
+        let state = EngineState::new(cfg.clone(), true, true, 100);
+
+        // Establish baseline on 198.51.100.10 (US).
+        let (state, _) = GuardEngine::step(
+            state,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: pass_probes(),
+            },
+            110,
+        );
+        assert!(!state.last_pass_ips.is_empty());
+
+        // User tightens whitelist to JP only (clearing IP allowlist) -> config persisted clears baseline.
+        let mut tightened = cfg.clone();
+        for t in &mut tightened.targets {
+            if t.enabled && t.anchor_kind != AnchorKind::Reachability {
+                t.expect_ips.clear();
+                t.expect_regions = vec!["JP".into()];
+            }
+        }
+        let (state, _) = GuardEngine::step(
+            state,
+            EngineEvent::ConfigPersisted {
+                ok: true,
+                config: Some(tightened),
+                error: None,
+            },
+            115,
+        );
+        assert!(state.last_pass_ips.is_empty());
+        let rev = state.cfg_rev;
+        let ep = state.runtime_epoch;
+        let (state, cmds_tight) = GuardEngine::step(
+            state,
+            EngineEvent::RoundCompleted {
+                cfg_rev: rev,
+                runtime_epoch: ep,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: pass_probes(), // 198.51.100.98 (US) is now disallowed
+            },
+            120,
+        );
+        assert_eq!(state.protection, ProtectionState::Isolating);
+        assert!(
+            cmds_tight
+                .iter()
+                .any(|c| matches!(c, EffectCommand::ExecuteIsolation { .. }))
+        );
+
+        // Disabling suppress_trip_when_ip_unchanged trips even when IP stays identical.
+        let mut strict_cfg = armed_config();
+        strict_cfg.trip_threshold = 1;
+        strict_cfg.suppress_trip_when_ip_unchanged = false;
+        for t in &mut strict_cfg.targets {
+            t.expect_ips.clear();
+        }
+        let st_strict = EngineState::new(strict_cfg, true, true, 100);
+        let (st_strict, _) = GuardEngine::step(
+            st_strict,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: pass_probes(),
+            },
+            110,
+        );
+        let mut same_ip_fail = pass_probes();
+        for (id, p) in &mut same_ip_fail {
+            if id == "claude" {
+                p.ip = Some("198.51.100.98".into());
+                p.country = Some("SG".into());
+                p.raw_region = Some("SG".into());
+            }
+        }
+        let (st_strict, cmds_strict) = GuardEngine::step(
+            st_strict,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: same_ip_fail,
+            },
+            120,
+        );
+        assert_eq!(st_strict.protection, ProtectionState::Isolating);
+        assert!(
+            cmds_strict
+                .iter()
+                .any(|c| matches!(c, EffectCommand::ExecuteIsolation { .. }))
+        );
+    }
+
+    #[test]
+    fn reachability_timeout_never_trips_and_still_blocks_launch_gate() {
+        let mut cfg = armed_config();
+        cfg.trip_threshold = 1;
+        let state = EngineState::new(cfg, true, true, 100);
+
+        // Claude & Codex pass, Antigravity (Reachability) times out twice in a row.
+        let mut ag_timeout = pass_probes();
+        for (id, p) in &mut ag_timeout {
+            if id == "antigravity" {
+                *p = ProbeResult::failed("proxy timeout");
+            }
+        }
+        let (state, cmds1) = GuardEngine::step(
+            state,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: ag_timeout.clone(),
+            },
+            110,
+        );
+        let (state, cmds2) = GuardEngine::step(
+            state,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: ag_timeout,
+            },
+            125,
+        );
+        assert_eq!(state.protection, ProtectionState::Monitoring);
+        assert!(
+            !cmds1
+                .iter()
+                .any(|c| matches!(c, EffectCommand::ExecuteIsolation { .. }))
+        );
+        assert!(
+            !cmds2
+                .iter()
+                .any(|c| matches!(c, EffectCommand::ExecuteIsolation { .. }))
+        );
+        let ag = state
+            .target_statuses
+            .iter()
+            .find(|t| t.id == "antigravity")
+            .expect("antigravity status");
+        assert_eq!(ag.state, TargetState::Unverified);
+        assert_eq!(ag.fail_streak, 0);
+        // Launch Gate still refuses launching while Antigravity backend is unreachable.
+        assert!(!GuardEngine::evaluate_launch_gate(&state, 125).allowed);
+    }
+
+    #[test]
+    fn monitor_only_suppresses_auto_trip_kill_and_auto_lockdown_while_keeping_manual_lockdown() {
+        let mut cfg = armed_config();
+        cfg.trip_threshold = 1;
+        cfg.monitor_only = true;
+        cfg.leak_trip = true;
+        cfg.lockdown_on_uncovered = true;
+        let state = EngineState::new(cfg, true, true, 100);
+
+        // Non-compliant CN IP does NOT trip or kill, warns once, and blocks launch gate.
+        let (state, cmds_fail) = GuardEngine::step(
+            state,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: fail_probes(),
+            },
+            110,
+        );
+        assert_eq!(state.protection, ProtectionState::Monitoring);
+        assert!(!cmds_fail.iter().any(|c| matches!(
+            c,
+            EffectCommand::ExecuteIsolation { .. } | EffectCommand::KillGuardedAgents { .. }
+        )));
+        assert!(
+            cmds_fail
+                .iter()
+                .any(|c| matches!(c, EffectCommand::Notify { class, .. } if class == "warning"))
+        );
+        assert!(!GuardEngine::evaluate_launch_gate(&state, 110).allowed);
+
+        // Uncovered access does NOT auto-lockdown or trip in monitor_only mode.
+        let (state, cmds_unc) = GuardEngine::step(
+            state,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: uncovered_access(),
+                probes: Vec::new(),
+            },
+            125,
+        );
+        assert_eq!(state.protection, ProtectionState::Monitoring);
+        assert!(!cmds_unc.iter().any(|c| matches!(
+            c,
+            EffectCommand::ExecuteIsolation { .. } | EffectCommand::SyncLockdown { want: true, .. }
+        )));
+
+        // Leak report does NOT auto-trip in monitor_only mode.
+        let (state, cmds_leak) = GuardEngine::step(
+            state,
+            EngineEvent::LeakUpdated {
+                report: LeakReport {
+                    applicable: true,
+                    direct_total: 2,
+                    ..LeakReport::default()
+                },
+            },
+            130,
+        );
+        assert_eq!(state.protection, ProtectionState::Monitoring);
+        assert!(
+            !cmds_leak
+                .iter()
+                .any(|c| matches!(c, EffectCommand::ExecuteIsolation { .. }))
+        );
+
+        // Manual lockdown STILL works when explicitly invoked by user.
+        let (_, cmds_manual) =
+            GuardEngine::step(state, EngineEvent::SetManualLockdown { on: true }, 135);
+        assert!(cmds_manual.iter().any(|c| matches!(
+            c,
+            EffectCommand::SyncLockdown {
+                want: true,
+                manual: true,
                 ..
             }
         )));

@@ -1,6 +1,6 @@
 [package]
 name = "cg-core"
-version = "4.1.0"
+version = "4.1.1"
 edition = "2024"
 license = "MIT"
 description = "ClaudeGuard v4 deterministic functional core: state machine, policy, anchors, redaction, onboarding, timeline"

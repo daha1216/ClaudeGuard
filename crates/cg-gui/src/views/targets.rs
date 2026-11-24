@@ -634,6 +634,8 @@ pub fn render_targets_page(
             if is_reach_only {
                 if is_pass {
                     format!("● 代理连通{ms_txt}")
+                } else if ls.state == TargetState::Unverified {
+                    format!("● 暂不可达（波动）{ms_txt}")
                 } else {
                     format!("● {}{ms_txt}", ls.state.label())
                 }

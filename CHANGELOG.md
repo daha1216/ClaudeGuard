@@ -4,6 +4,24 @@
 
 日期为实际发布日期（UTC / UTC+8）。更早的历史版本记录见 [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases)。
 
+## [4.1.1] - 2026-11-24
+
+**防误杀熔断优化版**：彻底修复代理网络波动导致反重力 IDE 被频繁强杀（看似“一直崩溃”）的问题，新增「出口 IP 不变时不熔断」与「仅监测不熔断」双开关，并在探测层加入瞬时抖动单次短重试。
+
+### 修复与熔断逻辑升级
+
+- **彻底消除反重力出口网络抖动误熔断**：
+  - `cg-core::policy` 将 `AnchorKind::Reachability`（反重力后端连通探测 `cloudcode-pa.googleapis.com`）的传输层超时/不可达判定由 `Fail` 修正为 `Unverified`（`经代理暂不可达`），与其他出口目标保持同一安全契约：启动门禁与 Flow A 恢复依然严格拦截，但代理偶发波动不再累计 `fail_streak` 强杀正在运行的 `Antigravity.exe` 及其他受管应用。
+  - 修正熔断原因文案，准确区分 `出口不在白名单` 与 `经代理不可达`，不再将连通失败误报为白名单越界。
+- **新增「出口 IP 不变时不熔断」（`suppress_trip_when_ip_unchanged`，默认开启）**：
+  - `GuardEngine` 在当前配置代次下自动维护各目标最近一次已核验合规（`Pass`）的出口 IP 基线（修改白名单/策略、撤防、熔断或重布防时自动清空）。
+  - 当代理链路完好且本轮探测未出现任何偏离合规基线的新 IP（例如同一合规 IP 偶发 GeoIP/CDN 地区抖动或无 IP 目标波动）时，仅记录去重告警并保持启动门禁拦截，不再误触发熔断杀进程。
+  - **绝不妥协安全底线**：从未通过合规校验的违规/直连 IP、探测到新 IP 越界、或代理/TUN 失效（`access_uncovered`）时，依然严格照常熔断。
+- **新增「仅监测不熔断」一键开关（`monitor_only`，默认关闭）**：
+  - 位于「熔断 → 策略与开关」页（与「出口 IP 不变时不熔断」并排，升级为对称 4×2 共 8 项规则），开启后保持只读巡检、时间轴记录、告警通知与启动门禁，但跳过所有自动熔断、自动进程终止与自动兜底封锁（手动紧急封锁仍可用），并在总览主状态卡清晰标注当前处于「仅监测模式」。
+- **代理探测瞬时抖动吸收**：
+  - `cg-daemon::PlatformProbeRunner` 在严格复用同一 `ProbeRoute`（绝不直连回退）的前提下，对快速发生的瞬时传输错误执行 1 次 350ms 短重试，吸收单包抖动减少界面闪黄。
+
 ## [4.1.0] - 2026-11-22
 
 **原生 GPUI 精雕重塑版**：全面升级透明蓝宝石折纸晶盾图标体系、5 套高级主题 × 明暗自适应、120Hz 零重排 GPU 动效引擎、Windows 11 原生 DWM 丝滑窗口过渡与全界面精炼中文文案，并同步修复防漏护盾即时同步与反重力可选核验模式告警噪音。
@@ -98,6 +116,7 @@
 
 ---
 
+[4.1.1]: https://github.com/daha1216/ClaudeGuard/releases/tag/v4.1.1
 [4.1.0]: https://github.com/daha1216/ClaudeGuard/releases/tag/v4.1.0
 [4.0.1]: https://github.com/daha1216/ClaudeGuard/releases/tag/v4.0.1
 [4.0.0]: https://github.com/daha1216/ClaudeGuard/releases/tag/v4.0.0
