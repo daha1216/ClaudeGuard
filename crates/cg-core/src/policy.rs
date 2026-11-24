@@ -31,19 +31,25 @@ pub fn evaluate_with_preset(
     }
 
     if target.anchor_kind == AnchorKind::Reachability {
-        return if probe.reachable {
-            eval(
-                PolicyVerdict::Pass,
-                format!("可达 · {}ms", probe.latency_ms),
-                Some("reachability".into()),
-            )
-        } else {
-            eval(
+        if !probe.reachable {
+            return eval(
                 PolicyVerdict::Unverified,
                 format!("经代理暂不可达（{}）", network_reason(probe)),
                 None,
-            )
-        };
+            );
+        }
+        if let Some(code @ (407 | 502 | 503 | 504)) = probe.status {
+            return eval(
+                PolicyVerdict::Unverified,
+                format!("代理或网关返回异常状态（HTTP {code}），暂不可确认可达"),
+                None,
+            );
+        }
+        return eval(
+            PolicyVerdict::Pass,
+            format!("可达 · {}ms", probe.latency_ms),
+            Some("reachability".into()),
+        );
     }
 
     if !probe.reachable {
@@ -327,6 +333,25 @@ mod tests {
             evaluate_with_preset(&t, &probe(None, None), PolicyPreset::StrictStaticIp).verdict,
             PolicyVerdict::Pass
         );
+        for ok_code in [200u16, 204, 401, 403, 404] {
+            let mut p = probe(None, None);
+            p.status = Some(ok_code);
+            assert_eq!(
+                evaluate(&t, &p).verdict,
+                PolicyVerdict::Pass,
+                "HTTP {ok_code}"
+            );
+        }
+        for gateway_err in [407u16, 502, 503, 504] {
+            let mut p = probe(None, None);
+            p.status = Some(gateway_err);
+            let ev = evaluate(&t, &p);
+            assert_eq!(
+                ev.verdict,
+                PolicyVerdict::Unverified,
+                "HTTP {gateway_err} must be Unverified"
+            );
+        }
         // Proxy/network jitter on Reachability evaluates to Unverified so it blocks launch
         // and warns the user without falsely tripping or killing running apps.
         let timeout_eval = evaluate(&t, &ProbeResult::failed("timeout"));

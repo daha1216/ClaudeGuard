@@ -28,6 +28,9 @@ const TZ_LABELS: &[(&str, &str)] = &[
     ("Eastern Standard Time", "美国东部时间"),
     ("Central Standard Time (Mexico)", "墨西哥中部时间"),
     ("E. South America Standard Time", "巴西标准时间"),
+    ("W. Australia Standard Time", "澳大利亚西部时间"),
+    ("Cen. Australia Standard Time", "澳大利亚中部时间"),
+    ("E. Australia Standard Time", "澳大利亚东部时间（布里斯班）"),
     ("AUS Eastern Standard Time", "澳大利亚东部时间"),
     ("New Zealand Standard Time", "新西兰标准时间"),
     ("South Africa Standard Time", "南非标准时间"),
@@ -311,5 +314,28 @@ mod tests {
         assert_eq!(mm_res.locale_match, Some(false));
         assert!(mm_res.mismatched());
         assert!(mm_res.note.contains("出口在CA"));
+
+        // 3. AU without colo behaves as multi-TZ (no single-city tz guess), while PER/ADL/BNE colos resolve exact TZ.
+        let perth_info = EnvInfo {
+            tz_key: "W. Australia Standard Time".into(),
+            tz_label: tz_label("W. Australia Standard Time"),
+            utc_offset_min: 480,
+            locale: "en-AU".into(),
+            lang: "en".into(),
+            region: "AU".into(),
+        };
+        let mut au_status = ca_no_colo;
+        au_status[0].country = Some("AU".into());
+        au_status[0].raw_region = Some("AU".into());
+        let au_no_colo = evaluate(&Config::default(), perth_info.clone(), &au_status);
+        assert_eq!(au_no_colo.tz_match, None);
+        assert_eq!(au_no_colo.locale_match, Some(true));
+        assert!(!au_no_colo.mismatched());
+
+        au_status[0].colo = Some("PER".into());
+        let au_perth = evaluate(&Config::default(), perth_info, &au_status);
+        assert_eq!(au_perth.expect_city.as_deref(), Some("珀斯"));
+        assert_eq!(au_perth.tz_match, Some(true));
+        assert_eq!(au_perth.locale_match, Some(true));
     }
 }

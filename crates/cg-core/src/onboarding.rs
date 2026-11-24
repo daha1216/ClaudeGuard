@@ -3,10 +3,10 @@
 use crate::geo;
 use crate::targets;
 use cg_protocol::{
-    AccessEvidence, Config, Ipv4Cidr, OnboardingOption, OnboardingProbeResult, OnboardingStrategy,
-    PolicyPreset, ProbeResult, clean_guarded_agents,
+    AccessEvidence, Config, IpRule, Ipv4Cidr, OnboardingOption, OnboardingProbeResult,
+    OnboardingStrategy, PolicyPreset, ProbeResult, clean_guarded_agents, normalize_ip,
 };
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// User selection emitted from the first-run onboarding modal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,12 +121,20 @@ pub fn recommend(
 
     let suggested_cidr = if is_cn_exit {
         Vec::new()
+    } else if let Some(norm) = ip.as_deref().and_then(normalize_ip) {
+        if let Ok(v4) = norm.parse::<Ipv4Addr>() {
+            Ipv4Cidr::parse(&format!("{v4}/24"))
+                .map(|c| vec![c.canonical()])
+                .unwrap_or_default()
+        } else if let Ok(v6) = norm.parse::<Ipv6Addr>() {
+            IpRule::parse(&format!("{v6}/64"))
+                .map(|r| vec![r.canonical()])
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
     } else {
-        ip.as_deref()
-            .and_then(|s| s.parse::<Ipv4Addr>().ok())
-            .and_then(|v4| Ipv4Cidr::parse(&format!("{v4}/24")))
-            .map(|c| vec![c.canonical()])
-            .unwrap_or_default()
+        Vec::new()
     };
     let suggested_regions = if is_cn_exit {
         Vec::new()
@@ -138,7 +146,8 @@ pub fn recommend(
         strategy: OnboardingStrategy::CustomCidrOrRegions,
         recommended: false,
         title: "自定义多国或 CIDR".into(),
-        subtitle: "手动配置多国地区代码、精确 IP 或 IPv4 CIDR 子网（如 198.51.100.0/24）".into(),
+        subtitle: "手动配置多国地区代码、精确 IP 或 IPv4/IPv6 CIDR 子网（如 198.51.100.0/24）"
+            .into(),
         preset: PolicyPreset::StandardRegion,
         expect_ips: suggested_cidr,
         expect_regions: suggested_regions,
@@ -155,6 +164,49 @@ pub fn recommend(
     }
 }
 
+fn parse_proxy_host_port(raw: &str) -> Option<(String, u16)> {
+    let trimmed = raw.trim();
+    let rest = match trimmed.find("://") {
+        Some(idx) => {
+            let scheme = &trimmed[..idx];
+            if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+                return None;
+            }
+            &trimmed[idx + 3..]
+        }
+        None => trimmed,
+    };
+    let rest = rest.trim().trim_end_matches('/');
+    if rest.is_empty()
+        || rest.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '@' | '/' | '\\' | '?' | '#')
+        })
+    {
+        return None;
+    }
+    if rest.starts_with('[') {
+        let close = rest.find(']')?;
+        let inner = &rest[1..close];
+        inner.parse::<Ipv6Addr>().ok()?;
+        let port_str = rest[close + 1..].strip_prefix(':')?;
+        if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let port = port_str.parse::<u16>().ok().filter(|&p| p > 0)?;
+        return Some((format!("[{inner}]"), port));
+    }
+    if rest.contains(']') || rest.matches(':').count() != 1 {
+        return None;
+    }
+    let (host, port_str) = rest.split_once(':')?;
+    let host = host.trim();
+    if host.is_empty() || port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let port = port_str.parse::<u16>().ok().filter(|&p| p > 0)?;
+    Some((host.to_string(), port))
+}
+
 /// Applies the user's selected onboarding strategy onto `base` and validates the resulting [`Config`].
 pub fn apply_choice(
     base: &Config,
@@ -168,17 +220,10 @@ pub fn apply_choice(
         cfg.proxy_port = port;
     }
     if let Some(addr) = rec.access.proxy_addr.as_deref()
-        && let Some((host, port_str)) = addr.rsplit_once(':')
+        && let Some((host, port)) = parse_proxy_host_port(addr)
     {
-        let host = host.trim();
-        if !host.is_empty() {
-            cfg.proxy_host = host.to_string();
-        }
-        if let Ok(port) = port_str.parse::<u16>()
-            && port > 0
-        {
-            cfg.proxy_port = port;
-        }
+        cfg.proxy_host = host;
+        cfg.proxy_port = port;
     }
     if !rec.installed_agents.is_empty() {
         cfg.guarded_agents = clean_guarded_agents(&rec.installed_agents);
@@ -298,6 +343,50 @@ mod tests {
             strict.target("claude").unwrap().expect_ips,
             vec!["198.51.100.98"]
         );
+    }
+
+    #[test]
+    fn onboarding_handles_ipv6_proxy_and_rejects_malformed_proxy_ports() {
+        let access_v6 = AccessEvidence {
+            level: AccessLevel::SystemProxy,
+            proxy_addr: Some("[::1]:7897".into()),
+            observed_at: 1_700_000_000,
+            revision: 1,
+            ..AccessEvidence::default()
+        };
+        let mut p_v6 = sample_probe();
+        p_v6.ip = Some("2606:4700:4700::1111".into());
+        let rec_v6 = recommend(&access_v6, Some(&p_v6), None, vec!["claude".into()]);
+        assert_eq!(rec_v6.options[2].expect_ips, vec!["2606:4700:4700::/64"]);
+        let cfg_v6 = apply_choice(
+            &Config::default(),
+            &rec_v6,
+            OnboardingChoice::RecommendRegion,
+        )
+        .expect("apply ipv6 proxy");
+        assert_eq!(cfg_v6.proxy_host, "[::1]");
+        assert_eq!(cfg_v6.proxy_port, 7897);
+        assert_eq!(cfg_v6.proxy_url(), "http://[::1]:7897");
+
+        // Portless IPv6 or zero port in proxy_addr must NOT corrupt base proxy_host/proxy_port.
+        for bad_addr in ["::1", "[::1]", "127.0.0.1:0", "127.0.0.1:99999"] {
+            let bad_acc = AccessEvidence {
+                level: AccessLevel::SystemProxy,
+                proxy_addr: Some(bad_addr.into()),
+                observed_at: 1_700_000_000,
+                revision: 1,
+                ..AccessEvidence::default()
+            };
+            let rec_bad = recommend(&bad_acc, Some(&sample_probe()), None, vec![]);
+            let cfg_bad = apply_choice(
+                &Config::default(),
+                &rec_bad,
+                OnboardingChoice::RecommendRegion,
+            )
+            .expect("fallback to base proxy");
+            assert_eq!(cfg_bad.proxy_host, "127.0.0.1");
+            assert_eq!(cfg_bad.proxy_port, 7890);
+        }
     }
 
     #[test]

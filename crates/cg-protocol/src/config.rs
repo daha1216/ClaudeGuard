@@ -394,7 +394,12 @@ impl Config {
     }
 
     pub fn proxy_url(&self) -> String {
-        format!("http://{}:{}", self.proxy_host, self.proxy_port)
+        let host = self.proxy_host.trim();
+        if host.contains(':') && !host.starts_with('[') && !host.ends_with(']') {
+            format!("http://[{}]:{}", host, self.proxy_port)
+        } else {
+            format!("http://{}:{}", host, self.proxy_port)
+        }
     }
 
     pub fn clamped_interval_secs(&self) -> u64 {
@@ -423,6 +428,26 @@ pub fn clean_guarded_agents(raw: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::model::AnchorKind;
+
+    #[test]
+    fn proxy_url_brackets_raw_ipv6_and_preserves_bracketed_or_ipv4() {
+        let mut cfg = Config {
+            proxy_host: "127.0.0.1".into(),
+            proxy_port: 7890,
+            ..Config::default()
+        };
+        assert_eq!(cfg.proxy_url(), "http://127.0.0.1:7890");
+
+        cfg.proxy_host = "::1".into();
+        assert_eq!(cfg.proxy_url(), "http://[::1]:7890");
+
+        cfg.proxy_host = "[::1]".into();
+        assert_eq!(cfg.proxy_url(), "http://[::1]:7890");
+
+        cfg.proxy_host = "2001:db8::1".into();
+        cfg.proxy_port = 7897;
+        assert_eq!(cfg.proxy_url(), "http://[2001:db8::1]:7897");
+    }
 
     #[test]
     fn migrates_v2_json_losslessly_to_v4() {
