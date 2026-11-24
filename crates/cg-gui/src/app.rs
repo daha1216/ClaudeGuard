@@ -5,6 +5,7 @@ use crate::assets::{EmbeddedAssets, brand_mark, ui_icon};
 use crate::demo::DemoScenario;
 use crate::ipc::{
     DaemonClient, TransportEndpoint, TransportError, launch_agent_normal_user, open_external_url,
+    start_daemon_service_elevated,
 };
 use crate::motion::{
     DirectionalTransition, PresenceSpring, SlidingIndicatorState, rgba_with_alpha_scale,
@@ -17,15 +18,17 @@ use crate::protocol::{
 };
 use crate::state::{
     ConsoleProjection, ConsoleProjectionInput, DraftStore, HudProjection, NavSection, TargetDraft,
-    project_console_from_input, project_hud, split_tokens,
+    extract_region_tokens_lossy, parse_and_validate_regions, project_console_from_input,
+    project_hud, split_tokens,
 };
 use crate::theme::{
     THEME_MODES, THEME_STYLES, ThemeMode, ThemePalette, ThemeStyle, layout, load_saved_theme_style,
     resolve_styled_palette, save_theme_style, system_prefers_light_theme, theme_mode_label,
 };
 use crate::tray_win::{
-    LogicalRect, TrayChannel, TrayEvent, TrayHandle, TrayTone, apply_win11_round_corners,
-    compute_hud_bounds, minimize_window_smooth, primary_work_area_logical,
+    LogicalRect, SingleInstanceOutcome, TrayChannel, TrayEvent, TrayHandle, TrayTone,
+    acquire_single_instance, apply_win11_round_corners, compute_hud_bounds,
+    ensure_window_on_screen, minimize_window_smooth, primary_work_area_logical,
     restore_window_if_minimized, signal_existing_tray_instance, toggle_maximize_window_smooth,
 };
 use crate::views;
@@ -68,8 +71,20 @@ struct RequestOptions {
     ok_msg: Option<String>,
     explicit_scope: Option<ActionScope>,
     optimistic_key: Option<&'static str>,
+    config_seq: Option<u64>,
+    is_ui_pref_save: bool,
     clear_targets_dirty_on_ok: bool,
     clear_feishu_inputs_on_ok: bool,
+}
+
+/// Contextual one-click recovery action attached to Dynamic-Island floating toasts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToastAction {
+    OpenExplorerPath(String),
+    JumpAntigravityRepair,
+    RearmNow,
+    JumpBreaker,
+    CopyText { label: &'static str, text: String },
 }
 
 /// Scoped in-flight action keys so one pending RPC doesn't disable unrelated controls or spinners.
@@ -86,11 +101,15 @@ pub enum ActionScope {
     TestFeishu,
     EnvAlign,
     SaveTargets,
+    LaunchGate(String),
+    StartService,
     Flow,
 }
 
 actions!([
     FocusGlobalSearch,
+    FocusNextField,
+    FocusPrevField,
     DismissHudWindow,
     DismissConsoleOverlay,
     SaveCurrentView,
@@ -329,17 +348,19 @@ pub struct AppController {
     pub onboarding_error: Option<String>,
     pub onboarding_proxy_off_sim: bool,
     pub toast: Option<(String, bool)>,
-    pub toast_action_path: Option<String>,
+    pub toast_action: Option<ToastAction>,
     pub toast_seq: u64,
     pub busy_action: bool,
     pub in_flight: HashSet<ActionScope>,
+    pub in_flight_config: Option<(u64, Config)>,
+    config_patch_seq: u64,
     pub optimistic_toggles: HashMap<&'static str, bool>,
-    pub pending_confirm: Option<(&'static str, Instant)>,
+    pub pending_confirm: Option<(String, Instant)>,
     pub queried_logs: Option<Arc<[LogEntry]>>,
     pub queried_logs_seq: u64,
     pub queried_logs_total: usize,
     pub logs_loading: bool,
-    pub pending_ui_prefs: bool,
+    pub pending_ui_prefs_ops: usize,
     pub feishu_initialized: bool,
     pub feishu_dirty: bool,
     pub last_seen_toast_seq: Option<u64>,
@@ -362,29 +383,40 @@ impl AppController {
         let client = DaemonClient::new(args.endpoint.clone());
         let weak = cx.entity().downgrade();
 
-        let make_input = |placeholder: &'static str,
-                          compact: bool,
-                          masked: bool,
-                          mono: bool,
-                          on_edit: fn(&mut AppController, &str) -> bool,
-                          cx: &mut Context<Self>|
-         -> Entity<DraftTextInput> {
-            let weak_cb = weak.clone();
-            cx.new(|cx| {
-                DraftTextInput::new(cx)
-                    .with_placeholder(placeholder)
-                    .with_compact(compact)
-                    .with_masked(masked)
-                    .with_monospace(mono)
-                    .with_on_change(move |text, _window, cx| {
-                        let _ = weak_cb.update(cx, |ctrl, cx| {
-                            if on_edit(ctrl, text) {
-                                cx.notify();
-                            }
+        let make_input =
+            |placeholder: &'static str,
+             compact: bool,
+             masked: bool,
+             mono: bool,
+             on_edit: fn(&mut AppController, &str) -> bool,
+             on_submit: Option<fn(&mut AppController, &mut Context<AppController>)>,
+             cx: &mut Context<Self>|
+             -> Entity<DraftTextInput> {
+                let weak_cb = weak.clone();
+                let weak_sub = weak.clone();
+                cx.new(|cx| {
+                    let mut inp = DraftTextInput::new(cx)
+                        .with_placeholder(placeholder)
+                        .with_compact(compact)
+                        .with_masked(masked)
+                        .with_monospace(mono)
+                        .with_on_change(move |text, _window, cx| {
+                            let _ = weak_cb.update(cx, |ctrl, cx| {
+                                if on_edit(ctrl, text) {
+                                    cx.notify();
+                                }
+                            });
                         });
-                    })
-            })
-        };
+                    if let Some(submit_fn) = on_submit {
+                        inp = inp.with_on_submit(move |_window, cx| {
+                            let _ = weak_sub.update(cx, |ctrl, cx| {
+                                submit_fn(ctrl, cx);
+                            });
+                        });
+                    }
+                    inp
+                })
+            };
 
         let weak_search_submit = weak.clone();
         let search_input = cx.new(|cx| {
@@ -423,6 +455,7 @@ impl AppController {
                     ctrl.drafts.mark_dirty();
                     !was_dirty
                 },
+                Some(AppController::save_target_drafts),
                 cx,
             ),
             interval_secs: make_input(
@@ -436,6 +469,7 @@ impl AppController {
                     ctrl.drafts.mark_dirty();
                     !was_dirty
                 },
+                Some(AppController::save_target_drafts),
                 cx,
             ),
             trip_threshold: make_input(
@@ -449,6 +483,7 @@ impl AppController {
                     ctrl.drafts.mark_dirty();
                     !was_dirty
                 },
+                Some(AppController::save_target_drafts),
                 cx,
             ),
             new_target_name: make_input(
@@ -460,6 +495,7 @@ impl AppController {
                     ctrl.drafts.new_target_name = text.to_string();
                     false
                 },
+                Some(AppController::add_custom_target_from_draft),
                 cx,
             ),
             new_target_url: make_input(
@@ -471,6 +507,7 @@ impl AppController {
                     ctrl.drafts.new_target_url = text.to_string();
                     false
                 },
+                Some(AppController::add_custom_target_from_draft),
                 cx,
             ),
             new_target_ips: make_input(
@@ -482,6 +519,7 @@ impl AppController {
                     ctrl.drafts.new_target_ips = text.to_string();
                     false
                 },
+                Some(AppController::add_custom_target_from_draft),
                 cx,
             ),
             new_target_regions: make_input(
@@ -491,8 +529,9 @@ impl AppController {
                 true,
                 |ctrl, text| {
                     ctrl.drafts.new_target_regions = text.to_string();
-                    false
+                    true
                 },
+                Some(AppController::add_custom_target_from_draft),
                 cx,
             ),
             target_ips: HashMap::new(),
@@ -508,6 +547,7 @@ impl AppController {
                     ctrl.feishu_dirty = true;
                     !was_dirty
                 },
+                Some(AppController::save_feishu_from_drafts),
                 cx,
             ),
             feishu_secret: make_input(
@@ -521,6 +561,7 @@ impl AppController {
                     ctrl.feishu_dirty = true;
                     !was_dirty
                 },
+                Some(AppController::save_feishu_from_drafts),
                 cx,
             ),
             onboarding_cidr: make_input(
@@ -532,6 +573,7 @@ impl AppController {
                     ctrl.drafts.onboarding_custom_cidr = text.to_string();
                     false
                 },
+                Some(AppController::complete_onboarding),
                 cx,
             ),
             onboarding_regions: make_input(
@@ -543,6 +585,7 @@ impl AppController {
                     ctrl.drafts.onboarding_custom_regions = text.to_string();
                     false
                 },
+                Some(AppController::complete_onboarding),
                 cx,
             ),
         };
@@ -608,17 +651,19 @@ impl AppController {
             onboarding_error: None,
             onboarding_proxy_off_sim: false,
             toast: None,
-            toast_action_path: None,
+            toast_action: None,
             toast_seq: 0,
             busy_action: false,
             in_flight: HashSet::new(),
+            in_flight_config: None,
+            config_patch_seq: 0,
             optimistic_toggles: HashMap::new(),
             pending_confirm: None,
             queried_logs: None,
             queried_logs_seq: 0,
             queried_logs_total: 0,
             logs_loading: false,
-            pending_ui_prefs: false,
+            pending_ui_prefs_ops: 0,
             feishu_initialized: false,
             feishu_dirty: false,
             last_seen_toast_seq: None,
@@ -779,8 +824,7 @@ impl AppController {
         self.refresh_global_palette(cx);
         let msg = format!("主题已切换为「{}」", theme_mode_label(mode));
         if self.connected {
-            self.pending_ui_prefs = true;
-            self.save_config_patch_msg(move |cfg| cfg.theme_mode = mode, msg, cx);
+            self.save_ui_pref_patch(move |cfg| cfg.theme_mode = mode, msg, cx);
         } else {
             self.set_toast(msg, true, cx);
         }
@@ -804,18 +848,22 @@ impl AppController {
         self.invalidate_console_cache();
         self.invalidate_hud_cache();
         if self.connected {
-            self.pending_ui_prefs = true;
-            self.save_config_patch(
+            self.save_ui_pref_patch(
                 move |cfg| cfg.privacy_mask_ip = next,
                 if next {
                     "已开启 IP 脱敏"
                 } else {
                     "已关闭 IP 脱敏"
-                },
+                }
+                .to_string(),
                 cx,
             );
         }
         cx.notify();
+    }
+
+    pub fn has_modal_open(&self) -> bool {
+        self.show_onboarding || self.show_plugins_modal
     }
 
     pub fn set_nav(&mut self, section: NavSection, cx: &mut Context<Self>) {
@@ -854,26 +902,33 @@ impl AppController {
         self.optimistic_toggles.get(key).copied().unwrap_or(actual)
     }
 
-    pub fn is_confirm_armed(&self, key: &'static str) -> bool {
+    pub fn is_confirm_armed(&self, key: &str) -> bool {
         self.pending_confirm
+            .as_ref()
             .is_some_and(|(k, at)| k == key && at.elapsed() <= CONFIRM_WINDOW)
     }
 
-    pub fn arm_or_consume_confirm(&mut self, key: &'static str, cx: &mut Context<Self>) -> bool {
-        if self.is_confirm_armed(key) {
+    pub fn arm_or_consume_confirm(
+        &mut self,
+        key: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let key_str = key.into();
+        if self.is_confirm_armed(&key_str) {
             self.pending_confirm = None;
             cx.notify();
             return true;
         }
         let now = Instant::now();
-        self.pending_confirm = Some((key, now));
+        self.pending_confirm = Some((key_str.clone(), now));
         cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(CONFIRM_WINDOW).await;
             let _ = this.update(cx, |ctrl, cx| {
                 if ctrl
                     .pending_confirm
-                    .is_some_and(|(k, at)| k == key && at == now)
+                    .as_ref()
+                    .is_some_and(|(k, at)| k == &key_str && *at == now)
                 {
                     ctrl.pending_confirm = None;
                     cx.notify();
@@ -912,12 +967,26 @@ impl AppController {
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    let arg = format!("/select,{path}");
-                    std::process::Command::new("explorer.exe")
-                        .arg(arg)
-                        .spawn()
-                        .map(|_| ())
-                        .map_err(|e| format!("无法打开资源管理器：{e}"))
+                    let clean_path = path.trim().trim_matches('"').replace('/', "\\");
+                    if clean_path.is_empty()
+                        || clean_path.chars().any(|c| c.is_control() || c == '"')
+                    {
+                        return Err("路径无效，无法在资源管理器中定位".to_string());
+                    }
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        std::process::Command::new("explorer.exe")
+                            .raw_arg(format!("/select,\"{clean_path}\""))
+                            .spawn()
+                            .map(|_| ())
+                            .map_err(|e| format!("无法打开资源管理器：{e}"))
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = clean_path;
+                        Err("仅 Windows 支持在资源管理器中定位文件".to_string())
+                    }
                 })
                 .await;
             if let Err(err) = res {
@@ -967,10 +1036,7 @@ impl AppController {
             return;
         }
         if target_id == "__new__" {
-            let mut list: Vec<String> = split_tokens(&self.drafts.new_target_regions)
-                .into_iter()
-                .map(|s| s.to_ascii_uppercase())
-                .collect();
+            let mut list = extract_region_tokens_lossy(&self.drafts.new_target_regions);
             if let Some(pos) = list.iter().position(|c| c == &upper) {
                 list.remove(pos);
             } else {
@@ -986,10 +1052,7 @@ impl AppController {
         }
 
         if let Some(t) = self.drafts.targets.iter_mut().find(|x| x.id == target_id) {
-            let mut list: Vec<String> = split_tokens(&t.expect_regions_text)
-                .into_iter()
-                .map(|s| s.to_ascii_uppercase())
-                .collect();
+            let mut list = extract_region_tokens_lossy(&t.expect_regions_text);
             if let Some(pos) = list.iter().position(|c| c == &upper) {
                 list.remove(pos);
             } else {
@@ -1184,7 +1247,7 @@ impl AppController {
         let prev_cfg_rev = self.snapshot.as_ref().map(|s| s.cfg_rev);
         self.connected = true;
         self.connection_err = None;
-        if !self.pending_ui_prefs && prev_cfg_rev != Some(snapshot.cfg_rev) {
+        if self.pending_ui_prefs_ops == 0 && prev_cfg_rev != Some(snapshot.cfg_rev) {
             self.theme_mode = snapshot.theme_mode;
             self.privacy_mask = snapshot.privacy_mask_ip;
             self.refresh_global_palette(cx);
@@ -1237,7 +1300,7 @@ impl AppController {
                 }
             }
         }
-        if !self.feishu_initialized {
+        if !self.feishu_initialized || !self.feishu_dirty {
             self.drafts.feishu_enabled = snapshot.feishu.enabled;
             self.feishu_initialized = true;
             self.feishu_dirty = false;
@@ -1275,6 +1338,7 @@ impl AppController {
         for td in targets {
             let id_ip = td.id.clone();
             let weak_ip = weak.clone();
+            let weak_ip_sub = weak.clone();
             let ip_entity = self
                 .inputs
                 .target_ips
@@ -1299,12 +1363,18 @@ impl AppController {
                                     }
                                 });
                             })
+                            .with_on_submit(move |_window, cx| {
+                                let _ = weak_ip_sub.update(cx, |ctrl, cx| {
+                                    ctrl.save_target_drafts(cx);
+                                });
+                            })
                     })
                 });
             ip_entity.update(cx, |i, cx| i.set_text_silent(&td.expect_ips_text, cx));
 
             let id_reg = td.id.clone();
             let weak_reg = weak.clone();
+            let weak_reg_sub = weak.clone();
             let reg_entity = self
                 .inputs
                 .target_regions
@@ -1317,16 +1387,18 @@ impl AppController {
                             .with_monospace(true)
                             .with_on_change(move |text, _window, cx| {
                                 let _ = weak_reg.update(cx, |ctrl, cx| {
-                                    let was_dirty = ctrl.drafts.dirty;
                                     if let Some(row) =
                                         ctrl.drafts.targets.iter_mut().find(|r| r.id == id_reg)
                                     {
                                         row.expect_regions_text = text.to_string();
                                         ctrl.drafts.mark_dirty();
-                                        if !was_dirty {
-                                            cx.notify();
-                                        }
+                                        cx.notify();
                                     }
+                                });
+                            })
+                            .with_on_submit(move |_window, cx| {
+                                let _ = weak_reg_sub.update(cx, |ctrl, cx| {
+                                    ctrl.save_target_drafts(cx);
                                 });
                             })
                     })
@@ -1355,7 +1427,7 @@ impl AppController {
     }
 
     pub fn set_toast(&mut self, msg: impl Into<String>, ok: bool, cx: &mut Context<Self>) {
-        self.set_toast_with_path(msg, ok, None, cx);
+        self.set_toast_with_action(msg, ok, None, cx);
     }
 
     pub fn set_toast_with_path(
@@ -1365,13 +1437,23 @@ impl AppController {
         action_path: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        self.set_toast_with_action(msg, ok, action_path.map(ToastAction::OpenExplorerPath), cx);
+    }
+
+    pub fn set_toast_with_action(
+        &mut self,
+        msg: impl Into<String>,
+        ok: bool,
+        action: Option<ToastAction>,
+        cx: &mut Context<Self>,
+    ) {
         self.toast_seq = self.toast_seq.wrapping_add(1);
         let seq = self.toast_seq;
         self.toast = Some((msg.into(), ok));
-        self.toast_action_path = action_path;
+        self.toast_action = action;
         cx.notify();
 
-        let timeout = if self.toast_action_path.is_some() {
+        let timeout = if self.toast_action.is_some() {
             Duration::from_millis(8500)
         } else if ok {
             Duration::from_millis(3500)
@@ -1383,7 +1465,7 @@ impl AppController {
             let _ = this.update(cx, |ctrl, cx| {
                 if ctrl.toast_seq == seq {
                     ctrl.toast = None;
-                    ctrl.toast_action_path = None;
+                    ctrl.toast_action = None;
                     cx.notify();
                 }
             });
@@ -1459,6 +1541,8 @@ impl AppController {
             ok_msg,
             explicit_scope,
             optimistic_key,
+            config_seq,
+            is_ui_pref_save,
             clear_targets_dirty_on_ok,
             clear_feishu_inputs_on_ok,
         } = opts;
@@ -1468,6 +1552,9 @@ impl AppController {
         self.busy_action = true;
         if let Some(sc) = scope.clone() {
             self.in_flight.insert(sc);
+        }
+        if is_ui_pref_save {
+            self.pending_ui_prefs_ops = self.pending_ui_prefs_ops.saturating_add(1);
         }
         cx.notify();
 
@@ -1484,8 +1571,18 @@ impl AppController {
                 if let Some(opt_k) = optimistic_key {
                     ctrl.optimistic_toggles.remove(opt_k);
                 }
+                if let Some(seq) = config_seq
+                    && ctrl
+                        .in_flight_config
+                        .as_ref()
+                        .is_some_and(|(cur, _)| *cur == seq)
+                {
+                    ctrl.in_flight_config = None;
+                }
+                if is_ui_pref_save {
+                    ctrl.pending_ui_prefs_ops = ctrl.pending_ui_prefs_ops.saturating_sub(1);
+                }
                 ctrl.busy_action = !ctrl.in_flight.is_empty();
-                ctrl.pending_ui_prefs = false;
                 match res {
                     Ok(PipeResponse::Snapshot { snapshot }) => {
                         if clear_targets_dirty_on_ok {
@@ -1613,6 +1710,50 @@ impl AppController {
         );
     }
 
+    pub fn reset_feishu_drafts(&mut self, cx: &mut Context<Self>) {
+        self.drafts.feishu_enabled = self.snapshot.as_ref().is_some_and(|s| s.feishu.enabled);
+        self.clear_feishu_draft_inputs(cx);
+        self.set_toast("已撤销未保存的飞书配置改动", true, cx);
+        cx.notify();
+    }
+
+    fn base_config_for_patch(&self) -> Option<Config> {
+        self.in_flight_config
+            .as_ref()
+            .map(|(_, cfg)| cfg.clone())
+            .or_else(|| self.snapshot.as_ref().map(|s| s.config.clone()))
+    }
+
+    fn record_in_flight_config(&mut self, cfg: &Config) -> u64 {
+        self.config_patch_seq = self.config_patch_seq.wrapping_add(1);
+        let seq = self.config_patch_seq;
+        self.in_flight_config = Some((seq, cfg.clone()));
+        seq
+    }
+
+    fn save_ui_pref_patch(
+        &mut self,
+        mutate: impl FnOnce(&mut Config) + Send + 'static,
+        ok_msg: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut cfg) = self.base_config_for_patch() else {
+            return;
+        };
+        mutate(&mut cfg);
+        let seq = self.record_in_flight_config(&cfg);
+        self.send_request_inner(
+            PipeRequest::SaveConfig { config: cfg },
+            RequestOptions {
+                ok_msg: Some(ok_msg),
+                config_seq: Some(seq),
+                is_ui_pref_save: true,
+                ..RequestOptions::default()
+            },
+            cx,
+        );
+    }
+
     pub fn save_config_patch(
         &mut self,
         mutate: impl FnOnce(&mut Config) + Send + 'static,
@@ -1628,14 +1769,16 @@ impl AppController {
         ok_msg: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(mut cfg) = self.snapshot.as_ref().map(|s| s.config.clone()) else {
+        let Some(mut cfg) = self.base_config_for_patch() else {
             return;
         };
         mutate(&mut cfg);
+        let seq = self.record_in_flight_config(&cfg);
         self.send_request_inner(
             PipeRequest::SaveConfig { config: cfg },
             RequestOptions {
                 ok_msg: Some(ok_msg),
+                config_seq: Some(seq),
                 ..RequestOptions::default()
             },
             cx,
@@ -1650,16 +1793,18 @@ impl AppController {
         ok_msg: &'static str,
         cx: &mut Context<Self>,
     ) {
-        let Some(mut cfg) = self.snapshot.as_ref().map(|s| s.config.clone()) else {
+        let Some(mut cfg) = self.base_config_for_patch() else {
             return;
         };
         mutate(&mut cfg);
+        let seq = self.record_in_flight_config(&cfg);
         self.optimistic_toggles.insert(key, next);
         self.send_request_inner(
             PipeRequest::SaveConfig { config: cfg },
             RequestOptions {
                 ok_msg: Some(ok_msg.to_string()),
                 optimistic_key: Some(key),
+                config_seq: Some(seq),
                 ..RequestOptions::default()
             },
             cx,
@@ -1667,18 +1812,20 @@ impl AppController {
     }
 
     pub fn save_target_drafts(&mut self, cx: &mut Context<Self>) {
-        let Some(base) = self.snapshot.as_ref().map(|s| s.config.clone()) else {
+        let Some(base) = self.base_config_for_patch() else {
             self.set_toast("尚未收到守护快照，无法保存", false, cx);
             return;
         };
         match self.drafts.build_updated_config(&base) {
             Ok(next_cfg) => {
                 self.drafts.validation_error = None;
+                let seq = self.record_in_flight_config(&next_cfg);
                 self.send_request_inner(
                     PipeRequest::SaveConfig { config: next_cfg },
                     RequestOptions {
                         ok_msg: Some("目标与白名单配置已保存".into()),
                         explicit_scope: Some(ActionScope::SaveTargets),
+                        config_seq: Some(seq),
                         clear_targets_dirty_on_ok: true,
                         ..RequestOptions::default()
                     },
@@ -1690,6 +1837,156 @@ impl AppController {
                 self.set_toast(err, false, cx);
             }
         }
+    }
+
+    /// Saves unsaved target drafts first (when `dirty == true`) and immediately triggers
+    /// `RecheckNow` on `target_id` so probes never run against stale saved rules.
+    pub fn save_and_recheck_target(
+        &mut self,
+        target_id: String,
+        target_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.drafts.dirty {
+            self.send_request_msg(
+                PipeRequest::RecheckNow {
+                    target_id: Some(target_id),
+                },
+                Some(format!("已重检：{target_name}")),
+                cx,
+            );
+            return;
+        }
+
+        let Some(base) = self.base_config_for_patch() else {
+            self.set_toast("尚未收到守护快照，无法保存并重检", false, cx);
+            return;
+        };
+        let next_cfg = match self.drafts.build_updated_config(&base) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                self.drafts.validation_error = Some(err.clone());
+                self.set_toast(err, false, cx);
+                return;
+            }
+        };
+
+        self.drafts.validation_error = None;
+        let seq = self.record_in_flight_config(&next_cfg);
+        let save_scope = ActionScope::SaveTargets;
+        let rc_scope = ActionScope::RecheckTarget(target_id.clone());
+        self.in_flight.insert(save_scope.clone());
+        self.in_flight.insert(rc_scope.clone());
+        self.busy_action = true;
+        let client = self.client.clone();
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let save_res = client.exchange(PipeRequest::SaveConfig { config: next_cfg })?;
+                    if let PipeResponse::Error { .. } = save_res {
+                        return Ok((save_res, None));
+                    }
+                    if let PipeResponse::Ack {
+                        receipt: Some(ref rc),
+                        ..
+                    } = save_res
+                        && rc.status == OperationStatus::Failed
+                    {
+                        return Ok((save_res, None));
+                    }
+                    let rc_res = client.exchange(PipeRequest::RecheckNow {
+                        target_id: Some(target_id),
+                    })?;
+                    Ok::<_, TransportError>((save_res, Some(rc_res)))
+                })
+                .await;
+
+            let _ = this.update(cx, |ctrl, cx| {
+                ctrl.in_flight.remove(&save_scope);
+                ctrl.in_flight.remove(&rc_scope);
+                if ctrl
+                    .in_flight_config
+                    .as_ref()
+                    .is_some_and(|(cur, _)| *cur == seq)
+                {
+                    ctrl.in_flight_config = None;
+                }
+                ctrl.busy_action = !ctrl.in_flight.is_empty();
+
+                match outcome {
+                    Ok((save_resp, recheck_opt)) => match save_resp {
+                        PipeResponse::Error { message, .. } => {
+                            ctrl.set_toast(message, false, cx);
+                        }
+                        PipeResponse::Ack {
+                            receipt: Some(rc),
+                            snapshot,
+                        } if rc.status == OperationStatus::Failed => {
+                            if let Some(snap) = snapshot {
+                                ctrl.apply_snapshot(*snap, cx);
+                            }
+                            let detail = rc
+                                .error
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| format!("保存未通过：{}", rc.verified_scope));
+                            ctrl.set_toast(detail, false, cx);
+                        }
+                        other_save => {
+                            ctrl.drafts.dirty = false;
+                            ctrl.drafts.validation_error = None;
+                            match recheck_opt {
+                                Some(PipeResponse::Snapshot { snapshot })
+                                | Some(PipeResponse::Ack {
+                                    snapshot: Some(snapshot),
+                                    ..
+                                }) => {
+                                    ctrl.apply_snapshot(*snapshot, cx);
+                                    ctrl.set_toast(
+                                        format!("已保存并重检：{target_name}"),
+                                        true,
+                                        cx,
+                                    );
+                                }
+                                Some(PipeResponse::Error { message, .. }) => {
+                                    ctrl.set_toast(message, false, cx);
+                                }
+                                _ => {
+                                    if let PipeResponse::Ack {
+                                        snapshot: Some(snap),
+                                        ..
+                                    }
+                                    | PipeResponse::Snapshot { snapshot: snap } = other_save
+                                    {
+                                        ctrl.apply_snapshot(*snap, cx);
+                                    }
+                                    ctrl.set_toast(
+                                        format!("已保存并重检：{target_name}"),
+                                        true,
+                                        cx,
+                                    );
+                                }
+                            }
+                        }
+                    },
+                    Err(err) => {
+                        let msg = err.to_string();
+                        if matches!(err, TransportError::DaemonOffline(_)) {
+                            ctrl.connected = false;
+                            ctrl.connection_err = Some(msg.clone());
+                            ctrl.invalidate_console_cache();
+                            ctrl.invalidate_hud_cache();
+                            ctrl.sync_tray_status();
+                        }
+                        ctrl.set_toast(msg, false, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn reset_target_drafts(&mut self, cx: &mut Context<Self>) {
@@ -1704,35 +2001,49 @@ impl AppController {
         let name = self.drafts.new_target_name.trim().to_string();
         let url = self.drafts.new_target_url.trim().to_string();
         let raw_ips = split_tokens(&self.drafts.new_target_ips);
-        let regions: Vec<String> = split_tokens(&self.drafts.new_target_regions)
-            .into_iter()
-            .map(|r| r.to_ascii_uppercase())
-            .collect();
 
         if name.is_empty() {
-            self.set_toast("请填写新目标名称", false, cx);
+            let err = "请填写新目标名称".to_string();
+            self.drafts.validation_error = Some(err.clone());
+            self.set_toast(err, false, cx);
             return;
         }
         if name.chars().count() > 16 {
-            self.set_toast("新目标名称不能超过 16 个字符", false, cx);
+            let err = "新目标名称不能超过 16 个字符".to_string();
+            self.drafts.validation_error = Some(err.clone());
+            self.set_toast(err, false, cx);
             return;
         }
         if !url.starts_with("https://") {
-            self.set_toast("探测地址须以 https:// 开头", false, cx);
+            let err = "探测地址须以 https:// 开头".to_string();
+            self.drafts.validation_error = Some(err.clone());
+            self.set_toast(err, false, cx);
             return;
         }
         let mut ips = Vec::with_capacity(raw_ips.len());
         for raw in raw_ips {
             let Some(norm) = normalize_ip_or_cidr(&raw) else {
-                self.set_toast(format!("无效的 IP 或 CIDR：「{raw}」"), false, cx);
+                let err = format!("无效的 IP 或 CIDR：「{raw}」");
+                self.drafts.validation_error = Some(err.clone());
+                self.set_toast(err, false, cx);
                 return;
             };
             if !ips.contains(&norm) {
                 ips.push(norm);
             }
         }
+        let regions = match parse_and_validate_regions(&self.drafts.new_target_regions) {
+            Ok(regs) => regs,
+            Err(err) => {
+                self.drafts.validation_error = Some(err.clone());
+                self.set_toast(err, false, cx);
+                return;
+            }
+        };
         if ips.is_empty() && regions.is_empty() {
-            self.set_toast("请至少填写 1 个允许地区或静态 IP / CIDR", false, cx);
+            let err = "请至少填写 1 个允许地区或静态 IP / CIDR".to_string();
+            self.drafts.validation_error = Some(err.clone());
+            self.set_toast(err, false, cx);
             return;
         }
 
@@ -1771,8 +2082,84 @@ impl AppController {
             .update(cx, |i, cx| i.set_text_silent("", cx));
         self.show_add_target_drawer = false;
         self.drafts.mark_dirty();
+        self.drafts.validation_error = None;
         self.sync_input_entities_from_drafts(cx);
         self.set_toast("已加入草稿，点「保存配置」生效", true, cx);
+    }
+
+    pub fn start_daemon_service(&mut self, cx: &mut Context<Self>) {
+        if self.client.is_demo() || self.is_scope_busy(&ActionScope::StartService) {
+            return;
+        }
+        let client = self.client.clone();
+        self.in_flight.insert(ActionScope::StartService);
+        self.busy_action = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let start_res = cx
+                .background_executor()
+                .spawn(async move { start_daemon_service_elevated() })
+                .await;
+
+            if let Err(err) = start_res {
+                let _ = this.update(cx, |ctrl, cx| {
+                    ctrl.in_flight.remove(&ActionScope::StartService);
+                    ctrl.busy_action = !ctrl.in_flight.is_empty();
+                    ctrl.set_toast_with_action(
+                        err,
+                        false,
+                        Some(ToastAction::CopyText {
+                            label: "复制启动命令",
+                            text: "Start-Service ClaudeGuardService".into(),
+                        }),
+                        cx,
+                    );
+                    cx.notify();
+                });
+                return;
+            }
+
+            let mut recovered: Option<GuardSnapshot> = None;
+            for _ in 0..6 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let poll_client = client.clone();
+                let res = cx
+                    .background_executor()
+                    .spawn(async move { poll_client.exchange(PipeRequest::GetSnapshot) })
+                    .await;
+                if let Ok(PipeResponse::Snapshot { snapshot }) = res {
+                    recovered = Some(*snapshot);
+                    break;
+                }
+            }
+
+            let _ = this.update(cx, |ctrl, cx| {
+                ctrl.in_flight.remove(&ActionScope::StartService);
+                ctrl.busy_action = !ctrl.in_flight.is_empty();
+                if let Some(snap) = recovered {
+                    ctrl.apply_snapshot(snap, cx);
+                    if ctrl.show_onboarding && ctrl.onboarding_probe.is_none() {
+                        ctrl.probe_onboarding(cx);
+                    }
+                    ctrl.set_toast("守护服务已启动并成功连接", true, cx);
+                } else {
+                    ctrl.set_toast_with_action(
+                        "已发起服务启动，若仍未就绪可复制命令在管理员终端执行",
+                        false,
+                        Some(ToastAction::CopyText {
+                            label: "复制启动命令",
+                            text: "Start-Service ClaudeGuardService".into(),
+                        }),
+                        cx,
+                    );
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn delete_target_draft(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -1827,10 +2214,23 @@ impl AppController {
         cx: &mut Context<Self>,
     ) {
         if !self.connected && !self.client.is_demo() {
-            self.set_toast("守护未连接 · 安全闭锁，禁止启动受管 AI 客户端", false, cx);
+            self.set_toast_with_action(
+                "守护未连接 · 安全闭锁，禁止启动受管 AI 客户端",
+                false,
+                Some(ToastAction::CopyText {
+                    label: "复制启动命令",
+                    text: "Start-Service ClaudeGuardService".into(),
+                }),
+                cx,
+            );
+            return;
+        }
+        let scope = ActionScope::LaunchGate(agent_id.clone());
+        if self.is_scope_busy(&scope) {
             return;
         }
         let client = self.client.clone();
+        self.in_flight.insert(scope.clone());
         self.busy_action = true;
         cx.notify();
 
@@ -1844,7 +2244,6 @@ impl AppController {
                 .await;
 
             let _ = this.update(cx, |ctrl, cx| {
-                ctrl.busy_action = false;
                 match res {
                     Ok(PipeResponse::LaunchGate {
                         allowed,
@@ -1856,6 +2255,8 @@ impl AppController {
                         }
                         if allowed {
                             if ctrl.client.is_demo() {
+                                ctrl.in_flight.remove(&scope);
+                                ctrl.busy_action = !ctrl.in_flight.is_empty();
                                 ctrl.set_toast(
                                     format!("[演示] 门禁放行：将以普通用户权限启动 {agent_id}"),
                                     true,
@@ -1864,6 +2265,7 @@ impl AppController {
                             } else {
                                 let aid_bg = agent_id.clone();
                                 let paths_bg = install_paths.clone();
+                                let scope_bg = scope.clone();
                                 cx.spawn(async move |this_l, cx| {
                                     let launch_res = cx
                                         .background_executor()
@@ -1871,27 +2273,77 @@ impl AppController {
                                             launch_agent_normal_user(&aid_bg, &paths_bg)
                                         })
                                         .await;
-                                    let _ = this_l.update(cx, |c, cx| match launch_res {
-                                        Ok(msg) => c.set_toast(msg, true, cx),
-                                        Err(err) => c.set_toast(err, false, cx),
+                                    let _ = this_l.update(cx, |c, cx| {
+                                        c.in_flight.remove(&scope_bg);
+                                        c.busy_action = !c.in_flight.is_empty();
+                                        match launch_res {
+                                            Ok(msg) => c.set_toast(msg, true, cx),
+                                            Err(err) => c.set_toast(err, false, cx),
+                                        }
+                                        cx.notify();
                                     });
                                 })
                                 .detach();
                             }
                         } else {
-                            ctrl.set_toast(format!("启动门禁拦截：{reason}"), false, cx);
+                            ctrl.in_flight.remove(&scope);
+                            ctrl.busy_action = !ctrl.in_flight.is_empty();
+                            let recovery_action =
+                                ctrl.suggest_launch_block_action(&agent_id, &reason);
+                            ctrl.set_toast_with_action(
+                                format!("启动门禁拦截：{reason}"),
+                                false,
+                                recovery_action,
+                                cx,
+                            );
                         }
                     }
                     Ok(PipeResponse::Error { message, .. }) => {
+                        ctrl.in_flight.remove(&scope);
+                        ctrl.busy_action = !ctrl.in_flight.is_empty();
                         ctrl.set_toast(message, false, cx);
                     }
-                    Ok(_) => {}
-                    Err(err) => ctrl.set_toast(err.to_string(), false, cx),
+                    Ok(_) => {
+                        ctrl.in_flight.remove(&scope);
+                        ctrl.busy_action = !ctrl.in_flight.is_empty();
+                    }
+                    Err(err) => {
+                        ctrl.in_flight.remove(&scope);
+                        ctrl.busy_action = !ctrl.in_flight.is_empty();
+                        ctrl.set_toast(err.to_string(), false, cx);
+                    }
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn suggest_launch_block_action(&self, agent_id: &str, reason: &str) -> Option<ToastAction> {
+        if let Some(snap) = self.snapshot.as_ref() {
+            if agent_id == "antigravity"
+                && snap.config.require_antigravity_proxy
+                && snap.antigravity_proxy.installed
+                && !snap.antigravity_proxy.is_ready_for_launch()
+            {
+                return Some(ToastAction::JumpAntigravityRepair);
+            }
+            if snap.lifecycle == Lifecycle::Disarmed {
+                return Some(ToastAction::RearmNow);
+            }
+            if snap.is_tripped() {
+                return Some(ToastAction::JumpBreaker);
+            }
+        }
+        if reason.contains("注入") || reason.contains("version.dll") {
+            Some(ToastAction::JumpAntigravityRepair)
+        } else if reason.contains("撤防") {
+            Some(ToastAction::RearmNow)
+        } else if reason.contains("熔断") || reason.contains("隔离") {
+            Some(ToastAction::JumpBreaker)
+        } else {
+            None
+        }
     }
 
     fn hydrate_onboarding_custom_from_probe(
@@ -2175,6 +2627,7 @@ pub fn open_hud_window(ctrl: Entity<AppController>, cx: &mut App) {
     if let Some(handle) = existing
         && handle
             .update(cx, |_, window, _| {
+                let _ = ensure_window_on_screen("ClaudeGuard Quick HUD");
                 window.activate_window();
             })
             .is_ok()
@@ -2224,6 +2677,7 @@ pub fn open_hud_window(ctrl: Entity<AppController>, cx: &mut App) {
         move |window, cx| cx.new(|cx| HudWindowView::new(ctrl_clone, window, cx)),
     ) {
         apply_win11_round_corners("ClaudeGuard Quick HUD", border_rgb);
+        let _ = ensure_window_on_screen("ClaudeGuard Quick HUD");
         ctrl.update(cx, |c, _| c.hud_window = Some(handle));
     }
 }
@@ -2265,9 +2719,9 @@ pub fn open_console_window(ctrl: Entity<AppController>, cx: &mut App) {
     if let Some(handle) = existing
         && handle
             .update(cx, |_, window, _| {
-                if !restore_window_if_minimized("ClaudeGuard v4") {
-                    window.activate_window();
-                }
+                let _ = restore_window_if_minimized("ClaudeGuard v4");
+                let _ = ensure_window_on_screen("ClaudeGuard v4");
+                window.activate_window();
             })
             .is_ok()
     {
@@ -2327,6 +2781,7 @@ pub fn open_console_window(ctrl: Entity<AppController>, cx: &mut App) {
         move |window, cx| cx.new(|cx| ConsoleWindowView::new(ctrl_clone, window, cx)),
     ) {
         apply_win11_round_corners("ClaudeGuard v4", border_rgb);
+        let _ = ensure_window_on_screen("ClaudeGuard v4");
         ctrl.update(cx, |c, _| c.console_window = Some(handle));
     }
 }
@@ -2338,7 +2793,7 @@ pub struct HudWindowView {
     was_activated: bool,
     entry_presence: PresenceSpring,
     toast_presence: PresenceSpring,
-    last_toast: Option<(String, bool)>,
+    last_toast: Option<(String, bool, Option<ToastAction>)>,
     _obs_sub: gpui::Subscription,
     _act_sub: gpui::Subscription,
     _app_sub: gpui::Subscription,
@@ -2412,16 +2867,17 @@ impl Render for HudWindowView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
         let reduce_motion = cx.reduce_motion();
-        let (p, proj, toast, busy) = self.ctrl.update(cx, |c, _| {
+        let (p, proj, toast, toast_action, busy) = self.ctrl.update(cx, |c, _| {
             let p = c.palette();
             let proj = c.hud_projection();
             let toast = c.toast.clone();
+            let toast_action = c.toast_action.clone();
             let busy = c.busy_action;
-            (p, proj, toast, busy)
+            (p, proj, toast, toast_action, busy)
         });
 
-        if let Some(t) = toast {
-            self.last_toast = Some(t);
+        if let Some((msg, ok)) = toast {
+            self.last_toast = Some((msg, ok, toast_action));
             self.toast_presence.set_open(true, reduce_motion);
         } else {
             self.toast_presence.set_open(false, reduce_motion);
@@ -2470,13 +2926,112 @@ impl Render for HudWindowView {
                     )),
             );
 
-        if show_toast && let Some((msg, ok)) = self.last_toast.clone() {
+        if show_toast && let Some((msg, ok, toast_action)) = self.last_toast.clone() {
             let b = if ok { p.badge_pass } else { p.badge_fail };
             let pill_border = if ok {
                 p.toast_border_rgba
             } else {
                 p.hero_tripped.border
             };
+            let ctrl_act_pill = self.ctrl.clone();
+            let action_label: Option<&'static str> = toast_action.as_ref().map(|act| match act {
+                ToastAction::OpenExplorerPath(_) => "打开目录",
+                ToastAction::JumpAntigravityRepair => "去热修复 →",
+                ToastAction::RearmNow => "立即布防",
+                ToastAction::JumpBreaker => "去解封 →",
+                ToastAction::CopyText { label, .. } => *label,
+            });
+            let mut right_row = div().flex().items_center().flex_shrink_0().gap(px(5.));
+            if let (Some(lbl), Some(act)) = (action_label, toast_action) {
+                right_row = right_row.child(
+                    div()
+                        .id("hud-toast-action-pill")
+                        .px(px(7.))
+                        .py(px(2.5))
+                        .rounded(px(6.5))
+                        .bg(rgb(p.accent_soft_bg))
+                        .border_1()
+                        .border_color(rgb(p.accent_soft_border))
+                        .text_size(px(10.5))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(p.accent_soft_text))
+                        .cursor_pointer()
+                        .hover(|s| s.opacity(0.88))
+                        .child(lbl)
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, window, cx| {
+                                cx.stop_propagation();
+                                match &act {
+                                    ToastAction::OpenExplorerPath(path) => {
+                                        let p_str = path.clone();
+                                        ctrl_act_pill.update(cx, |c, cx| {
+                                            c.open_path_in_explorer_async(p_str, cx);
+                                        });
+                                    }
+                                    ToastAction::JumpAntigravityRepair => {
+                                        ctrl_act_pill.update(cx, |c, cx| {
+                                            c.toast = None;
+                                            c.toast_action = None;
+                                            c.env_tab = EnvSubTab::Antigravity;
+                                            c.set_nav(NavSection::Environment, cx);
+                                            c.hud_window = None;
+                                        });
+                                        open_console_window(ctrl_act_pill.clone(), cx);
+                                        window.remove_window();
+                                    }
+                                    ToastAction::RearmNow => {
+                                        ctrl_act_pill.update(cx, |c, cx| {
+                                            c.toast = None;
+                                            c.toast_action = None;
+                                            c.send_request(
+                                                PipeRequest::Rearm,
+                                                Some("已重新布防，恢复出口守护"),
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                    ToastAction::JumpBreaker => {
+                                        ctrl_act_pill.update(cx, |c, cx| {
+                                            c.toast = None;
+                                            c.toast_action = None;
+                                            c.set_nav(NavSection::Breaker, cx);
+                                            c.hud_window = None;
+                                        });
+                                        open_console_window(ctrl_act_pill.clone(), cx);
+                                        window.remove_window();
+                                    }
+                                    ToastAction::CopyText { text, .. } => {
+                                        let t_str = text.clone();
+                                        ctrl_act_pill.update(cx, |c, cx| {
+                                            c.copy_to_clipboard(t_str, "命令", cx);
+                                        });
+                                    }
+                                }
+                            }),
+                        ),
+                );
+            }
+            right_row = right_row.child(
+                div()
+                    .id("hud-toast-close")
+                    .flex_shrink_0()
+                    .cursor_pointer()
+                    .p(px(2.))
+                    .rounded(px(5.))
+                    .child(ui_icon("icons/ui/close.svg", 10.5, p.text_muted))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            cx.stop_propagation();
+                            ctrl_dismiss.update(cx, |c, cx| {
+                                c.toast = None;
+                                c.toast_action = None;
+                                cx.notify();
+                            });
+                        }),
+                    ),
+            );
             root = root.child(
                 div()
                     .absolute()
@@ -2528,26 +3083,7 @@ impl Render for HudWindowView {
                                             .child(msg),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .id("hud-toast-close")
-                                    .flex_shrink_0()
-                                    .cursor_pointer()
-                                    .p(px(2.))
-                                    .rounded(px(5.))
-                                    .child(ui_icon("icons/ui/close.svg", 10.5, p.text_muted))
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |_, _, _, cx| {
-                                            cx.stop_propagation();
-                                            ctrl_dismiss.update(cx, |c, cx| {
-                                                c.toast = None;
-                                                c.toast_action_path = None;
-                                                cx.notify();
-                                            });
-                                        }),
-                                    ),
-                            ),
+                            .child(right_row),
                     ),
             );
         }
@@ -2647,7 +3183,7 @@ pub struct ConsoleWindowView {
     env_subtab: DirectionalTransition<EnvSubTab>,
     notify_subtab: DirectionalTransition<NotifySubTab>,
     toast_presence: PresenceSpring,
-    last_toast: Option<(String, bool, Option<String>)>,
+    last_toast: Option<(String, bool, Option<ToastAction>)>,
     policy_presence: PresenceSpring,
     theme_presence: PresenceSpring,
     _obs_sub: gpui::Subscription,
@@ -2720,6 +3256,9 @@ impl ConsoleWindowView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.ctrl.read(cx).has_modal_open() {
+            return;
+        }
         self.ctrl.update(cx, |c, cx| {
             if c.nav_section != NavSection::Audit {
                 c.set_nav(NavSection::Audit, cx);
@@ -2728,6 +3267,14 @@ impl ConsoleWindowView {
         let handle = self.ctrl.read(cx).inputs.search.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
         cx.notify();
+    }
+
+    fn on_focus_next(&mut self, _: &FocusNextField, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus_next(cx);
+    }
+
+    fn on_focus_prev(&mut self, _: &FocusPrevField, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus_prev(cx);
     }
 
     fn on_dismiss_overlay(
@@ -2740,6 +3287,10 @@ impl ConsoleWindowView {
             if c.show_plugins_modal {
                 c.show_plugins_modal = false;
                 cx.notify();
+            } else if c.show_onboarding {
+                if !c.onboarding_submitting {
+                    c.skip_onboarding(cx);
+                }
             } else if c.policy_menu_open {
                 c.policy_menu_open = false;
                 cx.notify();
@@ -2754,7 +3305,7 @@ impl ConsoleWindowView {
                 cx.notify();
             } else if c.toast.is_some() {
                 c.toast = None;
-                c.toast_action_path = None;
+                c.toast_action = None;
                 cx.notify();
             } else if c.pending_confirm.is_some() {
                 c.pending_confirm = None;
@@ -2769,6 +3320,9 @@ impl ConsoleWindowView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.ctrl.read(cx).has_modal_open() {
+            return;
+        }
         self.ctrl.update(cx, |c, cx| match c.nav_section {
             NavSection::Targets => {
                 if c.drafts.dirty {
@@ -2788,6 +3342,9 @@ impl ConsoleWindowView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.ctrl.read(cx).has_modal_open() {
+            return;
+        }
         self.ctrl.update(cx, |c, cx| {
             if !c.connected {
                 c.send_request(PipeRequest::GetSnapshot, Some("已重新连接守护服务"), cx);
@@ -2821,6 +3378,9 @@ impl ConsoleWindowView {
     }
 
     fn jump_nav(&mut self, section: NavSection, cx: &mut Context<Self>) {
+        if self.ctrl.read(cx).has_modal_open() {
+            return;
+        }
         self.ctrl.update(cx, |c, cx| c.set_nav(section, cx));
     }
 
@@ -2870,7 +3430,7 @@ impl Render for ConsoleWindowView {
             theme_menu_open,
             snapshot_opt,
             toast,
-            toast_action_path,
+            toast_action,
             targets_dirty,
             console_scroll,
             proj,
@@ -2889,7 +3449,7 @@ impl Render for ConsoleWindowView {
                 c.theme_menu_open,
                 c.snapshot.clone(),
                 c.toast.clone(),
-                c.toast_action_path.clone(),
+                c.toast_action.clone(),
                 c.drafts.dirty,
                 c.console_scroll.clone(),
                 proj,
@@ -2944,7 +3504,7 @@ impl Render for ConsoleWindowView {
         }
 
         if let Some((msg, ok)) = toast {
-            self.last_toast = Some((msg, ok, toast_action_path));
+            self.last_toast = Some((msg, ok, toast_action));
             self.toast_presence.set_open(true, reduce_motion);
         } else {
             self.toast_presence.set_open(false, reduce_motion);
@@ -3106,6 +3666,8 @@ impl Render for ConsoleWindowView {
             .key_context("ConsoleWindow")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_focus_search))
+            .on_action(cx.listener(Self::on_focus_next))
+            .on_action(cx.listener(Self::on_focus_prev))
             .on_action(cx.listener(Self::on_dismiss_overlay))
             .on_action(cx.listener(Self::on_save_current))
             .on_action(cx.listener(Self::on_refresh_current))
@@ -3176,7 +3738,7 @@ impl Render for ConsoleWindowView {
 
         // Dynamic-Island Floating Toast Overlay: rendered LAST (above modals), ZERO layout shift!
         if self.toast_presence.is_mounted()
-            && let Some((msg, ok, action_path)) = self.last_toast.clone()
+            && let Some((msg, ok, toast_action)) = self.last_toast.clone()
         {
             let b = if ok { p.badge_pass } else { p.badge_fail };
             let pill_border = if ok {
@@ -3187,7 +3749,7 @@ impl Render for ConsoleWindowView {
             let t_op = self.toast_presence.progress();
             let t_dy = (1.0 - self.toast_presence.raw_progress()) * 14.0;
             let ctrl_dismiss = ctrl_entity.clone();
-            let ctrl_open_dir = ctrl_entity.clone();
+            let ctrl_primary_act = ctrl_entity.clone();
             let ctrl_copy_path = ctrl_entity.clone();
             let hover_btn = p.sidebar_hover_bg;
 
@@ -3235,61 +3797,126 @@ impl Render for ConsoleWindowView {
                 );
 
             let mut right_actions = div().flex().items_center().flex_shrink_0().gap(px(5.));
-            if let Some(path) = action_path {
-                let p_open = path.clone();
-                let p_copy = path;
-                right_actions = right_actions
-                    .child(
-                        div()
-                            .id("toast-open-dir")
-                            .px(px(8.))
-                            .py(px(3.))
-                            .rounded(px(7.))
-                            .bg(rgb(p.accent_soft_bg))
-                            .border_1()
-                            .border_color(rgb(p.accent_soft_border))
-                            .text_size(px(11.))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(p.accent_soft_text))
-                            .cursor_pointer()
-                            .hover(move |s| s.opacity(0.88))
-                            .child("打开目录")
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |_, _, _, cx| {
-                                    cx.stop_propagation();
-                                    let p = p_open.clone();
-                                    ctrl_open_dir
-                                        .update(cx, |c, cx| c.open_path_in_explorer_async(p, cx));
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("toast-copy-path")
-                            .px(px(8.))
-                            .py(px(3.))
-                            .rounded(px(7.))
-                            .bg(rgb(p.secondary_btn_bg))
-                            .border_1()
-                            .border_color(rgb(p.secondary_btn_border))
-                            .text_size(px(11.))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(p.text_secondary))
-                            .cursor_pointer()
-                            .hover(move |s| s.bg(rgb(hover_btn)))
-                            .child("复制路径")
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |_, _, _, cx| {
-                                    cx.stop_propagation();
-                                    let p = p_copy.clone();
-                                    ctrl_copy_path.update(cx, |c, cx| {
-                                        c.copy_to_clipboard(p, "诊断包路径", cx);
-                                    });
-                                }),
-                            ),
-                    );
+            if let Some(action) = toast_action {
+                match action {
+                    ToastAction::OpenExplorerPath(path) => {
+                        let p_open = path.clone();
+                        let p_copy = path;
+                        right_actions = right_actions
+                            .child(
+                                div()
+                                    .id("toast-open-dir")
+                                    .px(px(8.))
+                                    .py(px(3.))
+                                    .rounded(px(7.))
+                                    .bg(rgb(p.accent_soft_bg))
+                                    .border_1()
+                                    .border_color(rgb(p.accent_soft_border))
+                                    .text_size(px(11.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(p.accent_soft_text))
+                                    .cursor_pointer()
+                                    .hover(move |s| s.opacity(0.88))
+                                    .child("打开目录")
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            cx.stop_propagation();
+                                            let p = p_open.clone();
+                                            ctrl_primary_act.update(cx, |c, cx| {
+                                                c.open_path_in_explorer_async(p, cx);
+                                            });
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("toast-copy-path")
+                                    .px(px(8.))
+                                    .py(px(3.))
+                                    .rounded(px(7.))
+                                    .bg(rgb(p.secondary_btn_bg))
+                                    .border_1()
+                                    .border_color(rgb(p.secondary_btn_border))
+                                    .text_size(px(11.))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(p.text_secondary))
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(rgb(hover_btn)))
+                                    .child("复制路径")
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            cx.stop_propagation();
+                                            let p = p_copy.clone();
+                                            ctrl_copy_path.update(cx, |c, cx| {
+                                                c.copy_to_clipboard(p, "诊断包路径", cx);
+                                            });
+                                        }),
+                                    ),
+                            );
+                    }
+                    other => {
+                        let lbl: &'static str = match &other {
+                            ToastAction::JumpAntigravityRepair => "去热修复 →",
+                            ToastAction::RearmNow => "立即布防",
+                            ToastAction::JumpBreaker => "去解封 →",
+                            ToastAction::CopyText { label, .. } => label,
+                            ToastAction::OpenExplorerPath(_) => "打开目录",
+                        };
+                        right_actions = right_actions.child(
+                            div()
+                                .id("toast-recovery-pill")
+                                .px(px(8.5))
+                                .py(px(3.))
+                                .rounded(px(7.))
+                                .bg(rgb(p.accent_soft_bg))
+                                .border_1()
+                                .border_color(rgb(p.accent_soft_border))
+                                .text_size(px(11.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(p.accent_soft_text))
+                                .cursor_pointer()
+                                .hover(|s| s.opacity(0.88))
+                                .child(lbl)
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |_, _, _, cx| {
+                                        cx.stop_propagation();
+                                        let act = other.clone();
+                                        ctrl_primary_act.update(cx, |c, cx| match act {
+                                            ToastAction::JumpAntigravityRepair => {
+                                                c.toast = None;
+                                                c.toast_action = None;
+                                                c.env_tab = EnvSubTab::Antigravity;
+                                                c.set_nav(NavSection::Environment, cx);
+                                            }
+                                            ToastAction::RearmNow => {
+                                                c.toast = None;
+                                                c.toast_action = None;
+                                                c.send_request(
+                                                    PipeRequest::Rearm,
+                                                    Some("已重新布防，恢复出口守护"),
+                                                    cx,
+                                                );
+                                            }
+                                            ToastAction::JumpBreaker => {
+                                                c.toast = None;
+                                                c.toast_action = None;
+                                                c.set_nav(NavSection::Breaker, cx);
+                                            }
+                                            ToastAction::CopyText { text, .. } => {
+                                                c.copy_to_clipboard(text, "命令", cx);
+                                            }
+                                            ToastAction::OpenExplorerPath(p) => {
+                                                c.open_path_in_explorer_async(p, cx);
+                                            }
+                                        });
+                                    }),
+                                ),
+                        );
+                    }
+                }
             }
 
             right_actions = right_actions.child(
@@ -3310,7 +3937,7 @@ impl Render for ConsoleWindowView {
                             cx.stop_propagation();
                             ctrl_dismiss.update(cx, |c, cx| {
                                 c.toast = None;
-                                c.toast_action_path = None;
+                                c.toast_action = None;
                                 cx.notify();
                             });
                         }),
@@ -4421,9 +5048,32 @@ fn win_ctrl_btn(
 /// Launches the GPUI desktop application + Win32 tray loop.
 pub fn run(args: LaunchArgs) {
     let is_demo = matches!(args.endpoint, TransportEndpoint::Demo(_));
-    if signal_existing_tray_instance(is_demo, args.start_hud, args.start_in_tray) {
-        return;
-    }
+    let _single_instance_guard = if !is_demo {
+        match acquire_single_instance() {
+            SingleInstanceOutcome::Acquired(guard) => {
+                if signal_existing_tray_instance(false, args.start_hud, args.start_in_tray) {
+                    return;
+                }
+                Some(guard)
+            }
+            SingleInstanceOutcome::AlreadyRunning => {
+                for attempt in 0..5 {
+                    if signal_existing_tray_instance(false, args.start_hud, args.start_in_tray) {
+                        break;
+                    }
+                    if attempt < 4 {
+                        std::thread::sleep(Duration::from_millis(40));
+                    }
+                }
+                return;
+            }
+        }
+    } else {
+        if signal_existing_tray_instance(true, args.start_hud, args.start_in_tray) {
+            return;
+        }
+        None
+    };
 
     let tray_channel = TrayChannel::new();
     let tray_handle = match TrayHandle::start(tray_channel.clone()) {
@@ -4442,6 +5092,8 @@ pub fn run(args: LaunchArgs) {
             text_input::bind_keys(cx);
             cx.bind_keys([
                 KeyBinding::new("ctrl-k", FocusGlobalSearch, Some("ConsoleWindow")),
+                KeyBinding::new("tab", FocusNextField, Some("ConsoleWindow")),
+                KeyBinding::new("shift-tab", FocusPrevField, Some("ConsoleWindow")),
                 KeyBinding::new("escape", DismissConsoleOverlay, Some("ConsoleWindow")),
                 KeyBinding::new("ctrl-s", SaveCurrentView, Some("ConsoleWindow")),
                 KeyBinding::new("ctrl-r", RefreshCurrentView, Some("ConsoleWindow")),
@@ -4511,14 +5163,17 @@ fn handle_tray_event(ctrl: Entity<AppController>, event: TrayEvent, cx: &mut App
             cx.quit();
         }
         TrayEvent::SafeExit => {
+            if ctrl.read(cx).is_scope_busy(&ActionScope::Flow) {
+                return;
+            }
             let client = ctrl.read(cx).client.clone();
-            ctrl.update(cx, |c, _| {
-                if let Some(mut tray) = c.tray.take() {
-                    tray.shutdown();
-                }
+            ctrl.update(cx, |c, cx| {
+                c.in_flight.insert(ActionScope::Flow);
+                c.busy_action = true;
+                cx.notify();
             });
             cx.spawn(async move |cx| {
-                let _ = cx
+                let res = cx
                     .background_executor()
                     .spawn(async move {
                         client.exchange(PipeRequest::DisarmAndRestoreFlowB {
@@ -4526,7 +5181,73 @@ fn handle_tray_event(ctrl: Entity<AppController>, event: TrayEvent, cx: &mut App
                         })
                     })
                     .await;
-                cx.update(|cx| cx.quit());
+                cx.update(|cx| {
+                    let outcome: Result<(), String> = match res {
+                        Ok(PipeResponse::Snapshot { snapshot }) => {
+                            ctrl.update(cx, |c, cx| c.apply_snapshot(*snapshot, cx));
+                            Ok(())
+                        }
+                        Ok(PipeResponse::Ack { receipt, snapshot }) => {
+                            if let Some(snap) = snapshot {
+                                ctrl.update(cx, |c, cx| c.apply_snapshot(*snap, cx));
+                            }
+                            if let Some(rc) = receipt
+                                && rc.status == OperationStatus::Failed
+                            {
+                                let detail = rc.error.filter(|s| !s.is_empty()).unwrap_or_else(
+                                    || format!("撤防未通过：{}", rc.verified_scope),
+                                );
+                                Err(detail)
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        Ok(PipeResponse::Error { message, .. }) => Err(message),
+                        Ok(_) => Err("守护服务返回未知响应".into()),
+                        Err(err) => Err(err.to_string()),
+                    };
+
+                    match outcome {
+                        Ok(()) => {
+                            ctrl.update(cx, |c, _| {
+                                c.in_flight.remove(&ActionScope::Flow);
+                                c.busy_action = !c.in_flight.is_empty();
+                                if let Some(mut tray) = c.tray.take() {
+                                    tray.shutdown();
+                                }
+                            });
+                            cx.quit();
+                        }
+                        Err(err_detail) => {
+                            let fallback_msg = format!(
+                                "安全撤防失败（{err_detail}），已保留托盘以防残留隔离锁网；可执行 claudeguard-cli --restore 应急解封"
+                            );
+                            open_console_window(ctrl.clone(), cx);
+                            cx.activate(true);
+                            ctrl.update(cx, |c, cx| {
+                                c.in_flight.remove(&ActionScope::Flow);
+                                c.busy_action = !c.in_flight.is_empty();
+                                if let Some(tray) = c.tray.as_ref() {
+                                    tray.show_balloon(
+                                        "ClaudeGuard 安全撤防未完成",
+                                        &fallback_msg,
+                                        true,
+                                    );
+                                }
+                                c.set_toast_with_action(
+                                    fallback_msg,
+                                    false,
+                                    Some(ToastAction::CopyText {
+                                        label: "复制应急命令",
+                                        text: "claudeguard-cli --restore".into(),
+                                    }),
+                                    cx,
+                                );
+                                cx.notify();
+                            });
+                        }
+                    }
+                });
             })
             .detach();
         }

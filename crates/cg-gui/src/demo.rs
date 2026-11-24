@@ -264,7 +264,8 @@ fn demo_logs(now: u64, scenario: DemoScenario) -> Vec<LogEntry> {
                 timestamp: now.saturating_sub(118),
                 level: LogLevel::Audit,
                 category: "firewall".into(),
-                message: "已终止 3 个受管桌面进程并写入 6 条应用级防火墙隔离规则（回读核验通过）".into(),
+                message: "已终止 3 个受管桌面进程并写入 6 条应用级防火墙隔离规则（回读核验通过）"
+                    .into(),
             });
             entries.push(LogEntry {
                 id: 106,
@@ -361,17 +362,20 @@ fn demo_antigravity_proxy(now: u64, scenario: DemoScenario) -> AntigravityProxyS
 }
 
 fn demo_updates(now: u64, scenario: DemoScenario) -> UpdateSummary {
+    let pkg_ver = env!("CARGO_PKG_VERSION");
     let claudeguard = ComponentUpdateStatus {
         id: "claudeguard".into(),
         name: "ClaudeGuard 主程序".into(),
         repo: "daha1216/ClaudeGuard".into(),
         phase: UpdateCheckPhase::UpToDate,
-        installed_version: Some("4.0.0".into()),
-        latest_version: Some("4.0.0".into()),
-        release_url: Some("https://github.com/daha1216/ClaudeGuard/releases/tag/v4.0.0".into()),
+        installed_version: Some(pkg_ver.into()),
+        latest_version: Some(pkg_ver.into()),
+        release_url: Some(format!(
+            "https://github.com/daha1216/ClaudeGuard/releases/tag/v{pkg_ver}"
+        )),
         asset_url: None,
         checked_at: Some(now.saturating_sub(18)),
-        note: "当前 v4.0.0 已是最新正式版本（官方签名校验已启用）".into(),
+        note: format!("当前 v{pkg_ver} 已是最新正式版本（官方签名校验已启用）"),
     };
     let antigravity_proxy = match scenario {
         DemoScenario::Trip => ComponentUpdateStatus {
@@ -867,7 +871,7 @@ pub fn build_demo_snapshot(scenario: DemoScenario) -> GuardSnapshot {
 
     GuardSnapshot {
         schema_version: 4,
-        version: "4.0.0".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
         platform: "windows".into(),
         network_isolation_supported: true,
         lifecycle,
@@ -956,7 +960,11 @@ pub fn build_demo_snapshot(scenario: DemoScenario) -> GuardSnapshot {
             } else {
                 "US-LAX-ISP-01".into()
             },
-            active_delay_ms: Some(if scenario == DemoScenario::Trip { 188 } else { 58 }),
+            active_delay_ms: Some(if scenario == DemoScenario::Trip {
+                188
+            } else {
+                58
+            }),
             candidates: vec![
                 crate::protocol::MihomoNodeInfo {
                     name: "US-LAX-ISP-01".into(),

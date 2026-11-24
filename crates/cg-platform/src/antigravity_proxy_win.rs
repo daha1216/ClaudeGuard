@@ -71,11 +71,20 @@ pub fn normalize_module_path(raw: &str) -> String {
 /// is mapped into the process address space.
 #[cfg(windows)]
 pub fn is_module_loaded_in_process(pid: u32, expected_dll_path: &Path) -> bool {
-    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
         TH32CS_SNAPMODULE32,
     };
+
+    struct HandleGuard(HANDLE);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
 
     const HRESULT_ERROR_BAD_LENGTH: i32 = 0x8007_0018u32 as i32;
 
@@ -106,6 +115,7 @@ pub fn is_module_loaded_in_process(pid: u32, expected_dll_path: &Path) -> bool {
         let Some(snap) = snap_opt else {
             return false;
         };
+        let _snap_guard = HandleGuard(snap);
 
         let mut matched = false;
         let mut entry = MODULEENTRY32W {
@@ -129,7 +139,6 @@ pub fn is_module_loaded_in_process(pid: u32, expected_dll_path: &Path) -> bool {
                 }
             }
         }
-        let _ = CloseHandle(snap);
         matched
     }
 }
@@ -143,10 +152,19 @@ pub fn is_module_loaded_in_process(_pid: u32, _expected_dll_path: &Path) -> bool
 /// from triggering spurious `RuntimeUnhooked` warnings during normal app shutdown.
 #[cfg(windows)]
 fn is_process_still_alive(pid: u32) -> bool {
-    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
+
+    struct HandleGuard(HANDLE);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
 
     const STILL_ACTIVE_CODE: u32 = 259;
 
@@ -157,10 +175,9 @@ fn is_process_still_alive(pid: u32) -> bool {
         let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
             return false;
         };
+        let _guard = HandleGuard(handle);
         let mut code: u32 = 0;
-        let alive = GetExitCodeProcess(handle, &mut code).is_ok() && code == STILL_ACTIVE_CODE;
-        let _ = CloseHandle(handle);
-        alive
+        GetExitCodeProcess(handle, &mut code).is_ok() && code == STILL_ACTIVE_CODE
     }
 }
 
@@ -457,6 +474,190 @@ pub struct AntigravityRepairReport {
     pub summary: String,
 }
 
+/// Rejects any NTFS junction, mount point, or symbolic link (`FILE_ATTRIBUTE_REPARSE_POINT`)
+/// on every ancestor component and target path so `LocalSystem` NEVER follows junctions into
+/// privileged system directories.
+pub fn ensure_no_reparse_points(path: &Path) -> Result<(), String> {
+    use std::path::Component;
+
+    if path.as_os_str().is_empty() {
+        return Err("路径为空，已拒绝写入".into());
+    }
+
+    let components: Vec<Component<'_>> = path.components().collect();
+    let mut cur = PathBuf::new();
+    for (idx, comp) in components.iter().enumerate() {
+        cur.push(comp.as_os_str());
+        if matches!(comp, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
+        let is_last = idx + 1 == components.len();
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(format!(
+                        "安全拦截：检测到符号链接路径（{}），已拒绝操作",
+                        cur.display()
+                    ));
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+                    if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                        return Err(format!(
+                            "安全拦截：检测到 NTFS 重解析点/目录联接（{}），已拒绝操作",
+                            cur.display()
+                        ));
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && is_last => {
+                // Target file does not exist yet (first-time creation).
+            }
+            Err(e) => {
+                return Err(format!("校验路径安全性失败（{}）：{e}", cur.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn next_temp_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut x = nanos ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (std::process::id() as u64);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+#[cfg(windows)]
+fn apply_user_writable_acl_if_service(path: &Path) {
+    use core::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{w, PWSTR};
+    use windows::Win32::Foundation::{LocalFree, BOOL, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    if !crate::access_win::is_session_zero() {
+        return;
+    }
+
+    struct SdGuard(PSECURITY_DESCRIPTOR);
+    impl Drop for SdGuard {
+        fn drop(&mut self) {
+            if !self.0 .0.is_null() {
+                unsafe {
+                    let _ = LocalFree(HLOCAL(self.0 .0.cast::<c_void>()));
+                }
+            }
+        }
+    }
+
+    unsafe {
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            w!("D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)"),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+        .is_err()
+        {
+            return;
+        }
+        let _sd_guard = SdGuard(sd);
+
+        let mut dacl_present = BOOL(0);
+        let mut dacl_ptr: *mut ACL = core::ptr::null_mut();
+        let mut dacl_defaulted = BOOL(0);
+        if GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl_ptr, &mut dacl_defaulted)
+            .is_err()
+            || !dacl_present.as_bool()
+        {
+            return;
+        }
+
+        let mut wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let _ = SetNamedSecurityInfoW(
+            PWSTR(wide_path.as_mut_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl_ptr.cast_const()),
+            None,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn apply_user_writable_acl_if_service(_path: &Path) {}
+
+fn atomic_write_verified_file(
+    dir: &Path,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
+    use std::io::Write;
+
+    ensure_no_reparse_points(dir)?;
+    let target_path = dir.join(file_name);
+    ensure_no_reparse_points(&target_path)?;
+
+    let pid = std::process::id();
+    let mut tmp_opt: Option<(PathBuf, std::fs::File)> = None;
+    for _ in 0..8 {
+        let candidate = dir.join(format!(
+            "{file_name}.{pid}.{:016x}.cg-tmp",
+            next_temp_nonce()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => {
+                tmp_opt = Some((candidate, f));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("创建临时文件 {file_name} 失败：{e}")),
+        }
+    }
+    let Some((tmp_path, mut tmp_file)) = tmp_opt else {
+        return Err(format!("创建独占临时文件 {file_name} 失败：命名冲突"));
+    };
+
+    if let Err(e) = tmp_file.write_all(bytes).and_then(|()| tmp_file.sync_all()) {
+        drop(tmp_file);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("写入临时 {file_name} 失败：{e}"));
+    }
+    drop(tmp_file);
+
+    ensure_no_reparse_points(&target_path)?;
+    if let Err(rename_err) = std::fs::rename(&tmp_path, &target_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("替换 {file_name} 失败：{rename_err}"));
+    }
+    apply_user_writable_acl_if_service(&target_path);
+    Ok(target_path)
+}
+
 /// Validates and atomically installs `version.dll` (raw DLL or `.zip` containing `version.dll`)
 /// and synchronizes `config.json` (`proxy.port = proxy_port`, `child_injection = true`).
 pub fn install_verified_proxy_bytes_into_dir(
@@ -466,6 +667,8 @@ pub fn install_verified_proxy_bytes_into_dir(
     proxy_port: u16,
     release_tag: &str,
 ) -> Result<AntigravityRepairReport, String> {
+    ensure_no_reparse_points(dir)?;
+
     let dll_bytes = if is_zip {
         let (_name, bytes) = crate::zip_util::extract_file_from_zip(raw_bytes, "version.dll")?;
         bytes
@@ -487,19 +690,16 @@ pub fn install_verified_proxy_bytes_into_dir(
         sha256_hex.push_str(&format!("{b:02x}"));
     }
 
-    // Atomic write `version.dll` via sibling temp file
-    let dll_path = dir.join("version.dll");
-    let tmp_dll = dir.join("version.dll.cg-tmp");
-    std::fs::write(&tmp_dll, &dll_bytes).map_err(|e| format!("写入临时 version.dll 失败：{e}"))?;
-    if let Err(rename_err) = std::fs::rename(&tmp_dll, &dll_path) {
-        let _ = std::fs::remove_file(&tmp_dll);
+    // Symlink-safe atomic write `version.dll` via randomized `create_new(true)` sibling temp file
+    if let Err(err) = atomic_write_verified_file(dir, "version.dll", &dll_bytes) {
         return Err(format!(
-            "替换 version.dll 失败（请先关闭正在运行的 Antigravity 客户端后重试）：{rename_err}"
+            "{err}（若 Antigravity 正在运行，请先关闭客户端后重试）"
         ));
     }
 
     // Preserve existing `config.json` fields while aligning `child_injection: true` & `proxy.port`.
     let cfg_path = dir.join("config.json");
+    ensure_no_reparse_points(&cfg_path)?;
     let mut cfg_val: serde_json::Value = std::fs::read_to_string(&cfg_path)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
@@ -532,40 +732,44 @@ pub fn install_verified_proxy_bytes_into_dir(
     }
     let cfg_bytes =
         serde_json::to_vec_pretty(&cfg_val).map_err(|e| format!("序列化 config.json 失败：{e}"))?;
-    let tmp_cfg = dir.join("config.json.cg-tmp");
-    std::fs::write(&tmp_cfg, &cfg_bytes).map_err(|e| format!("写入临时 config.json 失败：{e}"))?;
-    std::fs::rename(&tmp_cfg, &cfg_path).map_err(|e| format!("替换 config.json 失败：{e}"))?;
+    atomic_write_verified_file(dir, "config.json", &cfg_bytes)?;
 
+    process_win::invalidate_discovery_cache();
+
+    let sha_head = sha256_hex.get(..12).unwrap_or(&sha256_hex);
     Ok(AntigravityRepairReport {
         install_dir: dir.to_path_buf(),
         release_tag: release_tag.to_string(),
         sha256_hex: sha256_hex.clone(),
         proxy_port,
         summary: format!(
-            "已安装并验签 antigravity-proxy {release_tag}（SHA256 {}…），同步代理端口 :{proxy_port}",
-            &sha256_hex[..12]
+            "已安装并验签 antigravity-proxy {release_tag}（SHA256 {sha_head}…），同步代理端口 :{proxy_port}"
         ),
     })
 }
 
-/// Parse a proxy address string (`"http://127.0.0.1:7890"`, `"socks5h://host:10808/"`, `"host:port"`)
-/// into `(host, port)`, stripping any leading scheme and trailing `/` to prevent `http://http://...`.
+/// Parse a proxy address string (`"http://127.0.0.1:7890"`, `"socks5h://host:10808/"`, `"user:pass@host:port"`)
+/// into `(host, port)`, stripping any leading scheme, credentials, and trailing `/` to prevent `http://http://...`.
 fn parse_proxy_route_addr(addr: &str, fallback_port: u16) -> (&str, u16) {
     let mut s = addr.trim();
     loop {
         let matched = ["socks5h://", "socks5://", "https://", "http://"]
             .into_iter()
             .find(|scheme| {
-                s.get(..scheme.len())
-                    .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+                s.as_bytes()
+                    .get(..scheme.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(scheme.as_bytes()))
             });
         if let Some(scheme) = matched {
-            s = s[scheme.len()..].trim_start();
+            s = s.get(scheme.len()..).unwrap_or("").trim_start();
         } else {
             break;
         }
     }
     s = s.split('/').next().unwrap_or("").trim();
+    if let Some((_, after_at)) = s.rsplit_once('@') {
+        s = after_at.trim();
+    }
 
     if s.starts_with('[') {
         if let Some((bracketed, port_str)) = s.rsplit_once(':') {
@@ -939,6 +1143,14 @@ mod tests {
             ("198.51.100.77", 7890)
         );
         assert_eq!(parse_proxy_route_addr("[::1]:7890", 1080), ("[::1]", 7890));
+        assert_eq!(
+            parse_proxy_route_addr("http://alice:p@ss:w0rd@127.0.0.1:7897/", 1080),
+            ("127.0.0.1", 7897)
+        );
+        assert_eq!(
+            parse_proxy_route_addr("socks5://user:sec@[::1]:10808/", 7890),
+            ("[::1]", 10808)
+        );
 
         // End-to-end check with NetworkPolicy::with_proxy -> never produces http://http://
         let (h, p) = parse_proxy_route_addr("http://198.51.100.10:7890/", 7890);
@@ -946,6 +1158,22 @@ mod tests {
             crate::probe_http::NetworkPolicy::with_proxy(h, p).route(),
             crate::probe_http::Route::Proxy("http://198.51.100.10:7890".into())
         );
+
+        // Verify atomic randomized install & ensure_no_reparse_points
+        let install_dir = unique_temp_dir("atomic-install");
+        let rep = install_verified_proxy_bytes_into_dir(
+            &install_dir,
+            &synthetic_proxy_dll_bytes(),
+            false,
+            7890,
+            "v2.6.3",
+        )
+        .expect("verified atomic install");
+        assert_eq!(rep.proxy_port, 7890);
+        assert!(install_dir.join("version.dll").is_file());
+        assert!(install_dir.join("config.json").is_file());
+        assert!(ensure_no_reparse_points(&install_dir.join("version.dll")).is_ok());
+        std::fs::remove_dir_all(&install_dir).unwrap();
 
         // Verify pick_installed_antigravity_dir skips empty candidate and selects real install dir
         let empty_cand = unique_temp_dir("empty-cand");

@@ -18,18 +18,23 @@ const EOCD_SIG: u32 = 0x0605_4b50;
 pub const MAX_EXTRACT_BYTES: usize = 32 * 1024 * 1024;
 
 fn read_u16_le(buf: &[u8], off: usize) -> Option<u16> {
-    let b = buf.get(off..off + 2)?;
+    let end = off.checked_add(2)?;
+    let b = buf.get(off..end)?;
     Some(u16::from_le_bytes([b[0], b[1]]))
 }
 
 fn read_u32_le(buf: &[u8], off: usize) -> Option<u32> {
-    let b = buf.get(off..off + 4)?;
+    let end = off.checked_add(4)?;
+    let b = buf.get(off..end)?;
     Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 /// Extracts the first file whose path ends with `suffix_ci` (case-insensitive, e.g. `"version.dll"`)
 /// from a ZIP archive (supports STORE method 0 and DEFLATE method 8, verifying CRC-32).
-pub fn extract_file_from_zip(zip_bytes: &[u8], suffix_ci: &str) -> Result<(String, Vec<u8>), String> {
+pub fn extract_file_from_zip(
+    zip_bytes: &[u8],
+    suffix_ci: &str,
+) -> Result<(String, Vec<u8>), String> {
     let needle = suffix_ci.trim().replace('\\', "/").to_ascii_lowercase();
     if needle.is_empty() {
         return Err("ZIP 提取目标文件名为空".into());
@@ -59,7 +64,10 @@ pub fn extract_file_from_zip(zip_bytes: &[u8], suffix_ci: &str) -> Result<(Strin
 
     let mut cur = cd_offset;
     for _ in 0..total_entries {
-        if cur + 46 > cd_end {
+        let Some(header_end) = cur.checked_add(46) else {
+            break;
+        };
+        if header_end > cd_end {
             break;
         }
         if read_u32_le(zip_bytes, cur) != Some(CENTRAL_DIR_SIG) {
@@ -74,12 +82,23 @@ pub fn extract_file_from_zip(zip_bytes: &[u8], suffix_ci: &str) -> Result<(Strin
         let comment_len = read_u16_le(zip_bytes, cur + 32).unwrap_or(0) as usize;
         let local_off = read_u32_le(zip_bytes, cur + 42).unwrap_or(0) as usize;
 
-        let name_end = cur + 46 + name_len;
-        let Some(name_bytes) = zip_bytes.get(cur + 46..name_end) else {
+        let Some(name_end) = header_end.checked_add(name_len) else {
+            break;
+        };
+        if name_end > cd_end {
+            break;
+        }
+        let Some(name_bytes) = zip_bytes.get(header_end..name_end) else {
             break;
         };
         let entry_name = String::from_utf8_lossy(name_bytes).replace('\\', "/");
-        cur = name_end + extra_len + comment_len;
+        let Some(next_cur) = name_end
+            .checked_add(extra_len)
+            .and_then(|v| v.checked_add(comment_len))
+        else {
+            break;
+        };
+        cur = next_cur;
 
         let lower = entry_name.to_ascii_lowercase();
         let matches = lower == needle || lower.ends_with(&format!("/{needle}"));
@@ -89,19 +108,27 @@ pub fn extract_file_from_zip(zip_bytes: &[u8], suffix_ci: &str) -> Result<(Strin
         if uncomp_size > MAX_EXTRACT_BYTES {
             return Err(format!("ZIP 条目 {entry_name} 超过大小上限，已拒绝"));
         }
-        if local_off + 30 > zip_bytes.len()
+        let Some(local_hdr_end) = local_off.checked_add(30) else {
+            return Err(format!("ZIP 条目 {entry_name} 本地文件头损坏"));
+        };
+        if local_hdr_end > zip_bytes.len()
             || read_u32_le(zip_bytes, local_off) != Some(LOCAL_FILE_SIG)
         {
             return Err(format!("ZIP 条目 {entry_name} 本地文件头损坏"));
         }
         let l_name_len = read_u16_le(zip_bytes, local_off + 26).unwrap_or(0) as usize;
         let l_extra_len = read_u16_le(zip_bytes, local_off + 28).unwrap_or(0) as usize;
-        let data_start = local_off + 30 + l_name_len + l_extra_len;
+        let data_start = local_hdr_end
+            .checked_add(l_name_len)
+            .and_then(|v| v.checked_add(l_extra_len))
+            .ok_or_else(|| format!("ZIP 条目 {entry_name} 数据区越界"))?;
         let data_end = data_start
             .checked_add(comp_size)
             .filter(|&e| e <= zip_bytes.len())
             .ok_or_else(|| format!("ZIP 条目 {entry_name} 数据区越界"))?;
-        let comp_slice = &zip_bytes[data_start..data_end];
+        let Some(comp_slice) = zip_bytes.get(data_start..data_end) else {
+            return Err(format!("ZIP 条目 {entry_name} 数据区越界"));
+        };
 
         let out = match method {
             0 => comp_slice.to_vec(),
@@ -134,12 +161,18 @@ pub fn extract_file_from_zip(zip_bytes: &[u8], suffix_ci: &str) -> Result<(Strin
 
 /// Builds a standard DEFLATE `.zip` archive in memory from `(filename, content)` pairs.
 pub fn build_zip_archive(entries: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
+    let entry_count_u16 =
+        u16::try_from(entries.len()).map_err(|_| "ZIP 条目数量超过 65535 上限".to_string())?;
     let mut out = Vec::new();
     let mut central = Vec::new();
 
     for &(raw_name, data) in entries {
         let name = raw_name.trim_start_matches(['/', '\\']).replace('\\', "/");
         let name_bytes = name.as_bytes();
+        let name_len_u16 =
+            u16::try_from(name_bytes.len()).map_err(|_| format!("ZIP 文件名过长：{name}"))?;
+        let uncomp_len_u32 = u32::try_from(data.len())
+            .map_err(|_| format!("ZIP 条目 {name} 大小超过 ZIP32 上限"))?;
         let crc = crc32fast::hash(data);
 
         let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
@@ -154,8 +187,11 @@ pub fn build_zip_archive(entries: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
         } else {
             (0, data)
         };
+        let comp_len_u32 = u32::try_from(payload.len())
+            .map_err(|_| format!("ZIP 条目 {name} 压缩后大小超过 ZIP32 上限"))?;
 
-        let local_offset = out.len() as u32;
+        let local_offset = u32::try_from(out.len())
+            .map_err(|_| "ZIP 归档总大小超过 ZIP32 偏移上限".to_string())?;
         // Local file header
         out.extend_from_slice(&LOCAL_FILE_SIG.to_le_bytes());
         out.extend_from_slice(&20u16.to_le_bytes()); // version needed
@@ -164,9 +200,9 @@ pub fn build_zip_archive(entries: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
         out.extend_from_slice(&0u16.to_le_bytes()); // mod time
         out.extend_from_slice(&0u16.to_le_bytes()); // mod date
         out.extend_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(&comp_len_u32.to_le_bytes());
+        out.extend_from_slice(&uncomp_len_u32.to_le_bytes());
+        out.extend_from_slice(&name_len_u16.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes()); // extra len
         out.extend_from_slice(name_bytes);
         out.extend_from_slice(payload);
@@ -180,9 +216,9 @@ pub fn build_zip_archive(entries: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
         central.extend_from_slice(&0u16.to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes());
         central.extend_from_slice(&crc.to_le_bytes());
-        central.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        central.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        central.extend_from_slice(&comp_len_u32.to_le_bytes());
+        central.extend_from_slice(&uncomp_len_u32.to_le_bytes());
+        central.extend_from_slice(&name_len_u16.to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes()); // extra
         central.extend_from_slice(&0u16.to_le_bytes()); // comment
         central.extend_from_slice(&0u16.to_le_bytes()); // disk start
@@ -192,16 +228,18 @@ pub fn build_zip_archive(entries: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
         central.extend_from_slice(name_bytes);
     }
 
-    let cd_offset = out.len() as u32;
-    let cd_size = central.len() as u32;
+    let cd_offset =
+        u32::try_from(out.len()).map_err(|_| "ZIP 中央目录偏移超过 ZIP32 上限".to_string())?;
+    let cd_size =
+        u32::try_from(central.len()).map_err(|_| "ZIP 中央目录大小超过 ZIP32 上限".to_string())?;
     out.extend_from_slice(&central);
 
     // End of central directory record
     out.extend_from_slice(&EOCD_SIG.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // disk num
     out.extend_from_slice(&0u16.to_le_bytes()); // cd start disk
-    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    out.extend_from_slice(&entry_count_u16.to_le_bytes());
+    out.extend_from_slice(&entry_count_u16.to_le_bytes());
     out.extend_from_slice(&cd_size.to_le_bytes());
     out.extend_from_slice(&cd_offset.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // comment len

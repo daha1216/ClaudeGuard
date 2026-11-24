@@ -10,8 +10,8 @@
 use crate::app::{ActionScope, AppController, ConsoleWindowView, EnvSubTab};
 use crate::assets::{brand_icon_scaled, ui_icon};
 use crate::motion::PageChoreo;
-use crate::protocol::{AnchorKind, PipeRequest, TargetState, UiLabelExt};
-use crate::state::{NavSection, split_tokens};
+use crate::protocol::{AnchorKind, TargetState, UiLabelExt};
+use crate::state::{NavSection, extract_region_tokens_lossy};
 use crate::theme::ThemePalette;
 use crate::views::shared::page_guide_card;
 use crate::widgets::controls::{
@@ -315,6 +315,7 @@ pub fn render_targets_page(
 ) -> Div {
     let ctrl_r = ctrl.read(cx);
     let snap = ctrl_r.snapshot.clone();
+    let privacy_mask = ctrl_r.privacy_mask;
     let dirty = ctrl_r.drafts.dirty;
     let targets = ctrl_r.drafts.targets.clone();
     let show_drawer = ctrl_r.show_add_target_drawer;
@@ -323,6 +324,12 @@ pub fn render_targets_page(
     let busy = ctrl_r.busy_action;
     let connected = ctrl_r.connected;
     let can_act = connected && !busy;
+    let armed_del_target: Option<String> = ctrl_r
+        .pending_confirm
+        .as_ref()
+        .and_then(|(k, _)| k.strip_prefix("tgt-del-"))
+        .filter(|id| ctrl_r.is_confirm_armed(&format!("tgt-del-{id}")))
+        .map(str::to_string);
     let active_preset = snap
         .as_ref()
         .map(|s| s.preset)
@@ -499,10 +506,7 @@ pub fn render_targets_page(
     // -------------------------------------------------------------------------
     // Collapsible Add Custom Target Drawer
     // -------------------------------------------------------------------------
-    let new_reg_codes: Vec<String> = split_tokens(&new_regions_raw)
-        .into_iter()
-        .map(|s| s.to_ascii_uppercase())
-        .collect();
+    let new_reg_codes: Vec<String> = extract_region_tokens_lossy(&new_regions_raw);
 
     let add_drawer = show_drawer.then(|| {
         bento_card_bloom(p, 16.0, 12.0, choreo.tile(0, 1))
@@ -585,9 +589,6 @@ pub fn render_targets_page(
                             cx.listener(move |_, _, _, cx| {
                                 ctrl_add.update(cx, |c, cx| {
                                     c.add_custom_target_from_draft(cx);
-                                    if c.drafts.validation_error.is_none() {
-                                        c.show_add_target_drawer = false;
-                                    }
                                 });
                             }),
                         ),
@@ -666,17 +667,22 @@ pub fn render_targets_page(
 
         let ip_input = ip_map.get(&t.id).cloned();
         let reg_input = reg_map.get(&t.id).cloned();
-        let region_codes: Vec<String> = split_tokens(&t.expect_regions_text)
-            .into_iter()
-            .map(|s| s.to_ascii_uppercase())
-            .collect();
+        let region_codes: Vec<String> = extract_region_tokens_lossy(&t.expect_regions_text);
         let picker_open = open_picker.as_deref() == Some(t.id.as_str());
         let saved_on_daemon = live.is_some();
-        let can_recheck = can_act && t.enabled && saved_on_daemon;
+        let can_recheck = can_act && t.enabled && (saved_on_daemon || dirty);
         let target_busy = busy_targets.contains(&t.id);
+        let del_armed = armed_del_target.as_deref() == Some(t.id.as_str());
         let fail_reason = live
             .filter(|ls| matches!(ls.state, TargetState::Fail | TargetState::Unverified))
-            .map(|ls| ls.reason.trim().to_string())
+            .map(|ls| {
+                let raw = ls.reason.trim();
+                if privacy_mask {
+                    crate::protocol::mask_ips_in_text(raw)
+                } else {
+                    raw.to_string()
+                }
+            })
             .filter(|r| !r.is_empty());
         let del_hover_bg = p.danger_soft_bg;
         let del_hover_bdr = p.danger_soft_border;
@@ -810,6 +816,8 @@ pub fn render_targets_page(
                                     ))
                                     .child(if target_busy {
                                         "重检中"
+                                    } else if dirty {
+                                        "保存并重检"
                                     } else if !saved_on_daemon {
                                         "待保存"
                                     } else {
@@ -823,15 +831,9 @@ pub fn render_targets_page(
                                                 MouseButton::Left,
                                                 cx.listener(move |_, _, _, cx| {
                                                     let id = tid_recheck.clone();
-                                                    let msg = format!("已重检：{tname_rc}");
+                                                    let name = tname_rc.clone();
                                                     ctrl_rc.update(cx, |c, cx| {
-                                                        c.send_request_msg(
-                                                            PipeRequest::RecheckNow {
-                                                                target_id: Some(id),
-                                                            },
-                                                            Some(msg),
-                                                            cx,
-                                                        );
+                                                        c.save_and_recheck_target(id, name, cx);
                                                     });
                                                 }),
                                             )
@@ -858,7 +860,37 @@ pub fn render_targets_page(
                                         }),
                                     ),
                                 )
-                                .child(
+                                .child(if del_armed {
+                                    action_button(
+                                        gpui::ElementId::Name(format!("tgt-del-{}", t.id).into()),
+                                        "确认删除？",
+                                        ButtonKind::DangerSoft,
+                                        true,
+                                        p,
+                                    )
+                                    .h(px(25.))
+                                    .px(px(8.))
+                                    .text_size(px(10.5))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            ctrl_del.update(cx, |c, cx| {
+                                                if c.arm_or_consume_confirm(
+                                                    format!("tgt-del-{tid_del}"),
+                                                    cx,
+                                                ) {
+                                                    c.delete_target_draft(&tid_del, cx);
+                                                    c.set_toast(
+                                                        "已移除自定义目标，点「保存配置」生效",
+                                                        true,
+                                                        cx,
+                                                    );
+                                                }
+                                            });
+                                        }),
+                                    )
+                                    .into_any_element()
+                                } else {
                                     div()
                                         .id(gpui::ElementId::Name(
                                             format!("tgt-del-{}", t.id).into(),
@@ -890,11 +922,15 @@ pub fn render_targets_page(
                                             MouseButton::Left,
                                             cx.listener(move |_, _, _, cx| {
                                                 ctrl_del.update(cx, |c, cx| {
-                                                    c.delete_target_draft(&tid_del, cx);
+                                                    let _ = c.arm_or_consume_confirm(
+                                                        format!("tgt-del-{tid_del}"),
+                                                        cx,
+                                                    );
                                                 });
                                             }),
-                                        ),
-                                )
+                                        )
+                                        .into_any_element()
+                                })
                             }),
                     ),
             )
@@ -929,28 +965,30 @@ pub fn render_targets_page(
                                 .text_color(rgb(p.text_secondary))
                                 .child("仅核验代理连通与延迟，不限地区或静态 IP。"),
                         )
-                        .child(
-                            div()
-                                .id(gpui::ElementId::Name(
-                                    format!("tgt-ag-jump-{}", t.id).into(),
-                                ))
-                                .flex_shrink_0()
-                                .cursor_pointer()
-                                .text_size(px(11.5))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(p.link_text))
-                                .hover(|s| s.opacity(0.80))
-                                .child("查看代理注入 →")
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |_, _, _, cx| {
-                                        ctrl_ag_jump.update(cx, |c, cx| {
-                                            c.env_tab = EnvSubTab::Antigravity;
-                                            c.set_nav(NavSection::Environment, cx);
-                                        });
-                                    }),
-                                ),
-                        )
+                        .when(t.id == "antigravity", |box_d| {
+                            box_d.child(
+                                div()
+                                    .id(gpui::ElementId::Name(
+                                        format!("tgt-ag-jump-{}", t.id).into(),
+                                    ))
+                                    .flex_shrink_0()
+                                    .cursor_pointer()
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(p.link_text))
+                                    .hover(|s| s.opacity(0.80))
+                                    .child("查看代理注入 →")
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            ctrl_ag_jump.update(cx, |c, cx| {
+                                                c.env_tab = EnvSubTab::Antigravity;
+                                                c.set_nav(NavSection::Environment, cx);
+                                            });
+                                        }),
+                                    ),
+                            )
+                        })
                 } else {
                     div()
                         .flex()

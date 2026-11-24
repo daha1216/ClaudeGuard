@@ -8,10 +8,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Keywords matching virtual TUN adapters (lowercase substring against description/friendly name).
+/// Note: `"meta"` is intentionally NOT matched as a raw substring so `"Meta Quest"` / `"Meta Virtual"`
+/// adapters are never misclassified as Clash Meta TUN.
 const TUN_KEYWORDS: &[&str] = &[
     "mihomo",
     "clash",
-    "meta",
     "sing-box",
     "singbox",
     "sing-tun",
@@ -39,7 +40,7 @@ const TUN_KEYWORDS: &[&str] = &[
     "xray",
 ];
 
-/// Split-tunnel / hypervisor / capture / transition adapters that do not route default AI traffic.
+/// Split-tunnel / hypervisor / VR / capture / transition adapters that do not route default AI traffic.
 const TUN_EXCLUDES: &[&str] = &[
     "tailscale",
     "zerotier",
@@ -47,6 +48,9 @@ const TUN_EXCLUDES: &[&str] = &[
     "netbird",
     "radmin",
     "hamachi",
+    "meta quest",
+    "meta virtual",
+    "oculus",
     "vethernet",
     "wsl",
     "hyper-v",
@@ -211,6 +215,35 @@ pub fn wide_to_string(units: &[u16]) -> String {
     String::from_utf16_lossy(units)
 }
 
+fn strip_ascii_prefix_ci<'a>(s: &'a str, prefix_ascii: &str) -> Option<&'a str> {
+    if !prefix_ascii.is_ascii() {
+        return None;
+    }
+    let head = s.as_bytes().get(..prefix_ascii.len())?;
+    head.eq_ignore_ascii_case(prefix_ascii.as_bytes())
+        .then(|| s.get(prefix_ascii.len()..))
+        .flatten()
+}
+
+fn has_standalone_ascii_word(lower: &str, word: &str) -> bool {
+    let hb = lower.as_bytes();
+    let wb = word.as_bytes();
+    if wb.is_empty() || hb.len() < wb.len() {
+        return false;
+    }
+    for start in 0..=(hb.len() - wb.len()) {
+        if &hb[start..start + wb.len()] == wb {
+            let prev_alnum = start > 0 && hb[start - 1].is_ascii_alphanumeric();
+            let end = start + wb.len();
+            let next_alnum = end < hb.len() && hb[end].is_ascii_alphanumeric();
+            if !prev_alnum && !next_alnum {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn is_tun_excluded(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     TUN_EXCLUDES.iter().any(|kw| lower.contains(kw))
@@ -227,14 +260,25 @@ fn has_bounded_tun_token(lower: &str) -> bool {
         })
 }
 
+fn has_valid_meta_tun_token(lower: &str) -> bool {
+    lower == "meta"
+        || (has_standalone_ascii_word(lower, "meta")
+            && (lower.contains("clash")
+                || lower.contains("mihomo")
+                || lower.contains("wintun")
+                || has_standalone_ascii_word(lower, "tun")
+                || has_bounded_tun_token(lower)))
+}
+
 /// Whether an adapter description or friendly name identifies a full-tunnel TUN interface.
 pub fn is_tun_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
+    let lower = name.trim().to_ascii_lowercase();
     if TUN_EXCLUDES.iter().any(|kw| lower.contains(kw)) {
         return false;
     }
     lower.starts_with("utun")
         || has_bounded_tun_token(&lower)
+        || has_valid_meta_tun_token(&lower)
         || TUN_KEYWORDS.iter().any(|kw| lower.contains(kw))
 }
 
@@ -257,9 +301,19 @@ pub fn select_tun(adapters: &[(String, String, bool)]) -> Option<String> {
     None
 }
 
+/// Select the first active (`Up`) TUN adapter verified to carry default public IPv4 routing
+/// from `(description, friendly_name, is_up, carries_default_route)` tuples.
+pub fn select_routed_tun(adapters: &[(String, String, bool, bool)]) -> Option<String> {
+    let filtered: Vec<(String, String, bool)> = adapters
+        .iter()
+        .map(|(desc, friendly, up, routed)| (desc.clone(), friendly.clone(), *up && *routed))
+        .collect();
+    select_tun(&filtered)
+}
+
 fn strip_scheme(value: &str) -> (Option<&str>, &str) {
     match value.find("://") {
-        Some(idx) => (Some(&value[..idx]), &value[idx + 3..]),
+        Some(idx) => (value.get(..idx), value.get(idx + 3..).unwrap_or("")),
         None => (None, value),
     }
 }
@@ -269,18 +323,21 @@ fn has_host_and_port(addr: &str) -> bool {
         let Some((host, after)) = rest.split_once(']') else {
             return false;
         };
-        if host.is_empty() {
+        if host.is_empty() || host.contains(['=', ' ', '\t', '\\', '/', '[', ']', '@']) {
             return false;
         }
         let Some(port) = after.strip_prefix(':') else {
             return false;
         };
-        !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
+        port.parse::<u16>().is_ok_and(|p| p > 0)
     } else {
         let Some((host, port)) = addr.rsplit_once(':') else {
             return false;
         };
-        !host.is_empty() && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
+        if host.is_empty() || host.contains([':', '=', ' ', '\t', '\\', '/', '[', ']', '@']) {
+            return false;
+        }
+        port.parse::<u16>().is_ok_and(|p| p > 0)
     }
 }
 
@@ -291,8 +348,7 @@ fn clean_addr(value: &str) -> Option<String> {
         return None;
     }
     if let Some(scheme) = scheme {
-        let scheme = scheme.to_ascii_lowercase();
-        if scheme != "http" && scheme != "https" {
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
             return None;
         }
     }
@@ -302,58 +358,71 @@ fn clean_addr(value: &str) -> Option<String> {
     Some(rest.to_string())
 }
 
-/// Parse Windows `ProxyServer` registry value (`host:port`, `http=h:p;https=h:p`, or URL form).
+fn is_socks_proxy_segment(part: &str) -> bool {
+    [
+        "socks=",
+        "socks4=",
+        "socks5=",
+        "socks://",
+        "socks4://",
+        "socks5://",
+        "socks5h://",
+    ]
+    .into_iter()
+    .any(|prefix| strip_ascii_prefix_ci(part, prefix).is_some())
+}
+
+/// Parse Windows `ProxyServer` registry value (`host:port`, `http=h:p`, `http=h:p;https=h:p`, or URL form).
 pub fn parse_proxy_server(raw: Option<&str>) -> ProxyParse {
     let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
         return ProxyParse::Empty;
     };
-    if raw.contains(';') {
-        let mut https = None;
-        let mut http = None;
-        let mut other = false;
-        for part in raw.split(';') {
-            let part = part.trim();
-            if part.is_empty() {
-                continue;
+
+    let mut https = None;
+    let mut http = None;
+    let mut saw_socks = false;
+    let mut saw_other = false;
+
+    for part in raw.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(rest) = strip_ascii_prefix_ci(part, "https=") {
+            if let Some(addr) = clean_addr(rest) {
+                https.get_or_insert(addr);
+            } else {
+                saw_other = true;
             }
-            let lower = part.to_ascii_lowercase();
-            if lower.starts_with("https=") {
-                if let Some(addr) = clean_addr(&part["https=".len()..]) {
-                    https.get_or_insert(addr);
-                } else {
-                    other = true;
-                }
-            } else if lower.starts_with("http=") {
-                if let Some(addr) = clean_addr(&part["http=".len()..]) {
-                    http.get_or_insert(addr);
-                } else {
-                    other = true;
-                }
-            } else if lower.contains('=') {
-                other = true;
-            } else if let Some(addr) = clean_addr(part) {
+        } else if let Some(rest) = strip_ascii_prefix_ci(part, "http=") {
+            if let Some(addr) = clean_addr(rest) {
                 http.get_or_insert(addr);
             } else {
-                other = true;
+                saw_other = true;
             }
-        }
-        if let Some(addr) = https.or(http) {
-            return ProxyParse::Http(addr);
-        }
-        return if other {
-            ProxyParse::Unsupported("仅配置了不支持的代理协议")
+        } else if is_socks_proxy_segment(part) {
+            saw_socks = true;
+        } else if part.contains('=') {
+            saw_other = true;
+        } else if let Some(addr) = clean_addr(part) {
+            http.get_or_insert(addr);
         } else {
-            ProxyParse::Empty
-        };
+            saw_other = true;
+        }
     }
-    let lower = raw.to_ascii_lowercase();
-    if lower.starts_with("socks") {
-        return ProxyParse::Unsupported("仅配置了 SOCKS 代理");
+
+    if let Some(addr) = https.or(http) {
+        return ProxyParse::Http(addr);
     }
-    match clean_addr(raw) {
-        Some(addr) => ProxyParse::Http(addr),
-        None => ProxyParse::Unsupported("代理地址缺少端口或协议不受支持"),
+    if saw_socks {
+        return ProxyParse::Unsupported(
+            "仅配置了 SOCKS 代理，缺少 HTTP/HTTPS 代理端口（探测需复用 HTTP 代理端口）",
+        );
     }
+    if saw_other {
+        return ProxyParse::Unsupported("代理地址缺少有效端口或协议不受支持");
+    }
+    ProxyParse::Empty
 }
 
 fn bypass_entries(raw: Option<&str>) -> Vec<String> {
@@ -695,10 +764,18 @@ fn sid_for_wts_session(session_id: u32) -> Option<String> {
     if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_pwstr) }.is_err() {
         return None;
     }
-    let sid_str = wide_to_string(&unsafe { pwstr_units(sid_pwstr) });
-    unsafe {
-        let _ = LocalFree(HLOCAL(sid_pwstr.0.cast::<c_void>()));
+    struct LocalPwstrGuard(windows::core::PWSTR);
+    impl Drop for LocalPwstrGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let _ = LocalFree(HLOCAL(self.0 .0.cast::<c_void>()));
+                }
+            }
+        }
     }
+    let _sid_guard = LocalPwstrGuard(sid_pwstr);
+    let sid_str = wide_to_string(&unsafe { pwstr_units(sid_pwstr) });
     if is_interactive_user_sid(&sid_str) {
         Some(sid_str)
     } else {
@@ -939,9 +1016,40 @@ unsafe fn adapter_has_usable_unicast(
     false
 }
 
-/// Detect active Up TUN adapter with at least one usable unicast IP using `IpHelper::GetAdaptersAddresses`.
+#[cfg(windows)]
+fn best_interface_for_ipv4(ip: std::net::Ipv4Addr) -> Option<u32> {
+    use windows::Win32::NetworkManagement::IpHelper::GetBestInterfaceEx;
+    use windows::Win32::Networking::WinSock::{AF_INET, IN_ADDR, IN_ADDR_0, SOCKADDR, SOCKADDR_IN};
+
+    let sin = SOCKADDR_IN {
+        sin_family: AF_INET,
+        sin_port: 0,
+        sin_addr: IN_ADDR {
+            S_un: IN_ADDR_0 {
+                S_addr: u32::from_ne_bytes(ip.octets()),
+            },
+        },
+        sin_zero: [0; 8],
+    };
+    let mut best_if_index: u32 = 0;
+    let rc = unsafe {
+        GetBestInterfaceEx(
+            (&sin as *const SOCKADDR_IN).cast::<SOCKADDR>(),
+            &mut best_if_index,
+        )
+    };
+    if rc == 0 && best_if_index != 0 {
+        Some(best_if_index)
+    } else {
+        None
+    }
+}
+
+/// Detect active Up TUN adapter verified to carry default public IPv4 routing (`104.18.0.1` & `1.1.1.1`)
+/// with at least one usable unicast IP using `IpHelper::GetAdaptersAddresses` + `GetBestInterfaceEx`.
 #[cfg(windows)]
 pub fn detect_tun_adapter() -> Option<String> {
+    use std::net::Ipv4Addr;
     use windows::Win32::NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
         GAA_FLAG_SKIP_MULTICAST, GET_ADAPTERS_ADDRESSES_FLAGS, IP_ADAPTER_ADDRESSES_LH,
@@ -950,6 +1058,9 @@ pub fn detect_tun_adapter() -> Option<String> {
 
     const FAMILY_UNSPEC: u32 = 0;
     const ERROR_BUFFER_OVERFLOW: u32 = 111;
+
+    let best_if_104 = best_interface_for_ipv4(Ipv4Addr::new(104, 18, 0, 1));
+    let best_if_111 = best_interface_for_ipv4(Ipv4Addr::new(1, 1, 1, 1));
 
     let flags = GET_ADAPTERS_ADDRESSES_FLAGS(
         GAA_FLAG_SKIP_ANYCAST.0 | GAA_FLAG_SKIP_MULTICAST.0 | GAA_FLAG_SKIP_DNS_SERVER.0,
@@ -967,18 +1078,21 @@ pub fn detect_tun_adapter() -> Option<String> {
             )
         };
         if rc == 0 {
-            let mut candidates: Vec<(String, String, bool)> = Vec::new();
+            let mut candidates: Vec<(String, String, bool, bool)> = Vec::new();
             let mut current = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
             while !current.is_null() {
                 let adapter = unsafe { &*current };
+                let if_index = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
                 let desc = wide_to_string(&unsafe { pwstr_units(adapter.Description) });
                 let friendly = wide_to_string(&unsafe { pwstr_units(adapter.FriendlyName) });
                 let is_up = adapter.OperStatus == IfOperStatusUp
                     && unsafe { adapter_has_usable_unicast(adapter.FirstUnicastAddress) };
-                candidates.push((desc, friendly, is_up));
+                let carries_default_route =
+                    if_index != 0 && best_if_104 == Some(if_index) && best_if_111 == Some(if_index);
+                candidates.push((desc, friendly, is_up, carries_default_route));
                 current = adapter.Next;
             }
-            return select_tun(&candidates);
+            return select_routed_tun(&candidates);
         }
         if rc != ERROR_BUFFER_OVERFLOW {
             return None;
@@ -1049,30 +1163,42 @@ mod tests {
             parse_proxy_server(Some("HTTPS://127.0.0.1:7891/")),
             ProxyParse::Http("127.0.0.1:7891".into())
         );
+        // Single-key ProxyServer without `;` must NEVER corrupt into `http://http=...`!
+        assert_eq!(
+            parse_proxy_server(Some("http=127.0.0.1:7890")),
+            ProxyParse::Http("127.0.0.1:7890".into())
+        );
+        assert_eq!(
+            parse_proxy_server(Some("https=127.0.0.1:7890")),
+            ProxyParse::Http("127.0.0.1:7890".into())
+        );
     }
 
     #[test]
     fn unsupported_and_incomplete_proxy_forms_are_rejected() {
-        assert!(matches!(
-            parse_proxy_server(Some("socks=127.0.0.1:1080")),
-            ProxyParse::Unsupported(_)
-        ));
-        assert!(matches!(
-            parse_proxy_server(Some("socks5://127.0.0.1:1080")),
-            ProxyParse::Unsupported(_)
-        ));
-        assert!(matches!(
-            parse_proxy_server(Some("127.0.0.1")),
-            ProxyParse::Unsupported(_)
-        ));
-        assert!(matches!(
-            parse_proxy_server(Some("[::1]")),
-            ProxyParse::Unsupported(_)
-        ));
-        assert!(matches!(
-            parse_proxy_server(Some("127.0.0.1:abc")),
-            ProxyParse::Unsupported(_)
-        ));
+        match parse_proxy_server(Some("socks=127.0.0.1:10808")) {
+            ProxyParse::Unsupported(note) => assert!(note.contains("HTTP")),
+            other => panic!("expected Unsupported for socks=, got {other:?}"),
+        }
+        match parse_proxy_server(Some("socks5://127.0.0.1:1080")) {
+            ProxyParse::Unsupported(note) => assert!(note.contains("HTTP")),
+            other => panic!("expected Unsupported for socks5://, got {other:?}"),
+        }
+        for bad in [
+            "127.0.0.1",
+            "[::1]",
+            "127.0.0.1:abc",
+            "127.0.0.1:0",
+            "127.0.0.1:70000",
+            "foo=127.0.0.1:7890",
+            "bad host:7890",
+            r"127.0.0.1\evil:7890",
+        ] {
+            assert!(
+                matches!(parse_proxy_server(Some(bad)), ProxyParse::Unsupported(_)),
+                "expected Unsupported for {bad}"
+            );
+        }
         assert!(matches!(
             verdict(&ev(true, None), None, &[]),
             AccessPath::Unknown { .. }
@@ -1163,6 +1289,49 @@ mod tests {
         assert!(is_tun_name("tun0"));
         assert!(is_tun_name("tun"));
         assert!(!is_tun_name("iTunes"));
+
+        // Meta Quest / Meta Virtual / split-tunnel / game accelerators rejected; Clash Meta / exact Meta accepted
+        assert!(is_tun_name("Meta"));
+        assert!(is_tun_name("Clash Meta TUN"));
+        assert!(is_tun_name("Meta Wintun"));
+        assert!(!is_tun_name("Meta Quest Remote Desktop"));
+        assert!(!is_tun_name("Meta Virtual Monitor"));
+        assert!(!is_tun_name("Metaverse Adapter"));
+        assert_eq!(
+            select_routed_tun(&[
+                // Split-tunnel corporate WireGuard / UU game accelerator without default route -> rejected!
+                (
+                    "WireGuard Tunnel".into(),
+                    "Corp Split VPN".into(),
+                    true,
+                    false
+                ),
+                (
+                    "Wintun Userspace Tunnel".into(),
+                    "UU Game Booster".into(),
+                    true,
+                    false
+                ),
+                (
+                    "Wintun Userspace Tunnel".into(),
+                    "Meta Quest".into(),
+                    true,
+                    true
+                ),
+                ("Mihomo Tunnel".into(), "Meta".into(), true, true),
+            ])
+            .as_deref(),
+            Some("Mihomo Tunnel")
+        );
+        assert_eq!(
+            select_routed_tun(&[(
+                "Wintun Userspace Tunnel".into(),
+                "雷神加速器".into(),
+                true,
+                false
+            )]),
+            None
+        );
     }
 
     #[test]

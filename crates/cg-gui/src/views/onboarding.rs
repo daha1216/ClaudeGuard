@@ -39,12 +39,16 @@ pub fn render_onboarding_modal(
     let onboarding_error = ctrl_r.onboarding_error.clone();
     let connected = ctrl_r.connected;
     let is_demo = ctrl_r.client.is_demo();
+    let busy = ctrl_r.busy_action;
+    let start_svc_busy = ctrl_r.is_scope_busy(&crate::app::ActionScope::StartService);
     let proxy_off_sim = ctrl_r.onboarding_proxy_off_sim;
     let cidr_in = ctrl_r.inputs.onboarding_cidr.clone();
     let reg_in = ctrl_r.inputs.onboarding_regions.clone();
 
     let ctrl_skip = ctrl.clone();
     let ctrl_done = ctrl.clone();
+    let ctrl_start_svc = ctrl.clone();
+    let ctrl_reconn = ctrl.clone();
     let ctrl_reprobe = ctrl.clone();
     let ctrl_sim_toggle = ctrl.clone();
 
@@ -398,7 +402,59 @@ pub fn render_onboarding_modal(
                                         .child(if loading { "探测中…" } else { "重新探测" })
                                 }),
                         )
-                        .child({
+                        .child(if !connected && !is_demo {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    action_button(
+                                        "onb-reconnect",
+                                        "重连服务",
+                                        ButtonKind::Secondary,
+                                        !busy,
+                                        p,
+                                    )
+                                    .when(!busy, |b| {
+                                        b.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _, _, cx| {
+                                                ctrl_reconn.update(cx, |c, cx| {
+                                                    c.send_request(
+                                                        crate::protocol::PipeRequest::GetSnapshot,
+                                                        Some("已重新连接守护服务"),
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                        )
+                                    }),
+                                )
+                                .child(
+                                    action_button(
+                                        "onb-start-service",
+                                        if start_svc_busy {
+                                            "启动中…"
+                                        } else {
+                                            "启动守护服务"
+                                        },
+                                        ButtonKind::Primary,
+                                        !busy,
+                                        p,
+                                    )
+                                    .when(!busy, |b| {
+                                        b.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _, _, cx| {
+                                                ctrl_start_svc.update(cx, |c, cx| {
+                                                    c.start_daemon_service(cx);
+                                                });
+                                            }),
+                                        )
+                                    }),
+                                )
+                                .into_any_element()
+                        } else {
                             let can_complete =
                                 connected && !loading && !submitting && probe.is_some();
                             let complete_label = if !connected {
@@ -425,6 +481,7 @@ pub fn render_onboarding_modal(
                                     }),
                                 )
                             })
+                            .into_any_element()
                         }),
                 )
                 .with_spring(

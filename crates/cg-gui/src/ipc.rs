@@ -122,6 +122,9 @@ impl DaemonClient {
                 snap.privacy_mask_ip = config.privacy_mask_ip;
                 snap.config = config;
                 snap.cfg_rev += 1;
+                if snap.lifecycle == Lifecycle::Armed {
+                    sync_demo_leak_shield_status(snap);
+                }
                 PipeResponse::Ack {
                     receipt: None,
                     snapshot: Some(Box::new(snap.clone())),
@@ -279,11 +282,15 @@ impl DaemonClient {
                         }
                     }
                 };
+                let cg_note = format!(
+                    "当前 v{} 已是最新正式版本（官方签名校验已启用）",
+                    env!("CARGO_PKG_VERSION")
+                );
                 touch(
                     &mut snap.updates.claudeguard,
                     "claudeguard",
                     false,
-                    "当前 v4.0.0 已是最新正式版本（官方签名校验已启用）",
+                    &cg_note,
                 );
                 touch(
                     &mut snap.updates.antigravity_proxy,
@@ -460,20 +467,7 @@ impl DaemonClient {
                 }
             }
             PipeRequest::SyncLeakShield => {
-                let quic = snap.config.leak_shield_quic;
-                let dns = snap.config.leak_shield_dns_doh;
-                let ipv6 = snap.config.leak_shield_ipv6;
-                let rules = usize::from(quic) * 4 + usize::from(dns) * 12 + usize::from(ipv6) * 4;
-                snap.leak_shield.enabled = rules > 0;
-                snap.leak_shield.quic_blocked = quic;
-                snap.leak_shield.dns_doh_blocked = dns;
-                snap.leak_shield.ipv6_blocked = ipv6;
-                snap.leak_shield.active_rules = rules;
-                snap.leak_shield.summary = if rules == 0 {
-                    "防泄露护盾已关闭".into()
-                } else {
-                    format!("已同步防泄露护盾规则（生效 {rules} 条）")
-                };
+                sync_demo_leak_shield_status(snap);
                 PipeResponse::Ack {
                     receipt: None,
                     snapshot: Some(Box::new(snap.clone())),
@@ -565,6 +559,23 @@ impl DaemonClient {
             }
         }
     }
+}
+
+fn sync_demo_leak_shield_status(snap: &mut GuardSnapshot) {
+    let quic = snap.config.leak_shield_quic;
+    let dns = snap.config.leak_shield_dns_doh;
+    let ipv6 = snap.config.leak_shield_ipv6;
+    let rules = usize::from(quic) * 4 + usize::from(dns) * 12 + usize::from(ipv6) * 4;
+    snap.leak_shield.enabled = rules > 0;
+    snap.leak_shield.quic_blocked = quic;
+    snap.leak_shield.dns_doh_blocked = dns;
+    snap.leak_shield.ipv6_blocked = ipv6;
+    snap.leak_shield.active_rules = rules;
+    snap.leak_shield.summary = if rules == 0 {
+        "防泄露护盾已关闭".into()
+    } else {
+        format!("已同步防泄露护盾规则（生效 {rules} 条）")
+    };
 }
 
 /// Validates a Windows Named Pipe endpoint path (`\\.\pipe\<name>`).
@@ -1088,6 +1099,39 @@ pub fn open_external_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Requests UAC elevation to start the `ClaudeGuardService` Windows Service (`sc.exe start ClaudeGuardService`).
+#[cfg(windows)]
+pub fn start_daemon_service_elevated() -> Result<(), String> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    use windows::core::{PCWSTR, w};
+
+    // SAFETY: Static wide literals outlive ShellExecuteW.
+    let res = unsafe {
+        ShellExecuteW(
+            None,
+            w!("runas"),
+            w!("sc.exe"),
+            w!("start ClaudeGuardService"),
+            PCWSTR::null(),
+            SW_HIDE,
+        )
+    };
+    let code = res.0 as isize;
+    if code <= 32 {
+        if code == 5 {
+            return Err("已取消管理员授权（UAC），可复制命令在管理员终端手动启动".into());
+        }
+        return Err(format!("拉起 ClaudeGuardService 失败（错误码 {code}）"));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn start_daemon_service_elevated() -> Result<(), String> {
+    Err("仅 Windows 支持通过服务管理器启动 ClaudeGuardService".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1144,6 +1188,30 @@ mod tests {
             gate_disarmed,
             PipeResponse::LaunchGate { allowed: false, .. }
         ));
+    }
+
+    #[test]
+    fn demo_save_config_syncs_leak_shield_when_armed() {
+        let client = DaemonClient::new(TransportEndpoint::Demo(DemoScenario::Pass));
+        let mut cfg = build_demo_snapshot(DemoScenario::Pass).config;
+        cfg.leak_shield_quic = true;
+        cfg.leak_shield_dns_doh = true;
+        cfg.leak_shield_ipv6 = true;
+        let resp = client
+            .exchange(PipeRequest::SaveConfig { config: cfg })
+            .expect("save config");
+        match resp {
+            PipeResponse::Ack {
+                snapshot: Some(snap),
+                ..
+            } => {
+                assert!(snap.leak_shield.quic_blocked);
+                assert!(snap.leak_shield.dns_doh_blocked);
+                assert!(snap.leak_shield.ipv6_blocked);
+                assert_eq!(snap.leak_shield.active_rules, 20);
+            }
+            other => panic!("unexpected SaveConfig response: {other:?}"),
+        }
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use crate::state::OperationReceipt;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 pub fn default_true() -> bool {
     true
@@ -118,16 +118,25 @@ pub struct Target {
 }
 
 impl Target {
-    /// Extracts the authority/host portion from `anchor_url`.
+    /// Extracts the clean host portion from `anchor_url` (stripping `@` userinfo and `:port`,
+    /// while preserving bracketed IPv6 hosts such as `[2606:4700::1]`).
     pub fn host(&self) -> String {
-        self.anchor_url
+        let trimmed = self.anchor_url.trim();
+        let authority = trimmed
             .split("://")
             .nth(1)
-            .unwrap_or(&self.anchor_url)
-            .split(['/', '?', '#'])
+            .unwrap_or(trimmed)
+            .split(['/', '?', '#', '\\'])
             .next()
-            .unwrap_or("")
-            .to_string()
+            .unwrap_or("");
+        let host_port = authority.rsplit('@').next().unwrap_or(authority).trim();
+        if host_port.starts_with('[') {
+            if let Some(end) = host_port.find(']') {
+                return host_port[..=end].to_string();
+            }
+            return host_port.to_string();
+        }
+        host_port.split(':').next().unwrap_or(host_port).to_string()
     }
 
     /// Returns true if at least one IP/CIDR or region expectation is configured.
@@ -1105,11 +1114,75 @@ impl fmt::Display for Ipv4Cidr {
     }
 }
 
-/// Parsed IP allowlist rule supporting both exact IPv4/IPv6 and IPv4 CIDR subnets.
+/// Parsed IPv6 CIDR subnet (e.g. `2606:4700::/32`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Ipv6Cidr {
+    pub network: u128,
+    pub prefix_len: u8,
+}
+
+impl Ipv6Cidr {
+    /// Parses an IPv6 CIDR string like `2606:4700::/32`, normalizing host bits to the network address.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (ip_part, prefix_part) = raw.trim().split_once('/')?;
+        let addr: Ipv6Addr = ip_part.trim().parse().ok()?;
+        if addr.to_ipv4_mapped().is_some() {
+            return None;
+        }
+        let prefix_len: u8 = prefix_part.trim().parse().ok()?;
+        if prefix_len > 128 {
+            return None;
+        }
+        let mask = Self::mask_for(prefix_len);
+        Some(Self {
+            network: u128::from(addr) & mask,
+            prefix_len,
+        })
+    }
+
+    pub const fn mask_for(prefix_len: u8) -> u128 {
+        if prefix_len == 0 {
+            0
+        } else if prefix_len >= 128 {
+            !0u128
+        } else {
+            !0u128 << (128 - prefix_len)
+        }
+    }
+
+    /// Returns true if `ip` belongs to this IPv6 CIDR subnet.
+    pub fn contains(self, ip: Ipv6Addr) -> bool {
+        (u128::from(ip) & Self::mask_for(self.prefix_len)) == self.network
+    }
+
+    /// Formats canonical `ipv6/prefix` representation.
+    pub fn canonical(self) -> String {
+        format!("{}/{}", Ipv6Addr::from(self.network), self.prefix_len)
+    }
+}
+
+impl fmt::Display for Ipv6Cidr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", Ipv6Addr::from(self.network), self.prefix_len)
+    }
+}
+
+fn canonical_ip_addr(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+    }
+}
+
+/// Parsed IP allowlist rule supporting exact IPv4/IPv6, IPv4 CIDR, and IPv6 CIDR subnets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IpRule {
     Exact(IpAddr),
     CidrV4(Ipv4Cidr),
+    Ipv6Cidr { network: u128, prefix_len: u8 },
 }
 
 impl IpRule {
@@ -1118,39 +1191,89 @@ impl IpRule {
         if text.is_empty() {
             return None;
         }
-        if text.contains('/') {
-            Ipv4Cidr::parse(text).map(Self::CidrV4)
+        if let Some((ip_part, prefix_part)) = text.split_once('/') {
+            if let Some(v4_cidr) = Ipv4Cidr::parse(text) {
+                return Some(Self::CidrV4(v4_cidr));
+            }
+            let addr: Ipv6Addr = ip_part.trim().parse().ok()?;
+            let prefix_len: u8 = prefix_part.trim().parse().ok()?;
+            if prefix_len > 128 {
+                return None;
+            }
+            if let Some(v4) = addr.to_ipv4_mapped() {
+                if prefix_len < 96 {
+                    return None;
+                }
+                let v4_prefix = prefix_len - 96;
+                let mask = Ipv4Cidr::mask_for(v4_prefix);
+                return Some(Self::CidrV4(Ipv4Cidr {
+                    network: u32::from(v4) & mask,
+                    prefix_len: v4_prefix,
+                }));
+            }
+            let mask = Ipv6Cidr::mask_for(prefix_len);
+            Some(Self::Ipv6Cidr {
+                network: u128::from(addr) & mask,
+                prefix_len,
+            })
         } else {
-            text.parse::<IpAddr>().ok().map(Self::Exact)
+            text.parse::<IpAddr>()
+                .ok()
+                .map(|ip| Self::Exact(canonical_ip_addr(ip)))
+        }
+    }
+
+    pub fn contains(self, ip: IpAddr) -> bool {
+        let ip = canonical_ip_addr(ip);
+        match (self, ip) {
+            (Self::Exact(expected), actual) => canonical_ip_addr(expected) == actual,
+            (Self::CidrV4(cidr), IpAddr::V4(v4)) => cidr.contains(v4),
+            (Self::CidrV4(_), IpAddr::V6(_)) => false,
+            (
+                Self::Ipv6Cidr {
+                    network,
+                    prefix_len,
+                },
+                IpAddr::V6(v6),
+            ) => (u128::from(v6) & Ipv6Cidr::mask_for(prefix_len)) == network,
+            (Self::Ipv6Cidr { .. }, IpAddr::V4(_)) => false,
         }
     }
 
     pub fn matches(self, ip: IpAddr) -> bool {
-        match (self, ip) {
-            (Self::Exact(expected), actual) => expected == actual,
-            (Self::CidrV4(cidr), IpAddr::V4(v4)) => cidr.contains(v4),
-            (Self::CidrV4(_), IpAddr::V6(_)) => false,
-        }
+        self.contains(ip)
     }
 
     pub fn canonical(self) -> String {
-        match self {
-            Self::Exact(ip) => ip.to_string(),
-            Self::CidrV4(cidr) => cidr.canonical(),
+        self.to_string()
+    }
+}
+
+impl fmt::Display for IpRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Exact(ip) => write!(f, "{}", canonical_ip_addr(ip)),
+            Self::CidrV4(cidr) => write!(f, "{cidr}"),
+            Self::Ipv6Cidr {
+                network,
+                prefix_len,
+            } => write!(f, "{}/{}", Ipv6Addr::from(network), prefix_len),
         }
     }
 }
 
-/// Normalizes a single exact IP string (rejecting CIDRs or invalid syntax).
+/// Normalizes a single exact IP string (canonicalizing IPv4-mapped IPv6 and rejecting CIDRs or invalid syntax).
 pub fn normalize_ip(raw: &str) -> Option<String> {
     let text = raw.trim();
     if text.is_empty() {
         return None;
     }
-    text.parse::<IpAddr>().ok().map(|ip| ip.to_string())
+    text.parse::<IpAddr>()
+        .ok()
+        .map(|ip| canonical_ip_addr(ip).to_string())
 }
 
-/// Normalizes an exact IP or IPv4 CIDR allowlist entry.
+/// Normalizes an exact IP or IPv4/IPv6 CIDR allowlist entry.
 pub fn normalize_ip_or_cidr(raw: &str) -> Option<String> {
     IpRule::parse(raw).map(IpRule::canonical)
 }
@@ -1160,7 +1283,7 @@ pub fn matched_ip_rule(expect: &[String], ip: &str) -> Option<String> {
     let parsed_ip: IpAddr = ip.trim().parse().ok()?;
     for entry in expect {
         if let Some(rule) = IpRule::parse(entry)
-            && rule.matches(parsed_ip)
+            && rule.contains(parsed_ip)
         {
             return Some(rule.canonical());
         }
@@ -1466,11 +1589,47 @@ mod tests {
 
     #[test]
     fn ipv6_and_cidr_edge_cases() {
-        let rules = vec!["2001:db8::1".into(), "198.51.100.42/32".into()];
+        let rules = vec![
+            "2001:db8::1".into(),
+            "198.51.100.42/32".into(),
+            "2606:4700::1234/32".into(),
+            "2001:db8:abcd:0012::99/64".into(),
+        ];
         assert!(ip_hit(&rules, "2001:0db8:0000:0000:0000:0000:0000:0001"));
         assert!(ip_hit(&rules, "198.51.100.42"));
         assert!(!ip_hit(&rules, "198.51.100.43"));
-        assert!(IpRule::parse("2001:db8::/32").is_none());
+        assert_eq!(
+            matched_ip_rule(&rules, "2606:4700:4700::1111").as_deref(),
+            Some("2606:4700::/32")
+        );
+        assert_eq!(
+            matched_ip_rule(&rules, "2001:db8:abcd:12::dead:beef").as_deref(),
+            Some("2001:db8:abcd:12::/64")
+        );
+        assert!(!ip_hit(&rules, "2001:db8:abcd:13::1"));
+        assert!(IpRule::parse("2001:db8::/129").is_none());
+
+        // IPv4-mapped IPv6 canonicalization (`::ffff:198.51.100.98` -> `198.51.100.98`)
+        assert_eq!(
+            normalize_ip("::ffff:198.51.100.98").as_deref(),
+            Some("198.51.100.98")
+        );
+        assert_eq!(
+            normalize_ip_or_cidr("::ffff:198.51.100.98").as_deref(),
+            Some("198.51.100.98")
+        );
+        assert_eq!(
+            normalize_ip_or_cidr("::ffff:198.51.100.98/120").as_deref(),
+            Some("198.51.100.0/24")
+        );
+        assert!(ip_hit(&["198.51.100.0/24".into()], "::ffff:198.51.100.98"));
+
+        // Target::host() strips @ userinfo and :port while preserving bracketed IPv6
+        let mut t = default_builtin_targets(&[], &["US".into()])[1].clone();
+        t.anchor_url = "https://user:pass@claude.ai:8443/cdn-cgi/trace".into();
+        assert_eq!(t.host(), "claude.ai");
+        t.anchor_url = "https://[2606:4700::1]:443/cdn-cgi/trace".into();
+        assert_eq!(t.host(), "[2606:4700::1]");
     }
 
     #[test]

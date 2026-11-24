@@ -19,9 +19,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::VecDeque;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tempfile::NamedTempFile;
 
 const MAX_QUEUE: usize = 64;
 const MAX_FAILED: usize = 64;
@@ -259,14 +261,22 @@ impl FeishuNotifier {
     }
 
     fn persist_locked(&self, st: &StoredFeishu) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败：{e}"))?;
-        }
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| "飞书配置路径缺少父目录".to_string())?;
+        crate::journal::ensure_secure_data_dir(parent)?;
         let bytes =
             serde_json::to_vec_pretty(st).map_err(|e| format!("序列化飞书配置失败：{e}"))?;
-        let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, &bytes).map_err(|e| format!("写入飞书配置临时文件失败：{e}"))?;
-        fs::rename(&tmp, &self.path).map_err(|e| format!("原子落盘飞书配置失败：{e}"))?;
+        let mut tmp =
+            NamedTempFile::new_in(parent).map_err(|e| format!("创建飞书配置临时文件失败：{e}"))?;
+        tmp.write_all(&bytes)
+            .map_err(|e| format!("写入飞书配置临时文件失败：{e}"))?;
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| format!("同步飞书配置临时文件失败：{e}"))?;
+        tmp.persist(&self.path)
+            .map_err(|e| format!("原子落盘飞书配置失败：{}", e.error))?;
         Ok(())
     }
 

@@ -81,7 +81,8 @@ pub fn current_windows_arch() -> &'static str {
     }
 }
 
-/// Strip prefixes like `rust-v`, `v`, `V` cleanly before SemVer comparison.
+/// Strip prefixes like `rust-v`, `v`, `V` cleanly and normalize `YYYY-MM-DD` date versions
+/// into `YYYY.MM.DD` before SemVer comparison.
 pub fn normalize_version(raw: &str) -> String {
     let mut s = raw.trim();
     for prefix in ["rust-v", "rust-V", "v", "V"] {
@@ -90,7 +91,28 @@ pub fn normalize_version(raw: &str) -> String {
             break;
         }
     }
-    s.trim().to_string()
+    let s = s.trim();
+    if let Some(head) = s.as_bytes().get(..10) {
+        let is_ymd_hyphen = head[0..4].iter().all(|c| c.is_ascii_digit())
+            && head[4] == b'-'
+            && head[5..7].iter().all(|c| c.is_ascii_digit())
+            && head[7] == b'-'
+            && head[8..10].iter().all(|c| c.is_ascii_digit())
+            && matches!(s.as_bytes().get(10), None | Some(b'-' | b'+'));
+        if is_ymd_hyphen {
+            let year = s.get(..4).and_then(|y| y.parse::<u32>().ok()).unwrap_or(0);
+            let month = s.get(5..7).and_then(|m| m.parse::<u32>().ok()).unwrap_or(0);
+            let day = s
+                .get(8..10)
+                .and_then(|d| d.parse::<u32>().ok())
+                .unwrap_or(0);
+            if year >= 2020 && (1..=12).contains(&month) && (1..=31).contains(&day) {
+                let tail = s.get(10..).unwrap_or("");
+                return format!("{year:04}.{month:02}.{day:02}{tail}");
+            }
+        }
+    }
+    s.to_string()
 }
 
 fn parse_semver_parts(raw: &str) -> Option<(Vec<u64>, Option<String>)> {
@@ -297,10 +319,7 @@ pub fn is_date_version(v: &str) -> bool {
 
 fn extract_published_ymd(published_at: Option<&str>) -> Option<String> {
     let raw = published_at?.trim();
-    if raw.len() < 10 || !raw.is_char_boundary(10) {
-        return None;
-    }
-    let head = &raw[..10];
+    let head = raw.get(..10)?;
     let b = head.as_bytes();
     let valid = b[0..4].iter().all(|c| c.is_ascii_digit())
         && (b[4] == b'-' || b[4] == b'.' || b[4] == b'/')
@@ -310,13 +329,14 @@ fn extract_published_ymd(published_at: Option<&str>) -> Option<String> {
     valid.then(|| head.replace(['-', '/'], "."))
 }
 
-fn strip_ascii_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() < prefix.len() || !s.is_char_boundary(prefix.len()) {
+fn strip_ascii_prefix_ci<'a>(s: &'a str, prefix_ascii: &str) -> Option<&'a str> {
+    if !prefix_ascii.is_ascii() {
         return None;
     }
-    s[..prefix.len()]
-        .eq_ignore_ascii_case(prefix)
-        .then_some(&s[prefix.len()..])
+    let head = s.as_bytes().get(..prefix_ascii.len())?;
+    head.eq_ignore_ascii_case(prefix_ascii.as_bytes())
+        .then(|| s.get(prefix_ascii.len()..))
+        .flatten()
 }
 
 fn find_ascii_ci(haystack: &str, needle_lower: &str) -> Option<usize> {
@@ -358,8 +378,9 @@ fn extract_attr_value<'a>(tag: &'a str, attr_name_lower: &str) -> Option<&'a str
                 if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
                     let quote = bytes[j];
                     let start = j + 1;
-                    if let Some(rel_end) = tag[start..].find(quote as char) {
-                        return Some(&tag[start..start + rel_end]);
+                    let after_quote = tag.get(start..)?;
+                    if let Some(rel_end) = after_quote.find(quote as char) {
+                        return after_quote.get(..rel_end);
                     }
                 }
             }
@@ -647,11 +668,11 @@ fn fetch_github_latest_via_web_redirect_base(
     }
     let html_url = format!("https://github.com/{trimmed}/releases/tag/{tag}");
 
-    let requests_cg_exe = preferred_exts.iter().any(|ext| {
+    let requests_cg_setup = preferred_exts.iter().any(|ext| {
         let e = ext.trim().to_ascii_lowercase();
-        e == "-setup.exe" || e == ".exe"
+        e.contains("setup")
     });
-    if trimmed.eq_ignore_ascii_case(CLAUDEGUARD_REPO) && requests_cg_exe {
+    if trimmed.eq_ignore_ascii_case(CLAUDEGUARD_REPO) && requests_cg_setup {
         return Ok(GithubReleaseInfo {
             tag_name: tag.clone(),
             version,
@@ -854,9 +875,9 @@ pub fn parse_github_latest_commit(
         .or_else(|| first.pointer("/commit/author/date"))
         .and_then(|v| v.as_str())
         .map(str::trim)
-        .filter(|s| s.len() >= 10)
         .ok_or_else(|| PlatformError::Network("GitHub 提交记录缺少有效日期".to_string()))?;
-    let ymd = date_raw[..10].replace('-', ".");
+    let ymd = extract_published_ymd(Some(date_raw))
+        .ok_or_else(|| PlatformError::Network("GitHub 提交记录缺少有效日期".to_string()))?;
     let sha = first
         .get("sha")
         .and_then(|v| v.as_str())
@@ -2915,5 +2936,15 @@ abcdef0123456789abcdef0123456789abcdef01 AnthropicClaude-1.1.381-full.nupkg 1185
             .antigravity_proxy
             .note
             .contains("已注入有效模块（上游最新 v2.7.0）"));
+
+        // 4. UTF-8 multi-byte Chinese date strings must NEVER panic in parse_github_latest_commit,
+        //    and YYYY-MM-DD tags normalize cleanly to YYYY.MM.DD!
+        assert!(parse_github_latest_commit(
+            r#"[{"sha":"abc1234","commit":{"committer":{"date":"2026年11月24日"}}}]"#,
+            ANTIGRAVITY_CN_REPO,
+        )
+        .is_err());
+        assert_eq!(normalize_version("v2026-11-24"), "2026.11.24");
+        assert!(is_version_newer("2026-11-24", "2026.11.20"));
     }
 }

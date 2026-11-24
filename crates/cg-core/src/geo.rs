@@ -14,6 +14,14 @@ pub struct Place {
 /// Cloudflare `colo` IATA code table sorted alphabetically.
 pub const PLACES: &[Place] = &[
     Place {
+        colo: "ADL",
+        city: "阿德莱德",
+        country: "AU",
+        tz: "Cen. Australia Standard Time",
+        lat: -34.9285,
+        lon: 138.6007,
+    },
+    Place {
         colo: "AKL",
         city: "奥克兰",
         country: "NZ",
@@ -60,6 +68,14 @@ pub const PLACES: &[Place] = &[
         tz: "SE Asia Standard Time",
         lat: 13.7563,
         lon: 100.5018,
+    },
+    Place {
+        colo: "BNE",
+        city: "布里斯班",
+        country: "AU",
+        tz: "E. Australia Standard Time",
+        lat: -27.4698,
+        lon: 153.0251,
     },
     Place {
         colo: "BOM",
@@ -318,6 +334,14 @@ pub const PLACES: &[Place] = &[
         lon: 10.7522,
     },
     Place {
+        colo: "PER",
+        city: "珀斯",
+        country: "AU",
+        tz: "W. Australia Standard Time",
+        lat: -31.9505,
+        lon: 115.8605,
+    },
+    Place {
         colo: "PRG",
         city: "布拉格",
         country: "CZ",
@@ -423,7 +447,7 @@ pub const PLACES: &[Place] = &[
     },
 ];
 
-/// Single-timezone country fallbacks (multi-timezone countries like US/CA/RU are omitted intentionally).
+/// Single-timezone country fallbacks (multi-timezone countries like US/CA/RU/AU are omitted intentionally).
 pub const COUNTRY_FALLBACK: &[Place] = &[
     Place {
         colo: "",
@@ -595,14 +619,6 @@ pub const COUNTRY_FALLBACK: &[Place] = &[
     },
     Place {
         colo: "",
-        city: "悉尼",
-        country: "AU",
-        tz: "AUS Eastern Standard Time",
-        lat: -33.8688,
-        lon: 151.2093,
-    },
-    Place {
-        colo: "",
         city: "奥克兰",
         country: "NZ",
         tz: "New Zealand Standard Time",
@@ -648,11 +664,26 @@ mod tests {
     fn colo_and_country_lookup_work() {
         assert_eq!(by_colo("lax").map(|p| p.city), Some("洛杉矶"));
         assert_eq!(by_colo("nrt").map(|p| p.tz), Some("Tokyo Standard Time"));
+        assert_eq!(
+            by_colo("per").map(|p| p.tz),
+            Some("W. Australia Standard Time")
+        );
+        assert_eq!(
+            by_colo("adl").map(|p| p.tz),
+            Some("Cen. Australia Standard Time")
+        );
+        assert_eq!(
+            by_colo("bne").map(|p| p.tz),
+            Some("E. Australia Standard Time")
+        );
         assert!(by_colo("ZZZ").is_none());
         assert!(by_country("JP").is_some());
         assert!(by_country("US").is_none());
+        assert!(by_country("CA").is_none());
+        assert!(by_country("AU").is_none());
         assert_eq!(resolve(Some("LAX"), Some("US")).unwrap().city, "洛杉矶");
         assert_eq!(resolve(Some("XXX"), Some("JP")).unwrap().city, "东京");
+        assert!(resolve(None, Some("AU")).is_none());
     }
 
     #[test]

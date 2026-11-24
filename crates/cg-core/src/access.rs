@@ -149,7 +149,11 @@ fn strip_scheme(value: &str) -> (Option<&str>, &str) {
 fn clean_addr(value: &str) -> Option<String> {
     let (scheme, rest) = strip_scheme(value.trim());
     let rest = rest.trim().trim_end_matches('/');
-    if rest.is_empty() {
+    if rest.is_empty()
+        || rest.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '@' | '/' | '\\' | '?' | '#')
+        })
+    {
         return None;
     }
     if let Some(scheme) = scheme {
@@ -158,10 +162,27 @@ fn clean_addr(value: &str) -> Option<String> {
             return None;
         }
     }
-    if !rest.contains(':') {
+    if rest.starts_with('[') {
+        let close = rest.find(']')?;
+        let inner = &rest[1..close];
+        inner.parse::<std::net::Ipv6Addr>().ok()?;
+        let port_str = rest[close + 1..].strip_prefix(':')?;
+        if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let port = port_str.parse::<u16>().ok().filter(|&p| p > 0)?;
+        return Some(format!("[{inner}]:{port}"));
+    }
+    if rest.contains(']') || rest.matches(':').count() != 1 {
         return None;
     }
-    Some(rest.to_string())
+    let (host, port_str) = rest.split_once(':')?;
+    let host = host.trim();
+    if host.is_empty() || port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let port = port_str.parse::<u16>().ok().filter(|&p| p > 0)?;
+    Some(format!("{host}:{port}"))
 }
 
 /// Parses Windows `ProxyServer` strings (`host:port`, `http=...;https=...`, or scheme-prefixed).
@@ -330,6 +351,19 @@ pub fn bypass_hits_host(entry: &str, host: &str) -> bool {
     if e == "*." {
         return !host.contains('.');
     }
+    let e_unbracketed = e
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(e.as_str());
+    let host_unbracketed = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host.as_str());
+    if (e_unbracketed.contains(':') || host_unbracketed.contains(':'))
+        && (e_unbracketed == host_unbracketed || wildcard_match(e_unbracketed, host_unbracketed))
+    {
+        return true;
+    }
     let domain = entry_domain(&e).trim_end_matches('.').to_string();
     if domain.is_empty() || domain == "*" {
         return true;
@@ -362,14 +396,16 @@ pub fn monitored_hosts(cfg: &Config) -> Vec<String> {
     let mut out = Vec::new();
     for target in cfg.enabled_targets() {
         let host = target.host();
-        let clean = host
-            .rsplit('@')
-            .next()
-            .unwrap_or(&host)
-            .split(':')
-            .next()
-            .unwrap_or(&host)
-            .to_ascii_lowercase();
+        let hp = host.rsplit('@').next().unwrap_or(&host).trim();
+        let stripped = if hp.starts_with('[') {
+            match hp.find(']') {
+                Some(end) => &hp[..=end],
+                None => hp,
+            }
+        } else {
+            hp.split(':').next().unwrap_or(hp)
+        };
+        let clean = stripped.trim_end_matches('.').to_ascii_lowercase();
         if !clean.is_empty() && !out.contains(&clean) {
             out.push(clean);
         }
@@ -629,5 +665,33 @@ mod tests {
             parse_proxy_server(Some("127.0.0.1")),
             ProxyParse::Unsupported(_)
         ));
+        assert!(matches!(
+            parse_proxy_server(Some("127.0.0.1:0")),
+            ProxyParse::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse_proxy_server(Some("::1")),
+            ProxyParse::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse_proxy_server(Some("[::1]")),
+            ProxyParse::Unsupported(_)
+        ));
+        assert_eq!(
+            parse_proxy_server(Some("[::1]:7890")),
+            ProxyParse::Http("[::1]:7890".into())
+        );
+        assert_eq!(
+            parse_proxy_server(Some("http://[2001:db8::1]:7897/")),
+            ProxyParse::Http("[2001:db8::1]:7897".into())
+        );
+
+        let mut cfg = Config::default();
+        cfg.targets[1].anchor_url = "https://user:secret@Claude.AI:8443/cdn-cgi/trace".into();
+        cfg.targets[2].anchor_url = "https://[2606:4700::1]:443/cdn-cgi/trace".into();
+        let mhosts = monitored_hosts(&cfg);
+        assert!(mhosts.contains(&"claude.ai".to_string()));
+        assert!(mhosts.contains(&"[2606:4700::1]".to_string()));
+        assert!(bypass_hits_host("2606:4700::*", "[2606:4700::1]"));
     }
 }

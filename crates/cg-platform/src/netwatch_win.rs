@@ -32,10 +32,11 @@ pub struct TcpConn {
     pub port: u16,
 }
 
-/// TUN fake-ip ranges: `198.18.0.0/15` (RFC 2544) and `28.0.0.0/8` (Clash/Mihomo/sing-box/Surge).
+/// TUN fake-ip range: `198.18.0.0/15` (RFC 2544 benchmark block used by Clash/Mihomo/sing-box).
+/// Note: `28.0.0.0/8` is public routable IPv4 space and must NEVER be treated as fake-ip.
 pub fn is_fake_ip_v4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
-    (o[0] == 198 && (o[1] == 18 || o[1] == 19)) || o[0] == 28
+    o[0] == 198 && (o[1] == 18 || o[1] == 19)
 }
 
 fn ipv4_from_v6_compat(v6: Ipv6Addr) -> Option<Ipv4Addr> {
@@ -72,7 +73,7 @@ pub fn canonical_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Whether `ip` falls in a TUN fake-ip block (`198.18.0.0/15`, `28.0.0.0/8`, `fdfe:dcba:9876::/48`, `fc00::/18`).
+/// Whether `ip` falls in a TUN fake-ip block (`198.18.0.0/15`, `fdfe:dcba:9876::/48`, `fc00::/18`).
 pub fn is_fake_ip_addr(ip: IpAddr) -> bool {
     match canonical_ip(ip) {
         IpAddr::V4(v4) => is_fake_ip_v4(v4),
@@ -575,9 +576,13 @@ mod tests {
     }
 
     #[test]
-    fn nat64_28_slash_8_and_ipv6_fake_ip_pools_handled_cleanly() {
-        // 28.0.0.0/8 fake-ip & Class E 240.0.0.0/4 local
-        assert!(is_fake_ip_v4(Ipv4Addr::new(28, 1, 2, 3)));
+    fn nat64_public_28_slash_8_and_ipv6_fake_ip_pools_handled_cleanly() {
+        // 28.0.0.0/8 is routable public IPv4 (NOT fake-ip!), whereas Class E 240.0.0.0/4 is local
+        assert!(!is_fake_ip_v4(Ipv4Addr::new(28, 1, 2, 3)));
+        assert_eq!(
+            classify(IpAddr::V4(Ipv4Addr::new(28, 1, 2, 3)), 443, 7890),
+            Remote::Public
+        );
         assert!(is_local_v4(Ipv4Addr::new(240, 0, 0, 1)));
         assert_eq!(
             classify(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1)), 443, 7890),
@@ -592,7 +597,11 @@ mod tests {
         );
         assert_eq!(classify(nat64_pub, 443, 7890), Remote::Public);
 
-        let nat64_fake: IpAddr = "64:ff9b::28.0.0.9".parse().unwrap();
+        let nat64_28: IpAddr = "64:ff9b::28.0.0.9".parse().unwrap();
+        assert!(!is_fake_ip_addr(nat64_28));
+        assert_eq!(classify(nat64_28, 443, 7890), Remote::Public);
+
+        let nat64_fake: IpAddr = "64:ff9b::198.18.0.9".parse().unwrap();
         assert!(is_fake_ip_addr(nat64_fake));
         assert_eq!(classify(nat64_fake, 443, 7890), Remote::Local);
 

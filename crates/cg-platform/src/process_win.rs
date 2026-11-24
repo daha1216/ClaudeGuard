@@ -117,11 +117,37 @@ pub fn is_agent_scm_service_exe(exe_name_l: &str) -> bool {
     )
 }
 
-/// Zero-allocation case-insensitive directory prefix check enforcing a path-separator boundary
-/// so `...\Programs\antigravity` never falsely matches `...\Programs\antigravity ide`.
+pub(crate) fn strip_ascii_prefix_ci<'a>(s: &'a str, prefix_ascii: &str) -> Option<&'a str> {
+    if !prefix_ascii.is_ascii() {
+        return None;
+    }
+    let head = s.as_bytes().get(..prefix_ascii.len())?;
+    head.eq_ignore_ascii_case(prefix_ascii.as_bytes())
+        .then(|| s.get(prefix_ascii.len()..))
+        .flatten()
+}
+
+fn strip_verbatim_win32_str(raw: &str) -> std::borrow::Cow<'_, str> {
+    let t = raw.trim();
+    if let Some(unc) =
+        strip_ascii_prefix_ci(t, r"\\?\UNC\").or_else(|| strip_ascii_prefix_ci(t, "//?/UNC/"))
+    {
+        std::borrow::Cow::Owned(format!(r"\\{unc}"))
+    } else if let Some(dos) = t.strip_prefix(r"\\?\").or_else(|| t.strip_prefix("//?/")) {
+        std::borrow::Cow::Borrowed(dos)
+    } else {
+        std::borrow::Cow::Borrowed(t)
+    }
+}
+
+/// Zero-allocation (for normal DOS paths) case-insensitive directory prefix check enforcing a
+/// path-separator boundary and stripping `\\?\` so `...\Programs\antigravity` never falsely
+/// matches `...\Programs\antigravity ide`.
 pub fn path_under_dir_l(exe_path_l: &str, dir_l: &str) -> bool {
-    let d = dir_l.trim().trim_end_matches(['\\', '/']);
-    let p = exe_path_l.trim();
+    let d_cow = strip_verbatim_win32_str(dir_l);
+    let p_cow = strip_verbatim_win32_str(exe_path_l);
+    let d = d_cow.trim().trim_end_matches(['\\', '/']);
+    let p = p_cow.trim();
     if d.is_empty() || p.len() <= d.len() {
         return false;
     }
@@ -144,14 +170,16 @@ pub fn path_under_dir_l(exe_path_l: &str, dir_l: &str) -> bool {
 }
 
 fn is_claude_cli_path_l(exe_path_l: &str) -> bool {
-    exe_path_l.contains(r"\claude\claude-code\")
-        || exe_path_l.contains(r"\.local\bin\claude")
-        || exe_path_l.contains(r"\.claude\local\")
-        || exe_path_l.contains(r"\scoop\apps\claude-code\")
-        || exe_path_l.contains(r"\.bun\bin\claude")
-        || exe_path_l.contains(r"@anthropic-ai\claude-code")
-        || exe_path_l.contains("@anthropic-ai/claude-code")
-        || exe_path_l.contains("claude-code-win32")
+    let norm = exe_path_l.replace('/', "\\");
+    norm.contains(r"\claude\claude-code\")
+        || norm.contains(r"\.local\bin\claude")
+        || norm.contains(r"\.claude\local\")
+        || norm.contains(r"\scoop\apps\claude-code\")
+        || norm.contains(r"\.bun\bin\claude")
+        || norm.contains(r"\winget\packages\anthropic.claudecode")
+        || norm.contains(r"\winget\links\claude.exe")
+        || norm.contains(r"@anthropic-ai\claude-code")
+        || norm.contains("claude-code-win32")
 }
 
 /// Pure matcher for GUI desktop agent processes (all inputs expected lowercase).
@@ -194,8 +222,15 @@ pub fn gui_agent_matches(
     }
 }
 
-/// Pure matcher for CLI agent processes (all inputs expected lowercase).
-pub fn cli_agent_matches(id: &str, exe_name_l: &str, exe_path_l: &str, cmd_l: &str) -> bool {
+/// Pure matcher for CLI agent processes with explicit ChatGPT/Codex GUI directory exclusions
+/// so `Codex.exe` inside `chatgpt_dirs_l` is ALWAYS classified as GUI (`chatgpt`), never CLI (`codex`).
+pub fn cli_agent_matches_with_dirs(
+    id: &str,
+    exe_name_l: &str,
+    exe_path_l: &str,
+    cmd_l: &str,
+    chatgpt_dirs_l: &[String],
+) -> bool {
     if is_uninstaller_exe(exe_name_l) {
         return false;
     }
@@ -210,7 +245,10 @@ pub fn cli_agent_matches(id: &str, exe_name_l: &str, exe_path_l: &str, cmd_l: &s
             let in_msix_or_gui = exe_path_l.contains(r"\windowsapps\")
                 || exe_path_l.contains(r"\programs\codex\")
                 || exe_path_l.contains(r"\programs\chatgpt\")
-                || exe_path_l.contains(r"\programs\chatgpt classic\");
+                || exe_path_l.contains(r"\programs\chatgpt classic\")
+                || chatgpt_dirs_l
+                    .iter()
+                    .any(|d| path_under_dir_l(exe_path_l, d));
             !in_msix_or_gui
                 && (exe_name_l.starts_with("codex")
                     || cmd_l.contains(r"@openai\codex")
@@ -219,19 +257,35 @@ pub fn cli_agent_matches(id: &str, exe_name_l: &str, exe_path_l: &str, cmd_l: &s
                     || exe_path_l.contains("@openai/codex")
                     || exe_path_l.contains("codex-win32-"))
         }
-        "gemini" => cmd_l.contains("gemini-cli"),
+        "gemini" => {
+            let is_js_runtime = matches!(
+                exe_name_l,
+                "node.exe" | "node" | "bun.exe" | "bun" | "deno.exe" | "deno"
+            );
+            is_js_runtime
+                && (cmd_l.contains("@google/gemini-cli") || cmd_l.contains(r"@google\gemini-cli"))
+        }
         _ => false,
     }
 }
 
-fn is_any_cli_agent(p: &ProcInfo) -> bool {
-    CLI_AGENTS
-        .iter()
-        .any(|(cid, _)| cli_agent_matches(cid, &p.name_l, &p.path_l, &p.cmd_l))
+/// Pure matcher for CLI agent processes (all inputs expected lowercase).
+pub fn cli_agent_matches(id: &str, exe_name_l: &str, exe_path_l: &str, cmd_l: &str) -> bool {
+    cli_agent_matches_with_dirs(id, exe_name_l, exe_path_l, cmd_l, &[])
 }
 
-/// Interactive shells and standalone terminal hosts that must never be collateral-killed
-/// or traversed into as agent network helpers (unless their binary lives inside `<AntigravityDir>`).
+fn is_any_cli_agent_with_dirs(p: &ProcInfo, chatgpt_dirs_l: &[String]) -> bool {
+    CLI_AGENTS.iter().any(|(cid, _)| {
+        cli_agent_matches_with_dirs(cid, &p.name_l, &p.path_l, &p.cmd_l, chatgpt_dirs_l)
+    })
+}
+
+fn is_any_cli_agent(p: &ProcInfo) -> bool {
+    is_any_cli_agent_with_dirs(p, &[])
+}
+
+/// Interactive shells, ConPTY hosts, terminals, browsers, and editors that must never be
+/// collateral-killed or traversed into as agent network helpers (unless inside `<AgentDir>`).
 pub fn is_interactive_shell_or_terminal(exe_name_l: &str) -> bool {
     matches!(
         exe_name_l,
@@ -243,8 +297,56 @@ pub fn is_interactive_shell_or_terminal(exe_name_l: &str) -> bool {
             | "windowsterminal.exe"
             | "explorer.exe"
             | "bash.exe"
+            | "bash"
             | "wsl.exe"
+            | "wsl"
+            | "wslhost.exe"
+            | "conhost.exe"
+            | "openconsole.exe"
+            | "nu.exe"
+            | "nu"
+            | "zsh.exe"
+            | "zsh"
+            | "sh.exe"
+            | "sh"
+            | "fish.exe"
+            | "fish"
+            | "mintty.exe"
+            | "alacritty.exe"
+            | "wezterm-gui.exe"
+            | "chrome.exe"
+            | "msedge.exe"
+            | "firefox.exe"
+            | "brave.exe"
+            | "code.exe"
     )
+}
+
+fn cmd_has_batch_c_flag(cmd_l: &str) -> bool {
+    let bytes = cmd_l.as_bytes();
+    if bytes.len() < 2 {
+        return false;
+    }
+    for i in 0..=(bytes.len() - 2) {
+        if bytes[i] == b'/' && bytes[i + 1] == b'c' {
+            let prev_ok = i == 0 || bytes[i - 1].is_ascii_whitespace() || bytes[i - 1] == b'"';
+            let next_ok =
+                i + 2 == bytes.len() || bytes[i + 2].is_ascii_whitespace() || bytes[i + 2] == b'"';
+            if prev_ok && next_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Process-level interactive shell / user-app boundary check: also treats `cmd.exe` WITHOUT `/c`
+/// in `cmd_l` as an interactive user Command Prompt terminal so integrated `cmd.exe` shells are spared!
+pub fn is_interactive_shell_proc(p: &ProcInfo) -> bool {
+    if is_interactive_shell_or_terminal(&p.name_l) {
+        return true;
+    }
+    matches!(p.name_l.as_str(), "cmd.exe" | "cmd") && !cmd_has_batch_c_flag(&p.cmd_l)
 }
 
 /// Normalized process record stored in snapshots and used by pure sweep/tree logic.
@@ -284,7 +386,7 @@ fn is_claude_desktop_or_dir(p: &ProcInfo, claude_dirs_l: &[String]) -> bool {
 fn is_chatgpt_codex_dir_or_gui(p: &ProcInfo, chatgpt_dirs_l: &[String]) -> bool {
     !is_uninstaller_exe(&p.name_l)
         && !is_agent_scm_service_exe(&p.name_l)
-        && !is_any_cli_agent(p)
+        && !is_any_cli_agent_with_dirs(p, chatgpt_dirs_l)
         && (gui_agent_matches("chatgpt", &p.name_l, &p.path_l, None)
             || chatgpt_dirs_l
                 .iter()
@@ -413,28 +515,6 @@ fn reaches_any_root(
     false
 }
 
-fn has_ancestor_matching(
-    start_pid: u32,
-    by_pid: &HashMap<u32, &ProcInfo>,
-    pred: impl Fn(&ProcInfo) -> bool,
-) -> bool {
-    let Some(first) = by_pid.get(&start_pid) else {
-        return false;
-    };
-    let mut cur = first.ppid;
-    let mut visited = HashSet::new();
-    while cur != 0 && visited.insert(cur) {
-        let Some(par) = by_pid.get(&cur) else {
-            break;
-        };
-        if pred(par) {
-            return true;
-        }
-        cur = par.ppid;
-    }
-    false
-}
-
 #[allow(clippy::too_many_arguments)]
 fn expand_non_shell_descendants(
     procs: &[ProcInfo],
@@ -443,6 +523,7 @@ fn expand_non_shell_descendants(
     visited_pids: &mut HashSet<u32>,
     selected: &mut HashSet<usize>,
     skip_cli: bool,
+    chatgpt_dirs_l: &[String],
     in_agent_dir_fn: impl Fn(&ProcInfo) -> bool,
 ) {
     while let Some(pid) = queue.pop() {
@@ -451,11 +532,13 @@ fn expand_non_shell_descendants(
         };
         for &child_idx in kids {
             let child = &procs[child_idx];
-            if is_uninstaller_exe(&child.name_l) || (skip_cli && is_any_cli_agent(child)) {
+            if is_uninstaller_exe(&child.name_l)
+                || (skip_cli && is_any_cli_agent_with_dirs(child, chatgpt_dirs_l))
+            {
                 continue;
             }
             let in_dir = in_agent_dir_fn(child);
-            if !in_dir && is_interactive_shell_or_terminal(&child.name_l) {
+            if !in_dir && is_interactive_shell_proc(child) {
                 continue;
             }
             // Traverse through SCM service hosts to reach worker children without killing the SCM host itself.
@@ -545,7 +628,7 @@ pub fn pick_gui_agent_kill_tree_with_dirs(
     let mut visited_pids: HashSet<u32> = HashSet::new();
 
     for (idx, p) in procs.iter().enumerate() {
-        if is_uninstaller_exe(&p.name_l) || is_any_cli_agent(p) {
+        if is_uninstaller_exe(&p.name_l) || is_any_cli_agent_with_dirs(p, chatgpt_dirs_l) {
             continue;
         }
         if primary_gui_matches_with_dirs(agent_id, p, claude_dirs_l, chatgpt_dirs_l, ag_dirs_l) {
@@ -565,6 +648,7 @@ pub fn pick_gui_agent_kill_tree_with_dirs(
         &mut visited_pids,
         &mut selected,
         true,
+        chatgpt_dirs_l,
         |child| match agent_id {
             "antigravity" => is_antigravity_dir_proc(child, ag_dirs_l),
             "claude" => claude_dirs_l
@@ -589,6 +673,14 @@ pub fn pick_gui_agent_kill_tree_with_dirs(
 /// Pure selector building the complete kill tree for a CLI agent (`claude-code`, `codex`, `gemini`),
 /// walking descendant worker/MCP processes children-first and NEVER touching ancestor terminals.
 pub fn pick_cli_agent_kill_tree(cli_id: &str, procs: &[ProcInfo]) -> Vec<ProcessIdentity> {
+    pick_cli_agent_kill_tree_with_dirs(cli_id, procs, &[])
+}
+
+pub fn pick_cli_agent_kill_tree_with_dirs(
+    cli_id: &str,
+    procs: &[ProcInfo],
+    chatgpt_dirs_l: &[String],
+) -> Vec<ProcessIdentity> {
     let children_by_ppid = build_children_map(procs);
     let mut selected: HashSet<usize> = HashSet::new();
     let mut queue: Vec<u32> = Vec::new();
@@ -598,7 +690,7 @@ pub fn pick_cli_agent_kill_tree(cli_id: &str, procs: &[ProcInfo]) -> Vec<Process
         if is_uninstaller_exe(&p.name_l) || is_agent_scm_service_exe(&p.name_l) {
             continue;
         }
-        if cli_agent_matches(cli_id, &p.name_l, &p.path_l, &p.cmd_l) {
+        if cli_agent_matches_with_dirs(cli_id, &p.name_l, &p.path_l, &p.cmd_l, chatgpt_dirs_l) {
             selected.insert(idx);
             if visited_pids.insert(p.pid) {
                 queue.push(p.pid);
@@ -613,6 +705,7 @@ pub fn pick_cli_agent_kill_tree(cli_id: &str, procs: &[ProcInfo]) -> Vec<Process
         &mut visited_pids,
         &mut selected,
         false,
+        chatgpt_dirs_l,
         |_| false,
     );
 
@@ -622,12 +715,38 @@ pub fn pick_cli_agent_kill_tree(cli_id: &str, procs: &[ProcInfo]) -> Vec<Process
         .collect()
 }
 
+fn cmd_references_dir_l(cmd_l: &str, dir_l: &str) -> bool {
+    let d_cow = strip_verbatim_win32_str(dir_l);
+    let clean_d = d_cow
+        .trim()
+        .trim_end_matches(['\\', '/'])
+        .replace('/', "\\");
+    if clean_d.is_empty() {
+        return false;
+    }
+    let norm_cmd = cmd_l.replace('/', "\\");
+    let mut search_from = 0usize;
+    while let Some(rel) = norm_cmd.get(search_from..).and_then(|s| s.find(&clean_d)) {
+        let end = search_from + rel + clean_d.len();
+        if matches!(norm_cmd.as_bytes().get(end), Some(b'\\')) {
+            return true;
+        }
+        search_from = search_from + rel + 1;
+        while search_from < norm_cmd.len() && !norm_cmd.is_char_boundary(search_from) {
+            search_from += 1;
+        }
+    }
+    false
+}
+
 /// Pure detector for Antigravity residual and mid-run detached crash-orphan processes.
 ///
 /// - **Case A (Full exit residual)**: When NO live root Antigravity GUI exists in `procs`,
 ///   every remaining Antigravity-dir process (`language_server*.exe`, `antigravity.exe`,
-///   `webm_encoder.exe`, etc.), their non-shell helper children, and orphaned Antigravity/MCP
-///   `node.exe` processes whose `ppid` is dead are returned.
+///   `webm_encoder.exe`, etc.), their non-shell helper children, and orphaned Antigravity
+///   sidecar/extension `node.exe` processes (`sidecar_sdk`, `.antigravity\extensions`, or `ag_dirs_l`)
+///   whose `ppid` is dead are returned (never killing user dev servers in `.gemini\antigravity\scratch`
+///   or Claude/Cursor MCP servers).
 /// - **Case B (Mid-run detached crash-orphan)**: Even while a live root Antigravity GUI is running,
 ///   any Antigravity-dir process whose `ppid` ancestor chain does NOT reach any live root Antigravity GUI
 ///   AND whose immediate `ppid` is dead (plus its non-shell children) is returned.
@@ -645,10 +764,9 @@ pub fn pick_antigravity_orphans(procs: &[ProcInfo], ag_dirs_l: &[String]) -> Vec
         .collect();
     let children_by_ppid = build_children_map(procs);
 
-    let any_ag_proc_present = procs
-        .iter()
-        .any(|q| !is_agent_scm_service_exe(&q.name_l) && is_antigravity_dir_proc(q, ag_dirs_l));
     let mut selected: HashSet<usize> = HashSet::new();
+    let mut queue: Vec<u32> = Vec::new();
+    let mut visited_pids: HashSet<u32> = HashSet::new();
 
     if live_root_pids.is_empty() {
         for (idx, p) in procs.iter().enumerate() {
@@ -660,36 +778,34 @@ pub fn pick_antigravity_orphans(procs: &[ProcInfo], ag_dirs_l: &[String]) -> Vec
             }
             if is_antigravity_dir_proc(p, ag_dirs_l) {
                 selected.insert(idx);
+                if visited_pids.insert(p.pid) {
+                    queue.push(p.pid);
+                }
                 continue;
             }
-            if is_interactive_shell_or_terminal(&p.name_l) {
-                continue;
-            }
-            if has_ancestor_matching(p.pid, &by_pid, |par| {
-                is_antigravity_dir_proc(par, ag_dirs_l)
-            }) {
-                selected.insert(idx);
+            if is_interactive_shell_proc(p) {
                 continue;
             }
             if matches!(p.name_l.as_str(), "node.exe" | "node")
                 && (p.ppid == 0 || !alive_pids.contains(&p.ppid))
             {
-                let has_ag_marker = p.cmd_l.contains("antigravity")
-                    || p.cmd_l.contains("sidecar_sdk")
-                    || p.cmd_l.contains("mcp")
-                    || p.path_l.contains("antigravity")
-                    || ag_dirs_l
-                        .iter()
-                        .any(|d| !d.is_empty() && (p.path_l.contains(d) || p.cmd_l.contains(d)));
-                if has_ag_marker || (p.cmd_l.is_empty() && any_ag_proc_present) {
+                let norm_cmd = p.cmd_l.replace('/', "\\");
+                let has_ag_marker = norm_cmd.contains("sidecar_sdk")
+                    || norm_cmd.contains(r".antigravity\extensions")
+                    || norm_cmd.contains(r".gemini\antigravity\extensions")
+                    || ag_dirs_l.iter().any(|d| {
+                        !d.is_empty()
+                            && (path_under_dir_l(&p.path_l, d) || cmd_references_dir_l(&p.cmd_l, d))
+                    });
+                if has_ag_marker {
                     selected.insert(idx);
+                    if visited_pids.insert(p.pid) {
+                        queue.push(p.pid);
+                    }
                 }
             }
         }
     } else {
-        let mut queue: Vec<u32> = Vec::new();
-        let mut visited_pids: HashSet<u32> = HashSet::new();
-
         for (idx, p) in procs.iter().enumerate() {
             if is_agent_scm_service_exe(&p.name_l) || !is_antigravity_dir_proc(p, ag_dirs_l) {
                 continue;
@@ -703,17 +819,18 @@ pub fn pick_antigravity_orphans(procs: &[ProcInfo], ag_dirs_l: &[String]) -> Vec
                 }
             }
         }
-
-        expand_non_shell_descendants(
-            procs,
-            &children_by_ppid,
-            &mut queue,
-            &mut visited_pids,
-            &mut selected,
-            true,
-            |child| is_antigravity_dir_proc(child, ag_dirs_l),
-        );
     }
+
+    expand_non_shell_descendants(
+        procs,
+        &children_by_ppid,
+        &mut queue,
+        &mut visited_pids,
+        &mut selected,
+        true,
+        &[],
+        |child| is_antigravity_dir_proc(child, ag_dirs_l),
+    );
 
     postorder_indices(&selected, procs)
 }
@@ -748,14 +865,14 @@ pub fn pick_claude_orphans(procs: &[ProcInfo], claude_dirs_l: &[String]) -> Vec<
             if !is_uninstaller_exe(&p.name_l)
                 && !is_agent_scm_service_exe(&p.name_l)
                 && !is_any_cli_agent(p)
-                && !is_interactive_shell_or_terminal(&p.name_l)
+                && !is_interactive_shell_proc(p)
                 && (p.ppid == 0 || !alive_pids.contains(&p.ppid))
                 && (p.path_l.contains(r"\anthropicclaude\")
                     || p.cmd_l.contains("anthropicclaude")
                     || p.cmd_l.contains("github-mcp-server")
                     || claude_dirs_l.iter().any(|d| {
                         !d.is_empty()
-                            && (path_under_dir_l(&p.path_l, d) || p.cmd_l.contains(d.as_str()))
+                            && (path_under_dir_l(&p.path_l, d) || cmd_references_dir_l(&p.cmd_l, d))
                     }))
             {
                 selected.insert(idx);
@@ -787,6 +904,7 @@ pub fn pick_claude_orphans(procs: &[ProcInfo], claude_dirs_l: &[String]) -> Vec<
         &mut visited_pids,
         &mut selected,
         true,
+        &[],
         |child| {
             claude_dirs_l
                 .iter()
@@ -827,15 +945,15 @@ pub fn pick_chatgpt_codex_orphans(procs: &[ProcInfo], chatgpt_dirs_l: &[String])
             }
             if !is_uninstaller_exe(&p.name_l)
                 && !is_agent_scm_service_exe(&p.name_l)
-                && !is_any_cli_agent(p)
-                && !is_interactive_shell_or_terminal(&p.name_l)
+                && !is_any_cli_agent_with_dirs(p, chatgpt_dirs_l)
+                && !is_interactive_shell_proc(p)
                 && (p.ppid == 0 || !alive_pids.contains(&p.ppid))
                 && (p.path_l.contains(r"\windowsapps\openai.")
                     || p.cmd_l.contains("openai.codex_")
                     || p.cmd_l.contains("openai.chatgpt")
                     || chatgpt_dirs_l.iter().any(|d| {
                         !d.is_empty()
-                            && (path_under_dir_l(&p.path_l, d) || p.cmd_l.contains(d.as_str()))
+                            && (path_under_dir_l(&p.path_l, d) || cmd_references_dir_l(&p.cmd_l, d))
                     }))
             {
                 selected.insert(idx);
@@ -867,6 +985,7 @@ pub fn pick_chatgpt_codex_orphans(procs: &[ProcInfo], chatgpt_dirs_l: &[String])
         &mut visited_pids,
         &mut selected,
         true,
+        chatgpt_dirs_l,
         |child| {
             chatgpt_dirs_l
                 .iter()
@@ -881,6 +1000,14 @@ pub fn pick_chatgpt_codex_orphans(procs: &[ProcInfo], chatgpt_dirs_l: &[String])
 /// Pure detector for orphaned CLI sessions (`claude-code`, `codex`, `gemini`) whose launching
 /// parent terminal (`ppid`) is dead, plus their non-shell descendant helpers, ordered **children-first**.
 pub fn pick_cli_orphans(cli_id: &str, procs: &[ProcInfo]) -> Vec<usize> {
+    pick_cli_orphans_with_dirs(cli_id, procs, &[])
+}
+
+pub fn pick_cli_orphans_with_dirs(
+    cli_id: &str,
+    procs: &[ProcInfo],
+    chatgpt_dirs_l: &[String],
+) -> Vec<usize> {
     if procs.is_empty() {
         return Vec::new();
     }
@@ -894,7 +1021,7 @@ pub fn pick_cli_orphans(cli_id: &str, procs: &[ProcInfo]) -> Vec<usize> {
         if is_uninstaller_exe(&p.name_l) || is_agent_scm_service_exe(&p.name_l) {
             continue;
         }
-        if cli_agent_matches(cli_id, &p.name_l, &p.path_l, &p.cmd_l)
+        if cli_agent_matches_with_dirs(cli_id, &p.name_l, &p.path_l, &p.cmd_l, chatgpt_dirs_l)
             && (p.ppid == 0 || !alive_pids.contains(&p.ppid))
         {
             selected.insert(idx);
@@ -911,6 +1038,7 @@ pub fn pick_cli_orphans(cli_id: &str, procs: &[ProcInfo]) -> Vec<usize> {
         &mut visited_pids,
         &mut selected,
         false,
+        chatgpt_dirs_l,
         |_| false,
     );
 
@@ -935,52 +1063,107 @@ impl ClaudeKind {
 
 /// Classify a process as Claude Desktop vs Claude Code CLI (excluding SCM service hosts).
 pub fn classify_claude(p: &ProcInfo, claude_dir_l: Option<&str>) -> Option<ClaudeKind> {
+    let dirs: Vec<String> = claude_dir_l
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(ToString::to_string)
+        .collect();
+    classify_claude_with_dirs(p, &dirs)
+}
+
+pub fn classify_claude_with_dirs(p: &ProcInfo, claude_dirs_l: &[String]) -> Option<ClaudeKind> {
     if is_uninstaller_exe(&p.name_l) || is_agent_scm_service_exe(&p.name_l) {
         return None;
     }
     if cli_agent_matches("claude-code", &p.name_l, &p.path_l, &p.cmd_l) {
         return Some(ClaudeKind::Cli);
     }
-    if gui_agent_matches("claude", &p.name_l, &p.path_l, claude_dir_l) {
+    if gui_agent_matches(
+        "claude",
+        &p.name_l,
+        &p.path_l,
+        claude_dirs_l.first().map(String::as_str),
+    ) || claude_dirs_l.iter().any(|d| path_under_dir_l(&p.path_l, d))
+    {
         return Some(ClaudeKind::Desktop);
     }
     None
 }
 
-/// Select all Claude processes (Desktop + CLI) for explicit manual sweep.
+/// Select all Claude processes (Desktop + CLI) for explicit manual sweep, ordered **children-first**.
 pub fn pick_manual(procs: &[ProcInfo], claude_dir_l: Option<&str>) -> Vec<(usize, ClaudeKind)> {
-    procs
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| classify_claude(p, claude_dir_l).map(|k| (i, k)))
+    let dirs: Vec<String> = claude_dir_l
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(ToString::to_string)
+        .collect();
+    pick_manual_with_dirs(procs, &dirs)
+}
+
+pub fn pick_manual_with_dirs(
+    procs: &[ProcInfo],
+    claude_dirs_l: &[String],
+) -> Vec<(usize, ClaudeKind)> {
+    let mut kind_by_idx: HashMap<usize, ClaudeKind> = HashMap::new();
+    let mut selected: HashSet<usize> = HashSet::new();
+    for (i, p) in procs.iter().enumerate() {
+        if let Some(k) = classify_claude_with_dirs(p, claude_dirs_l) {
+            kind_by_idx.insert(i, k);
+            selected.insert(i);
+        }
+    }
+    postorder_indices(&selected, procs)
+        .into_iter()
+        .filter_map(|idx| kind_by_idx.get(&idx).copied().map(|k| (idx, k)))
         .collect()
 }
 
-/// Select only orphaned residual Claude processes after desktop has exited.
+/// Select only orphaned residual Claude processes after live root `Claude.exe` GUI has exited.
 ///
-/// - Returns `None` while any Claude Desktop process is still running.
-/// - Desktop auxiliary processes (renderer/crashpad/GPU) are selected.
+/// - Returns `None` while any live root `Claude.exe` GUI process is still running.
+/// - Sweeps orphaned desktop auxiliary processes (`--type=gpu-process`, `crashpad`, `github-mcp-server`,
+///   and their non-shell descendants) ordered **children-first**.
 /// - CLI processes are selected ONLY when their parent terminal (`ppid`) is dead.
 pub fn pick_residual(
     procs: &[ProcInfo],
     claude_dir_l: Option<&str>,
 ) -> Option<Vec<(usize, ClaudeKind)>> {
-    let all = pick_manual(procs, claude_dir_l);
-    if all.iter().any(|(_, k)| *k == ClaudeKind::Desktop) {
+    let dirs: Vec<String> = claude_dir_l
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(ToString::to_string)
+        .collect();
+    pick_residual_with_dirs(procs, &dirs)
+}
+
+pub fn pick_residual_with_dirs(
+    procs: &[ProcInfo],
+    claude_dirs_l: &[String],
+) -> Option<Vec<(usize, ClaudeKind)>> {
+    let by_pid: HashMap<u32, &ProcInfo> = procs.iter().map(|p| (p.pid, p)).collect();
+    if procs
+        .iter()
+        .any(|p| is_live_root_claude_gui(p, &by_pid, claude_dirs_l))
+    {
         return None;
     }
-    let alive: HashSet<u32> = procs.iter().map(|p| p.pid).collect();
-    Some(
-        all.into_iter()
-            .filter(|(i, k)| match k {
-                ClaudeKind::Desktop => true,
-                ClaudeKind::Cli => {
-                    let p = &procs[*i];
-                    p.ppid == 0 || !alive.contains(&p.ppid)
-                }
-            })
-            .collect(),
-    )
+
+    let desktop_orphans = pick_claude_orphans(procs, claude_dirs_l);
+    let cli_orphans = pick_cli_orphans("claude-code", procs);
+
+    let mut seen_pids = HashSet::new();
+    let mut out = Vec::with_capacity(desktop_orphans.len() + cli_orphans.len());
+    for idx in desktop_orphans {
+        if seen_pids.insert(procs[idx].pid) {
+            out.push((idx, ClaudeKind::Desktop));
+        }
+    }
+    for idx in cli_orphans {
+        if seen_pids.insert(procs[idx].pid) {
+            out.push((idx, ClaudeKind::Cli));
+        }
+    }
+    Some(out)
 }
 
 /// Sweep mode selector.
@@ -1040,7 +1223,9 @@ pub fn covered_dirs_from(
 }
 
 fn normalize_path_key_l(path: &Path) -> String {
-    path.to_string_lossy()
+    let raw = path.to_string_lossy();
+    let stripped = strip_verbatim_win32_str(&raw);
+    stripped
         .replace('/', "\\")
         .trim_end_matches('\\')
         .to_ascii_lowercase()
@@ -1148,6 +1333,10 @@ pub fn dedup_and_sort_packages(mut packages: Vec<(String, PathBuf)>) -> Vec<(Str
     out
 }
 
+pub(crate) fn package_name_matches_prefix(pkg_name: &str, family_prefix: &str) -> bool {
+    strip_ascii_prefix_ci(pkg_name, family_prefix).is_some()
+}
+
 #[cfg(windows)]
 fn scan_appmodel_packages_under(
     hive_root: &winreg::RegKey,
@@ -1159,9 +1348,7 @@ fn scan_appmodel_packages_under(
         return;
     };
     for name in key.enum_keys().flatten() {
-        if name.len() < family_prefix.len()
-            || !name[..family_prefix.len()].eq_ignore_ascii_case(family_prefix)
-        {
+        if !package_name_matches_prefix(&name, family_prefix) {
             continue;
         }
         let Ok(sub) = key.open_subkey(&name) else {
@@ -1229,16 +1416,12 @@ pub fn installed_msix_version(family_prefix: &str) -> Option<String> {
     })
 }
 
-fn find_windowsapps_dir(prefix: &str) -> Option<PathBuf> {
-    let root = Path::new(r"C:\Program Files\WindowsApps");
+pub(crate) fn find_windowsapps_dir_in(root: &Path, prefix: &str) -> Option<PathBuf> {
     let mut best: Option<(Vec<u64>, std::ffi::OsString)> = None;
     if let Ok(rd) = std::fs::read_dir(root) {
         for entry in rd.flatten() {
             let s = entry.file_name().to_string_lossy().to_string();
-            if s.len() >= prefix.len()
-                && s[..prefix.len()].eq_ignore_ascii_case(prefix)
-                && s.contains("__")
-            {
+            if package_name_matches_prefix(&s, prefix) && s.contains("__") {
                 let key = version_key(&s);
                 if best.as_ref().is_none_or(|(k, _)| key > *k) {
                     best = Some((key, entry.file_name()));
@@ -1247,6 +1430,10 @@ fn find_windowsapps_dir(prefix: &str) -> Option<PathBuf> {
         }
     }
     best.map(|(_, n)| root.join(n))
+}
+
+fn find_windowsapps_dir(prefix: &str) -> Option<PathBuf> {
+    find_windowsapps_dir_in(Path::new(r"C:\Program Files\WindowsApps"), prefix)
 }
 
 fn is_skipped_system_user_dir(name: &str) -> bool {
@@ -1271,11 +1458,8 @@ fn is_systemprofile_path(path: &Path) -> bool {
 pub(crate) fn expand_profile_image_path_with_drive(raw: &str, system_drive: &str) -> PathBuf {
     let trimmed = raw.trim().trim_matches('"').trim();
     let drive = system_drive.trim().trim_end_matches(['\\', '/']);
-    let sys_drive_tok = "%systemdrive%";
-    if trimmed.len() >= sys_drive_tok.len()
-        && trimmed[..sys_drive_tok.len()].eq_ignore_ascii_case(sys_drive_tok)
-    {
-        return PathBuf::from(format!("{drive}{}", &trimmed[sys_drive_tok.len()..]));
+    if let Some(rest) = strip_ascii_prefix_ci(trimmed, "%systemdrive%") {
+        return PathBuf::from(format!("{drive}{rest}"));
     }
     PathBuf::from(trimmed)
 }
@@ -1576,8 +1760,69 @@ fn scan_uninstall_subkey(hive: &winreg::RegKey, subkey_path: &str, out: &mut Vec
     }
 }
 
-#[cfg(windows)]
+const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(45);
+
+#[derive(Clone, Debug)]
+struct DiscoveryCacheState {
+    populated_at: Instant,
+    uninstall_records: Vec<UninstallRecord>,
+    claude_dirs: Vec<PathBuf>,
+    chatgpt_dirs: Vec<PathBuf>,
+    antigravity_dirs: Vec<PathBuf>,
+}
+
+fn discovery_cache_slot() -> &'static Mutex<Option<DiscoveryCacheState>> {
+    static SLOT: std::sync::OnceLock<Mutex<Option<DiscoveryCacheState>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Invalidates the 45-second covered-directory & Uninstall registry cache so newly installed or
+/// repaired client directories are picked up immediately on the next query.
+pub fn invalidate_discovery_cache() {
+    let mut guard = discovery_cache_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
+fn with_discovery_cache<R>(f: impl FnOnce(&DiscoveryCacheState) -> R) -> R {
+    {
+        let guard = discovery_cache_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ref state) = *guard {
+            if state.populated_at.elapsed() < DISCOVERY_CACHE_TTL {
+                return f(state);
+            }
+        }
+    }
+
+    let uninstall_records = scan_uninstall_records_uncached();
+    let claude_dirs = compute_claude_covered_dirs(&uninstall_records);
+    let chatgpt_dirs = compute_chatgpt_covered_dirs(&uninstall_records);
+    let antigravity_dirs = compute_antigravity_covered_dirs(&uninstall_records);
+    let fresh = DiscoveryCacheState {
+        populated_at: Instant::now(),
+        uninstall_records,
+        claude_dirs,
+        chatgpt_dirs,
+        antigravity_dirs,
+    };
+    let out = f(&fresh);
+    let mut guard = discovery_cache_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = Some(fresh);
+    out
+}
+
 fn scan_uninstall_records() -> Vec<UninstallRecord> {
+    with_discovery_cache(|c| c.uninstall_records.clone())
+}
+
+#[cfg(windows)]
+fn scan_uninstall_records_uncached() -> Vec<UninstallRecord> {
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS};
     use winreg::RegKey;
 
@@ -1621,7 +1866,7 @@ fn scan_uninstall_records() -> Vec<UninstallRecord> {
 }
 
 #[cfg(not(windows))]
-fn scan_uninstall_records() -> Vec<UninstallRecord> {
+fn scan_uninstall_records_uncached() -> Vec<UninstallRecord> {
     Vec::new()
 }
 
@@ -1637,29 +1882,33 @@ fn merge_covered_dirs(primary: Vec<PathBuf>, extra: Vec<PathBuf>) -> Vec<PathBuf
     out
 }
 
-pub fn claude_covered_dirs() -> Vec<PathBuf> {
+fn compute_claude_covered_dirs(uninstall_records: &[UninstallRecord]) -> Vec<PathBuf> {
     let msix = covered_dirs_from(
         &registered_package_dirs("Claude_"),
         find_windowsapps_dir("Claude_"),
     );
     let per_user = per_user_local_app_subdirs(&["AnthropicClaude", r"Programs\claude"]);
     let mut reg_dirs = Vec::new();
-    for rec in scan_uninstall_records() {
+    for rec in uninstall_records {
         let dn = rec.display_name.to_ascii_lowercase();
         let kn = rec.key_name.to_ascii_lowercase();
         if (dn == "claude" || dn.contains("anthropicclaude") || kn.contains("anthropicclaude"))
             && !dn.contains("claudeguard")
             && !dn.contains("claude code")
         {
-            if let Some(dir) = rec.install_dir.filter(|d| d.is_dir()) {
-                reg_dirs.push(dir);
+            if let Some(dir) = rec.install_dir.as_ref().filter(|d| d.is_dir()) {
+                reg_dirs.push(dir.clone());
             }
         }
     }
     merge_covered_dirs(merge_covered_dirs(msix, per_user), reg_dirs)
 }
 
-pub fn chatgpt_covered_dirs() -> Vec<PathBuf> {
+pub fn claude_covered_dirs() -> Vec<PathBuf> {
+    with_discovery_cache(|c| c.claude_dirs.clone())
+}
+
+fn compute_chatgpt_covered_dirs(uninstall_records: &[UninstallRecord]) -> Vec<PathBuf> {
     let mut pkgs = registered_package_dirs("OpenAI.Codex_");
     pkgs.extend(registered_package_dirs("OpenAI.ChatGPT_"));
     pkgs.extend(registered_package_dirs("OpenAI.ChatGPT-Desktop_"));
@@ -1679,15 +1928,19 @@ pub fn chatgpt_covered_dirs() -> Vec<PathBuf> {
         r"Programs\Codex",
     ]);
     let mut reg_dirs = Vec::new();
-    for rec in scan_uninstall_records() {
+    for rec in uninstall_records {
         let dn = rec.display_name.to_ascii_lowercase();
         if dn.contains("chatgpt") || dn == "codex" || dn == "openai codex" {
-            if let Some(dir) = rec.install_dir.filter(|d| d.is_dir()) {
-                reg_dirs.push(dir);
+            if let Some(dir) = rec.install_dir.as_ref().filter(|d| d.is_dir()) {
+                reg_dirs.push(dir.clone());
             }
         }
     }
     merge_covered_dirs(merge_covered_dirs(msix, per_user), reg_dirs)
+}
+
+pub fn chatgpt_covered_dirs() -> Vec<PathBuf> {
+    with_discovery_cache(|c| c.chatgpt_dirs.clone())
 }
 
 /// Testable multi-user Antigravity directory resolver supporting `LocalSystem` Windows Services
@@ -1705,26 +1958,24 @@ pub fn antigravity_covered_dirs_from_roots(
     )
 }
 
-/// Discover all Antigravity installation directories across `ProfileList` user homes, `C:\Users\*`,
-/// and custom WinReg `Uninstall` install locations (e.g. `D:\Antigravity`, `E:\Programs\Antigravity`).
-pub fn antigravity_covered_dirs() -> Vec<PathBuf> {
+fn compute_antigravity_covered_dirs(uninstall_records: &[UninstallRecord]) -> Vec<PathBuf> {
     let per_user =
         per_user_local_app_subdirs(&[r"Programs\antigravity", r"Programs\Antigravity IDE"]);
     let mut reg_dirs = Vec::new();
-    for rec in scan_uninstall_records() {
+    for rec in uninstall_records {
         let dn = rec.display_name.to_ascii_lowercase();
         let kn = rec.key_name.to_ascii_lowercase();
         if (dn.contains("antigravity") || kn.contains("antigravity"))
             && !dn.contains("desktop-cn")
             && !dn.contains("launcher")
         {
-            if let Some(dir) = rec.install_dir.filter(|d| {
+            if let Some(dir) = rec.install_dir.as_ref().filter(|d| {
                 d.is_dir()
                     && (d.join("Antigravity.exe").is_file()
                         || d.join("Antigravity IDE.exe").is_file()
                         || d.join("resources").is_dir())
             }) {
-                reg_dirs.push(dir);
+                reg_dirs.push(dir.clone());
             }
         }
     }
@@ -1742,6 +1993,12 @@ pub fn antigravity_covered_dirs() -> Vec<PathBuf> {
         }
     }
     merge_covered_dirs(per_user, reg_dirs)
+}
+
+/// Discover all Antigravity installation directories across `ProfileList` user homes, `C:\Users\*`,
+/// and custom WinReg `Uninstall` install locations (cached with 45s TTL).
+pub fn antigravity_covered_dirs() -> Vec<PathBuf> {
+    with_discovery_cache(|c| c.antigravity_dirs.clone())
 }
 
 /// Discover all covered executables inside `dirs` up to `max_depth = 5`, placing main GUI
@@ -1787,18 +2044,19 @@ fn expand_user_tokens(raw: &str, home: &Path) -> PathBuf {
         return home.to_path_buf();
     }
     let replace_ci = |input: &str, tok: &str, replacement: &str| -> String {
-        let low = input.to_ascii_lowercase();
-        let tok_l = tok.to_ascii_lowercase();
-        if let Some(pos) = low.find(&tok_l) {
-            format!(
-                "{}{}{}",
-                &input[..pos],
-                replacement,
-                &input[pos + tok.len()..]
-            )
-        } else {
-            input.to_string()
+        let ib = input.as_bytes();
+        let tb = tok.as_bytes();
+        if tb.is_empty() || ib.len() < tb.len() {
+            return input.to_string();
         }
+        for pos in 0..=(ib.len() - tb.len()) {
+            if ib[pos..pos + tb.len()].eq_ignore_ascii_case(tb) {
+                if let (Some(head), Some(tail)) = (input.get(..pos), input.get(pos + tb.len()..)) {
+                    return format!("{head}{replacement}{tail}");
+                }
+            }
+        }
+        input.to_string()
     };
     let home_s = home.to_string_lossy();
     let appdata_s = home
@@ -2155,9 +2413,32 @@ pub fn discover_cli_exes_in_homes(cli_id: &str, homes: &[PathBuf]) -> Vec<PathBu
                     home.join(".local").join("bin").join("claude.exe"),
                     home.join(".claude").join("local").join("claude.exe"),
                     home.join(".bun").join("bin").join("claude.exe"),
+                    home.join("AppData")
+                        .join("Local")
+                        .join("Microsoft")
+                        .join("WinGet")
+                        .join("Links")
+                        .join("claude.exe"),
                 ] {
                     if direct_claude.is_file() && !contains_path_ci(&exes, &direct_claude) {
                         exes.push(direct_claude);
+                    }
+                }
+                let winget_pkgs = home
+                    .join("AppData")
+                    .join("Local")
+                    .join("Microsoft")
+                    .join("WinGet")
+                    .join("Packages");
+                if let Ok(rd) = std::fs::read_dir(&winget_pkgs) {
+                    for entry in rd.flatten() {
+                        let p = entry.path();
+                        let fname = entry.file_name().to_string_lossy().to_string();
+                        if p.is_dir()
+                            && strip_ascii_prefix_ci(&fname, "Anthropic.ClaudeCode").is_some()
+                        {
+                            collect_exes_matching(&p, 0, 4, &|n| n == "claude.exe", &mut exes);
+                        }
                     }
                 }
                 let roaming_cc = home
@@ -2378,26 +2659,16 @@ fn is_numeric_version_str(clean: &str) -> bool {
         })
 }
 
-fn semver_tuple(clean: &str) -> Vec<u64> {
-    clean
-        .split(['-', '+'])
-        .next()
-        .unwrap_or("")
-        .split('.')
-        .map(|p| p.parse::<u64>().unwrap_or(0))
-        .collect()
-}
-
 fn pick_newer_version(best: &mut Option<String>, candidate: &str) {
-    let clean = candidate.trim().trim_start_matches(['v', 'V']).trim();
-    if !is_numeric_version_str(clean) {
+    let clean = crate::update_check::normalize_version(candidate);
+    if !is_numeric_version_str(&clean) {
         return;
     }
     match best {
-        None => *best = Some(clean.to_string()),
+        None => *best = Some(clean),
         Some(prev) => {
-            if semver_tuple(clean) > semver_tuple(prev) {
-                *best = Some(clean.to_string());
+            if crate::update_check::is_version_newer(&clean, prev) {
+                *best = Some(clean);
             }
         }
     }
@@ -2668,7 +2939,7 @@ pub fn installed_antigravity_ide_info_in_dirs(
         if let Some(ref dv) = dir_ver {
             let is_newer = best_ver
                 .as_deref()
-                .is_none_or(|prev| semver_tuple(dv) > semver_tuple(prev));
+                .is_none_or(|prev| crate::update_check::is_version_newer(dv, prev));
             if is_newer {
                 best_ver = Some(dv.clone());
                 if dir_url.is_some() {
@@ -2823,7 +3094,6 @@ pub fn asar_contains_cn_patch(asar_path: &Path) -> bool {
     header.contains("subframeLocalizationPreload.js")
         || header.contains("contextMonitor.js")
         || header.contains("context_monitor.js")
-        || header.contains("localization")
 }
 
 fn file_mtime_secs(path: &Path) -> Option<u64> {
@@ -2882,7 +3152,6 @@ pub fn installed_antigravity_cn_version_in_dirs(dirs: &[PathBuf]) -> Option<Stri
                     || txt.contains("subframeLocalizationPreload")
                     || txt.contains("contextMonitor")
                     || txt.contains("context_monitor")
-                    || txt.contains("localization")
                     || txt.contains("中文汉化")
                 {
                     unpacked_mtime = file_mtime_secs(&preload);
@@ -3007,6 +3276,28 @@ impl CachedProcessSnapshot {
         let guard_chatgpt = guarded_agents.iter().any(|g| g == "chatgpt");
         let guard_ag = guarded_agents.iter().any(|g| g == "antigravity");
 
+        let is_main_gui_exe = |owner_id: &str, exe_name_l: &str| -> bool {
+            match owner_id {
+                "claude" => exe_name_l == "claude.exe",
+                "chatgpt" => matches!(
+                    exe_name_l,
+                    "chatgpt.exe" | "chatgpt classic.exe" | "codex.exe"
+                ),
+                "antigravity" => matches!(exe_name_l, "antigravity.exe" | "antigravity ide.exe"),
+                _ => false,
+            }
+        };
+
+        let primary_proc_label = |base_label: &str, owner_id: &str, exe_name_l: &str| -> String {
+            if !is_main_gui_exe(owner_id, exe_name_l)
+                && crate::netwatch_win::is_mcp_agent_label(exe_name_l)
+            {
+                format!("{base_label} ({exe_name_l})")
+            } else {
+                base_label.to_string()
+            }
+        };
+
         let children_by_ppid = build_children_map(&self.procs);
         let mut queue: Vec<(u32, String, &'static str)> = Vec::new();
         let mut visited_pids: HashSet<u32> = HashSet::new();
@@ -3015,7 +3306,15 @@ impl CachedProcessSnapshot {
             if is_uninstaller_exe(&p.name_l) {
                 continue;
             }
-            if guard_claude && cli_agent_matches("claude-code", &p.name_l, &p.path_l, &p.cmd_l) {
+            if guard_claude
+                && cli_agent_matches_with_dirs(
+                    "claude-code",
+                    &p.name_l,
+                    &p.path_l,
+                    &p.cmd_l,
+                    chatgpt_dirs_l,
+                )
+            {
                 let label = "Claude Code".to_string();
                 out.insert(p.pid, label.clone());
                 if visited_pids.insert(p.pid) {
@@ -3023,9 +3322,25 @@ impl CachedProcessSnapshot {
                 }
                 continue;
             }
-            if guard_chatgpt && cli_agent_matches("codex", &p.name_l, &p.path_l, &p.cmd_l) {
+            if guard_chatgpt
+                && cli_agent_matches_with_dirs(
+                    "codex",
+                    &p.name_l,
+                    &p.path_l,
+                    &p.cmd_l,
+                    chatgpt_dirs_l,
+                )
+            {
                 let label = "Codex CLI".to_string();
-                out.insert(p.pid, label.clone());
+                let proc_label = if matches!(
+                    p.name_l.as_str(),
+                    "codex.exe" | "codex" | "node.exe" | "node" | "bun.exe" | "deno.exe"
+                ) {
+                    label.clone()
+                } else {
+                    format!("{label} ({})", p.name_l)
+                };
+                out.insert(p.pid, proc_label);
                 if visited_pids.insert(p.pid) {
                     queue.push((p.pid, label, "chatgpt"));
                 }
@@ -3041,7 +3356,7 @@ impl CachedProcessSnapshot {
                 )
             {
                 let label = gui_agent_name("claude").to_string();
-                out.insert(p.pid, label.clone());
+                out.insert(p.pid, primary_proc_label(&label, "claude", &p.name_l));
                 if visited_pids.insert(p.pid) {
                     queue.push((p.pid, label, "claude"));
                 }
@@ -3057,7 +3372,7 @@ impl CachedProcessSnapshot {
                 )
             {
                 let label = gui_agent_name("chatgpt").to_string();
-                out.insert(p.pid, label.clone());
+                out.insert(p.pid, primary_proc_label(&label, "chatgpt", &p.name_l));
                 if visited_pids.insert(p.pid) {
                     queue.push((p.pid, label, "chatgpt"));
                 }
@@ -3065,14 +3380,14 @@ impl CachedProcessSnapshot {
             }
             if guard_ag && is_antigravity_dir_proc(p, ag_dirs_l) {
                 let label = gui_agent_name("antigravity").to_string();
-                out.insert(p.pid, label.clone());
+                out.insert(p.pid, primary_proc_label(&label, "antigravity", &p.name_l));
                 if visited_pids.insert(p.pid) {
                     queue.push((p.pid, label, "antigravity"));
                 }
             }
         }
 
-        // Walk descendant trees across ALL guarded GUI & CLI processes (through cmd.exe & SCM services,
+        // Walk descendant trees across ALL guarded GUI & CLI processes (through `cmd.exe /c` & SCM services,
         // stopping at interactive user shells unless inside an agent's MSIX/install directory).
         while let Some((pid, label, owner_id)) = queue.pop() {
             let Some(kids) = children_by_ppid.get(&pid) else {
@@ -3080,7 +3395,9 @@ impl CachedProcessSnapshot {
             };
             for &child_idx in kids {
                 let child = &self.procs[child_idx];
-                if is_uninstaller_exe(&child.name_l) || is_any_cli_agent(child) {
+                if is_uninstaller_exe(&child.name_l)
+                    || is_any_cli_agent_with_dirs(child, chatgpt_dirs_l)
+                {
                     continue;
                 }
                 let in_agent_dir = match owner_id {
@@ -3096,14 +3413,23 @@ impl CachedProcessSnapshot {
                     }
                     _ => false,
                 };
-                if !in_agent_dir && is_interactive_shell_or_terminal(&child.name_l) {
+                if !in_agent_dir && is_interactive_shell_proc(child) {
                     continue;
                 }
                 if visited_pids.insert(child.pid) {
                     queue.push((child.pid, label.clone(), owner_id));
                 }
-                if !matches!(child.name_l.as_str(), "cmd.exe" | "cmd" | "conhost.exe") {
-                    out.entry(child.pid).or_insert_with(|| label.clone());
+                if !matches!(
+                    child.name_l.as_str(),
+                    "cmd.exe" | "cmd" | "conhost.exe" | "openconsole.exe"
+                ) {
+                    out.entry(child.pid).or_insert_with(|| {
+                        if is_main_gui_exe(owner_id, &child.name_l) {
+                            label.clone()
+                        } else {
+                            format!("{label} ({})", child.name_l)
+                        }
+                    });
                 }
             }
         }
@@ -3119,7 +3445,7 @@ fn primary_gui_matches_with_dirs(
     chatgpt_dirs_l: &[String],
     ag_dirs_l: &[String],
 ) -> bool {
-    if is_uninstaller_exe(&p.name_l) || is_any_cli_agent(p) {
+    if is_uninstaller_exe(&p.name_l) || is_any_cli_agent_with_dirs(p, chatgpt_dirs_l) {
         return false;
     }
     match agent_id {
@@ -3170,11 +3496,14 @@ pub fn build_process_snapshot_from_table(
         pick_chatgpt_codex_orphans(&all_procs, chatgpt_dirs_l)
             .into_iter()
             .collect();
-    let claude_cli_orphans_all: HashSet<usize> = pick_cli_orphans("claude-code", &all_procs)
-        .into_iter()
-        .collect();
+    let claude_cli_orphans_all: HashSet<usize> =
+        pick_cli_orphans_with_dirs("claude-code", &all_procs, chatgpt_dirs_l)
+            .into_iter()
+            .collect();
     let codex_cli_orphans_all: HashSet<usize> =
-        pick_cli_orphans("codex", &all_procs).into_iter().collect();
+        pick_cli_orphans_with_dirs("codex", &all_procs, chatgpt_dirs_l)
+            .into_iter()
+            .collect();
 
     let mut keep_indices: HashSet<usize> = HashSet::new();
     let mut queue: Vec<u32> = Vec::new();
@@ -3189,7 +3518,7 @@ pub fn build_process_snapshot_from_table(
             if visited_pids.insert(p.pid) {
                 queue.push(p.pid);
             }
-        } else if is_any_cli_agent(p) {
+        } else if is_any_cli_agent_with_dirs(p, chatgpt_dirs_l) {
             keep_indices.insert(idx);
             if visited_pids.insert(p.pid) {
                 queue.push(p.pid);
@@ -3302,7 +3631,15 @@ pub fn build_process_snapshot_from_table(
                 "codex" => codex_cli_orphan_new.contains(&idx),
                 _ => false,
             };
-            if !is_orphan && cli_agent_matches(cid, &info.name_l, &info.path_l, &info.cmd_l) {
+            if !is_orphan
+                && cli_agent_matches_with_dirs(
+                    cid,
+                    &info.name_l,
+                    &info.path_l,
+                    &info.cmd_l,
+                    chatgpt_dirs_l,
+                )
+            {
                 *cli_counts.entry((*cid).to_string()).or_default() += 1;
             }
         }
@@ -3329,8 +3666,19 @@ fn unix_now() -> u64 {
 
 fn dirs_to_lowercase(dirs: Vec<PathBuf>) -> Vec<String> {
     dirs.into_iter()
-        .map(|d| d.to_string_lossy().replace('/', "\\").to_ascii_lowercase())
+        .map(|d| {
+            let raw = d.to_string_lossy();
+            strip_verbatim_win32_str(&raw)
+                .replace('/', "\\")
+                .to_ascii_lowercase()
+        })
         .collect()
+}
+
+fn minimal_process_refresh_kind() -> sysinfo::ProcessRefreshKind {
+    sysinfo::ProcessRefreshKind::new()
+        .with_exe(sysinfo::UpdateKind::OnlyIfNotSet)
+        .with_cmd(sysinfo::UpdateKind::OnlyIfNotSet)
 }
 
 fn collect_sys_procs(sys: &sysinfo::System) -> Vec<ProcInfo> {
@@ -3342,7 +3690,12 @@ fn collect_sys_procs(sys: &sysinfo::System) -> Vec<ProcInfo> {
             name_l: p.name().to_ascii_lowercase(),
             path_l: p
                 .exe()
-                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .map(|e| {
+                    let raw = e.to_string_lossy();
+                    strip_verbatim_win32_str(&raw)
+                        .replace('/', "\\")
+                        .to_ascii_lowercase()
+                })
                 .unwrap_or_default(),
             cmd_l: p
                 .cmd()
@@ -3418,7 +3771,9 @@ impl ProcessScanner {
 
         let all_procs = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.sys.refresh_processes();
+            inner
+                .sys
+                .refresh_processes_specifics(minimal_process_refresh_kind());
             let collected = collect_sys_procs(&inner.sys);
             inner.last_refresh = Some(Instant::now());
             collected
@@ -3473,41 +3828,166 @@ where
     outcome
 }
 
-fn terminate_identities_with_sysinfo(
-    sys: &mut sysinfo::System,
-    candidates: &[ProcessIdentity],
-) -> VerifiedKillOutcome {
-    use sysinfo::Pid;
+#[cfg(windows)]
+fn normalize_identity_exe_path(raw: &str) -> String {
+    strip_verbatim_win32_str(raw)
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
 
-    let sys_cell = std::cell::RefCell::new(sys);
-    terminate_with_recheck(
-        candidates,
-        |pid_u32| {
-            let mut s = sys_cell.borrow_mut();
-            let pid = Pid::from_u32(pid_u32);
-            s.refresh_process(pid);
-            let p = s.process(pid)?;
-            Some(ProcessIdentity {
-                pid: pid_u32,
-                start_time: p.start_time(),
-                exe_path: p
-                    .exe()
-                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                    .unwrap_or_default(),
-            })
-        },
-        |pid_u32| {
-            sys_cell
-                .borrow()
-                .process(Pid::from_u32(pid_u32))
-                .is_some_and(|p| p.kill())
-        },
-    )
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeKillStep {
+    Killed,
+    Vanished,
+    SkippedMismatch,
+    Failed,
+}
+
+/// Native Win32 handle-pinned process termination:
+/// Opens ONE kernel `HANDLE` (`PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE`), verifies
+/// `GetExitCodeProcess == STILL_ACTIVE`, `GetProcessTimes` (`lpCreationTime`), and
+/// `QueryFullProcessImageNameW` (4096-`u16` buffer) on THAT EXACT HANDLE, then calls
+/// `TerminateProcess(h, 1)` directly — zero `taskkill.exe` subprocesses and zero PID-reuse TOCTOU!
+#[cfg(windows)]
+pub(crate) fn terminate_identity_win32(expected: &ProcessIdentity) -> NativeKillStep {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+        TerminateProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    struct WinHandleGuard(HANDLE);
+    impl Drop for WinHandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    const STILL_ACTIVE_CODE: u32 = 259;
+    const WINDOWS_TO_UNIX_EPOCH_SECS: u64 = 11_644_473_600;
+
+    if expected.pid == 0 || expected.pid == std::process::id() {
+        return NativeKillStep::SkippedMismatch;
+    }
+    if expected.start_time == 0 && expected.exe_path.trim().is_empty() {
+        return NativeKillStep::SkippedMismatch;
+    }
+
+    unsafe {
+        let handle = match OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            false,
+            expected.pid,
+        ) {
+            Ok(h) => h,
+            Err(e) if e.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
+                return NativeKillStep::Vanished;
+            }
+            Err(_) => return NativeKillStep::Failed,
+        };
+        let _guard = WinHandleGuard(handle);
+
+        let mut exit_code: u32 = 0;
+        if GetExitCodeProcess(handle, &mut exit_code).is_err() {
+            return NativeKillStep::Failed;
+        }
+        if exit_code != STILL_ACTIVE_CODE {
+            return NativeKillStep::Vanished;
+        }
+
+        let mut creation = FILETIME::default();
+        let mut exit_time = FILETIME::default();
+        let mut kernel_time = FILETIME::default();
+        let mut user_time = FILETIME::default();
+        if GetProcessTimes(
+            handle,
+            &mut creation,
+            &mut exit_time,
+            &mut kernel_time,
+            &mut user_time,
+        )
+        .is_err()
+        {
+            return NativeKillStep::SkippedMismatch;
+        }
+        let ticks = ((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64);
+        let actual_secs = (ticks / 10_000_000).saturating_sub(WINDOWS_TO_UNIX_EPOCH_SECS);
+        if expected.start_time != 0 && actual_secs.abs_diff(expected.start_time) > 1 {
+            return NativeKillStep::SkippedMismatch;
+        }
+
+        if !expected.exe_path.trim().is_empty() {
+            let mut buf = vec![0u16; 4096];
+            let mut size = buf.len() as u32;
+            if QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut size,
+            )
+            .is_err()
+                || size == 0
+            {
+                return NativeKillStep::SkippedMismatch;
+            }
+            let actual_path = String::from_utf16_lossy(&buf[..(size as usize).min(buf.len())]);
+            if normalize_identity_exe_path(&actual_path)
+                != normalize_identity_exe_path(&expected.exe_path)
+            {
+                return NativeKillStep::SkippedMismatch;
+            }
+        }
+
+        match TerminateProcess(handle, 1) {
+            Ok(()) => NativeKillStep::Killed,
+            Err(_) => {
+                let mut post_code: u32 = 0;
+                if GetExitCodeProcess(handle, &mut post_code).is_ok()
+                    && post_code != STILL_ACTIVE_CODE
+                {
+                    NativeKillStep::Vanished
+                } else {
+                    NativeKillStep::Failed
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn terminate_identities_native(candidates: &[ProcessIdentity]) -> VerifiedKillOutcome {
+    let mut outcome = VerifiedKillOutcome::default();
+    for expected in candidates {
+        match terminate_identity_win32(expected) {
+            NativeKillStep::Killed => outcome.killed.push(expected.clone()),
+            NativeKillStep::Vanished => outcome.vanished.push(expected.pid),
+            NativeKillStep::SkippedMismatch | NativeKillStep::Failed => {
+                outcome.skipped_reused.push(expected.clone());
+            }
+        }
+    }
+    outcome
+}
+
+#[cfg(not(windows))]
+fn terminate_identities_native(candidates: &[ProcessIdentity]) -> VerifiedKillOutcome {
+    let mut outcome = VerifiedKillOutcome::default();
+    for c in candidates {
+        outcome.vanished.push(c.pid);
+    }
+    outcome
 }
 
 /// Kill GUI process tree matching `agent_id` children-first (NEVER touches CLI processes,
 /// SCM service hosts, or interactive user shells), re-verifying `(pid, start_time, exe_path)`
-/// immediately before each kill.
+/// via a single pinned Win32 `HANDLE` immediately before each `TerminateProcess`.
 pub fn kill_gui_agent(agent_id: &str) -> Vec<ProcessIdentity> {
     use sysinfo::System;
 
@@ -3516,7 +3996,7 @@ pub fn kill_gui_agent(agent_id: &str) -> Vec<ProcessIdentity> {
     let ag_dirs_l = dirs_to_lowercase(antigravity_covered_dirs());
 
     let mut sys = System::new();
-    sys.refresh_processes();
+    sys.refresh_processes_specifics(minimal_process_refresh_kind());
     let procs = collect_sys_procs(&sys);
 
     let candidates = pick_gui_agent_kill_tree_with_dirs(
@@ -3526,42 +4006,40 @@ pub fn kill_gui_agent(agent_id: &str) -> Vec<ProcessIdentity> {
         &chatgpt_dirs_l,
         &ag_dirs_l,
     );
-    terminate_identities_with_sysinfo(&mut sys, &candidates).killed
+    terminate_identities_native(&candidates).killed
 }
 
 /// Kill CLI session process tree matching `cli_id` (`claude-code`, `codex`, `gemini`)
-/// children-first with PID-reuse identity re-verification (never touches ancestor terminals).
+/// children-first with handle-pinned PID-reuse identity re-verification (never touches ancestor terminals).
 pub fn kill_cli_agent(cli_id: &str) -> Vec<ProcessIdentity> {
     use sysinfo::System;
 
+    let chatgpt_dirs_l = dirs_to_lowercase(chatgpt_covered_dirs());
     let mut sys = System::new();
-    sys.refresh_processes();
+    sys.refresh_processes_specifics(minimal_process_refresh_kind());
     let procs = collect_sys_procs(&sys);
 
-    let candidates = pick_cli_agent_kill_tree(cli_id, &procs);
-    terminate_identities_with_sysinfo(&mut sys, &candidates).killed
+    let candidates = pick_cli_agent_kill_tree_with_dirs(cli_id, &procs, &chatgpt_dirs_l);
+    terminate_identities_native(&candidates).killed
 }
 
-/// Sweep Claude desktop residuals / orphan CLI processes with PID-reuse re-verification.
+/// Sweep Claude desktop residuals / orphan CLI processes with handle-pinned Win32 termination.
 /// Never kills CLI processes attached to live terminals in `SweepMode::Residual`.
 pub fn sweep_claude(mode: SweepMode) -> SweepReport {
-    use sysinfo::{Pid, System};
+    use sysinfo::System;
 
-    let claude_dir_l = claude_covered_dirs()
-        .into_iter()
-        .next()
-        .map(|d| d.to_string_lossy().to_ascii_lowercase());
+    let claude_dirs_l = dirs_to_lowercase(claude_covered_dirs());
     let mut sys = System::new();
-    sys.refresh_processes();
+    sys.refresh_processes_specifics(minimal_process_refresh_kind());
     let procs = collect_sys_procs(&sys);
 
     let picks = match mode {
-        SweepMode::Manual => pick_manual(&procs, claude_dir_l.as_deref()),
-        SweepMode::Residual => match pick_residual(&procs, claude_dir_l.as_deref()) {
+        SweepMode::Manual => pick_manual_with_dirs(&procs, &claude_dirs_l),
+        SweepMode::Residual => match pick_residual_with_dirs(&procs, &claude_dirs_l) {
             Some(v) => v,
             None => {
                 return SweepReport {
-                    scanned: pick_manual(&procs, claude_dir_l.as_deref()).len(),
+                    scanned: pick_manual_with_dirs(&procs, &claude_dirs_l).len(),
                     note: "桌面端仍在运行，不清理".into(),
                     ..SweepReport::default()
                 };
@@ -3569,45 +4047,36 @@ pub fn sweep_claude(mode: SweepMode) -> SweepReport {
         },
     };
 
+    if picks.is_empty() {
+        return SweepReport::default();
+    }
+
+    let candidates: Vec<ProcessIdentity> = picks
+        .iter()
+        .map(|(idx, _)| procs[*idx].identity())
+        .collect();
+    let meta_by_pid: HashMap<u32, (&str, ClaudeKind)> = picks
+        .iter()
+        .map(|(idx, kind)| (procs[*idx].pid, (procs[*idx].name_l.as_str(), *kind)))
+        .collect();
+
+    let outcome = terminate_identities_native(&candidates);
     let mut report = SweepReport {
-        scanned: picks.len(),
+        scanned: candidates.len(),
+        killed: outcome.killed.len(),
+        unconfirmed: outcome.skipped_reused.len() + outcome.vanished.len(),
         ..SweepReport::default()
     };
 
-    for (idx, kind) in picks {
-        let info = &procs[idx];
-        let expected = info.identity();
-        let pid = Pid::from_u32(info.pid);
-        sys.refresh_process(pid);
-        let confirmed = sys.process(pid).is_some_and(|p| {
-            let observed = ProcessIdentity {
-                pid: info.pid,
-                start_time: p.start_time(),
-                exe_path: p
-                    .exe()
-                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                    .unwrap_or_default(),
-            };
-            same_identity(&expected, &observed)
-        });
-        if !confirmed {
-            report.unconfirmed += 1;
-            continue;
-        }
-        if let Some(p) = sys.process(pid) {
-            if p.kill() {
-                report.killed += 1;
-                match kind {
-                    ClaudeKind::Desktop => report.desktop_killed += 1,
-                    ClaudeKind::Cli => report.cli_killed += 1,
-                }
-                report.detail.push(format!(
-                    "pid={} {}（{}）",
-                    info.pid,
-                    info.name_l,
-                    kind.label()
-                ));
+    for killed in &outcome.killed {
+        if let Some(&(name_l, kind)) = meta_by_pid.get(&killed.pid) {
+            match kind {
+                ClaudeKind::Desktop => report.desktop_killed += 1,
+                ClaudeKind::Cli => report.cli_killed += 1,
             }
+            report
+                .detail
+                .push(format!("pid={} {}（{}）", killed.pid, name_l, kind.label()));
         }
     }
     report
@@ -3664,10 +4133,13 @@ pub fn pick_all_orphan_targets(
             OrphanCategory::ChatGptCodex,
         ),
         (
-            pick_cli_orphans("claude-code", procs),
+            pick_cli_orphans_with_dirs("claude-code", procs, chatgpt_dirs_l),
             OrphanCategory::ClaudeCodeCli,
         ),
-        (pick_cli_orphans("codex", procs), OrphanCategory::CodexCli),
+        (
+            pick_cli_orphans_with_dirs("codex", procs, chatgpt_dirs_l),
+            OrphanCategory::CodexCli,
+        ),
     ];
 
     for (indices, cat) in buckets {
@@ -3682,7 +4154,7 @@ pub fn pick_all_orphan_targets(
 
 /// Sweep all orphaned residual processes across all 5 guarded categories (Claude desktop,
 /// ChatGPT/Codex desktop, Antigravity, Claude Code CLI, Codex CLI) children-first with
-/// `(pid, start_time, exe_path)` PID-reuse re-verification.
+/// handle-pinned `(pid, start_time, exe_path)` Win32 termination.
 pub fn sweep_all_orphans() -> SweepReport {
     use sysinfo::System;
 
@@ -3691,7 +4163,7 @@ pub fn sweep_all_orphans() -> SweepReport {
     let ag_dirs_l = dirs_to_lowercase(antigravity_covered_dirs());
 
     let mut sys = System::new();
-    sys.refresh_processes();
+    sys.refresh_processes_specifics(minimal_process_refresh_kind());
     let procs = collect_sys_procs(&sys);
 
     let targets = pick_all_orphan_targets(&procs, &claude_dirs_l, &chatgpt_dirs_l, &ag_dirs_l);
@@ -3708,7 +4180,7 @@ pub fn sweep_all_orphans() -> SweepReport {
         .map(|(idx, cat)| (procs[*idx].pid, (procs[*idx].name_l.as_str(), *cat)))
         .collect();
 
-    let outcome = terminate_identities_with_sysinfo(&mut sys, &candidates);
+    let outcome = terminate_identities_native(&candidates);
     let mut report = SweepReport {
         scanned: candidates.len(),
         killed: outcome.killed.len(),
@@ -3744,7 +4216,7 @@ pub enum ClaudePresence {
 
 #[cfg(windows)]
 pub fn claude_presence_fast(claude_dir_l: Option<&str>) -> ClaudePresence {
-    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
@@ -3754,6 +4226,17 @@ pub fn claude_presence_fast(claude_dir_l: Option<&str>) -> ClaudePresence {
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
+    struct WinHandleGuard(HANDLE);
+    impl Drop for WinHandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
     let mut seen = ClaudePresence::None;
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
@@ -3762,6 +4245,8 @@ pub fn claude_presence_fast(claude_dir_l: Option<&str>) -> ClaudePresence {
         if snap == INVALID_HANDLE_VALUE {
             return ClaudePresence::Desktop;
         }
+        let _snap_guard = WinHandleGuard(snap);
+
         let mut entry = PROCESSENTRY32W {
             dwSize: core::mem::size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
@@ -3774,14 +4259,18 @@ pub fn claude_presence_fast(claude_dir_l: Option<&str>) -> ClaudePresence {
                     .position(|&c| c == 0)
                     .unwrap_or(entry.szExeFile.len());
                 let name_l = String::from_utf16_lossy(&entry.szExeFile[..len]).to_ascii_lowercase();
-                if name_l.contains("claude") && !is_agent_scm_service_exe(&name_l) {
+                if name_l.contains("claude")
+                    && !is_agent_scm_service_exe(&name_l)
+                    && !is_uninstaller_exe(&name_l)
+                {
                     let mut path_l = String::new();
                     if let Ok(handle) = OpenProcess(
                         PROCESS_QUERY_LIMITED_INFORMATION,
                         false,
                         entry.th32ProcessID,
                     ) {
-                        let mut buf = [0u16; 1024];
+                        let _proc_guard = WinHandleGuard(handle);
+                        let mut buf = vec![0u16; 4096];
                         let mut size = buf.len() as u32;
                         if QueryFullProcessImageNameW(
                             handle,
@@ -3790,11 +4279,12 @@ pub fn claude_presence_fast(claude_dir_l: Option<&str>) -> ClaudePresence {
                             &mut size,
                         )
                         .is_ok()
+                            && size > 0
                         {
-                            path_l = String::from_utf16_lossy(&buf[..size as usize])
-                                .to_ascii_lowercase();
+                            path_l =
+                                String::from_utf16_lossy(&buf[..(size as usize).min(buf.len())])
+                                    .to_ascii_lowercase();
                         }
-                        let _ = CloseHandle(handle);
                     }
                     let cli = is_claude_cli_path_l(&path_l) || path_l.contains("@anthropic-ai");
                     let in_dir = claude_dir_l.is_some_and(|d| path_under_dir_l(&path_l, d));
@@ -3816,7 +4306,6 @@ pub fn claude_presence_fast(claude_dir_l: Option<&str>) -> ClaudePresence {
                 }
             }
         }
-        let _ = CloseHandle(snap);
     }
     seen
 }
@@ -3868,13 +4357,383 @@ pub fn build_launch_command(target: &LaunchTarget) -> PlatformResult<(PathBuf, V
     }
 }
 
-/// Launch a desktop app under the normal-privilege desktop shell token (`explorer.exe`).
+fn push_quoted_win32_arg(out: &mut String, arg: &str, force_quotes: bool) {
+    let needs_quotes =
+        force_quotes || arg.is_empty() || arg.chars().any(|c| matches!(c, ' ' | '\t' | '"'));
+    if !needs_quotes {
+        out.push_str(arg);
+        return;
+    }
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+        } else if ch == '"' {
+            for _ in 0..(backslashes * 2 + 1) {
+                out.push('\\');
+            }
+            out.push('"');
+            backslashes = 0;
+        } else {
+            for _ in 0..backslashes {
+                out.push('\\');
+            }
+            backslashes = 0;
+            out.push(ch);
+        }
+    }
+    for _ in 0..(backslashes * 2) {
+        out.push('\\');
+    }
+    out.push('"');
+}
+
+/// Pure `CommandLineToArgvW`-compliant Windows command line encoder.
+pub(crate) fn format_windows_command_line(program: &Path, args: &[String]) -> String {
+    let mut cmd = String::new();
+    push_quoted_win32_arg(&mut cmd, &program.to_string_lossy(), true);
+    for arg in args {
+        cmd.push(' ');
+        push_quoted_win32_arg(&mut cmd, arg, false);
+    }
+    cmd
+}
+
+#[cfg(windows)]
+fn query_active_session_user_token() -> Option<windows::Win32::Foundation::HANDLE> {
+    use core::ffi::c_void;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::RemoteDesktop::{
+        WTSActive, WTSEnumerateSessionsW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
+        WTSQueryUserToken, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW,
+    };
+
+    struct WtsMemGuard(*mut c_void);
+    impl Drop for WtsMemGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    WTSFreeMemory(self.0);
+                }
+            }
+        }
+    }
+
+    unsafe {
+        let console_id = WTSGetActiveConsoleSessionId();
+        if console_id != 0 && console_id != u32::MAX {
+            let mut tok = HANDLE::default();
+            if WTSQueryUserToken(console_id, &mut tok).is_ok() && !tok.is_invalid() {
+                return Some(tok);
+            }
+        }
+
+        let mut sessions_ptr: *mut WTS_SESSION_INFOW = core::ptr::null_mut();
+        let mut count: u32 = 0;
+        if WTSEnumerateSessionsW(
+            WTS_CURRENT_SERVER_HANDLE,
+            0,
+            1,
+            &mut sessions_ptr,
+            &mut count,
+        )
+        .is_err()
+            || sessions_ptr.is_null()
+        {
+            return None;
+        }
+        let _mem = WtsMemGuard(sessions_ptr.cast::<c_void>());
+        let sessions = core::slice::from_raw_parts(sessions_ptr, count as usize);
+        for info in sessions {
+            if info.SessionId != 0 && info.State == WTSActive {
+                let mut tok = HANDLE::default();
+                if WTSQueryUserToken(info.SessionId, &mut tok).is_ok() && !tok.is_invalid() {
+                    return Some(tok);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn build_user_unicode_env_block_for_service() -> Option<Vec<u16>> {
+    let home = user_home_dirs().into_iter().next()?;
+    let mut env_map: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| {
+            !matches!(
+                k.to_ascii_uppercase().as_str(),
+                "USERPROFILE" | "APPDATA" | "LOCALAPPDATA" | "TEMP" | "TMP"
+            )
+        })
+        .collect();
+
+    let home_s = home.to_string_lossy().into_owned();
+    let roaming = home
+        .join("AppData")
+        .join("Roaming")
+        .to_string_lossy()
+        .into_owned();
+    let local = home.join("AppData").join("Local");
+    let temp = local.join("Temp").to_string_lossy().into_owned();
+    let local_s = local.to_string_lossy().into_owned();
+
+    env_map.push(("USERPROFILE".into(), home_s));
+    env_map.push(("APPDATA".into(), roaming));
+    env_map.push(("LOCALAPPDATA".into(), local_s));
+    env_map.push(("TEMP".into(), temp.clone()));
+    env_map.push(("TMP".into(), temp));
+    env_map.sort_by_key(|a| a.0.to_ascii_uppercase());
+
+    let mut block: Vec<u16> = Vec::new();
+    for (k, v) in env_map {
+        if k.contains('\0') || v.contains('\0') {
+            continue;
+        }
+        block.extend(k.encode_utf16());
+        block.push(b'=' as u16);
+        block.extend(v.encode_utf16());
+        block.push(0);
+    }
+    block.push(0);
+    Some(block)
+}
+
+#[cfg(windows)]
+fn launch_from_session_zero(
+    program: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> PlatformResult<()> {
+    use core::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        DuplicateTokenEx, SecurityIdentification, TokenPrimary, TOKEN_ADJUST_DEFAULT,
+        TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{
+        CreateProcessAsUserW, CREATE_UNICODE_ENVIRONMENT, PROCESS_CREATION_FLAGS,
+        PROCESS_INFORMATION, STARTUPINFOW,
+    };
+
+    struct WinHandleGuard(HANDLE);
+    impl Drop for WinHandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    let raw_user_tok = query_active_session_user_token().ok_or_else(|| {
+        PlatformError::Io("未检测到活动的交互式桌面会话，无法从服务会话启动客户端".into())
+    })?;
+    let _user_tok_guard = WinHandleGuard(raw_user_tok);
+
+    let mut primary_tok = HANDLE::default();
+    unsafe {
+        DuplicateTokenEx(
+            raw_user_tok,
+            TOKEN_ASSIGN_PRIMARY
+                | TOKEN_DUPLICATE
+                | TOKEN_QUERY
+                | TOKEN_ADJUST_DEFAULT
+                | TOKEN_ADJUST_SESSIONID,
+            None,
+            SecurityIdentification,
+            TokenPrimary,
+            &mut primary_tok,
+        )
+    }
+    .map_err(|e| PlatformError::Io(format!("DuplicateTokenEx(Session0) failed: {e}")))?;
+    let _primary_guard = WinHandleGuard(primary_tok);
+
+    let prog_w: Vec<u16> = program.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut cmd_w: Vec<u16> = format_windows_command_line(program, args)
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let cwd_w: Option<Vec<u16>> = cwd.map(|d| d.as_os_str().encode_wide().chain(Some(0)).collect());
+    let cwd_pcwstr = cwd_w
+        .as_ref()
+        .map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr()));
+    let mut desktop_w: Vec<u16> = "winsta0\\default".encode_utf16().chain(Some(0)).collect();
+    let env_block = build_user_unicode_env_block_for_service();
+    let flags = if env_block.is_some() {
+        CREATE_UNICODE_ENVIRONMENT
+    } else {
+        PROCESS_CREATION_FLAGS(0)
+    };
+
+    let si = STARTUPINFOW {
+        cb: core::mem::size_of::<STARTUPINFOW>() as u32,
+        lpDesktop: PWSTR(desktop_w.as_mut_ptr()),
+        ..Default::default()
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+
+    unsafe {
+        CreateProcessAsUserW(
+            primary_tok,
+            PCWSTR(prog_w.as_ptr()),
+            PWSTR(cmd_w.as_mut_ptr()),
+            None,
+            None,
+            false,
+            flags,
+            env_block.as_ref().map(|b| b.as_ptr().cast::<c_void>()),
+            cwd_pcwstr,
+            &si,
+            &mut pi,
+        )
+    }
+    .map_err(|e| {
+        PlatformError::Io(format!(
+            "CreateProcessAsUserW failed for {}: {e}",
+            program.display()
+        ))
+    })?;
+
+    let _proc_guard = WinHandleGuard(pi.hProcess);
+    let _thread_guard = WinHandleGuard(pi.hThread);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn try_launch_via_shell_token(
+    program: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> PlatformResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ADJUST_DEFAULT,
+        TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{
+        CreateProcessWithTokenW, OpenProcess, OpenProcessToken, LOGON_WITH_PROFILE,
+        PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+        STARTUPINFOW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
+
+    struct WinHandleGuard(HANDLE);
+    impl Drop for WinHandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    unsafe {
+        let shell_hwnd = GetShellWindow();
+        if shell_hwnd.0.is_null() {
+            return Err(PlatformError::Io("desktop shell window unavailable".into()));
+        }
+        let mut shell_pid: u32 = 0;
+        GetWindowThreadProcessId(shell_hwnd, Some(&mut shell_pid));
+        if shell_pid == 0 || shell_pid == std::process::id() {
+            return Err(PlatformError::Io("invalid desktop shell PID".into()));
+        }
+
+        let shell_proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, shell_pid)
+            .map_err(|e| PlatformError::Io(format!("OpenProcess(shell) failed: {e}")))?;
+        let _proc_guard = WinHandleGuard(shell_proc);
+
+        let mut shell_tok = HANDLE::default();
+        OpenProcessToken(shell_proc, TOKEN_DUPLICATE, &mut shell_tok)
+            .map_err(|e| PlatformError::Io(format!("OpenProcessToken(shell) failed: {e}")))?;
+        let _tok_guard = WinHandleGuard(shell_tok);
+
+        let mut primary_tok = HANDLE::default();
+        DuplicateTokenEx(
+            shell_tok,
+            TOKEN_ASSIGN_PRIMARY
+                | TOKEN_DUPLICATE
+                | TOKEN_QUERY
+                | TOKEN_ADJUST_DEFAULT
+                | TOKEN_ADJUST_SESSIONID,
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut primary_tok,
+        )
+        .map_err(|e| PlatformError::Io(format!("DuplicateTokenEx(shell) failed: {e}")))?;
+        let _primary_guard = WinHandleGuard(primary_tok);
+
+        let prog_w: Vec<u16> = program.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut cmd_w: Vec<u16> = format_windows_command_line(program, args)
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let cwd_w: Option<Vec<u16>> =
+            cwd.map(|d| d.as_os_str().encode_wide().chain(Some(0)).collect());
+        let cwd_pcwstr = cwd_w
+            .as_ref()
+            .map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr()));
+        let si = STARTUPINFOW {
+            cb: core::mem::size_of::<STARTUPINFOW>() as u32,
+            ..Default::default()
+        };
+        let mut pi = PROCESS_INFORMATION::default();
+
+        CreateProcessWithTokenW(
+            primary_tok,
+            LOGON_WITH_PROFILE,
+            PCWSTR(prog_w.as_ptr()),
+            PWSTR(cmd_w.as_mut_ptr()),
+            PROCESS_CREATION_FLAGS(0),
+            None,
+            cwd_pcwstr,
+            &si,
+            &mut pi,
+        )
+        .map_err(|e| PlatformError::Io(format!("CreateProcessWithTokenW failed: {e}")))?;
+
+        let _child_proc = WinHandleGuard(pi.hProcess);
+        let _child_thread = WinHandleGuard(pi.hThread);
+        Ok(())
+    }
+}
+
+/// Launch a desktop app under the normal-privilege interactive user token:
+/// - In Session 0 (`LocalSystem` service): `WTSQueryUserToken` -> `DuplicateTokenEx` -> `CreateProcessAsUserW` (`winsta0\default`).
+/// - When elevated in an interactive session: `GetShellWindow` (`explorer.exe`) -> `CreateProcessWithTokenW(LOGON_WITH_PROFILE)` (falling back to `Command::spawn` if shell token unavailable).
+/// - When already unelevated: `std::process::Command::spawn`.
 #[cfg(windows)]
 pub fn launch_normal_privilege(target: &LaunchTarget) -> PlatformResult<()> {
     let (program, args) = build_launch_command(target)?;
-    std::process::Command::new(&program)
-        .args(&args)
-        .spawn()
+    let cwd = match target {
+        LaunchTarget::Executable { path, .. } => path.parent().filter(|p| p.is_dir()),
+        LaunchTarget::AppsFolder { .. } => None,
+    };
+
+    if crate::access_win::is_session_zero() {
+        return launch_from_session_zero(&program, &args, cwd);
+    }
+
+    if crate::access_win::is_elevated().unwrap_or(false)
+        && try_launch_via_shell_token(&program, &args, cwd).is_ok()
+    {
+        return Ok(());
+    }
+
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(&args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.spawn()
         .map_err(|e| PlatformError::Io(format!("failed to launch {}: {e}", program.display())))?;
     Ok(())
 }
@@ -4204,13 +5063,21 @@ mod tests {
         assert_eq!(snap.gui_counts.get("antigravity"), Some(&3));
 
         let pids = snap.guarded_agent_pids(&["antigravity".to_string()], None);
-        for expected_pid in [100u32, 200, 202, 203, 204] {
+        for expected_pid in [100u32, 200, 202] {
             assert_eq!(
                 pids.get(&expected_pid).map(String::as_str),
                 Some("反重力"),
                 "pid {expected_pid} must map to 反重力"
             );
         }
+        assert_eq!(pids.get(&203).map(String::as_str), Some("反重力 (uv.exe)"));
+        assert_eq!(
+            pids.get(&204).map(String::as_str),
+            Some("反重力 (python.exe)")
+        );
+        assert!(crate::netwatch_win::is_mcp_agent_label(
+            pids.get(&204).unwrap()
+        ));
         assert!(!pids.contains_key(&300), "pwsh.exe must not be attributed");
         assert!(
             !pids.contains_key(&301),
@@ -4398,8 +5265,24 @@ mod tests {
                 9999,
                 "node.exe",
                 r"c:\nodejs\node.exe",
-                "node antigravity-mcp.js",
+                r"node c:\users\u\.antigravity\extensions\agy-mcp\index.js",
             ),
+            // User dev server in `.gemini\antigravity\scratch` & Cursor MCP & unreadable-cmd node MUST be spared!
+            mk(
+                601,
+                9999,
+                "node.exe",
+                r"c:\nodejs\node.exe",
+                r"node c:\users\u\.gemini\antigravity\scratch\my-app\vite.js",
+            ),
+            mk(
+                602,
+                9999,
+                "node.exe",
+                r"c:\nodejs\node.exe",
+                r"node c:\users\u\.cursor\mcp\server.js",
+            ),
+            mk(603, 9999, "node.exe", r"c:\nodejs\node.exe", ""),
         ];
         let orphans_a: Vec<u32> = pick_antigravity_orphans(&after_exit, &[ag_dir.to_string()])
             .into_iter()
@@ -4407,6 +5290,9 @@ mod tests {
             .collect();
         assert_eq!(orphans_a.len(), 5);
         assert!(!orphans_a.contains(&501));
+        assert!(!orphans_a.contains(&601));
+        assert!(!orphans_a.contains(&602));
+        assert!(!orphans_a.contains(&603));
         let pos_a = |pid: u32| orphans_a.iter().position(|&x| x == pid).unwrap();
         assert!(pos_a(112) < pos_a(111));
         assert!(pos_a(111) < pos_a(110));
@@ -4825,7 +5711,10 @@ mod tests {
 
         // Yet SCM services ARE retained in procs and monitored in guarded_agent_pids!
         let pids_idle = snap_idle.guarded_agent_pids(&["claude".into(), "chatgpt".into()], None);
-        assert_eq!(pids_idle.get(&50).map(String::as_str), Some("Claude"));
+        assert_eq!(
+            pids_idle.get(&50).map(String::as_str),
+            Some("Claude (cowork-svc.exe)")
+        );
         assert_eq!(pids_idle.get(&60).map(String::as_str), Some("ChatGPT"));
         assert_eq!(pids_idle.get(&61).map(String::as_str), Some("ChatGPT"));
 
@@ -4982,15 +5871,30 @@ mod tests {
 
         // Full descendant socket monitoring across GUI + CLI trees
         let pids = snap.guarded_agent_pids(&["claude".into(), "chatgpt".into()], None);
-        assert_eq!(pids.get(&110).map(String::as_str), Some("Claude"));
-        assert_eq!(pids.get(&111).map(String::as_str), Some("Claude"));
+        assert_eq!(
+            pids.get(&110).map(String::as_str),
+            Some("Claude (github-mcp-server.exe)")
+        );
+        assert_eq!(
+            pids.get(&111).map(String::as_str),
+            Some("Claude (node.exe)")
+        );
         assert_eq!(pids.get(&200).map(String::as_str), Some("ChatGPT"));
         assert_eq!(pids.get(&201).map(String::as_str), Some("ChatGPT"));
-        assert_eq!(pids.get(&202).map(String::as_str), Some("ChatGPT"));
+        assert_eq!(
+            pids.get(&202).map(String::as_str),
+            Some("ChatGPT (node.exe)")
+        );
         assert_eq!(pids.get(&301).map(String::as_str), Some("Claude Code"));
-        assert_eq!(pids.get(&302).map(String::as_str), Some("Claude Code"));
+        assert_eq!(
+            pids.get(&302).map(String::as_str),
+            Some("Claude Code (node.exe)")
+        );
         assert_eq!(pids.get(&400).map(String::as_str), Some("Codex CLI"));
-        assert_eq!(pids.get(&401).map(String::as_str), Some("Codex CLI"));
+        assert_eq!(
+            pids.get(&401).map(String::as_str),
+            Some("Codex CLI (codex-command-runner.exe)")
+        );
         assert!(
             !pids.contains_key(&300),
             "wt.exe terminal must never be monitored"
@@ -5421,5 +6325,263 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn utf8_chinese_msix_packages_and_profile_paths_never_panic() {
+        // 1. 3-byte Chinese UTF-8 MSIX package names where ASCII prefix lengths (7, 13) land mid-character!
+        for pkg in ["腾讯会议_3.20", "网易云音乐_2.10", "哔哩哔哩_1.0"] {
+            assert!(!package_name_matches_prefix(pkg, "Claude_"));
+            assert!(!package_name_matches_prefix(pkg, "OpenAI.Codex_"));
+            assert!(!package_name_matches_prefix(pkg, "OpenAI.ChatGPT-Desktop_"));
+        }
+        assert!(package_name_matches_prefix(
+            "claude_5.1231.2.0_x64__pzs8sxrjxfjjc",
+            "Claude_"
+        ));
+
+        let wa_root = unique_temp_dir("zh-msix");
+        for folder in [
+            "腾讯会议_3.20__abc",
+            "网易云音乐_2.10__def",
+            "哔哩哔哩_1.0__ghi",
+            "Claude_5.1231.2.0_x64__pzs8sxrjxfjjc",
+        ] {
+            std::fs::create_dir_all(wa_root.join(folder)).unwrap();
+        }
+        let matched = find_windowsapps_dir_in(&wa_root, "Claude_").unwrap();
+        assert!(matched.ends_with("Claude_5.1231.2.0_x64__pzs8sxrjxfjjc"));
+        assert!(find_windowsapps_dir_in(&wa_root, "OpenAI.Codex_").is_none());
+        let _ = std::fs::remove_dir_all(&wa_root);
+
+        // 2. Chinese user profile path (`D:\Users\张三\AppData` has byte 13 mid-char of `三`!)
+        assert_eq!(
+            expand_profile_image_path_with_drive(r"D:\Users\张三\AppData", "C:"),
+            PathBuf::from(r"D:\Users\张三\AppData")
+        );
+        assert_eq!(
+            expand_profile_image_path_with_drive(r"%SystemDrive%\Users\张三", "D:"),
+            PathBuf::from(r"D:\Users\张三")
+        );
+        assert!(path_under_dir_l(
+            r"\\?\d:\users\张三\appdata\local\programs\antigravity\antigravity.exe",
+            r"d:\users\张三\appdata\local\programs\antigravity"
+        ));
+    }
+
+    #[test]
+    fn conpty_interactive_cmd_winget_codex_dir_gemini_and_claude_residual_sweep() {
+        // 1. ConPTY / interactive cmd.exe without `/c` vs batch `cmd.exe /c`
+        let mk = |pid: u32, ppid: u32, name: &str, path: &str, cmd: &str| ProcInfo {
+            pid,
+            ppid,
+            name_l: name.to_string(),
+            path_l: path.to_string(),
+            cmd_l: cmd.to_string(),
+            start_time: 8000 + pid as u64,
+        };
+        assert!(is_interactive_shell_or_terminal("conhost.exe"));
+        assert!(is_interactive_shell_or_terminal("openconsole.exe"));
+        assert!(is_interactive_shell_or_terminal("code.exe"));
+        assert!(is_interactive_shell_or_terminal("chrome.exe"));
+        assert!(is_interactive_shell_proc(&mk(
+            1,
+            0,
+            "cmd.exe",
+            r"c:\windows\system32\cmd.exe",
+            r#""c:\windows\system32\cmd.exe""#
+        )));
+        assert!(!is_interactive_shell_proc(&mk(
+            2,
+            0,
+            "cmd.exe",
+            r"c:\windows\system32\cmd.exe",
+            r#"cmd.exe /d /s /c "agy-node.cmd""#
+        )));
+
+        // Integrated `cmd.exe` (no `/c`) and `openconsole.exe` inside Antigravity MUST spare user's `node.exe`!
+        let ag_dir = r"c:\apps\antigravity";
+        let procs = vec![
+            mk(
+                100,
+                10,
+                "antigravity.exe",
+                &format!(r"{ag_dir}\antigravity.exe"),
+                "",
+            ),
+            mk(
+                110,
+                100,
+                "cmd.exe",
+                r"c:\windows\system32\cmd.exe",
+                "cmd.exe",
+            ),
+            mk(111, 110, "node.exe", r"c:\nodejs\node.exe", "node vite.js"),
+            mk(
+                120,
+                100,
+                "openconsole.exe",
+                r"c:\windows\openconsole.exe",
+                "",
+            ),
+            mk(121, 120, "nu.exe", r"c:\tools\nu.exe", ""),
+        ];
+        let kill_pids: Vec<u32> =
+            pick_gui_agent_kill_tree("antigravity", &procs, None, &[ag_dir.to_string()])
+                .into_iter()
+                .map(|i| i.pid)
+                .collect();
+        assert_eq!(kill_pids, vec![100]);
+
+        // 2. WinGet Claude CLI is CLI, never GUI
+        for wg in [
+            r"c:\users\u\appdata\local\microsoft\winget\packages\anthropic.claudecode_microsoft.winget.source_8wekyb3d8bbwe\claude.exe",
+            r"c:\users\u\appdata\local\microsoft\winget\links\claude.exe",
+        ] {
+            assert!(!gui_agent_matches("claude", "claude.exe", wg, None));
+            assert!(cli_agent_matches("claude-code", "claude.exe", wg, ""));
+        }
+
+        // 3. `Codex.exe` inside custom `chatgpt_dirs_l` is GUI (`chatgpt`), NOT CLI (`codex`)!
+        let custom_codex_dir = r"d:\custom\openai codex";
+        let custom_codex_exe = r"d:\custom\openai codex\app\codex.exe";
+        assert!(!cli_agent_matches_with_dirs(
+            "codex",
+            "codex.exe",
+            custom_codex_exe,
+            "",
+            &[custom_codex_dir.to_string()]
+        ));
+        let codex_procs = vec![mk(50, 10, "codex.exe", custom_codex_exe, "")];
+        let gpt_tree = pick_gui_agent_kill_tree_with_dirs(
+            "chatgpt",
+            &codex_procs,
+            &[],
+            &[custom_codex_dir.to_string()],
+            &[],
+        );
+        assert_eq!(gpt_tree.len(), 1);
+
+        // 4. Gemini CLI requires JS runtime (`node`/`bun`/`deno`) + `@google/gemini-cli`
+        assert!(cli_agent_matches(
+            "gemini",
+            "bun.exe",
+            r"c:\bun\bun.exe",
+            r"bun c:\node_modules\@google\gemini-cli\dist\index.js"
+        ));
+        assert!(!cli_agent_matches(
+            "gemini",
+            "code.exe",
+            r"c:\vscode\code.exe",
+            "code gemini-cli"
+        ));
+
+        // 5. `pick_residual` sweeps orphaned Claude `--type=gpu-process` / `github-mcp-server.exe` -> `node.exe` children-first!
+        let claude_dir = r"c:\program files\windowsapps\claude_5.1231.2.0_x64__pzs8sxrjxfjjc";
+        let residual_procs = vec![
+            mk(
+                210,
+                200,
+                "claude.exe",
+                &format!(r"{claude_dir}\app\claude.exe"),
+                "--type=gpu-process",
+            ),
+            mk(
+                220,
+                200,
+                "github-mcp-server.exe",
+                &format!(r"{claude_dir}\app\github-mcp-server.exe"),
+                "",
+            ),
+            mk(221, 220, "node.exe", r"c:\nodejs\node.exe", "mcp-worker.js"),
+        ];
+        let res = pick_residual(&residual_procs, Some(claude_dir))
+            .expect("orphaned GPU/MCP helpers must be swept when root Claude.exe is gone");
+        let res_pids: Vec<u32> = res.iter().map(|(i, _)| residual_procs[*i].pid).collect();
+        assert_eq!(res_pids.len(), 3);
+        let pos = |pid: u32| res_pids.iter().position(|&x| x == pid).unwrap();
+        assert!(
+            pos(221) < pos(220),
+            "child node.exe must precede parent mcp-server"
+        );
+
+        // 6. Command line quoting & discovery cache invalidation
+        let quoted = format_windows_command_line(
+            Path::new(r"D:\Users\张三\Antigravity IDE\Antigravity IDE.exe"),
+            &[
+                "--proxy-server=http://127.0.0.1:7890".into(),
+                "arg with space".into(),
+            ],
+        );
+        assert!(quoted.starts_with(r#""D:\Users\张三\Antigravity IDE\Antigravity IDE.exe""#));
+        assert!(quoted.ends_with(r#""arg with space""#));
+        invalidate_discovery_cache();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win32_handle_pinned_termination_verifies_identity_and_terminates_without_taskkill() {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let ping_exe = PathBuf::from(r"C:\Windows\System32\PING.EXE");
+        if !ping_exe.is_file() {
+            return;
+        }
+
+        let child = Command::new(&ping_exe)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("spawn background ping.exe for handle-pinned kill test");
+
+        struct ChildCleanup(std::process::Child);
+        impl Drop for ChildCleanup {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut guard = ChildCleanup(child);
+        let pid = guard.0.id();
+
+        // 1. Mismatched exe_path must be rejected without killing the process!
+        assert_eq!(
+            terminate_identity_win32(&ProcessIdentity {
+                pid,
+                start_time: 0,
+                exe_path: r"C:\Windows\System32\notepad.exe".into(),
+            }),
+            NativeKillStep::SkippedMismatch
+        );
+        assert!(guard.0.try_wait().unwrap().is_none());
+
+        // 2. Mismatched start_time must be rejected without killing the process!
+        assert_eq!(
+            terminate_identity_win32(&ProcessIdentity {
+                pid,
+                start_time: 946_684_800, // Year 2000
+                exe_path: ping_exe.to_string_lossy().into_owned(),
+            }),
+            NativeKillStep::SkippedMismatch
+        );
+        assert!(guard.0.try_wait().unwrap().is_none());
+
+        // 3. Matching identity terminates via handle-pinned `TerminateProcess(h, 1)`!
+        let now_secs = unix_now();
+        assert_eq!(
+            terminate_identity_win32(&ProcessIdentity {
+                pid,
+                start_time: now_secs,
+                exe_path: ping_exe.to_string_lossy().into_owned(),
+            }),
+            NativeKillStep::Killed
+        );
+        let status = guard.0.wait().expect("wait terminated ping.exe");
+        assert!(!status.success());
     }
 }

@@ -569,6 +569,7 @@ pub fn render_notify_page(
 
             let ctrl_fs_en = ctrl.clone();
             let ctrl_fs_clr = ctrl.clone();
+            let ctrl_fs_reset = ctrl.clone();
             let ctrl_fs_test = ctrl.clone();
             let ctrl_fs_save = ctrl.clone();
 
@@ -751,6 +752,28 @@ pub fn render_notify_page(
                                 .flex()
                                 .items_center()
                                 .gap(px(8.))
+                                .when(feishu_dirty, |row| {
+                                    row.child(
+                                        action_button(
+                                            "fs-reset-btn",
+                                            "撤销",
+                                            ButtonKind::Secondary,
+                                            !busy,
+                                            p,
+                                        )
+                                        .h(px(28.))
+                                        .when(!busy, |b| {
+                                            b.on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |_, _, _, cx| {
+                                                    ctrl_fs_reset.update(cx, |c, cx| {
+                                                        c.reset_feishu_drafts(cx);
+                                                    });
+                                                }),
+                                            )
+                                        }),
+                                    )
+                                })
                                 .child(
                                     action_button(
                                         "fs-test-btn",

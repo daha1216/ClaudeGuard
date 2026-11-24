@@ -14,8 +14,8 @@
 //!   immediately so `{app}\ClaudeGuard.exe` is unlocked, waits for installation completion, and
 //!   cleans up legacy `{app}\ClaudeGuard.exe` + `.exe.old` artifacts once v4 is installed.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::thread;
@@ -28,12 +28,402 @@ const EMBEDDED_SETUP: &[u8] = &[];
 
 const WAITER_FLAG: &str = "--cg-wait";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_JSON_DEPTH: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WaiterArgs {
     app_exe: PathBuf,
     old_exe: PathBuf,
     setup_exe: PathBuf,
+}
+
+/// Pure-Rust FIPS 180-4 SHA-256 implementation (zero external crate dependencies).
+struct Sha256 {
+    state: [u32; 8],
+    buf: [u8; 64],
+    buf_len: usize,
+    total_bits: u64,
+}
+
+impl Sha256 {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    fn new() -> Self {
+        Self {
+            state: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buf: [0u8; 64],
+            buf_len: 0,
+            total_bits: 0,
+        }
+    }
+
+    fn compress_block(state: &mut [u32; 8], block: &[u8; 64]) {
+        let mut w = [0u32; 64];
+        for (i, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*chunk);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+        for (&wi, &ki) in w.iter().zip(Self::K.iter()) {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(ki)
+                .wrapping_add(wi);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+        state[5] = state[5].wrapping_add(f);
+        state[6] = state[6].wrapping_add(g);
+        state[7] = state[7].wrapping_add(h);
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        self.total_bits = self.total_bits.wrapping_add((data.len() as u64) * 8);
+        if self.buf_len > 0 {
+            let need = 64 - self.buf_len;
+            if data.len() < need {
+                self.buf[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
+                self.buf_len += data.len();
+                return;
+            }
+            self.buf[self.buf_len..64].copy_from_slice(&data[..need]);
+            let block = self.buf;
+            Self::compress_block(&mut self.state, &block);
+            self.buf_len = 0;
+            data = &data[need..];
+        }
+        let (blocks, rem) = data.as_chunks::<64>();
+        for block in blocks {
+            Self::compress_block(&mut self.state, block);
+        }
+        if !rem.is_empty() {
+            self.buf[..rem.len()].copy_from_slice(rem);
+            self.buf_len = rem.len();
+        }
+    }
+
+    fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.total_bits;
+        self.buf[self.buf_len] = 0x80;
+        self.buf_len += 1;
+        if self.buf_len > 56 {
+            for b in &mut self.buf[self.buf_len..64] {
+                *b = 0;
+            }
+            let block = self.buf;
+            Self::compress_block(&mut self.state, &block);
+            self.buf_len = 0;
+        }
+        for b in &mut self.buf[self.buf_len..56] {
+            *b = 0;
+        }
+        self.buf[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        let block = self.buf;
+        Self::compress_block(&mut self.state, &block);
+
+        let mut out = [0u8; 32];
+        for (i, word) in self.state.iter().enumerate() {
+            out[i * 4..(i + 1) * 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize()
+}
+
+fn sha256_file(file: &mut File) -> Result<[u8; 32], String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("读取安装包校验偏移失败：{e}"))?;
+    let mut hasher = Sha256::new();
+    let mut chunk = [0u8; 65_536];
+    loop {
+        let n = file
+            .read(&mut chunk)
+            .map_err(|e| format!("读取安装包校验数据失败：{e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&chunk[..n]);
+    }
+    Ok(hasher.finalize())
+}
+
+/// Opens `setup_exe` with `FILE_SHARE_READ` (`1`) only, preventing external processes from
+/// writing, truncating, deleting, or renaming the staged binary while allowing OS image execution.
+fn open_setup_read_locked(setup_exe: &Path) -> Result<File, String> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ_ONLY: u32 = 1;
+        opts.share_mode(FILE_SHARE_READ_ONLY);
+    }
+    opts.open(setup_exe)
+        .map_err(|e| format!("锁定升级安装包失败（{}）：{e}", setup_exe.display()))
+}
+
+fn verify_locked_setup_sha256(file: &mut File, expected_bytes: &[u8]) -> Result<(), String> {
+    if expected_bytes.is_empty() {
+        return Err("内嵌安装包摘要为空，拒绝执行升级安装包".into());
+    }
+    let expected = sha256_bytes(expected_bytes);
+    let actual = sha256_file(file)?;
+    if actual != expected {
+        return Err("升级安装包 SHA-256 完整性校验失败（疑似被篡改或损坏），已中止执行".into());
+    }
+    Ok(())
+}
+
+struct JsonScan<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonScan<'a> {
+    fn skip_ws(&mut self) {
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn parse_string(&mut self) -> bool {
+        if self.peek() != Some(b'"') {
+            return false;
+        }
+        self.pos += 1;
+        while let Some(&b) = self.bytes.get(self.pos) {
+            self.pos += 1;
+            match b {
+                b'"' => return true,
+                0x00..=0x1F => return false,
+                b'\\' => {
+                    let Some(&esc) = self.bytes.get(self.pos) else {
+                        return false;
+                    };
+                    self.pos += 1;
+                    match esc {
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
+                        b'u' => {
+                            for _ in 0..4 {
+                                let Some(&hex) = self.bytes.get(self.pos) else {
+                                    return false;
+                                };
+                                if !hex.is_ascii_hexdigit() {
+                                    return false;
+                                }
+                                self.pos += 1;
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn parse_number(&mut self) -> bool {
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+            }
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while self.peek().is_some_and(|d| d.is_ascii_digit()) {
+                    self.pos += 1;
+                }
+            }
+            _ => return false,
+        }
+        if self.peek() == Some(b'.') {
+            self.pos += 1;
+            if !self.peek().is_some_and(|d| d.is_ascii_digit()) {
+                return false;
+            }
+            while self.peek().is_some_and(|d| d.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            if !self.peek().is_some_and(|d| d.is_ascii_digit()) {
+                return false;
+            }
+            while self.peek().is_some_and(|d| d.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        true
+    }
+
+    fn parse_literal(&mut self, lit: &[u8]) -> bool {
+        let Some(slice) = self.bytes.get(self.pos..self.pos + lit.len()) else {
+            return false;
+        };
+        if slice == lit {
+            self.pos += lit.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_array(&mut self, depth: usize) -> bool {
+        if depth > MAX_JSON_DEPTH || self.peek() != Some(b'[') {
+            return false;
+        }
+        self.pos += 1;
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return true;
+        }
+        loop {
+            if !self.parse_value(depth + 1) {
+                return false;
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                }
+                Some(b']') => {
+                    self.pos += 1;
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize) -> bool {
+        if depth > MAX_JSON_DEPTH || self.peek() != Some(b'{') {
+            return false;
+        }
+        self.pos += 1;
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return true;
+        }
+        loop {
+            self.skip_ws();
+            if !self.parse_string() {
+                return false;
+            }
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return false;
+            }
+            self.pos += 1;
+            if !self.parse_value(depth + 1) {
+                return false;
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    fn parse_value(&mut self, depth: usize) -> bool {
+        if depth > MAX_JSON_DEPTH {
+            return false;
+        }
+        self.skip_ws();
+        match self.peek() {
+            Some(b'{') => self.parse_object(depth),
+            Some(b'[') => self.parse_array(depth),
+            Some(b'"') => self.parse_string(),
+            Some(b't') => self.parse_literal(b"true"),
+            Some(b'f') => self.parse_literal(b"false"),
+            Some(b'n') => self.parse_literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.parse_number(),
+            _ => false,
+        }
+    }
+}
+
+fn is_valid_json_object(text: &str) -> bool {
+    let mut scan = JsonScan {
+        bytes: text.as_bytes(),
+        pos: 0,
+    };
+    scan.skip_ws();
+    if !scan.parse_object(0) {
+        return false;
+    }
+    scan.skip_ws();
+    scan.pos == scan.bytes.len()
 }
 
 fn parse_waiter_args(args: &[String]) -> Option<WaiterArgs> {
@@ -74,7 +464,7 @@ fn ensure_staging_dir() -> Result<PathBuf, String> {
 }
 
 /// Copies legacy v3 `%APPDATA%\ClaudeGuard\config.json` into `%ProgramData%\ClaudeGuard\config.json`
-/// ONLY when the destination does not already exist, preserving the original `%APPDATA%` file.
+/// ONLY when the destination does not already exist, stripping UTF-8 BOM and verifying valid JSON object.
 fn migrate_config_if_absent(appdata_dir: Option<&Path>, programdata_dir: Option<&Path>) -> bool {
     let (Some(src_base), Some(dst_base)) = (appdata_dir, programdata_dir) else {
         return false;
@@ -89,28 +479,20 @@ fn migrate_config_if_absent(appdata_dir: Option<&Path>, programdata_dir: Option<
     let Ok(bytes) = fs::read(&src) else {
         return false;
     };
-    if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+    let stripped = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    let Ok(text) = std::str::from_utf8(stripped) else {
+        return false;
+    };
+    if !is_valid_json_object(text) {
         return false;
     }
     if fs::create_dir_all(&dst_dir).is_err() {
         return false;
     }
-    let tmp = dst_dir.join(format!("config.json.v3mig.{}.tmp", process::id()));
-    let Ok(mut file) = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp)
-    else {
+    let Ok(tmp) = write_unique_file(&dst_dir, "config.json.v3mig", "tmp", stripped) else {
         return false;
     };
-    if file.write_all(&bytes).is_err() || file.sync_all().is_err() {
-        drop(file);
-        let _ = fs::remove_file(&tmp);
-        return false;
-    }
-    drop(file);
-    if fs::rename(&tmp, &dst).is_err() {
+    if dst.exists() || fs::rename(&tmp, &dst).is_err() {
         let _ = fs::remove_file(&tmp);
         return false;
     }
@@ -131,14 +513,21 @@ fn write_unique_file(dir: &Path, prefix: &str, ext: &str, bytes: &[u8]) -> Resul
         let path = dir.join(format!("{prefix}-{pid}-{attempt}-{}.{ext}", unique_tag()));
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
-                file.write_all(bytes)
-                    .map_err(|e| format!("写入临时文件失败（{}）：{e}", path.display()))?;
-                file.sync_all()
-                    .map_err(|e| format!("落盘临时文件失败（{}）：{e}", path.display()))?;
+                if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Err(format!("写入临时文件失败（{}）：{e}", path.display()));
+                }
                 return Ok(path);
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(format!("创建临时文件失败（{}）：{e}", path.display(), e = err)),
+            Err(err) => {
+                return Err(format!(
+                    "创建临时文件失败（{}）：{e}",
+                    path.display(),
+                    e = err
+                ));
+            }
         }
     }
     Err("创建临时升级文件失败：重试次数耗尽".into())
@@ -222,28 +611,22 @@ fn cleanup_post_install(args: &WaiterArgs, setup_succeeded: bool) {
 }
 
 fn schedule_waiter_self_cleanup(waiter_exe: &Path) {
+    // Rely strictly on Win32 MoveFileExW(MOVEFILE_DELAY_UNTIL_REBOOT) + Inno Setup ssPostInstall
+    // cleanup (zero cmd.exe /C shell command construction).
     win_api::schedule_delete_on_reboot(waiter_exe);
-    #[cfg(windows)]
-    {
-        let exe_s = waiter_exe.to_string_lossy().replace('"', "");
-        let dir_s = waiter_exe
-            .parent()
-            .map(|p| p.to_string_lossy().replace('"', ""))
-            .unwrap_or_default();
-        let script = if !dir_s.is_empty() && dir_s.to_ascii_lowercase().ends_with("\\staging") {
-            format!("ping -n 3 127.0.0.1 >nul & del /f /q \"{exe_s}\" >nul 2>&1 & rmdir \"{dir_s}\" >nul 2>&1")
-        } else {
-            format!("ping -n 3 127.0.0.1 >nul & del /f /q \"{exe_s}\" >nul 2>&1")
-        };
-        let mut cmd = Command::new("cmd.exe");
-        cmd.args(["/C", &script]);
-        let _ = spawn_detached(&mut cmd);
+    if let Some(dir) = waiter_exe.parent() {
+        if dir
+            .file_name()
+            .is_some_and(|n| n.eq_ignore_ascii_case("staging"))
+        {
+            win_api::schedule_delete_on_reboot(dir);
+        }
     }
 }
 
 #[cfg(windows)]
 mod win_api {
-    use std::ffi::{OsStr, c_void};
+    use std::ffi::{c_void, OsStr};
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
 
@@ -275,7 +658,8 @@ mod win_api {
 
     #[link(name = "user32")]
     unsafe extern "system" {
-        fn MessageBoxW(hwnd: *mut c_void, text: *const u16, caption: *const u16, utype: u32) -> i32;
+        fn MessageBoxW(hwnd: *mut c_void, text: *const u16, caption: *const u16, utype: u32)
+            -> i32;
     }
 
     #[link(name = "kernel32")]
@@ -291,6 +675,18 @@ mod win_api {
         fn ShellExecuteExW(exec_info: *mut ShellExecuteInfoW) -> i32;
     }
 
+    struct ProcessHandleGuard(*mut c_void);
+
+    impl Drop for ProcessHandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
     fn wide_null(s: &OsStr) -> Vec<u16> {
         s.encode_wide().chain(std::iter::once(0)).collect()
     }
@@ -299,7 +695,12 @@ mod win_api {
         let t = wide_null(OsStr::new(title));
         let m = wide_null(OsStr::new(msg));
         unsafe {
-            MessageBoxW(std::ptr::null_mut(), m.as_ptr(), t.as_ptr(), MB_OK | MB_ICONERROR);
+            MessageBoxW(
+                std::ptr::null_mut(),
+                m.as_ptr(),
+                t.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
         }
     }
 
@@ -342,11 +743,11 @@ mod win_api {
         if sei.h_process.is_null() {
             return Ok(false);
         }
+        let _proc_guard = ProcessHandleGuard(sei.h_process);
         let mut exit_code: u32 = 1;
         unsafe {
             WaitForSingleObject(sei.h_process, INFINITE);
             GetExitCodeProcess(sei.h_process, &mut exit_code);
-            CloseHandle(sei.h_process);
         }
         Ok(exit_code == 0)
     }
@@ -372,8 +773,17 @@ fn spawn_detached(cmd: &mut Command) -> std::io::Result<process::Child> {
 }
 
 fn run_waiter(args: WaiterArgs) -> Result<(), String> {
+    // Hold a FILE_SHARE_READ-only handle across the 350ms sleep and UAC launch to prevent TOCTOU tampering.
+    let mut setup_lock = open_setup_read_locked(&args.setup_exe)?;
+
     // Allow brief window for the launching bridge (`ClaudeGuard.exe`) and old v3 daemon to exit.
     thread::sleep(Duration::from_millis(350));
+
+    if let Err(err) = verify_locked_setup_sha256(&mut setup_lock, EMBEDDED_SETUP) {
+        drop(setup_lock);
+        remove_file_with_retry(&args.setup_exe);
+        return Err(err);
+    }
 
     match Command::new(&args.setup_exe)
         .arg("/SP-")
@@ -383,29 +793,41 @@ fn run_waiter(args: WaiterArgs) -> Result<(), String> {
         .spawn()
     {
         Ok(mut child) => {
-            let status = child
-                .wait()
-                .map_err(|e| format!("等待安装程序完成失败：{e}"))?;
+            let status_res = child.wait();
+            drop(setup_lock);
+            let status = status_res.map_err(|e| format!("等待安装程序完成失败：{e}"))?;
             cleanup_post_install(&args, status.success());
             Ok(())
         }
         Err(err) if err.raw_os_error() == Some(740) => {
-            // Non-elevated v3 updater: prompt UAC via ShellExecuteExW("runas") and WAIT
-            // for setup to finish so post-install cleanup removes staging + legacy v3 files.
-            let ok = win_api::run_elevated_setup_and_wait(&args.setup_exe)?;
-            cleanup_post_install(&args, ok);
-            Ok(())
+            // Non-elevated v3 updater: prompt UAC via ShellExecuteExW("runas") while holding
+            // the read-locked file handle, then release handle right before post-install cleanup.
+            let run_res = win_api::run_elevated_setup_and_wait(&args.setup_exe);
+            drop(setup_lock);
+            match run_res {
+                Ok(ok) => {
+                    cleanup_post_install(&args, ok);
+                    Ok(())
+                }
+                Err(e) => {
+                    remove_file_with_retry(&args.setup_exe);
+                    Err(e)
+                }
+            }
         }
-        Err(err) => Err(format!(
-            "启动安装程序失败（{}）：{err}",
-            args.setup_exe.display()
-        )),
+        Err(err) => {
+            drop(setup_lock);
+            remove_file_with_retry(&args.setup_exe);
+            Err(format!(
+                "启动安装程序失败（{}）：{err}",
+                args.setup_exe.display()
+            ))
+        }
     }
 }
 
 fn run_primary() -> Result<(), String> {
-    let cur_exe = std::env::current_exe()
-        .map_err(|e| format!("无法定位当前升级程序路径：{e}"))?;
+    let cur_exe = std::env::current_exe().map_err(|e| format!("无法定位当前升级程序路径：{e}"))?;
     let app_dir = cur_exe
         .parent()
         .ok_or_else(|| "无法识别安装目录".to_string())?;
@@ -422,7 +844,9 @@ fn run_primary() -> Result<(), String> {
     }
 
     if EMBEDDED_SETUP.is_empty() {
-        return Err("当前升级引导包未内嵌安装包正文，请从 GitHub Releases 下载完整 setup.exe 安装。".into());
+        return Err(
+            "当前升级引导包未内嵌安装包正文，请从 GitHub Releases 下载完整 setup.exe 安装。".into(),
+        );
     }
 
     // Preserve existing v3 settings from `%APPDATA%\ClaudeGuard\config.json` into `%ProgramData%\ClaudeGuard\config.json`.
@@ -454,18 +878,41 @@ fn run_primary() -> Result<(), String> {
         let _ = fs::remove_file(&waiter_path);
     }
 
-    // Direct fallback if waiter copy could not be spawned.
-    match spawn_detached(Command::new(&setup_path).arg("/SP-")) {
-        Ok(_) => Ok(()),
-        Err(err) if err.raw_os_error() == Some(740) => {
-            let _ = win_api::run_elevated_setup_and_wait(&setup_path)?;
+    // Direct fallback if waiter copy could not be spawned: lock & verify SHA-256 before execution.
+    let mut setup_lock = match open_setup_read_locked(&setup_path) {
+        Ok(f) => f,
+        Err(e) => {
             remove_file_with_retry(&setup_path);
+            return Err(e);
+        }
+    };
+    if let Err(err) = verify_locked_setup_sha256(&mut setup_lock, EMBEDDED_SETUP) {
+        drop(setup_lock);
+        remove_file_with_retry(&setup_path);
+        return Err(err);
+    }
+
+    match spawn_detached(Command::new(&setup_path).arg("/SP-")) {
+        Ok(_) => {
+            drop(setup_lock);
+            win_api::schedule_delete_on_reboot(&setup_path);
             Ok(())
         }
-        Err(err) => Err(format!(
-            "启动安装程序失败（{}）：{err}",
-            setup_path.display()
-        )),
+        Err(err) if err.raw_os_error() == Some(740) => {
+            let run_res = win_api::run_elevated_setup_and_wait(&setup_path);
+            drop(setup_lock);
+            remove_file_with_retry(&setup_path);
+            let _ = run_res?;
+            Ok(())
+        }
+        Err(err) => {
+            drop(setup_lock);
+            remove_file_with_retry(&setup_path);
+            Err(format!(
+                "启动安装程序失败（{}）：{err}",
+                setup_path.display()
+            ))
+        }
     }
 }
 
@@ -491,6 +938,52 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn hex_lower(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    #[test]
+    fn sha256_matches_nist_vectors_and_detects_tampering_under_read_lock() {
+        assert_eq!(
+            hex_lower(&sha256_bytes(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex_lower(&sha256_bytes(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let multi_block = vec![b'x'; 130_000];
+        let dir = std::env::temp_dir().join(format!("cg-v3-sha-{}", unique_tag()));
+        fs::create_dir_all(&dir).unwrap();
+        let staged = write_unique_file(&dir, "setup", "exe", &multi_block).unwrap();
+
+        let mut lock = open_setup_read_locked(&staged).expect("open read-locked setup");
+        verify_locked_setup_sha256(&mut lock, &multi_block).expect("digest matches");
+        assert!(verify_locked_setup_sha256(&mut lock, b"tampered").is_err());
+
+        #[cfg(windows)]
+        {
+            // While `lock` is open with share_mode(1), external write and delete MUST fail!
+            assert!(
+                OpenOptions::new().write(true).open(&staged).is_err(),
+                "share_mode(1) must block concurrent write open"
+            );
+            assert!(
+                fs::remove_file(&staged).is_err(),
+                "share_mode(1) must block concurrent unlink"
+            );
+        }
+
+        drop(lock);
+        remove_file_with_retry(&staged);
+        assert!(!staged.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn parses_waiter_args_with_spaces_and_unicode() {
         let args = vec![
@@ -512,20 +1005,31 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v3_config_only_when_v4_config_is_absent() {
+    fn migrates_v3_config_stripping_bom_and_rejecting_corrupt_or_non_object_json() {
         let base = std::env::temp_dir().join(format!("cg-v3-bridge-mig-{}", unique_tag()));
         let appdata = base.join("roaming");
         let progdata = base.join("progdata");
         fs::create_dir_all(appdata.join("ClaudeGuard")).unwrap();
-        let legacy_cfg = br#"{"version":3,"proxy_port":7890,"first_run":false}"#;
-        fs::write(appdata.join("ClaudeGuard").join("config.json"), legacy_cfg).unwrap();
+
+        // 1) Corrupt JSON and JSON array are rejected.
+        for invalid in [&b"{not-json"[..], &b"[1, 2, 3]"[..], &b"\"str\""[..]] {
+            fs::write(appdata.join("ClaudeGuard").join("config.json"), invalid).unwrap();
+            assert!(!migrate_config_if_absent(Some(&appdata), Some(&progdata)));
+            assert!(!progdata.join("ClaudeGuard").join("config.json").exists());
+        }
+
+        // 2) UTF-8 BOM + valid nested JSON object is stripped of BOM and migrated atomically.
+        let legacy_body = br#"{"version":3,"proxy_port":7890,"first_run":false,"targets":[{"id":"claude","expect_regions":["US"]}]}"#;
+        let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+        with_bom.extend_from_slice(legacy_body);
+        fs::write(appdata.join("ClaudeGuard").join("config.json"), &with_bom).unwrap();
 
         assert!(migrate_config_if_absent(Some(&appdata), Some(&progdata)));
         let migrated = fs::read(progdata.join("ClaudeGuard").join("config.json")).unwrap();
-        assert_eq!(migrated, legacy_cfg);
+        assert_eq!(migrated, legacy_body, "UTF-8 BOM must be stripped");
         assert!(appdata.join("ClaudeGuard").join("config.json").is_file());
 
-        // Never overwrites an already-existing v4 config.json.
+        // 3) Never overwrites an already-existing v4 config.json.
         let newer_cfg = br#"{"version":4,"proxy_port":17890}"#;
         fs::write(progdata.join("ClaudeGuard").join("config.json"), newer_cfg).unwrap();
         assert!(!migrate_config_if_absent(Some(&appdata), Some(&progdata)));

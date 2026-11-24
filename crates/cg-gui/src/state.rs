@@ -219,8 +219,9 @@ impl DraftStore {
         next.proxy_port = port;
         next.interval_secs = interval;
         next.trip_threshold = threshold;
-        next.targets = self.targets.iter().map(TargetDraft::to_target).collect();
-        for t in &mut next.targets {
+        let mut validated_targets = Vec::with_capacity(self.targets.len());
+        for draft in &self.targets {
+            let mut t = draft.to_target();
             if t.name.is_empty() {
                 return Err("存在名称为空的监控目标".into());
             }
@@ -243,6 +244,8 @@ impl DraftStore {
                 }
             }
             t.expect_ips = normalized_ips;
+            t.expect_regions = parse_and_validate_regions(&draft.expect_regions_text)
+                .map_err(|err| format!("目标「{}」{err}", t.name))?;
             if t.enabled
                 && t.anchor_kind != AnchorKind::Reachability
                 && t.expect_ips.is_empty()
@@ -253,17 +256,90 @@ impl DraftStore {
                     t.name
                 ));
             }
+            validated_targets.push(t);
         }
+        next.targets = validated_targets;
         Ok(next)
     }
 }
 
 pub fn split_tokens(raw: &str) -> Vec<String> {
-    raw.split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | ';' | '；'))
+    raw.split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | ';' | '；' | '、'))
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+fn map_chinese_region_name(token: &str) -> Option<&'static str> {
+    match token.trim() {
+        "美国" => Some("US"),
+        "日本" => Some("JP"),
+        "新加坡" => Some("SG"),
+        "英国" => Some("GB"),
+        "台湾" => Some("TW"),
+        "香港" => Some("HK"),
+        "韩国" => Some("KR"),
+        "德国" => Some("DE"),
+        "法国" => Some("FR"),
+        "加拿大" => Some("CA"),
+        "澳大利亚" => Some("AU"),
+        "荷兰" => Some("NL"),
+        "爱尔兰" => Some("IE"),
+        "瑞典" => Some("SE"),
+        "印度" => Some("IN"),
+        "瑞士" => Some("CH"),
+        "中国" => Some("CN"),
+        "澳门" => Some("MO"),
+        "俄罗斯" => Some("RU"),
+        "巴西" => Some("BR"),
+        "土耳其" => Some("TR"),
+        "阿联酋" => Some("AE"),
+        "意大利" => Some("IT"),
+        "西班牙" => Some("ES"),
+        _ => None,
+    }
+}
+
+/// Parses, normalizes, and strictly validates region tokens against ISO 3166-1 alpha-2 codes.
+pub fn parse_and_validate_regions(raw: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for token in raw
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | ';' | '；' | '/' | '、'))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let mapped = map_chinese_region_name(token).unwrap_or(token);
+        let Some(norm) = crate::protocol::normalize_region(mapped)
+            .filter(|code| crate::protocol::is_known_region(code))
+        else {
+            return Err(format!(
+                "包含无效的国家/地区代码：「{token}」（请填写有效 ISO 两字母代码，如 US、JP、SG）"
+            ));
+        };
+        if !out.contains(&norm) {
+            out.push(norm);
+        }
+    }
+    Ok(out)
+}
+
+/// Non-failing region token extractor for live chip previews while typing in `Targets` / `AddTarget`.
+pub fn extract_region_tokens_lossy(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in raw
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | ';' | '；' | '/' | '、'))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let mapped = map_chinese_region_name(token).unwrap_or(token);
+        let norm = crate::protocol::normalize_region(mapped)
+            .unwrap_or_else(|| mapped.to_ascii_uppercase());
+        if !out.contains(&norm) {
+            out.push(norm);
+        }
+    }
+    out
 }
 
 /// Projected Hero Bento card state shared by Mode A HUD and Mode B Console.
@@ -479,6 +555,32 @@ pub fn format_unix_hm(ts: u64) -> String {
     format!("{h:02}:{m:02}:{s:02}")
 }
 
+/// Formats a Unix epoch timestamp into local `YYYY-MM-DD HH:MM:SS` (proleptic Gregorian calendar).
+pub fn format_unix_ymdhms(ts: u64) -> String {
+    if ts == 0 {
+        return "----/--/-- --:--:--".into();
+    }
+    let local_total = ts as i64 + local_utc_offset_secs();
+    let days = local_total.div_euclid(86_400);
+    let secs_of_day = local_total.rem_euclid(86_400) as u64;
+    let h = secs_of_day / 3600;
+    let m = (secs_of_day % 3600) / 60;
+    let s = secs_of_day % 60;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if mo <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
+}
+
 pub fn project_hero(
     snap: Option<&GuardSnapshot>,
     connected: bool,
@@ -585,7 +687,7 @@ pub fn project_hero(
         )
     } else if fail_count > 0 && snap.config.monitor_only {
         (
-            HeroTone::Tripped,
+            HeroTone::DisarmedOrPaused,
             "仅监测 · 出口异常".into(),
             "检测到出口异常（仅监测）".into(),
             format!("有 {fail_count} 个目标未通过校验（已开启仅监测，不自动熔断）"),
@@ -1673,19 +1775,27 @@ pub fn build_onboarding_config(
             (PolicyPreset::StandardRegion, Vec::new(), reg)
         }
         OnboardingStrategy::StrictStaticIp => {
-            let ip = probe
+            let raw_ip = probe
                 .probe
                 .as_ref()
                 .and_then(|p| p.ip.clone())
                 .ok_or_else(|| "未能探测到当前出口静态 IP，无法启用严格锁定".to_string())?;
+            let ip = crate::protocol::normalize_ip_or_cidr(&raw_ip)
+                .ok_or_else(|| format!("探测到的出口 IP 格式无效：「{raw_ip}」"))?;
             (PolicyPreset::StrictStaticIp, vec![ip], Vec::new())
         }
         OnboardingStrategy::CustomCidrOrRegions => {
-            let ips = split_tokens(custom_cidr);
-            let regions: Vec<String> = split_tokens(custom_regions)
-                .into_iter()
-                .map(|r| r.to_ascii_uppercase())
-                .collect();
+            let raw_ips = split_tokens(custom_cidr);
+            let mut ips = Vec::with_capacity(raw_ips.len());
+            for raw in raw_ips {
+                let Some(norm) = crate::protocol::normalize_ip_or_cidr(&raw) else {
+                    return Err(format!("包含无效的 IP 或 CIDR 网段：「{raw}」"));
+                };
+                if !ips.contains(&norm) {
+                    ips.push(norm);
+                }
+            }
+            let regions = parse_and_validate_regions(custom_regions)?;
             if ips.is_empty() && regions.is_empty() {
                 return Err("请至少填写 1 个国家代码（如 US）或 IP/CIDR 网段".into());
             }
@@ -2102,5 +2212,79 @@ mod tests {
             .expect("antigravity card");
         assert_eq!(ag_card.badge_tone, BadgeTone::Warn);
         assert_eq!(ag_card.ip_display, "暂不可达（网络波动）");
+
+        // Monitor-only with failing targets uses DisarmedOrPaused (amber Warn) when not tripped.
+        let mut mon_fail = build_demo_snapshot(DemoScenario::Trip);
+        mon_fail.tripped = None;
+        mon_fail.protection = ProtectionState::Monitoring;
+        mon_fail.config.monitor_only = true;
+        let mon_hud = project_hud(Some(&mon_fail), true, None, false);
+        assert_eq!(mon_hud.hero.tone, HeroTone::DisarmedOrPaused);
+        assert_eq!(mon_hud.hero.pill_label, "仅监测 · 出口异常");
+    }
+
+    #[test]
+    fn parse_and_validate_regions_supports_chinese_names_delimiters_and_rejects_invalid() {
+        let parsed =
+            parse_and_validate_regions("美国 / 日本、新加坡, 爱尔兰；瑞典 USA jp").expect("valid");
+        assert_eq!(
+            parsed,
+            vec![
+                "US".to_string(),
+                "JP".to_string(),
+                "SG".to_string(),
+                "IE".to_string(),
+                "SE".to_string(),
+            ]
+        );
+
+        let err = parse_and_validate_regions("US, ZZ, JP").expect_err("ZZ is not ISO 3166-1");
+        assert!(err.contains("ZZ"), "error must name invalid token: {err}");
+
+        // Onboarding custom validation rejects invalid region or CIDR and preserves canonical values.
+        let probe = build_demo_onboarding_probe(true);
+        assert!(
+            build_onboarding_config(
+                &Config::default(),
+                &probe,
+                OnboardingStrategy::CustomCidrOrRegions,
+                "198.51.100.98/24",
+                "ZZ",
+            )
+            .is_err()
+        );
+        assert!(
+            build_onboarding_config(
+                &Config::default(),
+                &probe,
+                OnboardingStrategy::CustomCidrOrRegions,
+                "bad-cidr",
+                "US",
+            )
+            .is_err()
+        );
+        let canon = build_onboarding_config(
+            &Config::default(),
+            &probe,
+            OnboardingStrategy::CustomCidrOrRegions,
+            "198.51.100.98/24",
+            "美国/新加坡",
+        )
+        .expect("canonical custom onboarding");
+        assert_eq!(
+            canon.target("claude").unwrap().expect_ips,
+            vec!["198.51.100.0/24".to_string()]
+        );
+        assert_eq!(
+            canon.target("claude").unwrap().expect_regions,
+            vec!["US".to_string(), "SG".to_string()]
+        );
+
+        // Full date+time formatter produces 19-char `YYYY-MM-DD HH:MM:SS`.
+        let dt = format_unix_ymdhms(1_763_942_400);
+        assert_eq!(dt.len(), 19);
+        assert_eq!(&dt[4..5], "-");
+        assert_eq!(&dt[7..8], "-");
+        assert_eq!(&dt[10..11], " ");
     }
 }

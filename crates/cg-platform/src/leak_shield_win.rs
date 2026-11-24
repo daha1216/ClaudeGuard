@@ -21,9 +21,13 @@ use crate::traits::PlatformResult;
 /// Distinct rule name prefix managed exclusively by the Leak Shield.
 pub const SHIELD_RULE_PREFIX: &str = "ClaudeGuard-Shield-";
 
-const PUBLIC_DOH_REMOTES: &str =
-    "1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4,9.9.9.9,149.112.112.112,2606:4700:4700::1111,2001:4860:4860::8888";
-const GLOBAL_IPV6_RANGE: &str = "2000::/3";
+const PUBLIC_DOH_REMOTES: &str = concat!(
+    "1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4,9.9.9.9,149.112.112.112,",
+    "223.5.5.5,223.6.6.6,119.29.29.29,94.140.14.14,",
+    "2606:4700:4700::1111,2606:4700:4700::1001,",
+    "2001:4860:4860::8888,2001:4860:4860::8844,2620:fe::fe"
+);
+const GLOBAL_IPV6_RANGE: &str = "2000::/3,64:ff9b::/96,fc00::/7";
 
 #[derive(Clone, Debug)]
 struct ShieldRuleSpec {
@@ -45,11 +49,9 @@ fn build_shield_specs(
     block_ipv6: bool,
 ) -> Vec<ShieldRuleSpec> {
     let mut specs = Vec::new();
-    for (idx, exe) in app_paths.iter().enumerate() {
-        let stem = exe
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("app");
+    for (idx, raw_exe) in app_paths.iter().enumerate() {
+        let exe = crate::firewall_com::resolve_program_path_for_firewall(raw_exe);
+        let stem = exe.file_stem().and_then(|s| s.to_str()).unwrap_or("app");
         let tag = format!("{stem}-{idx}");
         if block_quic {
             specs.push(ShieldRuleSpec {
@@ -79,6 +81,13 @@ fn build_shield_specs(
                 name: format!("{SHIELD_RULE_PREFIX}DoH-{tag}"),
                 program: exe.clone(),
                 protocol: PROTO_TCP,
+                remote_ports: Some("443,853"),
+                remote_addresses: Some(PUBLIC_DOH_REMOTES),
+            });
+            specs.push(ShieldRuleSpec {
+                name: format!("{SHIELD_RULE_PREFIX}DoH-UDP-{tag}"),
+                program: exe.clone(),
+                protocol: PROTO_UDP,
                 remote_ports: Some("443,853"),
                 remote_addresses: Some(PUBLIC_DOH_REMOTES),
             });
@@ -115,10 +124,20 @@ fn summarize_shield(
     if ipv6_blocked {
         parts.push("公网 IPv6");
     }
-    format!("已拦截 {}（生效 {} 条护盾规则）", parts.join(" + "), active_rules)
+    format!(
+        "已拦截 {}（生效 {} 条护盾规则）",
+        parts.join(" + "),
+        active_rules
+    )
 }
 
 /// Synchronizes Windows Firewall `ClaudeGuard-Shield-*` rules to match desired vectors.
+///
+/// Fail-closed invariant:
+/// - Propagates `?` (`map_win_err`) on EVERY `rule.Set*` COM call BEFORE `rules.Add(&rule)` so an
+///   invalid `ApplicationName` can NEVER create a wildcard OS-wide block rule.
+/// - Adds all desired shield rules BEFORE removing pre-existing `ClaudeGuard-Shield-*` COM instances
+///   so mid-sync errors never fail open.
 #[cfg(windows)]
 pub fn sync_leak_shield(
     app_paths: &[PathBuf],
@@ -126,33 +145,26 @@ pub fn sync_leak_shield(
     block_dns_doh: bool,
     block_ipv6: bool,
 ) -> PlatformResult<LeakShieldStatus> {
+    use windows::core::BSTR;
     use windows::Win32::Foundation::VARIANT_TRUE;
     use windows::Win32::NetworkManagement::WindowsFirewall::{
         INetFwPolicy2, INetFwRule, NetFwPolicy2, NetFwRule, NET_FW_ACTION_BLOCK,
         NET_FW_RULE_DIR_OUT,
     };
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
-    use windows::core::BSTR;
 
-    use crate::com::ComGuard;
+    use crate::com::{map_win_err, ComGuard};
+    use crate::firewall_com::ComFirewallEngine;
     use crate::traits::{PlatformError, FW_PROFILE_ALL};
 
     let _com = ComGuard::init_mta()?;
     let policy: INetFwPolicy2 = unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_ALL) }
-        .map_err(|e| PlatformError::Com {
-            code: e.code().0,
-            context: format!("创建 INetFwPolicy2 失败：{e}"),
-        })?;
-    let rules = unsafe { policy.Rules() }.map_err(|e| PlatformError::Com {
-        code: e.code().0,
-        context: format!("获取防火墙规则集合失败：{e}"),
-    })?;
-
-    // Clear previous shield rules first so toggled-off vectors leave zero residue.
-    let _ = remove_shield_rules_with_collection(&rules);
+        .map_err(|e| map_win_err(e, "CoCreateInstance(NetFwPolicy2)"))?;
+    let rules = unsafe { policy.Rules() }.map_err(|e| map_win_err(e, "INetFwPolicy2::Rules"))?;
 
     let specs = build_shield_specs(app_paths, block_quic, block_dns_doh, block_ipv6);
     if specs.is_empty() {
+        let _ = remove_shield_rules_with_collection(&rules);
         return Ok(LeakShieldStatus {
             enabled: false,
             quic_blocked: false,
@@ -163,36 +175,65 @@ pub fn sync_leak_shield(
         });
     }
 
+    // Snapshot pre-existing COM rule pointers BEFORE adding replacements so we can delete ONLY
+    // stale instances after new rules are safely active.
+    let old_pairs = ComFirewallEngine::enumerate_com_rules_with_prefix(&rules, SHIELD_RULE_PREFIX)?;
+
     let mut added = 0usize;
     for spec in &specs {
-        let rule: INetFwRule = unsafe { CoCreateInstance(&NetFwRule, None, CLSCTX_ALL) }
-            .map_err(|e| PlatformError::Com {
-                code: e.code().0,
-                context: format!("创建护盾规则对象失败：{e}"),
-            })?;
-        unsafe {
-            let _ = rule.SetName(&BSTR::from(spec.name.as_str()));
-            let _ = rule.SetDescription(&BSTR::from(
-                "ClaudeGuard v4 4-Vector Leak Shield (auto-managed)",
+        let prog_str = spec.program.to_string_lossy();
+        if prog_str.trim().is_empty() {
+            return Err(PlatformError::InvalidInput(
+                "护盾规则可执行文件路径为空，已拒绝创建全局规则".to_string(),
             ));
-            let _ = rule.SetGrouping(&BSTR::from("ClaudeGuard Shield"));
-            let _ = rule.SetApplicationName(&BSTR::from(spec.program.to_string_lossy().as_ref()));
-            let _ = rule.SetProtocol(spec.protocol);
+        }
+        let rule: INetFwRule = unsafe { CoCreateInstance(&NetFwRule, None, CLSCTX_ALL) }
+            .map_err(|e| map_win_err(e, "CoCreateInstance(NetFwRule)"))?;
+        unsafe {
+            rule.SetName(&BSTR::from(spec.name.as_str()))
+                .map_err(|e| map_win_err(e, "INetFwRule::SetName"))?;
+            rule.SetDescription(&BSTR::from(
+                "ClaudeGuard v4 4-Vector Leak Shield (auto-managed)",
+            ))
+            .map_err(|e| map_win_err(e, "INetFwRule::SetDescription"))?;
+            rule.SetGrouping(&BSTR::from("ClaudeGuard Shield"))
+                .map_err(|e| map_win_err(e, "INetFwRule::SetGrouping"))?;
+            rule.SetApplicationName(&BSTR::from(prog_str.as_ref()))
+                .map_err(|e| map_win_err(e, "INetFwRule::SetApplicationName"))?;
+            rule.SetProtocol(spec.protocol)
+                .map_err(|e| map_win_err(e, "INetFwRule::SetProtocol"))?;
             if let Some(ports) = spec.remote_ports {
-                let _ = rule.SetRemotePorts(&BSTR::from(ports));
+                rule.SetRemotePorts(&BSTR::from(ports))
+                    .map_err(|e| map_win_err(e, "INetFwRule::SetRemotePorts"))?;
             }
             if let Some(addrs) = spec.remote_addresses {
-                let _ = rule.SetRemoteAddresses(&BSTR::from(addrs));
+                rule.SetRemoteAddresses(&BSTR::from(addrs))
+                    .map_err(|e| map_win_err(e, "INetFwRule::SetRemoteAddresses"))?;
             }
-            let _ = rule.SetDirection(NET_FW_RULE_DIR_OUT);
-            let _ = rule.SetAction(NET_FW_ACTION_BLOCK);
-            let _ = rule.SetProfiles(FW_PROFILE_ALL);
-            let _ = rule.SetEnabled(VARIANT_TRUE);
+            rule.SetDirection(NET_FW_RULE_DIR_OUT)
+                .map_err(|e| map_win_err(e, "INetFwRule::SetDirection"))?;
+            rule.SetAction(NET_FW_ACTION_BLOCK)
+                .map_err(|e| map_win_err(e, "INetFwRule::SetAction"))?;
+            rule.SetProfiles(FW_PROFILE_ALL)
+                .map_err(|e| map_win_err(e, "INetFwRule::SetProfiles"))?;
+            rule.SetEnabled(VARIANT_TRUE)
+                .map_err(|e| map_win_err(e, "INetFwRule::SetEnabled"))?;
             rules
                 .Add(&rule)
-                .map_err(|e| PlatformError::AccessDenied(format!("写入护盾规则失败：{e}")))?;
+                .map_err(|e| map_win_err(e, "INetFwRules::Add"))?;
         }
         added += 1;
+    }
+
+    // Now that all new rules are committed, remove pre-existing shield instances via sentinel rename.
+    let pid = std::process::id();
+    for (seq, (old_rule, old_rec)) in old_pairs.iter().enumerate() {
+        let sentinel = format!("__CG_SHIELD_OLD_{pid}_{seq}");
+        if unsafe { old_rule.SetName(&BSTR::from(&sentinel)) }.is_ok() {
+            let _ = unsafe { rules.Remove(&BSTR::from(&sentinel)) };
+        } else {
+            let _ = unsafe { rules.Remove(&BSTR::from(old_rec.name.as_str())) };
+        }
     }
 
     Ok(LeakShieldStatus {
@@ -238,15 +279,11 @@ pub fn inspect_leak_shield() -> LeakShieldStatus {
         };
     };
     let active_rules = rules.iter().filter(|r| r.enabled).count();
-    let quic_blocked = rules
-        .iter()
-        .any(|r| r.enabled && r.name.contains("QUIC-"));
+    let quic_blocked = rules.iter().any(|r| r.enabled && r.name.contains("QUIC-"));
     let dns_doh_blocked = rules
         .iter()
         .any(|r| r.enabled && (r.name.contains("DNS-") || r.name.contains("DoH-")));
-    let ipv6_blocked = rules
-        .iter()
-        .any(|r| r.enabled && r.name.contains("IPv6-"));
+    let ipv6_blocked = rules.iter().any(|r| r.enabled && r.name.contains("IPv6-"));
     LeakShieldStatus {
         enabled: active_rules > 0,
         quic_blocked,
@@ -299,13 +336,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builds_expected_rules_per_enabled_vector() {
-        let exes = vec![PathBuf::from(r"C:\Apps\Claude.exe")];
+    fn builds_expected_rules_per_enabled_vector_and_strips_verbatim_prefix() {
+        let exes = vec![PathBuf::from(r"\\?\C:\Apps\Claude.exe")];
         let specs = build_shield_specs(&exes, true, true, true);
-        assert_eq!(specs.len(), 5);
-        assert!(specs.iter().any(|s| s.name.contains("QUIC-") && s.protocol == PROTO_UDP));
-        assert!(specs.iter().any(|s| s.name.contains("DoH-") && s.remote_addresses.is_some()));
-        assert!(specs.iter().any(|s| s.name.contains("IPv6-") && s.remote_addresses == Some("2000::/3")));
+        assert_eq!(specs.len(), 6);
+        assert!(specs
+            .iter()
+            .all(|s| s.program == std::path::Path::new(r"C:\Apps\Claude.exe")));
+        assert!(specs
+            .iter()
+            .any(|s| s.name.contains("QUIC-") && s.protocol == PROTO_UDP));
+        assert!(specs.iter().any(|s| {
+            s.name.contains("DoH-")
+                && s.protocol == PROTO_TCP
+                && s.remote_ports == Some("443,853")
+                && s.remote_addresses
+                    .is_some_and(|a| a.contains("223.5.5.5") && a.contains("2620:fe::fe"))
+        }));
+        assert!(specs.iter().any(|s| {
+            s.name.contains("DoH-UDP-")
+                && s.protocol == PROTO_UDP
+                && s.remote_ports == Some("443,853")
+        }));
+        assert!(specs.iter().any(|s| {
+            s.name.contains("IPv6-") && s.remote_addresses == Some("2000::/3,64:ff9b::/96,fc00::/7")
+        }));
 
         let quic_only = build_shield_specs(&exes, true, false, false);
         assert_eq!(quic_only.len(), 1);

@@ -69,7 +69,9 @@ pub fn render_overview(
     let ctrl_r = ctrl.read(cx);
     let snap = ctrl_r.snapshot.clone();
     let busy = ctrl_r.busy_action;
+    let is_demo = ctrl_r.client.is_demo();
     let recheck_all_busy = ctrl_r.is_scope_busy(&ActionScope::RecheckAll);
+    let start_svc_busy = ctrl_r.is_scope_busy(&ActionScope::StartService);
     let kill_all_armed = ctrl_r.is_confirm_armed("ov-kill-all");
     let connected = proj.connected;
     let can_act = connected && !busy;
@@ -211,6 +213,11 @@ pub fn render_overview(
                 "守护已暂停".into()
             } else if ip_unchanged_hold {
                 "出口波动 · IP 未变暂不熔断".into()
+            } else if monitor_only && proj.hero.fail_count > 0 {
+                format!(
+                    "仅监测预警 · {} 项异常（不熔断）",
+                    proj.hero.fail_count.max(1)
+                )
             } else {
                 proj.hero.pill_label.clone()
             }
@@ -285,31 +292,70 @@ pub fn render_overview(
     let hover_tile = p.sidebar_hover_bg;
 
     let hero_actions = if !connected {
+        let ctrl_start = ctrl.clone();
         let ctrl_conn = ctrl.clone();
-        div().flex().items_center().gap(px(8.)).child(
-            icon_action_button(
-                "ov-reconnect",
-                "icons/ui/refresh.svg",
-                if busy { "重连中…" } else { "重连服务" },
-                ButtonKind::Primary,
-                !busy,
-                p,
-            )
-            .when(!busy, |b| {
-                b.on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(move |_, _, _, cx| {
-                        ctrl_conn.update(cx, |c, cx| {
-                            c.send_request(
-                                PipeRequest::GetSnapshot,
-                                Some("已重新连接守护服务"),
-                                cx,
-                            );
-                        });
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(8.))
+            .when(!is_demo, |row| {
+                row.child(
+                    spinning_action_button(
+                        "ov-start-service",
+                        "icons/ui/shield.svg",
+                        if start_svc_busy {
+                            "启动中…"
+                        } else {
+                            "启动守护服务"
+                        },
+                        ButtonKind::Primary,
+                        !busy,
+                        start_svc_busy,
+                        p,
+                    )
+                    .when(!busy, |b| {
+                        b.on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                ctrl_start.update(cx, |c, cx| c.start_daemon_service(cx));
+                            }),
+                        )
                     }),
                 )
-            }),
-        )
+            })
+            .child(
+                icon_action_button(
+                    "ov-reconnect",
+                    "icons/ui/refresh.svg",
+                    if busy && !start_svc_busy {
+                        "重连中…"
+                    } else {
+                        "重连服务"
+                    },
+                    if is_demo {
+                        ButtonKind::Primary
+                    } else {
+                        ButtonKind::Secondary
+                    },
+                    !busy,
+                    p,
+                )
+                .when(!busy, |b| {
+                    b.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            ctrl_conn.update(cx, |c, cx| {
+                                c.send_request(
+                                    PipeRequest::GetSnapshot,
+                                    Some("已重新连接守护服务"),
+                                    cx,
+                                );
+                            });
+                        }),
+                    )
+                }),
+            )
     } else if lifecycle == Lifecycle::Unconfigured {
         let ctrl_onb = ctrl.clone();
         div().flex().items_center().gap(px(8.)).child(
@@ -677,7 +723,7 @@ pub fn render_overview(
     // Upper Row Right: Dedicated 2x2 Safe Launch Deck (53%)
     // -------------------------------------------------------------------------
     let deck_ok = connected && proj.hero.can_launch;
-    let deck_crisis = really_tripped || pre_trip_fail;
+    let deck_crisis = really_tripped || (pre_trip_fail && !monitor_only);
     let deck_dot_color = if deck_crisis || !connected {
         p.badge_fail.dot
     } else if deck_ok {

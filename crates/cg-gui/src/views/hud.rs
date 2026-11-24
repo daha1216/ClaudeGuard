@@ -45,12 +45,15 @@ pub fn render_hud(
     let connected = proj.connected;
     let can_act = connected && !busy;
     let ctrl_r = ctrl.read(cx);
+    let is_demo = ctrl_r.client.is_demo();
+    let start_svc_busy = ctrl_r.is_scope_busy(&crate::app::ActionScope::StartService);
     let snap = ctrl_r.snapshot.clone();
     let lifecycle = snap
         .as_deref()
         .map(|s| s.lifecycle)
         .unwrap_or(Lifecycle::Unconfigured);
     let really_tripped = snap.as_deref().is_some_and(|s| s.is_tripped());
+    let monitor_only = snap.as_deref().is_some_and(|s| s.config.monitor_only);
     let pre_trip_fail = !really_tripped && proj.hero.fail_count > 0;
     let proxy_port = snap.as_deref().map(|s| s.config.proxy_port).unwrap_or(7890);
     let total_running: usize = snap
@@ -93,6 +96,8 @@ pub fn render_hud(
         "已撤防放行".into()
     } else if proj.hero.is_paused {
         "守护已暂停".into()
+    } else if pre_trip_fail && monitor_only {
+        "仅监测 · 异常".into()
     } else if pre_trip_fail {
         "出口异常".into()
     } else if proj.hero.tone == HeroTone::Healthy {
@@ -103,6 +108,7 @@ pub fn render_hud(
 
     let ctrl_close = ctrl.clone();
     let ctrl_kill_all = ctrl.clone();
+    let ctrl_start_svc = ctrl.clone();
     let ctrl_primary = ctrl.clone();
     let ctrl_console = ctrl.clone();
     let ctrl_ag_jump = ctrl.clone();
@@ -615,6 +621,33 @@ pub fn render_hud(
                         .flex()
                         .items_center()
                         .gap(px(6.))
+                        .when(!connected && !is_demo, |row| {
+                            row.child(
+                                action_button(
+                                    "hud-start-service",
+                                    if start_svc_busy {
+                                        "启动中…"
+                                    } else {
+                                        "启动守护服务"
+                                    },
+                                    ButtonKind::Primary,
+                                    !busy,
+                                    p,
+                                )
+                                .h(px(28.))
+                                .px(px(9.))
+                                .text_size(px(11.))
+                                .when(!busy, |b| {
+                                    b.on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            ctrl_start_svc
+                                                .update(cx, |c, cx| c.start_daemon_service(cx));
+                                        }),
+                                    )
+                                }),
+                            )
+                        })
                         .child(
                             action_button(
                                 "hud-recheck-or-recover",
@@ -677,7 +710,11 @@ pub fn render_hud(
                             action_button(
                                 "hud-open-console",
                                 "主控台",
-                                ButtonKind::Primary,
+                                if !connected && !is_demo {
+                                    ButtonKind::Secondary
+                                } else {
+                                    ButtonKind::Primary
+                                },
                                 true,
                                 p,
                             )

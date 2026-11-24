@@ -3,6 +3,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+fn parse_sdk_version(name: &str) -> (u32, u32, u32, u32) {
+    let mut parts = name.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
+}
+
 fn find_rc_exe() -> Option<PathBuf> {
     if let Ok(path) = env::var("PATH") {
         for dir in env::split_paths(&path) {
@@ -29,7 +39,11 @@ fn find_rc_exe() -> Option<PathBuf> {
                 if rc.is_file() { Some((name, rc)) } else { None }
             })
             .collect();
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        candidates.sort_by(|a, b| {
+            parse_sdk_version(&b.0)
+                .cmp(&parse_sdk_version(&a.0))
+                .then_with(|| b.0.cmp(&a.0))
+        });
         if let Some((_, rc)) = candidates.into_iter().next() {
             return Some(rc);
         }

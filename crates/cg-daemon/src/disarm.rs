@@ -29,8 +29,7 @@ pub fn read_disarmed(dir: &Path) -> Result<Option<String>, String> {
 
 /// Atomically writes and fsyncs the persistent disarm marker.
 pub fn mark_disarmed(dir: &Path, reason: &str) -> Result<(), String> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| format!("failed to create data dir {}: {e}", dir.display()))?;
+    crate::journal::ensure_secure_data_dir(dir)?;
     let path = disarm_path(dir);
     let mut tmp = NamedTempFile::new_in(dir).map_err(|e| {
         format!(

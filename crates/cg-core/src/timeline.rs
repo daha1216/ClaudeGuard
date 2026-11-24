@@ -111,13 +111,16 @@ impl TimelineAggregator {
             TimelineStatus::Empty
         };
 
-        self.prune_before(start);
+        self.prune_window(start);
     }
 
-    fn prune_before(&mut self, current_bucket_start: u64) {
-        let span = (self.bucket_count as u64).saturating_sub(1) * u64::from(self.bucket_secs);
+    fn prune_window(&mut self, current_bucket_start: u64) {
+        let step = u64::from(self.bucket_secs);
+        let span = (self.bucket_count as u64).saturating_sub(1) * step;
         let oldest_keep = current_bucket_start.saturating_sub(span);
-        self.buckets.retain(|&ts, _| ts >= oldest_keep);
+        let max_keep = current_bucket_start.saturating_add(step);
+        self.buckets
+            .retain(|&ts, _| ts >= oldest_keep && ts <= max_keep);
     }
 
     /// Produces a chronological fixed-length (`48` or `96`) slice covering the 24h window ending at `now_secs`.
@@ -284,5 +287,30 @@ mod tests {
         assert_eq!(snap[47].status, TimelineStatus::Warn);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backwards_ntp_clock_jump_prunes_future_buckets() {
+        let mut tl = TimelineAggregator::new(48);
+        let future_ts = 2_000_000_000;
+        tl.record(
+            future_ts,
+            ProtectionState::Quarantined,
+            Some(PolicyVerdict::Fail),
+            99,
+        );
+        assert_eq!(tl.buckets.len(), 1);
+
+        // NTP steps system clock back to real time -> future bucket (> cur + BUCKET_SECS) must be pruned!
+        let real_ts = 1_700_000_000;
+        tl.record(
+            real_ts,
+            ProtectionState::Monitoring,
+            Some(PolicyVerdict::Pass),
+            20,
+        );
+        let max_allowed = tl.align_ts(real_ts) + u64::from(tl.bucket_secs());
+        assert!(tl.buckets.keys().all(|&ts| ts <= max_allowed));
+        assert_eq!(tl.buckets.len(), 1);
     }
 }
