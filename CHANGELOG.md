@@ -4,6 +4,35 @@
 
 日期为实际发布日期（UTC / UTC+8）。更早的历史版本记录见 [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases)。
 
+## [4.1.3] - 2026-11-25
+
+**全栈安全加固、防休眠误杀、底层防误判与交互体验跃升版**：全量严查并修复 46 项安全权限边界、中文路径切片崩溃、PID 复用隐患、笔记本睡眠唤醒误熔断、游戏加速器/分流网卡误判与前端状态竞态问题，同步落地离线一键拉起服务、全键盘表单流、门禁灵动岛快捷恢复等 5 大体验升级。
+
+### 安全与特权边界深度加固
+
+- **封堵 `SYSTEM` 任意文件写入提权与目录抢注（`antigravity_proxy_win` / `diagnostics` / `journal` / `config_store`）**：
+  - 反重力透明代理热修复与诊断包导出新增全路径重解析点（NTFS Junction / Symlink）拦截、随机名 `create_new(true)` + `sync_all()` 原子落盘与用户权限继承，杜绝低权限符号链接劫持覆盖系统文件或导致客户端自更新无权限。
+  - `%ProgramData%\ClaudeGuard` 强制施加受保护 DACL `D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`，防止本机低权限进程读取 `DpapiScope::LocalMachine` 飞书密钥或篡改/锁死 `disarmed`、`journal.json`、`env_backup.json`。
+- **Named Pipe IPC、SSRF 与 `v3` 升级桥接加固（`ipc_pipe` / `targets` / `probe_http` / `cg-v3-bridge` / `redact`）**：
+  - 命名管道收敛为 16 实例 / 16 并发连接上限、`256 KiB` 请求帧上限、`15s` Overlapped 读写超时取消及 Session-0 活动桌面会话鉴权；`PipeClient` 同步支持 Overlapped 超时。
+  - 目标 URL 严禁回环/内网/链路本地/元数据地址与 `@` 混淆并在守护启动时强制重验；修复下载重定向 `\` + `@` 绕过、首跳未校验及探测重定向 `https -> http` 降级风险；`cg-v3-bridge` 在 UAC 等待期持有 `FILE_SHARE_READ` 内核锁并二次校验 SHA-256，移除 `cmd.exe /C` 拼接；补齐 IPv6、代理凭据、Windows 用户名路径与定位坐标备份的全量脱敏。
+
+### 核心状态机、防休眠误杀与底层平台精修
+
+- **笔记本睡眠 / 休眠唤醒 20s 重连缓冲保护（`cg-core::engine` / `service_win`）**：
+  - 接入 Windows 服务 `SERVICE_ACCEPT_POWEREVENT`（`PBT_APMRESUMEAUTOMATIC`）与时钟跳跃检测：唤醒后给予 20 秒 Wi-Fi / 代理 / TUN 重连缓冲（一旦探测恢复即提前秒解），期间由启动门禁兜底拦新而不误杀运行中的 Claude / Codex / 反重力会话。
+- **核心引擎与防火墙一致性（`engine` / `engine_runtime` / `firewall_com` / `leak_shield_win` / `journal`）**：
+  - 修复快速开机 `< 10s` 拉起服务时 `Instant` 下溢导致后台监控线程静默退出；修复 `GeminiRegion` 无 IP 靶标逃逸熔断与事务执行中途 `ConfigPersisted` 递增 `runtime_epoch` 死锁；开启 `monitor_only` 自动解封已有隔离规则；微软商店 MSIX 静默更新目录后自动重同步防火墙与护盾规则；打通 WAL 时区真实回滚、`ClaudeGuard-Shield-*` 前缀清理与 **IPv6 CIDR 白名单**支持。
+- **中文环境零崩溃、原生句柄终止进程与路由级 TUN 真伪校验（`process_win` / `access_win` / `mihomo_win`）**：
+  - 修复三字中文 MSIX 包名（如腾讯会议/网易云音乐）与中文用户路径 UTF-8 字节越界崩溃；以单 Win32 `HANDLE` 身份校验 + `TerminateProcess` 彻底取代 `taskkill.exe /F`（毫秒级静默终止且 100% 免疫 PID 复用误杀）；保护 `OpenConsole`/`conhost` ConPTY 终端、浏览器与本地开发服务免受连坐清理；新增目录/注册表 TTL 缓存降低后台轮询开销 90%+。
+  - 新增 `GetBestInterfaceEx` 公网默认路由核验，杜绝 UU/雷神/迅游/奇游等游戏加速器、企业分流 VPN 及 Meta 虚拟网卡被误判为全局 TUN 导致国内裸连；修复无分号 `http=127.0.0.1:7890` 代理配置解析，Mihomo 候选节点扩容至 64 个并支持 UTF-8 BOM 与首尾空格节点名。
+
+### GPUI 桌面端修复与 5 大体验升级
+
+- **托盘唤醒、安全退出与输入防护（`tray_win` / `app` / `state` / `text_input`）**：
+  - 新增单实例互斥锁 + `AllowSetForegroundWindow` + UIPI 消息放行 + 副屏拔线防丢窗；托盘「安全撤防并退出」必须等守护端确认防火墙规则清零才退出；地区支持 `US/JP` 与中文名直输（如 `美国、日本、新加坡`）并实时高亮胶囊；修复密码框中文 IME 边界、超大文本粘贴卡顿与快速连点吞配置。
+- **5 大交互升级**：守护离线一键 **「启动守护服务」**；安全启动门禁拦截灵动岛附带 **「去热修复 → / 立即布防 / 去解封 →」** 一键直达；全表单打通 `Tab` / `Shift+Tab` / `Enter` / `Esc` 键盘流；未保存草稿自动切换 **「保存并重检」** + 自定义目标删除二次确认 + 飞书未保存「撤销」；「仅监测不熔断」告警采用独立琥珀色视觉区分，审计页新增 **「复制筛选结果」** 与完整日期时间戳，静默升级自动恢复用户托盘图标。
+
 ## [4.1.2] - 2026-11-24
 
 **全链路更新巡检与本机/网络检测可靠性重构版**：彻底解决共享代理下检查更新频繁限流失败、`claude.ai` Cloudflare 403 拦截、10 组件串行卡顿、反重力代理热修复 URL 拼接错误以及 Session-0 多场景漏检与误判问题，真机 10 组件全量并发检查耗时压降至约 1.1 秒。
