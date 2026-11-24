@@ -1,6 +1,6 @@
 [package]
 name = "cg-platform"
-version = "4.1.0"
+version = "4.1.1"
 edition = "2021"
 license = "MIT"
 description = "ClaudeGuard v4 native OS/platform driver (COM firewall, IpHelper, Toolhelp32, WinRT Toast, DPAPI, HTTP policy)"
