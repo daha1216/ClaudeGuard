@@ -2,9 +2,10 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use cg_core::redact::{mask_snapshot, redact};
-use cg_platform::{env_win, zip_util};
+use cg_platform::{env_win, process_win, zip_util};
 use cg_protocol::{AppliedEnv, GuardSnapshot};
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +30,8 @@ pub fn save_env_backup(data_dir: &Path, backup: &EnvBackup) -> Result<(), String
     fs::create_dir_all(data_dir).map_err(|e| format!("创建数据目录失败：{e}"))?;
     let path = data_dir.join(ENV_BACKUP_FILE);
     let tmp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(backup).map_err(|e| format!("序列化环境备份失败：{e}"))?;
+    let bytes =
+        serde_json::to_vec_pretty(backup).map_err(|e| format!("序列化环境备份失败：{e}"))?;
     fs::write(&tmp, &bytes).map_err(|e| format!("写入环境备份临时文件失败：{e}"))?;
     fs::rename(&tmp, &path).map_err(|e| format!("落盘环境备份失败：{e}"))?;
     Ok(())
@@ -75,7 +77,9 @@ pub fn apply_env_alignment(
         let desired_tz = target_tz_key
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| "当前未检测到合规出口对应的目标时区，请先完成一次出口探测".to_string())?;
+            .ok_or_else(|| {
+                "当前未检测到合规出口对应的目标时区，请先完成一次出口探测".to_string()
+            })?;
         let verified = env_win::set_windows_timezone(desired_tz)
             .map_err(|e| format!("应用系统时区失败：{e}"))?;
         if backup.applied.tz_from.is_empty() {
@@ -132,8 +136,7 @@ pub fn rollback_env_alignment(data_dir: &Path) -> Result<String, String> {
                 notes.push("已还原原始默认定位".into());
             }
             _ => {
-                env_win::delete_default_location()
-                    .map_err(|e| format!("清除覆写定位失败：{e}"))?;
+                env_win::delete_default_location().map_err(|e| format!("清除覆写定位失败：{e}"))?;
                 notes.push("已清除覆写的默认定位".into());
             }
         }
@@ -146,15 +149,144 @@ pub fn rollback_env_alignment(data_dir: &Path) -> Result<String, String> {
     }
 }
 
-/// Picks a user-accessible output directory (`Desktop` if writable, otherwise `<data_dir>\diagnostics`).
-fn resolve_diagnostics_dir(data_dir: &Path) -> PathBuf {
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        let desktop = PathBuf::from(profile).join("Desktop");
+fn is_system_profile_path(path: &Path) -> bool {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    lower.contains("systemprofile")
+        || lower.contains(r"\serviceprofiles\localservice")
+        || lower.contains(r"\serviceprofiles\networkservice")
+        || lower.contains("/serviceprofiles/localservice")
+        || lower.contains("/serviceprofiles/networkservice")
+}
+
+fn profile_recency(home: &Path) -> SystemTime {
+    [
+        home.join("Desktop"),
+        home.join("AppData").join("Local"),
+        home.join("NTUSER.DAT"),
+        home.to_path_buf(),
+    ]
+    .into_iter()
+    .filter_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+    .max()
+    .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+fn discover_interactive_user_home() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // 1. Extract interactive user homes resolved via `cg_platform::process_win` (`ProfileList` / covered dirs).
+    for covered in process_win::claude_covered_dirs() {
+        for anc in covered.ancestors() {
+            if anc
+                .file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("AppData"))
+            {
+                if let Some(home) = anc.parent() {
+                    if home.is_dir()
+                        && !is_system_profile_path(home)
+                        && !candidates.iter().any(|c| c == home)
+                    {
+                        candidates.push(home.to_path_buf());
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // 2. Also scan `<SystemDrive>\Users` for interactive profiles in case Claude dirs are absent.
+    let sys_drive = std::env::var("SystemDrive")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "C:".into());
+    let users_root = PathBuf::from(format!(
+        r"{}\Users",
+        sys_drive.trim_end_matches(['\\', '/'])
+    ));
+    if let Ok(entries) = fs::read_dir(&users_root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let lower = name.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "public" | "default" | "default user" | "all users"
+            ) || is_system_profile_path(&p)
+            {
+                continue;
+            }
+            if p.is_dir()
+                && (p.join("Desktop").is_dir() || p.join("AppData").is_dir())
+                && !candidates.iter().any(|c| c == &p)
+            {
+                candidates.push(p);
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        let a_desk = a.join("Desktop").is_dir();
+        let b_desk = b.join("Desktop").is_dir();
+        b_desk
+            .cmp(&a_desk)
+            .then_with(|| profile_recency(b).cmp(&profile_recency(a)))
+    });
+    candidates.into_iter().next()
+}
+
+fn resolve_diagnostics_dir_with(
+    user_profile: Option<&Path>,
+    interactive_home: Option<&Path>,
+    data_dir: &Path,
+    temp_dir: &Path,
+) -> PathBuf {
+    let is_session0_system = user_profile.is_some_and(is_system_profile_path);
+    if let Some(profile) = user_profile.filter(|p| !is_system_profile_path(p)) {
+        let desktop = profile.join("Desktop");
         if desktop.is_dir() {
             return desktop;
         }
+        if profile.is_dir() {
+            return profile.to_path_buf();
+        }
     }
+
+    if is_session0_system || user_profile.is_none() {
+        if let Some(home) = interactive_home.filter(|h| !is_system_profile_path(h)) {
+            let desktop = home.join("Desktop");
+            if desktop.is_dir() {
+                return desktop;
+            }
+            if home.is_dir() {
+                return home.to_path_buf();
+            }
+        }
+        if is_session0_system {
+            return temp_dir.to_path_buf();
+        }
+    }
+
     data_dir.join("diagnostics")
+}
+
+/// Picks a user-accessible output directory (`Desktop` if writable, interactive user home under
+/// Session-0 `LocalSystem`, `env::temp_dir()` fallback for `systemprofile`, otherwise `<data_dir>\diagnostics`).
+fn resolve_diagnostics_dir(data_dir: &Path) -> PathBuf {
+    let user_profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    let interactive = if user_profile.as_deref().is_none_or(is_system_profile_path) {
+        discover_interactive_user_home()
+    } else {
+        None
+    };
+    let temp = std::env::temp_dir();
+    resolve_diagnostics_dir_with(
+        user_profile.as_deref(),
+        interactive.as_deref(),
+        data_dir,
+        &temp,
+    )
 }
 
 /// Builds a strictly redacted `.zip` diagnostic bundle containing zero raw IPs or credentials.
@@ -175,8 +307,8 @@ pub fn export_redacted_diagnostics_zip(
         }
     }
 
-    let snap_json = serde_json::to_vec_pretty(&masked)
-        .map_err(|e| format!("序列化脱敏快照失败：{e}"))?;
+    let snap_json =
+        serde_json::to_vec_pretty(&masked).map_err(|e| format!("序列化脱敏快照失败：{e}"))?;
 
     let cfg_json = serde_json::to_vec_pretty(&masked.config)
         .map_err(|e| format!("序列化脱敏配置失败：{e}"))?;
@@ -253,9 +385,8 @@ mod tests {
             message: "检测到真实出口 203.0.113.45 异常".into(),
         });
 
-        let out =
-            export_redacted_diagnostics_zip(dir.path(), &snap, 1700000000, Some(dir.path()))
-                .expect("export zip");
+        let out = export_redacted_diagnostics_zip(dir.path(), &snap, 1700000000, Some(dir.path()))
+            .expect("export zip");
         assert!(out.is_file());
         let raw = fs::read(&out).unwrap();
         let (_, snap_entry) =
@@ -268,5 +399,38 @@ mod tests {
             zip_util::extract_file_from_zip(&raw, "audit_logs.txt").expect("read logs");
         let logs_text = String::from_utf8(logs_entry).unwrap();
         assert!(!logs_text.contains("203.0.113.45"));
+    }
+
+    #[test]
+    fn resolve_diagnostics_dir_handles_session0_systemprofile_and_fallback() {
+        let root = tempdir().unwrap();
+        let data_dir = root.path().join("ProgramData");
+        let temp_dir = root.path().join("Temp");
+        let user_home = root.path().join("Users").join("alice");
+        let user_desktop = user_home.join("Desktop");
+        fs::create_dir_all(&user_desktop).unwrap();
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let sys_profile = Path::new(r"C:\Windows\System32\config\systemprofile");
+        assert!(is_system_profile_path(sys_profile));
+        assert!(!is_system_profile_path(&user_home));
+
+        // Session-0 LocalSystem resolves to active interactive user's Desktop when available.
+        assert_eq!(
+            resolve_diagnostics_dir_with(Some(sys_profile), Some(&user_home), &data_dir, &temp_dir,),
+            user_desktop
+        );
+
+        // When no interactive user home is found under Session-0, falls back to env::temp_dir().
+        assert_eq!(
+            resolve_diagnostics_dir_with(Some(sys_profile), None, &data_dir, &temp_dir),
+            temp_dir
+        );
+
+        // Normal interactive user resolves directly to their Desktop.
+        assert_eq!(
+            resolve_diagnostics_dir_with(Some(&user_home), None, &data_dir, &temp_dir),
+            user_desktop
+        );
     }
 }

@@ -11,9 +11,9 @@
 //!   exponential backoff (`15s -> 30s -> 60s -> 300s -> 900s`, up to 12 attempts).
 
 use cg_platform::crypto_win::{
-    DpapiScope, feishu_webhook_sign, protect_str_base64, unprotect_str_base64,
+    feishu_webhook_sign, protect_str_base64, unprotect_str_base64, DpapiScope,
 };
-use cg_platform::probe_http::{NetworkPolicy, post_json_notify};
+use cg_platform::probe_http::{post_json_notify, NetworkPolicy};
 use cg_protocol::FeishuStatus;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -28,6 +28,7 @@ const MAX_FAILED: usize = 64;
 const MAX_ATTEMPTS: u32 = 12;
 const FEISHU_PREFIX: &str = "https://open.feishu.cn/open-apis/bot/v2/hook/";
 const LARK_PREFIX: &str = "https://open.larksuite.com/open-apis/bot/v2/hook/";
+const LARKOFFICE_PREFIX: &str = "https://open.larkoffice.com/open-apis/bot/v2/hook/";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -93,9 +94,8 @@ pub fn validate_webhook_url(url: &str) -> Result<(), String> {
     let token = trimmed
         .strip_prefix(FEISHU_PREFIX)
         .or_else(|| trimmed.strip_prefix(LARK_PREFIX))
-        .ok_or_else(|| {
-            "请填写飞书 / Lark 群自定义机器人的官方 HTTPS Webhook 地址".to_string()
-        })?;
+        .or_else(|| trimmed.strip_prefix(LARKOFFICE_PREFIX))
+        .ok_or_else(|| "请填写飞书 / Lark 群自定义机器人的官方 HTTPS Webhook 地址".to_string())?;
     if token.is_empty()
         || token.len() > 200
         || !token
@@ -117,6 +117,10 @@ pub fn mask_webhook_url(url: &str) -> String {
     if let Some(tok) = trimmed.strip_prefix(LARK_PREFIX) {
         let tail = tok.get(tok.len().saturating_sub(4)..).unwrap_or("");
         return format!("open.larksuite.com/.../{tail}");
+    }
+    if let Some(tok) = trimmed.strip_prefix(LARKOFFICE_PREFIX) {
+        let tail = tok.get(tok.len().saturating_sub(4)..).unwrap_or("");
+        return format!("open.larkoffice.com/.../{tail}");
     }
     String::new()
 }
@@ -153,6 +157,18 @@ fn classify_feishu_response(status: u16, body: &str) -> Result<(), DeliveryError
         Some(0) => Ok(()),
         Some(99991400 | 5000) => Err(DeliveryError::transient(
             "飞书机器人触发限流或服务抖动，将稍后自动重试",
+        )),
+        Some(19021) => Err(DeliveryError::transient(
+            "飞书拒绝消息（错误码 19021）：签名时间戳偏差过大，请校准系统时间",
+        )),
+        Some(19022) => Err(DeliveryError::permanent(
+            "飞书拒绝消息（错误码 19022）：签名密钥 Secret 不匹配，请核对加签密钥",
+        )),
+        Some(19024) => Err(DeliveryError::permanent(
+            "飞书拒绝消息（错误码 19024）：消息未包含自定义机器人安全关键词",
+        )),
+        Some(19025) => Err(DeliveryError::permanent(
+            "飞书拒绝消息（错误码 19025）：当前出口 IP 不在飞书机器人 IP 白名单内",
         )),
         Some(n) => {
             let msg = parsed
@@ -225,6 +241,7 @@ fn decrypt_opt(enc: &str) -> String {
 pub struct FeishuNotifier {
     path: PathBuf,
     state: Mutex<StoredFeishu>,
+    flush_lock: Mutex<()>,
 }
 
 impl FeishuNotifier {
@@ -237,6 +254,7 @@ impl FeishuNotifier {
         Self {
             path,
             state: Mutex::new(stored),
+            flush_lock: Mutex::new(()),
         }
     }
 
@@ -244,7 +262,8 @@ impl FeishuNotifier {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败：{e}"))?;
         }
-        let bytes = serde_json::to_vec_pretty(st).map_err(|e| format!("序列化飞书配置失败：{e}"))?;
+        let bytes =
+            serde_json::to_vec_pretty(st).map_err(|e| format!("序列化飞书配置失败：{e}"))?;
         let tmp = self.path.with_extension("json.tmp");
         fs::write(&tmp, &bytes).map_err(|e| format!("写入飞书配置临时文件失败：{e}"))?;
         fs::rename(&tmp, &self.path).map_err(|e| format!("原子落盘飞书配置失败：{e}"))?;
@@ -355,7 +374,19 @@ impl FeishuNotifier {
 
     /// Attempts to deliver all due queued events through `NetworkPolicy`.
     pub fn flush_due(&self, policy: &NetworkPolicy) -> usize {
+        let Ok(_guard) = self.flush_lock.try_lock() else {
+            return 0;
+        };
+        self.flush_due_with(|webhook, secret, ev| deliver_one(policy, webhook, secret, ev))
+    }
+
+    fn flush_due_with<F>(&self, deliver_fn: F) -> usize
+    where
+        F: Fn(&str, &str, &QueuedEvent) -> Result<(), DeliveryError>,
+    {
         let mut delivered = 0usize;
+        let mut tried_ids = Vec::with_capacity(8);
+
         for _ in 0..8 {
             let (ev, webhook, secret) = {
                 let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -363,30 +394,31 @@ impl FeishuNotifier {
                     break;
                 }
                 let now = now_secs();
-                let Some(front) = st.queue.front() else {
+                let Some(due) = st
+                    .queue
+                    .iter()
+                    .find(|item| item.next_attempt_at <= now && !tried_ids.contains(&item.id))
+                else {
                     break;
                 };
-                if front.next_attempt_at > now {
-                    break;
-                }
                 let url = decrypt_opt(&st.webhook_enc);
                 if url.is_empty() {
                     break;
                 }
                 let sec = decrypt_opt(&st.secret_enc);
-                (front.clone(), url, sec)
+                (due.clone(), url, sec)
             };
 
-            let send_res = deliver_one(policy, &webhook, &secret, &ev);
+            tried_ids.push(ev.id);
+            let send_res = deliver_fn(&webhook, &secret, &ev);
             let now = now_secs();
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(mut front) = st.queue.pop_front() else {
-                break;
-            };
-            if front.id != ev.id {
-                st.queue.push_front(front);
+            let Some(pos) = st.queue.iter().position(|item| item.id == ev.id) else {
                 continue;
-            }
+            };
+            let Some(mut target) = st.queue.remove(pos) else {
+                continue;
+            };
 
             match send_res {
                 Ok(()) => {
@@ -396,21 +428,19 @@ impl FeishuNotifier {
                 }
                 Err(err) => {
                     st.last_error = err.message.clone();
-                    front.attempts = front.attempts.saturating_add(1);
-                    if err.retryable && front.attempts < MAX_ATTEMPTS {
-                        front.next_attempt_at = now.saturating_add(backoff_secs(front.attempts));
-                        st.queue.push_back(front);
+                    target.attempts = target.attempts.saturating_add(1);
+                    if err.retryable && target.attempts < MAX_ATTEMPTS {
+                        target.next_attempt_at = now.saturating_add(backoff_secs(target.attempts));
+                        st.queue.push_back(target);
                     } else {
                         if st.failed.len() >= MAX_FAILED {
                             st.failed.pop_front();
                         }
                         st.failed.push_back(FailedEvent {
-                            event: front,
+                            event: target,
                             error: err.message,
                         });
                     }
-                    let _ = self.persist_locked(&st);
-                    break;
                 }
             }
             let _ = self.persist_locked(&st);
@@ -510,12 +540,18 @@ mod tests {
     fn validates_and_masks_feishu_and_lark_urls() {
         let feishu = "https://open.feishu.cn/open-apis/bot/v2/hook/abc12345-6789";
         let lark = "https://open.larksuite.com/open-apis/bot/v2/hook/xyz9988";
+        let lark_office = "https://open.larkoffice.com/open-apis/bot/v2/hook/office4321";
         assert!(validate_webhook_url(feishu).is_ok());
         assert!(validate_webhook_url(lark).is_ok());
+        assert!(validate_webhook_url(lark_office).is_ok());
         assert!(validate_webhook_url("http://open.feishu.cn/open-apis/bot/v2/hook/abc").is_err());
         assert!(validate_webhook_url("https://example.com/hook").is_err());
         assert_eq!(mask_webhook_url(feishu), "open.feishu.cn/.../6789");
         assert_eq!(mask_webhook_url(lark), "open.larksuite.com/.../9988");
+        assert_eq!(
+            mask_webhook_url(lark_office),
+            "open.larkoffice.com/.../4321"
+        );
     }
 
     #[test]
@@ -524,10 +560,78 @@ mod tests {
         assert!(classify_feishu_response(200, r#"{"StatusCode":0}"#).is_ok());
         let rate = classify_feishu_response(200, r#"{"code":99991400}"#).unwrap_err();
         assert!(rate.retryable);
-        let perm = classify_feishu_response(200, r#"{"code":19021,"msg":"sign fail"}"#).unwrap_err();
-        assert!(!perm.retryable);
+        let ts_skew = classify_feishu_response(200, r#"{"code":19021,"msg":"timestamp expired"}"#)
+            .unwrap_err();
+        assert!(ts_skew.retryable);
+        assert!(ts_skew.message.contains("时间戳偏差"));
+        let bad_sec =
+            classify_feishu_response(200, r#"{"code":19022,"msg":"sign match fail"}"#).unwrap_err();
+        assert!(!bad_sec.retryable);
+        assert!(bad_sec.message.contains("Secret 不匹配"));
+        let bad_kw = classify_feishu_response(200, r#"{"code":19024,"msg":"Key Words Not Found"}"#)
+            .unwrap_err();
+        assert!(!bad_kw.retryable);
+        assert!(bad_kw.message.contains("安全关键词"));
+        let bad_ip =
+            classify_feishu_response(200, r#"{"code":19025,"msg":"ip not allowed"}"#).unwrap_err();
+        assert!(!bad_ip.retryable);
+        assert!(bad_ip.message.contains("IP 白名单"));
         let http502 = classify_feishu_response(502, "bad gateway").unwrap_err();
         assert!(http502.retryable);
+    }
+
+    #[test]
+    fn flush_due_skips_backoff_head_of_line_and_prevents_concurrent_duplicate_sends() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempdir().unwrap();
+        let notifier = Arc::new(FeishuNotifier::load(dir.path()));
+        notifier
+            .save_config(
+                true,
+                Some("https://open.larkoffice.com/open-apis/bot/v2/hook/token-abcd".into()),
+                None,
+                false,
+            )
+            .expect("save larkoffice config");
+
+        assert!(notifier.enqueue("warning", "第一条待退避", "事件一"));
+        assert!(notifier.enqueue("trip", "第二条紧急告警", "事件二"));
+
+        // First flush: event #1 hits transient failure (enters backoff), event #2 still delivers immediately!
+        let delivered = notifier.flush_due_with(|_url, _sec, ev| {
+            if ev.title.contains("第一条") {
+                Err(DeliveryError::transient("模拟网络抖动"))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(delivered, 1, "event #2 must bypass backoff head-of-line");
+        assert_eq!(notifier.status().queued, 1);
+
+        // Enqueue event #3 and verify flush_lock prevents concurrent duplicate sends.
+        assert!(notifier.enqueue("recover", "第三条恢复", "事件三"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let guard = notifier.flush_lock.lock().unwrap();
+        assert_eq!(
+            notifier.flush_due(&NetworkPolicy::direct()),
+            0,
+            "concurrent flush_due must immediately return 0 while flush_lock is held"
+        );
+        drop(guard);
+
+        let calls_ref = calls.clone();
+        let delivered2 = notifier.flush_due_with(|_url, _sec, _ev| {
+            calls_ref.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        });
+        assert_eq!(
+            delivered2, 1,
+            "due event #3 delivered while event #1 stays in backoff"
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(notifier.status().queued, 1);
     }
 
     #[test]

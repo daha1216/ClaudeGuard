@@ -121,26 +121,55 @@ fn read_timezone_reg() -> (String, i32) {
     (tz_key, -(bias as i32))
 }
 
+#[cfg(any(windows, test))]
+fn compose_locale_from_reg_values(
+    locale_name: Option<&str>,
+    iso_lang: Option<&str>,
+    iso_ctry: Option<&str>,
+    s_lang: Option<&str>,
+    s_country: Option<&str>,
+) -> String {
+    if let Some(name) = locale_name.map(str::trim).filter(|s| !s.is_empty()) {
+        return name.to_string();
+    }
+    let iso_l = iso_lang.map(str::trim).unwrap_or("");
+    let iso_c = iso_ctry.map(str::trim).unwrap_or("");
+    if !iso_l.is_empty() {
+        return if iso_c.is_empty() {
+            iso_l.to_string()
+        } else {
+            format!("{iso_l}-{iso_c}")
+        };
+    }
+    let lang = s_lang.map(str::trim).unwrap_or("");
+    let country = s_country.map(str::trim).unwrap_or("");
+    if lang.is_empty() {
+        String::new()
+    } else if country.is_empty() {
+        lang.to_string()
+    } else {
+        format!("{lang}-{country}")
+    }
+}
+
 #[cfg(windows)]
 fn read_locale_reg() -> String {
     let Some(key) = crate::access_win::open_interactive_user_subkey(r"Control Panel\International")
     else {
         return String::new();
     };
-    if let Ok(name) = key.get_value::<String, _>("LocaleName") {
-        if !name.trim().is_empty() {
-            return name.trim().to_string();
-        }
-    }
-    let lang: String = key.get_value("sLanguage").unwrap_or_default();
-    let country: String = key.get_value("sCountry").unwrap_or_default();
-    if lang.is_empty() {
-        String::new()
-    } else if country.is_empty() {
-        lang
-    } else {
-        format!("{lang}-{country}")
-    }
+    let locale_name: Option<String> = key.get_value("LocaleName").ok();
+    let iso_lang: Option<String> = key.get_value("sISO639LangName").ok();
+    let iso_ctry: Option<String> = key.get_value("sISO3166CTRYName").ok();
+    let s_lang: Option<String> = key.get_value("sLanguage").ok();
+    let s_country: Option<String> = key.get_value("sCountry").ok();
+    compose_locale_from_reg_values(
+        locale_name.as_deref(),
+        iso_lang.as_deref(),
+        iso_ctry.as_deref(),
+        s_lang.as_deref(),
+        s_country.as_deref(),
+    )
 }
 
 /// Read Windows Sensor default location `(Latitude, Longitude)` from HKLM Registry.
@@ -254,7 +283,9 @@ fn parse_reg_tzi(bytes: &[u8]) -> Option<RegTzi> {
 /// Requires `SE_TIME_ZONE_NAME` privilege (held by Administrators and `LocalSystem` Windows Service).
 #[cfg(windows)]
 pub fn set_windows_timezone(tz_key: &str) -> PlatformResult<String> {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID, SYSTEMTIME};
+    use windows::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED, HANDLE, LUID, SYSTEMTIME,
+    };
     use windows::Win32::Security::{
         AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
         SE_TIME_ZONE_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
@@ -272,12 +303,12 @@ pub fn set_windows_timezone(tz_key: &str) -> PlatformResult<String> {
     }
 
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let sub_path = format!(
-        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Time Zones\{key_name}"
-    );
+    let sub_path = format!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Time Zones\{key_name}");
     let tz_reg = hklm
         .open_subkey_with_flags(&sub_path, KEY_READ)
-        .map_err(|e| PlatformError::InvalidInput(format!("系统注册表中未找到时区「{key_name}」：{e}")))?;
+        .map_err(|e| {
+            PlatformError::InvalidInput(format!("系统注册表中未找到时区「{key_name}」：{e}"))
+        })?;
 
     let tzi_raw = tz_reg
         .get_raw_value("TZI")
@@ -319,6 +350,11 @@ pub fn set_windows_timezone(tz_key: &str) -> PlatformResult<String> {
     };
     unsafe { AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None) }
         .map_err(|e| PlatformError::AccessDenied(format!("启用时区特权失败：{e}")))?;
+    if unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
+        return Err(PlatformError::AccessDenied(
+            "当前进程令牌缺少 SE_TIME_ZONE_NAME 时区修改特权（需要管理员或服务权限）".into(),
+        ));
+    }
 
     let to_systime = |a: [u16; 8]| SYSTEMTIME {
         wYear: a[0],
@@ -331,7 +367,11 @@ pub fn set_windows_timezone(tz_key: &str) -> PlatformResult<String> {
         wMilliseconds: a[7],
     };
     let copy_wide = |src: &str, dst: &mut [u16]| {
-        for (i, u) in src.encode_utf16().take(dst.len().saturating_sub(1)).enumerate() {
+        for (i, u) in src
+            .encode_utf16()
+            .take(dst.len().saturating_sub(1))
+            .enumerate()
+        {
             dst[i] = u;
         }
     };
@@ -349,8 +389,9 @@ pub fn set_windows_timezone(tz_key: &str) -> PlatformResult<String> {
     copy_wide(&dlt_name, &mut dtzi.DaylightName);
     copy_wide(key_name, &mut dtzi.TimeZoneKeyName);
 
-    unsafe { SetDynamicTimeZoneInformation(&dtzi) }
-        .map_err(|e| PlatformError::AccessDenied(format!("设置系统时区失败（需要管理员或服务权限）：{e}")))?;
+    unsafe { SetDynamicTimeZoneInformation(&dtzi) }.map_err(|e| {
+        PlatformError::AccessDenied(format!("设置系统时区失败（需要管理员或服务权限）：{e}"))
+    })?;
 
     let (verified_key, _) = read_timezone_reg();
     Ok(verified_key)
@@ -383,6 +424,41 @@ mod tests {
 
         assert_eq!(tz_label("China Standard Time"), "中国标准时间");
         assert_eq!(tz_label("Unknown Zone"), "Unknown Zone");
+
+        assert_eq!(
+            compose_locale_from_reg_values(
+                Some("en-US"),
+                Some("zh"),
+                Some("CN"),
+                Some("CHS"),
+                Some("China")
+            ),
+            "en-US"
+        );
+        assert_eq!(
+            compose_locale_from_reg_values(
+                Some(" "),
+                Some("en"),
+                Some("US"),
+                Some("ENU"),
+                Some("United States")
+            ),
+            "en-US"
+        );
+        assert_eq!(
+            split_locale(&compose_locale_from_reg_values(
+                None,
+                Some("ja"),
+                Some("JP"),
+                Some("JPN"),
+                Some("Japan")
+            )),
+            ("ja".into(), "JP".into())
+        );
+        assert_eq!(
+            compose_locale_from_reg_values(None, None, None, Some("CHS"), Some("CN")),
+            "CHS-CN"
+        );
     }
 
     #[cfg(windows)]

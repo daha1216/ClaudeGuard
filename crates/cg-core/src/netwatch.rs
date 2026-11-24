@@ -20,21 +20,23 @@ pub struct TcpConn {
     pub port: u16,
 }
 
-/// Returns true if `ip` is in `198.18.0.0/15` (RFC 2544 TUN fake-ip pool used by Clash/Mihomo/sing-box).
+/// Returns true if `ip` is in `198.18.0.0/15` or `28.0.0.0/8` (TUN fake-ip pools used by Clash/Mihomo/sing-box/Surge).
 pub fn is_fake_ip_v4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
-    o[0] == 198 && (o[1] == 18 || o[1] == 19)
+    (o[0] == 198 && (o[1] == 18 || o[1] == 19)) || o[0] == 28
 }
 
-/// Returns true for loopback, RFC1918, link-local, CGNAT (`100.64.0.0/10`), and `0.0.0.0/8`.
+/// Returns true for loopback, RFC1918, link-local, multicast, Class E/broadcast (`240.0.0.0/4`), CGNAT (`100.64.0.0/10`), and `0.0.0.0/8`.
 pub fn is_local_v4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local()
         || ip.is_unspecified()
+        || ip.is_multicast()
         || (o[0] == 100 && (64..=127).contains(&o[1]))
         || o[0] == 0
+        || o[0] >= 240
 }
 
 pub fn classify(remote: Ipv4Addr, port: u16, proxy_port: u16) -> RemoteKind {
@@ -236,5 +238,41 @@ mod tests {
         let r = fold(&conns, &agents, 7890, &sys_proxy, 100);
         assert_eq!(r.direct_total, 15);
         assert_eq!(r.direct.len(), MAX_LISTED);
+    }
+
+    #[test]
+    fn excludes_28_slash_8_fake_ip_and_reserved_class_e_v4() {
+        assert!(is_fake_ip_v4(Ipv4Addr::new(28, 0, 0, 1)));
+        assert!(is_fake_ip_v4(Ipv4Addr::new(28, 255, 255, 254)));
+        assert!(is_local_v4(Ipv4Addr::new(240, 0, 0, 1)));
+        assert!(is_local_v4(Ipv4Addr::new(255, 255, 255, 255)));
+        assert_eq!(
+            classify(Ipv4Addr::new(240, 0, 0, 1), 443, 7890),
+            RemoteKind::Local
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(7, "Claude".into());
+        let conns = vec![
+            TcpConn {
+                pid: 7,
+                remote: Ipv4Addr::new(28, 0, 1, 9),
+                port: 443,
+            },
+            TcpConn {
+                pid: 7,
+                remote: Ipv4Addr::new(198, 51, 100, 98),
+                port: 443,
+            },
+        ];
+        let access = AccessEvidence {
+            level: AccessLevel::SystemProxy,
+            proxy_addr: Some("127.0.0.1:7890".into()),
+            ..AccessEvidence::default()
+        };
+        let report = fold(&conns, &agents, 7890, &access, 500);
+        assert!(!report.applicable);
+        assert_eq!(report.direct_total, 0);
+        assert!(report.note.contains("TUN 接管"));
     }
 }

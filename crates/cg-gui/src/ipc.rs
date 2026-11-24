@@ -580,18 +580,282 @@ pub fn validate_pipe_name(pipe_name: &str) -> Result<(), TransportError> {
     Ok(())
 }
 
-/// Synchronous Named Pipe roundtrip (runs on background thread pool).
+#[cfg(any(windows, test))]
+fn request_timeout_ms(req: &PipeRequest) -> u64 {
+    match req {
+        PipeRequest::RepairAntigravityProxy => 65_000,
+        PipeRequest::CheckUpdates { .. }
+        | PipeRequest::RecheckNow { .. }
+        | PipeRequest::ProbeOnboarding
+        | PipeRequest::SyncLeakShield
+        | PipeRequest::TestFeishu { .. }
+        | PipeRequest::CheckLaunchGate { .. } => 30_000,
+        _ => 8_000,
+    }
+}
+
+#[cfg(windows)]
+mod win_overlapped {
+    use std::ffi::c_void;
+    use std::io::{self, Read, Write};
+    use std::time::Instant;
+
+    const ERROR_HANDLE_EOF_RAW: u32 = 38;
+    const ERROR_BROKEN_PIPE_RAW: u32 = 109;
+    const ERROR_IO_PENDING_RAW: u32 = 997;
+    const WAIT_OBJECT_0_RAW: u32 = 0;
+    const WAIT_TIMEOUT_RAW: u32 = 258;
+
+    #[repr(C)]
+    struct RawOverlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        h_event: *mut c_void,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateEventW(
+            lp_event_attributes: *const c_void,
+            b_manual_reset: i32,
+            b_initial_state: i32,
+            lp_name: *const u16,
+        ) -> *mut c_void;
+        fn ResetEvent(h_event: *mut c_void) -> i32;
+        fn WaitForSingleObject(h_handle: *mut c_void, dw_milliseconds: u32) -> u32;
+        fn ReadFile(
+            h_file: *mut c_void,
+            lp_buffer: *mut u8,
+            n_number_of_bytes_to_read: u32,
+            lp_number_of_bytes_read: *mut u32,
+            lp_overlapped: *mut RawOverlapped,
+        ) -> i32;
+        fn WriteFile(
+            h_file: *mut c_void,
+            lp_buffer: *const u8,
+            n_number_of_bytes_to_write: u32,
+            lp_number_of_bytes_written: *mut u32,
+            lp_overlapped: *mut RawOverlapped,
+        ) -> i32;
+        fn CancelIoEx(h_file: *mut c_void, lp_overlapped: *const RawOverlapped) -> i32;
+        fn GetOverlappedResult(
+            h_file: *mut c_void,
+            lp_overlapped: *const RawOverlapped,
+            lp_number_of_bytes_transferred: *mut u32,
+            b_wait: i32,
+        ) -> i32;
+        fn CloseHandle(h_object: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    pub(super) struct OverlappedPipe {
+        handle: *mut c_void,
+        event: *mut c_void,
+        deadline: Instant,
+        pub(super) timed_out: bool,
+    }
+
+    impl OverlappedPipe {
+        pub(super) fn new(handle: *mut c_void, deadline: Instant) -> Result<Self, io::Error> {
+            // SAFETY: Manual-reset unnamed Win32 event; `handle` is owned and closed on error/Drop.
+            let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if event.is_null() {
+                let err = unsafe { GetLastError() };
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
+                return Err(io::Error::from_raw_os_error(err as i32));
+            }
+            Ok(Self {
+                handle,
+                event,
+                deadline,
+                timed_out: false,
+            })
+        }
+
+        fn remaining_ms(&mut self) -> Result<u32, io::Error> {
+            let rem = self.deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                self.timed_out = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "named pipe deadline expired",
+                ));
+            }
+            Ok(rem.as_millis().clamp(1, u32::MAX as u128) as u32)
+        }
+    }
+
+    impl Drop for OverlappedPipe {
+        fn drop(&mut self) {
+            // SAFETY: Both `event` and `handle` are exclusively owned by `OverlappedPipe`.
+            unsafe {
+                if !self.event.is_null() {
+                    let _ = CloseHandle(self.event);
+                }
+                if !self.handle.is_null() {
+                    let _ = CloseHandle(self.handle);
+                }
+            }
+        }
+    }
+
+    impl Read for OverlappedPipe {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let wait_ms = self.remaining_ms()?;
+            let to_read = buf.len().min(u32::MAX as usize) as u32;
+            // SAFETY: Event is reset before issuing overlapped ReadFile; on timeout/error,
+            // CancelIoEx + blocking GetOverlappedResult drains the IRP before `ov` or `buf` drops.
+            unsafe {
+                let _ = ResetEvent(self.event);
+                let mut ov = RawOverlapped {
+                    internal: 0,
+                    internal_high: 0,
+                    offset: 0,
+                    offset_high: 0,
+                    h_event: self.event,
+                };
+                let mut transferred = 0u32;
+                let ok = ReadFile(
+                    self.handle,
+                    buf.as_mut_ptr(),
+                    to_read,
+                    &mut transferred,
+                    &mut ov,
+                );
+                if ok != 0 {
+                    return Ok(transferred as usize);
+                }
+                let err = GetLastError();
+                if err == ERROR_BROKEN_PIPE_RAW || err == ERROR_HANDLE_EOF_RAW {
+                    return Ok(0);
+                }
+                if err != ERROR_IO_PENDING_RAW {
+                    return Err(io::Error::from_raw_os_error(err as i32));
+                }
+
+                let w = WaitForSingleObject(self.event, wait_ms);
+                if w == WAIT_OBJECT_0_RAW {
+                    if GetOverlappedResult(self.handle, &ov, &mut transferred, 0) != 0 {
+                        return Ok(transferred as usize);
+                    }
+                    let gerr = GetLastError();
+                    if gerr == ERROR_BROKEN_PIPE_RAW || gerr == ERROR_HANDLE_EOF_RAW {
+                        return Ok(0);
+                    }
+                    return Err(io::Error::from_raw_os_error(gerr as i32));
+                }
+
+                let wait_err = GetLastError();
+                let _ = CancelIoEx(self.handle, &ov);
+                let _ = GetOverlappedResult(self.handle, &ov, &mut transferred, 1);
+                if w == WAIT_TIMEOUT_RAW {
+                    self.timed_out = true;
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "named pipe read timed out",
+                    ))
+                } else {
+                    Err(io::Error::from_raw_os_error(wait_err as i32))
+                }
+            }
+        }
+    }
+
+    impl Write for OverlappedPipe {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let wait_ms = self.remaining_ms()?;
+            let to_write = buf.len().min(u32::MAX as usize) as u32;
+            // SAFETY: Event is reset before issuing overlapped WriteFile; on timeout/error,
+            // CancelIoEx + blocking GetOverlappedResult drains the IRP before `ov` or `buf` drops.
+            unsafe {
+                let _ = ResetEvent(self.event);
+                let mut ov = RawOverlapped {
+                    internal: 0,
+                    internal_high: 0,
+                    offset: 0,
+                    offset_high: 0,
+                    h_event: self.event,
+                };
+                let mut transferred = 0u32;
+                let ok = WriteFile(
+                    self.handle,
+                    buf.as_ptr(),
+                    to_write,
+                    &mut transferred,
+                    &mut ov,
+                );
+                if ok != 0 {
+                    return Ok(transferred as usize);
+                }
+                let err = GetLastError();
+                if err != ERROR_IO_PENDING_RAW {
+                    return Err(io::Error::from_raw_os_error(err as i32));
+                }
+
+                let w = WaitForSingleObject(self.event, wait_ms);
+                if w == WAIT_OBJECT_0_RAW {
+                    if GetOverlappedResult(self.handle, &ov, &mut transferred, 0) != 0 {
+                        return Ok(transferred as usize);
+                    }
+                    let gerr = GetLastError();
+                    return Err(io::Error::from_raw_os_error(gerr as i32));
+                }
+
+                let wait_err = GetLastError();
+                let _ = CancelIoEx(self.handle, &ov);
+                let _ = GetOverlappedResult(self.handle, &ov, &mut transferred, 1);
+                if w == WAIT_TIMEOUT_RAW {
+                    self.timed_out = true;
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "named pipe write timed out",
+                    ))
+                } else {
+                    Err(io::Error::from_raw_os_error(wait_err as i32))
+                }
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+}
+
+/// Synchronous Named Pipe roundtrip (runs on background thread pool) with strict per-request deadline.
 #[cfg(windows)]
 fn exchange_named_pipe(pipe_name: &str, req: &PipeRequest) -> Result<PipeResponse, TransportError> {
+    exchange_named_pipe_with_timeout(
+        pipe_name,
+        req,
+        std::time::Duration::from_millis(request_timeout_ms(req)),
+    )
+}
+
+#[cfg(windows)]
+fn exchange_named_pipe_with_timeout(
+    pipe_name: &str,
+    req: &PipeRequest,
+    timeout: std::time::Duration,
+) -> Result<PipeResponse, TransportError> {
     use crate::protocol::{encode_frame, read_frame};
-    use std::fs::File;
     use std::io::Write;
-    use std::os::windows::io::FromRawHandle;
+    use std::time::Instant;
     use windows::Win32::Foundation::{
         ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE,
     };
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING,
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, OPEN_EXISTING,
     };
     use windows::Win32::System::Pipes::WaitNamedPipeW;
     use windows::core::HSTRING;
@@ -599,10 +863,17 @@ fn exchange_named_pipe(pipe_name: &str, req: &PipeRequest) -> Result<PipeRespons
     validate_pipe_name(pipe_name)?;
     let frame = encode_frame(req).map_err(|e| TransportError::Protocol(e.to_string()))?;
     let wide = HSTRING::from(pipe_name);
+    let timeout_ms = timeout.as_millis().max(1);
+    let deadline = Instant::now() + timeout;
 
     let mut last_err = String::new();
     let handle = 'connect: {
         for attempt in 0..3 {
+            if Instant::now() >= deadline {
+                return Err(TransportError::Timeout(format!(
+                    "连接守护管道超时（>{timeout_ms}ms）"
+                )));
+            }
             let res = unsafe {
                 CreateFileW(
                     &wide,
@@ -610,7 +881,7 @@ fn exchange_named_pipe(pipe_name: &str, req: &PipeRequest) -> Result<PipeRespons
                     FILE_SHARE_NONE,
                     None,
                     OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
                     None,
                 )
             };
@@ -621,8 +892,20 @@ fn exchange_named_pipe(pipe_name: &str, req: &PipeRequest) -> Result<PipeRespons
                     let win32_err = code & 0xFFFF;
                     last_err = err.message();
                     if win32_err == ERROR_PIPE_BUSY.0 && attempt < 2 {
-                        let _ = unsafe { WaitNamedPipeW(&wide, 1200) };
+                        let rem_ms = deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_millis()
+                            .min(1200) as u32;
+                        if rem_ms == 0 {
+                            return Err(TransportError::Timeout(format!(
+                                "守护管道繁忙超时（>{timeout_ms}ms）"
+                            )));
+                        }
+                        let _ = unsafe { WaitNamedPipeW(&wide, rem_ms) };
                         continue;
+                    }
+                    if win32_err == ERROR_PIPE_BUSY.0 {
+                        return Err(TransportError::Timeout(last_err));
                     }
                     if win32_err == ERROR_FILE_NOT_FOUND.0 {
                         return Err(TransportError::DaemonOffline(
@@ -636,15 +919,28 @@ fn exchange_named_pipe(pipe_name: &str, req: &PipeRequest) -> Result<PipeRespons
         return Err(TransportError::Timeout(last_err));
     };
 
-    // SAFETY: `handle` is an owned valid Win32 file handle from CreateFileW.
-    let mut pipe_file = unsafe { File::from_raw_handle(handle.0) };
-    pipe_file
-        .write_all(&frame)
-        .and_then(|()| pipe_file.flush())
+    let mut pipe = win_overlapped::OverlappedPipe::new(handle.0, deadline)
         .map_err(|e| TransportError::Protocol(e.to_string()))?;
-    let resp: PipeResponse =
-        read_frame(&mut pipe_file).map_err(|e| TransportError::Protocol(e.to_string()))?;
-    Ok(resp)
+    if let Err(err) = pipe.write_all(&frame) {
+        if pipe.timed_out || err.kind() == std::io::ErrorKind::TimedOut {
+            return Err(TransportError::Timeout(format!(
+                "发送守护请求超时（>{timeout_ms}ms）"
+            )));
+        }
+        return Err(TransportError::Protocol(err.to_string()));
+    }
+    match read_frame(&mut pipe) {
+        Ok(resp) => Ok(resp),
+        Err(err) => {
+            if pipe.timed_out {
+                Err(TransportError::Timeout(format!(
+                    "等待守护服务响应超时（>{timeout_ms}ms）"
+                )))
+            } else {
+                Err(TransportError::Protocol(err.to_string()))
+            }
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -1045,5 +1341,105 @@ mod tests {
         assert!(fallback.working_dir.is_none());
         assert!(!fallback.toast_message.contains("QUIC"));
         assert!(!fallback.toast_message.contains("工作目录"));
+    }
+
+    #[test]
+    fn request_timeout_tiers_match_rpc_workload() {
+        assert_eq!(request_timeout_ms(&PipeRequest::GetSnapshot), 8_000);
+        assert_eq!(
+            request_timeout_ms(&PipeRequest::CheckUpdates { component: None }),
+            30_000
+        );
+        assert_eq!(
+            request_timeout_ms(&PipeRequest::RecheckNow { target_id: None }),
+            30_000
+        );
+        assert_eq!(request_timeout_ms(&PipeRequest::ProbeOnboarding), 30_000);
+        assert_eq!(request_timeout_ms(&PipeRequest::SyncLeakShield), 30_000);
+        assert_eq!(
+            request_timeout_ms(&PipeRequest::RepairAntigravityProxy),
+            65_000
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn overlapped_named_pipe_enforces_deadline_and_classifies_offline() {
+        use std::ffi::c_void;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateNamedPipeW(
+                lp_name: *const u16,
+                dw_open_mode: u32,
+                dw_pipe_mode: u32,
+                n_max_instances: u32,
+                n_out_buffer_size: u32,
+                n_in_buffer_size: u32,
+                n_default_time_out: u32,
+                lp_security_attributes: *const c_void,
+            ) -> *mut c_void;
+            fn ConnectNamedPipe(h_named_pipe: *mut c_void, lp_overlapped: *mut c_void) -> i32;
+            fn DisconnectNamedPipe(h_named_pipe: *mut c_void) -> i32;
+            fn CloseHandle(h_object: *mut c_void) -> i32;
+        }
+
+        // 1. Missing pipe immediately returns DaemonOffline (not Timeout/Protocol).
+        let missing_pipe = format!(r"\\.\pipe\cg-gui-missing-{}", std::process::id());
+        let offline = exchange_named_pipe_with_timeout(
+            &missing_pipe,
+            &PipeRequest::GetSnapshot,
+            Duration::from_millis(200),
+        );
+        assert!(matches!(offline, Err(TransportError::DaemonOffline(_))));
+
+        // 2. Stalled pipe server that accepts client and writes nothing triggers Timeout via CancelIoEx.
+        let pipe_name = format!(r"\\.\pipe\cg-gui-stall-{}", std::process::id());
+        let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+
+        let server = std::thread::spawn(move || unsafe {
+            const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+            let h = CreateNamedPipeW(
+                wide.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                0,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null(),
+            );
+            assert!(!h.is_null() && (h as isize) != -1);
+            ready_tx.send(()).unwrap();
+            let _ = ConnectNamedPipe(h, std::ptr::null_mut());
+            // Hold connection open without sending response until client cancels via deadline.
+            let _ = done_rx.recv_timeout(Duration::from_secs(3));
+            let _ = DisconnectNamedPipe(h);
+            let _ = CloseHandle(h);
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        let stalled = exchange_named_pipe_with_timeout(
+            &pipe_name,
+            &PipeRequest::GetSnapshot,
+            Duration::from_millis(120),
+        );
+        let elapsed = started.elapsed();
+        let _ = done_tx.send(());
+        server.join().unwrap();
+
+        assert!(
+            matches!(stalled, Err(TransportError::Timeout(_))),
+            "expected Timeout on stalled pipe, got {stalled:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "CancelIoEx must abort stalled read promptly, took {elapsed:?}"
+        );
     }
 }

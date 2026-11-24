@@ -4,6 +4,32 @@
 
 日期为实际发布日期（UTC / UTC+8）。更早的历史版本记录见 [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases)。
 
+## [4.1.2] - 2026-11-24
+
+**全链路更新巡检与本机/网络检测可靠性重构版**：彻底解决共享代理下检查更新频繁限流失败、`claude.ai` Cloudflare 403 拦截、10 组件串行卡顿、反重力代理热修复 URL 拼接错误以及 Session-0 多场景漏检与误判问题，真机 10 组件全量并发检查耗时压降至约 1.1 秒。
+
+### 更新巡检与联网稳定性升级
+
+- **10 组件全并发检查与多源抗限流回退（`cg-platform::update_check`）**：
+  - 全量更新巡检改为 `std::thread::scope` 10 路并发执行，总耗时由串行最高 140s 降至 ~1.1s，并将后台定时更新巡检移出监控主循环避免阻塞。
+  - **GitHub 零 API 限流链路**：全部 5 个 GitHub 跟踪仓库优先通过网页 `302 /releases/latest`、`releases/expanded_assets` 与 `commits.atom` 获取最新标签、资产与提交日期，彻底规避共享代理出口 `api.github.com` 60 次/小时未认证限流（403/429）。
+  - **多渠道官方备份源**：`Claude 桌面端` 优先读取 `downloads.claude.ai` 官方 Squirrel `RELEASES` 清单（免疫 `claude.ai` Cloudflare 403 Challenge）；`Claude Code` / `Codex CLI` 支持 `npmjs.org` → `npmmirror.com` 自动回退；`ChatGPT / Codex 桌面端` 支持 `HEAD` → `Range GET` → 官方 Cask 元数据三级回退；`Antigravity IDE` 支持自定义源失败自动回退官方默认源并内置短重试。
+- **修复 `antigravity-proxy` 一键热修复代理地址双重协议前缀必败 Bug**：
+  - 修复 `repair_antigravity_proxy` 与 `NetworkPolicy::route` 在 `SystemProxy` 模式下拼出 `http://http://127.0.0.1:7890` 导致下载必败的问题，同时统一启用 `max_idle_connections(0)` 与分段连接/读取超时，消除代理连接池陈旧复用导致的 `UnexpectedEof` 报错。
+
+### 本机检测、接入识别与守护编排全面加固
+
+- **本机客户端、CLI 与插件跨工具链精准识别（`cg-platform::process_win`）**：
+  - 修复 Microsoft Store `OpenAI.ChatGPT-Desktop_` 包名前缀漏检与活动 `ChatGPT Classic.exe` 被误判为孤儿进程清理的问题。
+  - 新增零依赖 ASAR 头部解析校验反重力汉化补丁（`Silas-02/antigravity-desktop-cn`）：避免 IDE 升级覆盖 `app.asar` 后因残留 `app.asar.bak` 误报已汉化，修正补丁时间读取自 `app.asar`，并实现本地日期版本（`YYYY.MM.DD`）与上游 SemVer 发布日期跨轨精准对比。
+  - Session-0 服务态支持通过 `ProfileList` 与 `Uninstall` 注册表发现非 C 盘自定义安装目录及 Squirrel `AnthropicClaude`；扩展 `nvm`、`fnm`、`Volta`、`pnpm`、`bun`、`.npmrc`、Scoop、`.cargo/.crates2.json`（解决 Rust 版 `codex.exe` 无 PE 版本资源问题）与 `.vsix` 扩展目录扫描。
+- **接入路径、TUN 与直连雷达精准度加固（`access_win` / `netwatch_win` / `mihomo_win` / `envcheck`）**：
+  - 支持 Entra ID / Azure AD 账户（`S-1-12-1-*`）及 RDP 活动会话注册表读取；修复 `Tailscale` / `ZeroTier` / `EasyTier` Wintun 描述误判为全局 TUN 的问题；过滤闲置 TAP 网卡 APIPA 地址与陈旧未启用的 `AutoConfigURL`；扩充 `sing-tun`、`flclash`、`nekobox`、`karing`、`hiddify`、`sparkle` 等主流 TUN 关键字。
+  - 修复 `enforce_access_path = false` 时忽略已检测到的 TUN / 自定义系统代理端口而强绑 `7890` 的问题；修复监控循环忽略 `leak_watch` 开关、代理+TUN 双开误报直连、自定义代理端口未计入代理连接及 `28.0.0.0/8` / IPv6 Fake-IP 识别；修复跨境 Anycast `colo` 导致的环境区域误报与 Mihomo `"Taiwan"` 误命中 `"ai"` 分组问题。
+- **飞书通知与前端 IPC 交互优化（`feishu` / `cg-gui`）**：
+  - 飞书发送队列增加互斥防重入锁与按到期项扫描（消除重复发卡与队头阻塞），新增 `open.larkoffice.com` 支持与 `19021`/`19022`/`19024`/`19025` 中文排障提示。
+  - 前端 Named Pipe 升级为 `FILE_FLAG_OVERLAPPED` 按请求独立超时，超时不再误判守护离线；更新页与插件弹窗改为按单组件独立忙碌态，不再检查单项时冻结全局按钮。
+
 ## [4.1.1] - 2026-11-24
 
 **防误杀熔断优化版**：彻底修复代理网络波动导致反重力 IDE 被频繁强杀（看似“一直崩溃”）的问题，新增「出口 IP 不变时不熔断」与「仅监测不熔断」双开关，并在探测层加入瞬时抖动单次短重试。
@@ -116,6 +142,7 @@
 
 ---
 
+[4.1.2]: https://github.com/daha1216/ClaudeGuard/releases/tag/v4.1.2
 [4.1.1]: https://github.com/daha1216/ClaudeGuard/releases/tag/v4.1.1
 [4.1.0]: https://github.com/daha1216/ClaudeGuard/releases/tag/v4.1.0
 [4.0.1]: https://github.com/daha1216/ClaudeGuard/releases/tag/v4.0.1

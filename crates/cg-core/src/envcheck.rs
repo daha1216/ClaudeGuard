@@ -112,25 +112,57 @@ pub fn evaluate(cfg: &Config, info: EnvInfo, statuses: &[TargetStatus]) -> EnvCh
     };
     out.egress_country = country.clone();
     out.egress_colo = colo.clone();
-    let Some(place) = geo::resolve(colo.as_deref(), country.as_deref()) else {
-        out.note = "出口地区不在内置地点表内，暂不判定".into();
+
+    // If Cloudflare Anycast routed to a cross-border POP (e.g. US egress IP hitting YYZ in CA),
+    // ignore `colo` so we evaluate against `country` rather than comparing locale against CA.
+    let effective_colo =
+        colo.as_deref()
+            .filter(|c_code| match (geo::by_colo(c_code), country.as_deref()) {
+                (Some(colo_place), Some(probe_country)) => {
+                    colo_place.country.eq_ignore_ascii_case(probe_country)
+                }
+                (Some(_), None) => true,
+                (None, _) => false,
+            });
+
+    if let Some(place) = geo::resolve(effective_colo, country.as_deref()) {
+        if out.egress_country.is_none() && !place.country.is_empty() {
+            out.egress_country = Some(place.country.to_string());
+        }
+        out.expect_city = Some(place.city.to_string());
+        out.expect_tz = Some(place.tz.to_string());
+        out.tz_match = Some(out.info.tz_key.eq_ignore_ascii_case(place.tz));
+        let eff_country = country.as_deref().unwrap_or(place.country);
+        if !out.info.region.is_empty() && !eff_country.is_empty() {
+            out.locale_match = Some(out.info.region.eq_ignore_ascii_case(eff_country));
+        }
+        out.note = describe(&out);
         return out;
-    };
-    out.expect_city = Some(place.city.to_string());
-    out.expect_tz = Some(place.tz.to_string());
-    out.tz_match = Some(out.info.tz_key.eq_ignore_ascii_case(place.tz));
-    if !out.info.region.is_empty() && !place.country.is_empty() {
-        out.locale_match = Some(out.info.region.eq_ignore_ascii_case(place.country));
     }
-    out.note = describe(&out);
+
+    // Multi-timezone countries without a single default colo (e.g. US, CA, AU) still evaluate `locale_match`.
+    if let Some(probe_country) = country.as_deref().filter(|s| !s.is_empty())
+        && !out.info.region.is_empty()
+    {
+        out.locale_match = Some(out.info.region.eq_ignore_ascii_case(probe_country));
+        out.note = describe(&out);
+        return out;
+    }
+
+    out.note = "出口地区不在内置地点表内，暂不判定".into();
     out
 }
 
 pub fn describe(c: &EnvCheck) -> String {
-    let Some(city) = &c.expect_city else {
+    if c.expect_city.is_none() && c.tz_match.is_none() && c.locale_match.is_none() {
         return "出口信息不足，暂不判定".into();
-    };
+    }
     let country = c.egress_country.clone().unwrap_or_default();
+    let target_loc = c
+        .expect_city
+        .as_deref()
+        .or(c.egress_country.as_deref())
+        .unwrap_or("未知");
     let mut parts = Vec::new();
     if c.tz_match == Some(false) {
         let sys_tz = if c.info.tz_label.is_empty() {
@@ -144,7 +176,7 @@ pub fn describe(c: &EnvCheck) -> String {
                 offset_label(c.info.utc_offset_min)
             )
         };
-        parts.push(format!("时区不一致（出口在{city}，系统是{sys_tz}）"));
+        parts.push(format!("时区不一致（出口在{target_loc}，系统是{sys_tz}）"));
     }
     if c.locale_match == Some(false) {
         let loc = if c.info.locale.is_empty() {
@@ -155,7 +187,7 @@ pub fn describe(c: &EnvCheck) -> String {
         parts.push(format!("区域不一致（出口在{country}，系统是{loc}）"));
     }
     if parts.is_empty() {
-        format!("环境与出口一致（{city}）")
+        format!("环境与出口一致（{target_loc}）")
     } else {
         parts.join("；")
     }
@@ -207,5 +239,77 @@ mod tests {
         assert_eq!(res.locale_match, Some(false));
         assert!(res.mismatched());
         assert!(res.note.contains("洛杉矶"));
+    }
+
+    #[test]
+    fn cross_border_anycast_colo_and_multi_tz_country_evaluate_cleanly() {
+        // 1. US IP routed through Toronto (YYZ, CA) POP while Windows locale is en-US -> MUST NOT mismatch!
+        let us_info = EnvInfo {
+            tz_key: "Eastern Standard Time".into(),
+            tz_label: tz_label("Eastern Standard Time"),
+            utc_offset_min: -300,
+            locale: "en-US".into(),
+            lang: "en".into(),
+            region: "US".into(),
+        };
+        let cross_border = vec![TargetStatus {
+            id: "claude".into(),
+            name: "Claude".into(),
+            builtin: true,
+            state: TargetState::Pass,
+            anchor_url: String::new(),
+            anchor_kind: AnchorKind::Trace,
+            expect_ips: vec![],
+            expect_regions: vec![],
+            ip: Some("198.51.100.98".into()),
+            country: Some("US".into()),
+            raw_region: Some("US".into()),
+            colo: Some("YYZ".into()),
+            city: None,
+            latency_ms: 28,
+            checked_at: Some(200),
+            reason: String::new(),
+            fail_streak: 0,
+            matched_rule: None,
+        }];
+        let ok_res = evaluate(&Config::default(), us_info, &cross_border);
+        assert_eq!(ok_res.locale_match, Some(true));
+        assert!(!ok_res.mismatched(), "note={}", ok_res.note);
+        assert!(!ok_res.note.contains("不一致"));
+
+        // 2. Multi-TZ country (US/CA/AU) without colo still detects zh-CN locale mismatch.
+        let cn_info = EnvInfo {
+            tz_key: "China Standard Time".into(),
+            tz_label: tz_label("China Standard Time"),
+            utc_offset_min: 480,
+            locale: "zh-CN".into(),
+            lang: "zh".into(),
+            region: "CN".into(),
+        };
+        let ca_no_colo = vec![TargetStatus {
+            id: "claude".into(),
+            name: "Claude".into(),
+            builtin: true,
+            state: TargetState::Pass,
+            anchor_url: String::new(),
+            anchor_kind: AnchorKind::JsonIp,
+            expect_ips: vec![],
+            expect_regions: vec![],
+            ip: Some("203.0.113.45".into()),
+            country: Some("CA".into()),
+            raw_region: Some("CA".into()),
+            colo: None,
+            city: None,
+            latency_ms: 35,
+            checked_at: Some(300),
+            reason: String::new(),
+            fail_streak: 0,
+            matched_rule: None,
+        }];
+        let mm_res = evaluate(&Config::default(), cn_info, &ca_no_colo);
+        assert_eq!(mm_res.tz_match, None);
+        assert_eq!(mm_res.locale_match, Some(false));
+        assert!(mm_res.mismatched());
+        assert!(mm_res.note.contains("出口在CA"));
     }
 }

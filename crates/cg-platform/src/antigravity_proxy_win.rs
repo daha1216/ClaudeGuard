@@ -260,6 +260,12 @@ pub fn inspect_antigravity_proxy_in_dir(
         }
     }
 
+    if dll_valid && injector_version.is_none() {
+        injector_version = process_win::read_pe_file_version(&dll_path)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+
     let port_matches_guard =
         proxy_port.is_some_and(|p| expected_proxy_port == 0 || p == expected_proxy_port);
 
@@ -484,8 +490,7 @@ pub fn install_verified_proxy_bytes_into_dir(
     // Atomic write `version.dll` via sibling temp file
     let dll_path = dir.join("version.dll");
     let tmp_dll = dir.join("version.dll.cg-tmp");
-    std::fs::write(&tmp_dll, &dll_bytes)
-        .map_err(|e| format!("写入临时 version.dll 失败：{e}"))?;
+    std::fs::write(&tmp_dll, &dll_bytes).map_err(|e| format!("写入临时 version.dll 失败：{e}"))?;
     if let Err(rename_err) = std::fs::rename(&tmp_dll, &dll_path) {
         let _ = std::fs::remove_file(&tmp_dll);
         return Err(format!(
@@ -528,8 +533,7 @@ pub fn install_verified_proxy_bytes_into_dir(
     let cfg_bytes =
         serde_json::to_vec_pretty(&cfg_val).map_err(|e| format!("序列化 config.json 失败：{e}"))?;
     let tmp_cfg = dir.join("config.json.cg-tmp");
-    std::fs::write(&tmp_cfg, &cfg_bytes)
-        .map_err(|e| format!("写入临时 config.json 失败：{e}"))?;
+    std::fs::write(&tmp_cfg, &cfg_bytes).map_err(|e| format!("写入临时 config.json 失败：{e}"))?;
     std::fs::rename(&tmp_cfg, &cfg_path).map_err(|e| format!("替换 config.json 失败：{e}"))?;
 
     Ok(AntigravityRepairReport {
@@ -544,6 +548,57 @@ pub fn install_verified_proxy_bytes_into_dir(
     })
 }
 
+/// Parse a proxy address string (`"http://127.0.0.1:7890"`, `"socks5h://host:10808/"`, `"host:port"`)
+/// into `(host, port)`, stripping any leading scheme and trailing `/` to prevent `http://http://...`.
+fn parse_proxy_route_addr(addr: &str, fallback_port: u16) -> (&str, u16) {
+    let mut s = addr.trim();
+    loop {
+        let matched = ["socks5h://", "socks5://", "https://", "http://"]
+            .into_iter()
+            .find(|scheme| {
+                s.get(..scheme.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+            });
+        if let Some(scheme) = matched {
+            s = s[scheme.len()..].trim_start();
+        } else {
+            break;
+        }
+    }
+    s = s.split('/').next().unwrap_or("").trim();
+
+    if s.starts_with('[') {
+        if let Some((bracketed, port_str)) = s.rsplit_once(':') {
+            if bracketed.ends_with(']') {
+                if let Ok(port) = port_str.trim().parse::<u16>() {
+                    if port > 0 {
+                        return (bracketed.trim(), port);
+                    }
+                }
+                return (bracketed.trim(), fallback_port);
+            }
+        }
+        return (s, fallback_port);
+    }
+
+    if let Some((h, p)) = s.rsplit_once(':') {
+        let h_trim = h.trim();
+        if !h_trim.contains(':') {
+            if let Ok(port) = p.trim().parse::<u16>() {
+                if port > 0 && !h_trim.is_empty() {
+                    return (h_trim, port);
+                }
+            }
+            if !h_trim.is_empty() && p.trim().is_empty() {
+                return (h_trim, fallback_port);
+            }
+        }
+    }
+
+    let host = if s.is_empty() { "127.0.0.1" } else { s };
+    (host, fallback_port)
+}
+
 /// One-click verified hot re-injector: fetches latest `yuaotian/antigravity-proxy` release asset
 /// strictly through `NetworkPolicy` (never falls back to direct when proxy configured), verifies
 /// `version.dll` binary signature, and atomically repairs `<AntigravityDir>\version.dll` + `config.json`.
@@ -556,18 +611,18 @@ pub fn repair_antigravity_proxy(
         Some(d) => d.to_path_buf(),
         None => {
             let dirs = process_win::antigravity_covered_dirs();
-            dirs.into_iter()
-                .next()
-                .ok_or_else(|| "本机未检测到 Antigravity 安装目录，无法执行热修复注入".to_string())?
+            pick_installed_antigravity_dir(&dirs)
+                .cloned()
+                .or_else(|| dirs.into_iter().next())
+                .ok_or_else(|| {
+                    "本机未检测到 Antigravity 安装目录，无法执行热修复注入".to_string()
+                })?
         }
     };
 
     let policy = match route {
         crate::probe_http::ProbeRoute::Proxy(addr) => {
-            let (host, port) = addr
-                .rsplit_once(':')
-                .and_then(|(h, p)| p.parse::<u16>().ok().map(|port| (h, port)))
-                .unwrap_or(("127.0.0.1", proxy_port));
+            let (host, port) = parse_proxy_route_addr(addr, proxy_port);
             crate::probe_http::NetworkPolicy::with_proxy(host, port)
         }
         crate::probe_http::ProbeRoute::Direct => crate::probe_http::NetworkPolicy::direct(),
@@ -602,15 +657,9 @@ pub fn repair_antigravity_proxy(
     )
     .map_err(|e| format!("下载 antigravity-proxy 资产失败：{e}"))?;
 
-    let is_zip = asset_url.to_ascii_lowercase().ends_with(".zip")
-        || downloaded.starts_with(b"PK\x03\x04");
-    install_verified_proxy_bytes_into_dir(
-        &dir,
-        &downloaded,
-        is_zip,
-        proxy_port,
-        &release.version,
-    )
+    let is_zip =
+        asset_url.to_ascii_lowercase().ends_with(".zip") || downloaded.starts_with(b"PK\x03\x04");
+    install_verified_proxy_bytes_into_dir(&dir, &downloaded, is_zip, proxy_port, &release.version)
 }
 
 #[cfg(test)]
@@ -861,5 +910,53 @@ mod tests {
             Path::new(r"C:\DefinitelyMissing\antigravity\version.dll")
         ));
         assert!(!is_module_loaded_in_process(0, &self_exe));
+    }
+
+    #[test]
+    fn repair_proxy_url_parsing_strips_schemes_and_prevents_double_http() {
+        assert_eq!(
+            parse_proxy_route_addr("http://127.0.0.1:7890", 10808),
+            ("127.0.0.1", 7890)
+        );
+        assert_eq!(
+            parse_proxy_route_addr("HTTP://http://198.51.100.10:7897/", 7890),
+            ("198.51.100.10", 7897)
+        );
+        assert_eq!(
+            parse_proxy_route_addr("https://203.0.113.25:8443/pac", 7890),
+            ("203.0.113.25", 8443)
+        );
+        assert_eq!(
+            parse_proxy_route_addr("socks5://198.51.100.42:10808/", 7890),
+            ("198.51.100.42", 10808)
+        );
+        assert_eq!(
+            parse_proxy_route_addr("socks5h://203.0.113.99:10809/", 7890),
+            ("203.0.113.99", 10809)
+        );
+        assert_eq!(
+            parse_proxy_route_addr("198.51.100.77", 7890),
+            ("198.51.100.77", 7890)
+        );
+        assert_eq!(parse_proxy_route_addr("[::1]:7890", 1080), ("[::1]", 7890));
+
+        // End-to-end check with NetworkPolicy::with_proxy -> never produces http://http://
+        let (h, p) = parse_proxy_route_addr("http://198.51.100.10:7890/", 7890);
+        assert_eq!(
+            crate::probe_http::NetworkPolicy::with_proxy(h, p).route(),
+            crate::probe_http::Route::Proxy("http://198.51.100.10:7890".into())
+        );
+
+        // Verify pick_installed_antigravity_dir skips empty candidate and selects real install dir
+        let empty_cand = unique_temp_dir("empty-cand");
+        let real_cand = unique_temp_dir("real-cand");
+        std::fs::write(real_cand.join("Antigravity.exe"), b"MZ").unwrap();
+        let candidates = vec![empty_cand.clone(), real_cand.clone()];
+        assert_eq!(
+            pick_installed_antigravity_dir(&candidates),
+            Some(&real_cand)
+        );
+        std::fs::remove_dir_all(&empty_cand).unwrap();
+        std::fs::remove_dir_all(&real_cand).unwrap();
     }
 }

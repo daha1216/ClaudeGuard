@@ -2,12 +2,25 @@
 
 use cg_protocol::{AccessEvidence, AccessLevel, Config};
 
-const TUN_KEYWORDS: [&str; 15] = [
+const TUN_KEYWORDS: &[&str] = &[
     "mihomo",
     "clash",
     "meta",
     "sing-box",
     "singbox",
+    "sing-tun",
+    "flclash",
+    "verge",
+    "nyanpasu",
+    "sparkle",
+    "nekobox",
+    "nekoray",
+    "throne",
+    "karing",
+    "hiddify",
+    "shadowsocks",
+    "surfboard",
+    "warp",
     "wintun",
     "wireguard",
     "openvpn",
@@ -20,7 +33,24 @@ const TUN_KEYWORDS: [&str; 15] = [
     "xray",
 ];
 
-const TUN_EXCLUDES: [&str; 1] = ["tailscale"];
+const TUN_EXCLUDES: &[&str] = &[
+    "tailscale",
+    "zerotier",
+    "easytier",
+    "netbird",
+    "radmin",
+    "hamachi",
+    "vethernet",
+    "wsl",
+    "hyper-v",
+    "vmware",
+    "virtualbox",
+    "npcap",
+    "loopback",
+    "teredo",
+    "isatap",
+    "6to4",
+];
 
 const SENSITIVE_SUFFIXES: [&str; 8] = [
     "anthropic.com",
@@ -58,19 +88,40 @@ pub enum ProbeRoute {
     Skip,
 }
 
+fn is_tun_excluded(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    TUN_EXCLUDES.iter().any(|kw| lower.contains(kw))
+}
+
+fn has_bounded_tun_token(lower: &str) -> bool {
+    lower == "tun"
+        || lower.ends_with("-tun")
+        || lower.ends_with("_tun")
+        || lower.ends_with(" tun")
+        || lower.strip_prefix("tun").is_some_and(|s| {
+            s.starts_with(['-', '_', ' '])
+                || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
 /// Checks whether a network adapter name/description looks like a full-tunnel TUN device.
 pub fn is_tun_name(name: &str) -> bool {
     let lower = name.to_lowercase();
     if TUN_EXCLUDES.iter().any(|kw| lower.contains(kw)) {
         return false;
     }
-    lower.starts_with("utun") || TUN_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    lower.starts_with("utun")
+        || has_bounded_tun_token(&lower)
+        || TUN_KEYWORDS.iter().any(|kw| lower.contains(kw))
 }
 
 /// Picks the first active (`up = true`) TUN adapter from `(description, friendly_name, is_up)`.
 pub fn select_tun(adapters: &[(String, String, bool)]) -> Option<String> {
     for (desc, friendly, up) in adapters {
         if !*up {
+            continue;
+        }
+        if is_tun_excluded(desc) || is_tun_excluded(friendly) {
             continue;
         }
         if is_tun_name(desc) {
@@ -186,37 +237,107 @@ fn entry_domain(entry: &str) -> String {
         .to_string()
 }
 
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p = pattern.as_bytes();
+    let t = text.as_bytes();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 /// Returns true for local/loopback/RFC1918 bypass entries that never leak public AI traffic.
 pub fn bypass_local_entry(entry: &str) -> bool {
     let e = entry.trim().to_ascii_lowercase();
-    match e.as_str() {
-        "<local>" | "localhost" | "localhost.*" | "*.localhost" | "*.local" | "[::1]" | "::1" => {
-            return true;
-        }
-        _ => {}
-    }
-    let Some(prefix) = e.strip_suffix(".*") else {
-        return false;
+    let host_part = if !e.starts_with('[') {
+        e.split(':').next().unwrap_or(&e)
+    } else {
+        e.as_str()
     };
-    let octets: Vec<u8> = prefix
+    if matches!(
+        host_part,
+        "<local>"
+            | "<-loopback>"
+            | "*."
+            | "localhost"
+            | "localhost.*"
+            | "*.localhost"
+            | "*.local"
+            | "*.localdomain"
+            | "127.0.0.1"
+            | "[::1]"
+            | "::1"
+    ) || e == "::1"
+        || e.starts_with("[::1]:")
+        || e.starts_with("fe80:")
+        || e.starts_with("[fe80:")
+    {
+        return true;
+    }
+    if let Ok(v4) = host_part.parse::<std::net::Ipv4Addr>() {
+        return v4.is_loopback() || v4.is_private() || v4.is_link_local();
+    }
+    let mut prefix = host_part;
+    let mut stripped = false;
+    while let Some(p) = prefix.strip_suffix(".*") {
+        prefix = p;
+        stripped = true;
+    }
+    if !stripped || prefix.is_empty() {
+        return false;
+    }
+    let Some(octets) = prefix
         .split('.')
         .map(|v| v.parse::<u8>().ok())
         .collect::<Option<Vec<_>>>()
-        .unwrap_or_default();
+    else {
+        return false;
+    };
+    if octets.len() > 3 {
+        return false;
+    }
     match octets.as_slice() {
-        [10] | [127] | [192, 168] | [169, 254] => true,
-        [172, second] => (16..=31).contains(second),
+        [10, ..] | [127, ..] | [192, 168, ..] | [169, 254, ..] => true,
+        [172, second, ..] => (16..=31).contains(second),
         _ => false,
     }
 }
 
 pub fn bypass_hits_host(entry: &str, host: &str) -> bool {
-    let domain = entry_domain(entry);
-    if domain.is_empty() {
+    let e = entry.trim().to_ascii_lowercase();
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if e.is_empty() || e == "." || e == "<-loopback>" || host.is_empty() {
+        return false;
+    }
+    if e == "*." {
+        return !host.contains('.');
+    }
+    let domain = entry_domain(&e).trim_end_matches('.').to_string();
+    if domain.is_empty() || domain == "*" {
         return true;
     }
-    let host = host.trim().to_ascii_lowercase();
-    host == domain || host.ends_with(&format!(".{domain}"))
+    if !domain.contains('*') && (host == domain || host.ends_with(&format!(".{domain}"))) {
+        return true;
+    }
+    wildcard_match(&e, &host) || wildcard_match(&e, &format!("sub.{host}"))
 }
 
 pub fn bypass_risk(raw: Option<&str>, hosts: &[String]) -> Option<String> {
@@ -331,19 +452,47 @@ pub fn evaluate_access(
                 }
             }
         }
-        ProxyParse::Unsupported(why) => AccessEvidence {
-            level: AccessLevel::Unknown,
-            observed_at,
-            revision,
-            note: format!("系统代理配置无法等价复用：{why}"),
-            ..AccessEvidence::default()
+        ProxyParse::Unsupported(why) => match tun_adapter {
+            Some(adapter) => {
+                let clean = adapter.trim().to_string();
+                AccessEvidence {
+                    level: AccessLevel::Tun,
+                    tun_iface: Some(clean.clone()),
+                    route_hint: true,
+                    observed_at,
+                    revision,
+                    note: format!("TUN 直连（{clean}）"),
+                    ..AccessEvidence::default()
+                }
+            }
+            None => AccessEvidence {
+                level: AccessLevel::Unknown,
+                observed_at,
+                revision,
+                note: format!("系统代理配置无法等价复用：{why}"),
+                ..AccessEvidence::default()
+            },
         },
-        ProxyParse::Empty => AccessEvidence {
-            level: AccessLevel::Unknown,
-            observed_at,
-            revision,
-            note: "系统代理已开启但未读到代理地址".into(),
-            ..AccessEvidence::default()
+        ProxyParse::Empty => match tun_adapter {
+            Some(adapter) => {
+                let clean = adapter.trim().to_string();
+                AccessEvidence {
+                    level: AccessLevel::Tun,
+                    tun_iface: Some(clean.clone()),
+                    route_hint: true,
+                    observed_at,
+                    revision,
+                    note: format!("TUN 直连（{clean}）"),
+                    ..AccessEvidence::default()
+                }
+            }
+            None => AccessEvidence {
+                level: AccessLevel::Unknown,
+                observed_at,
+                revision,
+                note: "系统代理已开启但未读到代理地址".into(),
+                ..AccessEvidence::default()
+            },
         },
     }
 }
@@ -371,7 +520,7 @@ mod tests {
             enable: true,
             server: Some("http=127.0.0.1:80;https=127.0.0.1:7890".into()),
             autoconfig: None,
-            overrides: Some("<local>;127.*;192.168.*;*jd.com".into()),
+            overrides: Some("<local>;<-loopback>;*.;127.*;192.168.*;*jd.com".into()),
         };
         let acc = evaluate_access(&ev_ok, None, &hosts, 100, 1);
         assert_eq!(acc.level, AccessLevel::SystemProxy);
@@ -392,7 +541,7 @@ mod tests {
         assert_eq!(acc_pac.level, AccessLevel::Unknown);
         assert_eq!(plan_route(&acc_pac), ProbeRoute::Skip);
 
-        // Missing server -> Unknown
+        // Missing server -> Unknown when no TUN, Tun when TUN active
         let ev_empty = ProxyEvidence {
             enable: true,
             server: None,
@@ -402,6 +551,22 @@ mod tests {
         assert_eq!(
             evaluate_access(&ev_empty, None, &hosts, 100, 1).level,
             AccessLevel::Unknown
+        );
+        assert_eq!(
+            evaluate_access(&ev_empty, Some("Mihomo".into()), &hosts, 100, 1).level,
+            AccessLevel::Tun
+        );
+
+        // SOCKS-only proxy with active TUN falls back cleanly to Tun
+        let ev_socks = ProxyEvidence {
+            enable: true,
+            server: Some("socks=127.0.0.1:1080".into()),
+            autoconfig: None,
+            overrides: None,
+        };
+        assert_eq!(
+            evaluate_access(&ev_socks, Some("sing-tun".into()), &hosts, 100, 1).level,
+            AccessLevel::Tun
         );
 
         // Uncovered -> Skip
@@ -422,17 +587,32 @@ mod tests {
         let units: Vec<u16> = name.encode_utf16().collect();
         assert_eq!(wide_to_string(&units), name);
 
+        // Split-tunnel mesh VPNs with generic "Wintun Userspace Tunnel" description must be excluded!
         let adapters = vec![
-            ("Tailscale Tunnel".into(), "Tailscale".into(), true),
+            ("Wintun Userspace Tunnel".into(), "Tailscale".into(), true),
+            (
+                "Wintun Userspace Tunnel".into(),
+                "ZeroTier One".into(),
+                true,
+            ),
+            ("Wintun Userspace Tunnel".into(), "EasyTier".into(), true),
             ("Mihomo".into(), "Mihomo".into(), false),
-            ("Ethernet 2".into(), "Clash Verge TUN".into(), true),
+            ("Ethernet 2".into(), "FlClash TUN".into(), true),
         ];
-        assert_eq!(select_tun(&adapters).as_deref(), Some("Clash Verge TUN"));
+        assert_eq!(select_tun(&adapters).as_deref(), Some("FlClash TUN"));
+        assert!(is_tun_name("sing-tun"));
+        assert!(is_tun_name("tun0"));
+        assert!(is_tun_name("tun"));
+        assert!(!is_tun_name("iTunes Virtual Audio"));
 
         let hosts = vec!["claude.ai".into()];
+        assert!(bypass_local_entry("<-loopback>"));
+        assert!(bypass_local_entry("*."));
+        assert!(!bypass_hits_host("*.", "claude.ai"));
+        assert!(bypass_hits_host("*.*", "claude.ai"));
         assert_eq!(
             bypass_risk(
-                Some("<local>;127.*;10.*;172.16.*;192.168.*;*jd.com"),
+                Some("<local>;<-loopback>;*.;127.*;10.*;172.16.*;192.168.*;*jd.com"),
                 &hosts
             ),
             None

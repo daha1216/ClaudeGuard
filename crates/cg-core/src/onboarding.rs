@@ -39,6 +39,13 @@ pub fn recommend(
         p.city = Some(place.city.to_string());
     }
 
+    let ip = enriched_probe.as_ref().and_then(|p| p.ip.clone());
+    let country = enriched_probe.as_ref().and_then(|p| p.country.clone());
+    let city = enriched_probe.as_ref().and_then(|p| p.city.clone());
+    let is_cn_exit = country
+        .as_deref()
+        .is_some_and(|code| code.eq_ignore_ascii_case("CN"));
+
     let standby_notice = if !access_ready {
         Some(if access.is_uncovered() {
             "当前未检测到开启的系统代理或 TUN 网卡，守护器处于安全待机状态；可先开启代理后重测，或手动填写白名单。".into()
@@ -56,18 +63,26 @@ pub fn recommend(
             "代理已接入，但未能从探针提取到出口 IP 或地区信息；请检查代理连通性或手动填写白名单。"
                 .into(),
         )
+    } else if is_cn_exit {
+        let exit_desc = match (&city, &ip) {
+            (Some(c), Some(addr)) => format!("CN · {c}（{addr}）"),
+            (None, Some(addr)) => format!("CN（{addr}）"),
+            _ => "CN".into(),
+        };
+        Some(format!(
+            "检测到当前路由出口位于中国大陆直连地址（{exit_desc}），代理分流可能未覆盖目标站点；请切换海外节点或全局代理后重测，切勿直接将 CN 加入白名单。"
+        ))
     } else {
         None
     };
 
-    let ip = enriched_probe.as_ref().and_then(|p| p.ip.clone());
-    let country = enriched_probe.as_ref().and_then(|p| p.country.clone());
-    let city = enriched_probe.as_ref().and_then(|p| p.city.clone());
-
     let mut options = Vec::new();
     let mut recommended_strategy = None;
 
-    if access_ready && let Some(ref code) = country {
+    if access_ready
+        && !is_cn_exit
+        && let Some(ref code) = country
+    {
         let place_desc = match (&city, &ip) {
             (Some(c), Some(addr)) => format!("{code} · {c}（{addr}）"),
             (None, Some(addr)) => format!("{code}（{addr}）"),
@@ -85,7 +100,10 @@ pub fn recommend(
         });
     }
 
-    if access_ready && let Some(ref addr) = ip {
+    if access_ready
+        && !is_cn_exit
+        && let Some(ref addr) = ip
+    {
         let is_rec = recommended_strategy.is_none();
         if is_rec {
             recommended_strategy = Some(OnboardingStrategy::StrictStaticIp);
@@ -101,13 +119,20 @@ pub fn recommend(
         });
     }
 
-    let suggested_cidr = ip
-        .as_deref()
-        .and_then(|s| s.parse::<Ipv4Addr>().ok())
-        .and_then(|v4| Ipv4Cidr::parse(&format!("{v4}/24")))
-        .map(|c| vec![c.canonical()])
-        .unwrap_or_default();
-    let suggested_regions = country.into_iter().collect::<Vec<_>>();
+    let suggested_cidr = if is_cn_exit {
+        Vec::new()
+    } else {
+        ip.as_deref()
+            .and_then(|s| s.parse::<Ipv4Addr>().ok())
+            .and_then(|v4| Ipv4Cidr::parse(&format!("{v4}/24")))
+            .map(|c| vec![c.canonical()])
+            .unwrap_or_default()
+    };
+    let suggested_regions = if is_cn_exit {
+        Vec::new()
+    } else {
+        country.into_iter().collect::<Vec<_>>()
+    };
 
     options.push(OnboardingOption {
         strategy: OnboardingStrategy::CustomCidrOrRegions,
@@ -339,5 +364,41 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn mainland_cn_egress_never_recommends_region_and_emits_standby_warning() {
+        let access = AccessEvidence {
+            level: AccessLevel::SystemProxy,
+            proxy_addr: Some("127.0.0.1:7890".into()),
+            route_hint: true,
+            observed_at: 200,
+            revision: 1,
+            ..AccessEvidence::default()
+        };
+        let cn_probe = ProbeResult {
+            reachable: true,
+            status: Some(200),
+            ip: Some("203.0.113.88".into()),
+            country: Some("CN".into()),
+            raw_region: Some("CN".into()),
+            colo: Some("SHA".into()),
+            latency_ms: 25,
+            parsed_as: "trace".into(),
+            detail: String::new(),
+            city: None,
+        };
+        let rec = recommend(&access, Some(&cn_probe), Some(7890), vec!["claude".into()]);
+        assert!(rec.recommended_strategy.is_none());
+        assert!(rec.options.iter().all(|o| !o.recommended));
+        assert!(
+            !rec.options
+                .iter()
+                .any(|o| o.strategy == OnboardingStrategy::RecommendRegion)
+        );
+        let notice = rec.standby_notice.as_deref().expect("CN standby warning");
+        assert!(notice.contains("CN"));
+        assert!(notice.contains("直连"));
+        assert!(apply_choice(&Config::default(), &rec, OnboardingChoice::RecommendRegion).is_err());
     }
 }

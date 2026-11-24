@@ -160,13 +160,13 @@ All screenshots below are real HiDPI renders captured directly from `claudeguard
 
 Grab the latest release from [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases):
 
-1. **Installer — `ClaudeGuard-v4.1.1-setup.exe` (Recommended)**
+1. **Installer — `ClaudeGuard-v4.1.2-setup.exe` (Recommended)**
    - Registers & starts `ClaudeGuardService` (`LocalSystem`, auto-start at boot) and adds normal-privilege tray autostart (`claudeguard-gui.exe --tray`) so daily usage requires **0 UAC prompts**.
    - Upgrading from v3 (`v3.x`): shares the same Inno Setup `AppId`, gracefully stops `ClaudeGuard.exe`, cleans up the legacy v3 `HKCU\...\Run\ClaudeGuard` entry, and automatically migrates legacy `config.json` (writing a one-time `config.v3.bak.json` backup).
    - Uninstall cleanly removes the Windows Service & binaries while deliberately preserving configuration and journals in `%ProgramData%\ClaudeGuard` and `%APPDATA%\ClaudeGuard`.
-2. **In-App Upgrade Bridge — `ClaudeGuard-v4.1.1-upgrade.exe` (For `v3.x` Auto-Update)**
+2. **In-App Upgrade Bridge — `ClaudeGuard-v4.1.2-upgrade.exe` (For `v3.x` Auto-Update)**
    - Matched automatically by legacy `v3.x` clients during 6-hour background checks and manual "Check for updates": copies `%APPDATA%\ClaudeGuard\config.json` into `%ProgramData%\ClaudeGuard\config.json`, stages and launches the v4 installer cleanly, waits for completion, and removes legacy `ClaudeGuard.exe`, shortcuts, and staging residue after installation succeeds.
-3. **Portable — `ClaudeGuard-v4.1.1-portable.zip`**
+3. **Portable — `ClaudeGuard-v4.1.2-portable.zip`**
    - Contains `claudeguard-daemon.exe`, `claudeguard-cli.exe`, and `claudeguard-gui.exe`. Run `claudeguard-daemon.exe --console` (elevated) or register the service via `--install-service --start`, then launch `claudeguard-gui.exe` as your normal user.
 
 > Verify integrity anytime against the release `SHA256SUMS.txt`.

@@ -47,7 +47,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "cg-core"
-version = "4.1.1"
+version = "4.1.2"
 dependencies = [
  "cg-protocol",
  "serde",
@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "cg-daemon"
-version = "4.1.1"
+version = "4.1.2"
 dependencies = [
  "cg-core",
  "cg-platform",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "cg-platform"
-version = "4.1.1"
+version = "4.1.2"
 dependencies = [
  "base64",
  "cg-protocol",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "cg-protocol"
-version = "4.1.1"
+version = "4.1.2"
 dependencies = [
  "serde",
  "serde_json",
