@@ -8,12 +8,25 @@
 use serde::{Deserialize, Serialize};
 
 /// Keywords matching virtual TUN adapters (lowercase substring against description/friendly name).
-const TUN_KEYWORDS: [&str; 15] = [
+const TUN_KEYWORDS: &[&str] = &[
     "mihomo",
     "clash",
     "meta",
     "sing-box",
     "singbox",
+    "sing-tun",
+    "flclash",
+    "verge",
+    "nyanpasu",
+    "sparkle",
+    "nekobox",
+    "nekoray",
+    "throne",
+    "karing",
+    "hiddify",
+    "shadowsocks",
+    "surfboard",
+    "warp",
     "wintun",
     "wireguard",
     "openvpn",
@@ -26,8 +39,25 @@ const TUN_KEYWORDS: [&str; 15] = [
     "xray",
 ];
 
-/// Split-tunnel adapters that do not route default AI traffic.
-const TUN_EXCLUDES: [&str; 1] = ["tailscale"];
+/// Split-tunnel / hypervisor / capture / transition adapters that do not route default AI traffic.
+const TUN_EXCLUDES: &[&str] = &[
+    "tailscale",
+    "zerotier",
+    "easytier",
+    "netbird",
+    "radmin",
+    "hamachi",
+    "vethernet",
+    "wsl",
+    "hyper-v",
+    "vmware",
+    "virtualbox",
+    "npcap",
+    "loopback",
+    "teredo",
+    "isatap",
+    "6to4",
+];
 
 /// Service domain suffixes whose appearance in `ProxyOverride` implies direct leak risk.
 const SENSITIVE_SUFFIXES: [&str; 8] = [
@@ -181,19 +211,40 @@ pub fn wide_to_string(units: &[u16]) -> String {
     String::from_utf16_lossy(units)
 }
 
+fn is_tun_excluded(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    TUN_EXCLUDES.iter().any(|kw| lower.contains(kw))
+}
+
+fn has_bounded_tun_token(lower: &str) -> bool {
+    lower == "tun"
+        || lower.ends_with("-tun")
+        || lower.ends_with("_tun")
+        || lower.ends_with(" tun")
+        || lower.strip_prefix("tun").is_some_and(|s| {
+            s.starts_with(['-', '_', ' '])
+                || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
 /// Whether an adapter description or friendly name identifies a full-tunnel TUN interface.
 pub fn is_tun_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     if TUN_EXCLUDES.iter().any(|kw| lower.contains(kw)) {
         return false;
     }
-    lower.starts_with("utun") || TUN_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    lower.starts_with("utun")
+        || has_bounded_tun_token(&lower)
+        || TUN_KEYWORDS.iter().any(|kw| lower.contains(kw))
 }
 
 /// Select the first active (`Up`) TUN adapter from `(description, friendly_name, is_up)` tuples.
 pub fn select_tun(adapters: &[(String, String, bool)]) -> Option<String> {
     for (desc, friendly, up) in adapters {
         if !*up {
+            continue;
+        }
+        if is_tun_excluded(desc) || is_tun_excluded(friendly) {
             continue;
         }
         if is_tun_name(desc) {
@@ -326,39 +377,109 @@ fn entry_domain(entry: &str) -> String {
         .to_string()
 }
 
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p = pattern.as_bytes();
+    let t = text.as_bytes();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 /// Whether a `ProxyOverride` entry covers only loopback / RFC1918 / link-local ranges.
 pub fn bypass_local_entry(entry: &str) -> bool {
     let e = entry.trim().to_ascii_lowercase();
-    match e.as_str() {
-        "<local>" | "localhost" | "localhost.*" | "*.localhost" | "*.local" | "[::1]" | "::1" => {
-            return true;
-        }
-        _ => {}
-    }
-    let Some(prefix) = e.strip_suffix(".*") else {
-        return false;
+    let host_part = if !e.starts_with('[') {
+        e.split(':').next().unwrap_or(&e)
+    } else {
+        e.as_str()
     };
-    let octets: Vec<u8> = prefix
+    if matches!(
+        host_part,
+        "<local>"
+            | "<-loopback>"
+            | "*."
+            | "localhost"
+            | "localhost.*"
+            | "*.localhost"
+            | "*.local"
+            | "*.localdomain"
+            | "127.0.0.1"
+            | "[::1]"
+            | "::1"
+    ) || e == "::1"
+        || e.starts_with("[::1]:")
+        || e.starts_with("fe80:")
+        || e.starts_with("[fe80:")
+    {
+        return true;
+    }
+    if let Ok(v4) = host_part.parse::<std::net::Ipv4Addr>() {
+        return v4.is_loopback() || v4.is_private() || v4.is_link_local();
+    }
+    let mut prefix = host_part;
+    let mut stripped = false;
+    while let Some(p) = prefix.strip_suffix(".*") {
+        prefix = p;
+        stripped = true;
+    }
+    if !stripped || prefix.is_empty() {
+        return false;
+    }
+    let Some(octets) = prefix
         .split('.')
         .map(|v| v.parse::<u8>().ok())
         .collect::<Option<Vec<_>>>()
-        .unwrap_or_default();
+    else {
+        return false;
+    };
+    if octets.len() > 3 {
+        return false;
+    }
     match octets.as_slice() {
-        [10] | [127] => true,
-        [192, 168] | [169, 254] => true,
-        [172, second] => (16..=31).contains(second),
+        [10, ..] | [127, ..] => true,
+        [192, 168, ..] | [169, 254, ..] => true,
+        [172, second, ..] => (16..=31).contains(second),
         _ => false,
     }
 }
 
 /// Whether a bypass entry matches a target host or its subdomains.
 pub fn bypass_hits_host(entry: &str, host: &str) -> bool {
-    let domain = entry_domain(entry);
-    if domain.is_empty() {
+    let e = entry.trim().to_ascii_lowercase();
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if e.is_empty() || e == "." || e == "<-loopback>" || host.is_empty() {
+        return false;
+    }
+    if e == "*." {
+        return !host.contains('.');
+    }
+    let domain = entry_domain(&e).trim_end_matches('.').to_string();
+    if domain.is_empty() || domain == "*" {
         return true;
     }
-    let host = host.trim().to_ascii_lowercase();
-    host == domain || host.ends_with(&format!(".{domain}"))
+    if !domain.contains('*') && (host == domain || host.ends_with(&format!(".{domain}"))) {
+        return true;
+    }
+    wildcard_match(&e, &host) || wildcard_match(&e, &format!("sub.{host}"))
 }
 
 /// Check if `ProxyOverride` contains any rule that could bypass the proxy for monitored AI hosts.
@@ -431,11 +552,17 @@ pub fn verdict(
                 AccessPath::SystemProxy { addr }
             }
         }
-        ProxyParse::Unsupported(why) => AccessPath::Unknown {
-            reason: format!("系统代理配置无法等价复用：{why}"),
+        ProxyParse::Unsupported(why) => match tun_adapter {
+            Some(adapter) => AccessPath::Tun { adapter },
+            None => AccessPath::Unknown {
+                reason: format!("系统代理配置无法等价复用：{why}"),
+            },
         },
-        ProxyParse::Empty => AccessPath::Unknown {
-            reason: "系统代理已开启但未读到代理地址".into(),
+        ProxyParse::Empty => match tun_adapter {
+            Some(adapter) => AccessPath::Tun { adapter },
+            None => AccessPath::Unknown {
+                reason: "系统代理已开启但未读到代理地址".into(),
+            },
         },
     }
 }
@@ -493,11 +620,13 @@ pub fn is_elevated() -> crate::traits::PlatformResult<bool> {
     ))
 }
 
-/// Returns true if a registry SID string under `HKEY_USERS` represents a normal interactive user
-/// (`S-1-5-21-...`, excluding `*_Classes`).
+/// Returns true if a registry SID string under `HKEY_USERS` / `ProfileList` represents an
+/// interactive local/AD (`S-1-5-21-...`) or Entra ID / Azure AD (`S-1-12-1-...`) user, excluding `*_Classes`.
 pub fn is_interactive_user_sid(name: &str) -> bool {
     let trimmed = name.trim();
-    trimmed.starts_with("S-1-5-21-") && !trimmed.ends_with("_Classes")
+    (trimmed.starts_with("S-1-5-21-") || trimmed.starts_with("S-1-12-1-"))
+        && !trimmed.ends_with("_Classes")
+        && !trimmed.to_ascii_lowercase().ends_with("_classes")
 }
 
 /// Returns true when running inside Windows Session 0 (e.g., `LocalSystem` Windows Service).
@@ -516,19 +645,14 @@ pub fn is_session_zero() -> bool {
     false
 }
 
-/// Resolves the SID string (`S-1-5-21-...`) of the currently active console session user.
-///
-/// Works under `LocalSystem` (Session 0 service) via `WTSGetActiveConsoleSessionId` +
-/// `WTSQueryUserToken` + `GetTokenInformation(TokenUser)` + `ConvertSidToStringSidW`.
 #[cfg(windows)]
-pub fn active_interactive_user_sid() -> Option<String> {
+fn sid_for_wts_session(session_id: u32) -> Option<String> {
     use core::ffi::c_void;
     use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER};
-    use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+    use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
 
-    let session_id = unsafe { WTSGetActiveConsoleSessionId() };
     if session_id == u32::MAX || session_id == 0 {
         return None;
     }
@@ -582,6 +706,66 @@ pub fn active_interactive_user_sid() -> Option<String> {
     }
 }
 
+/// Resolves the SID string (`S-1-5-21-...` or `S-1-12-1-...`) of the currently active interactive user.
+///
+/// Works under `LocalSystem` (Session 0 service) via `WTSGetActiveConsoleSessionId`, falling back
+/// to `WTSEnumerateSessionsW` (`WTSActive`) so headless RDP sessions resolve cleanly.
+#[cfg(windows)]
+pub fn active_interactive_user_sid() -> Option<String> {
+    use core::ffi::c_void;
+    use windows::Win32::System::RemoteDesktop::{
+        WTSActive, WTSEnumerateSessionsW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
+        WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW,
+    };
+
+    let console_id = unsafe { WTSGetActiveConsoleSessionId() };
+    if let Some(sid) = sid_for_wts_session(console_id) {
+        return Some(sid);
+    }
+
+    let mut sessions_ptr: *mut WTS_SESSION_INFOW = core::ptr::null_mut();
+    let mut count: u32 = 0;
+    if unsafe {
+        WTSEnumerateSessionsW(
+            WTS_CURRENT_SERVER_HANDLE,
+            0,
+            1,
+            &mut sessions_ptr,
+            &mut count,
+        )
+    }
+    .is_err()
+        || sessions_ptr.is_null()
+    {
+        return None;
+    }
+
+    struct WtsMemGuard(*mut c_void);
+    impl Drop for WtsMemGuard {
+        fn drop(&mut self) {
+            unsafe {
+                WTSFreeMemory(self.0);
+            }
+        }
+    }
+    let _guard = WtsMemGuard(sessions_ptr.cast::<c_void>());
+
+    let sessions = unsafe { core::slice::from_raw_parts(sessions_ptr, count as usize) };
+    for info in sessions {
+        if info.SessionId != 0 && info.SessionId != console_id && info.State == WTSActive {
+            if let Some(sid) = sid_for_wts_session(info.SessionId) {
+                return Some(sid);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub fn active_interactive_user_sid() -> Option<String> {
+    None
+}
+
 /// Opens a per-user registry subkey for the interactive desktop user.
 ///
 /// - When running in an interactive user session (`Session > 0`), opens `HKCU\<subpath>` directly.
@@ -632,13 +816,22 @@ pub fn open_interactive_user_subkey(subpath: &str) -> Option<winreg::RegKey> {
     hkcu.open_subkey_with_flags(subpath, KEY_READ).ok()
 }
 
+/// Returns `false` when `Connections\DefaultConnectionSettings` explicitly indicates
+/// `PROXY_TYPE_AUTO_PROXY_URL` (`0x04` at byte 8) is disabled, guarding against stale `AutoConfigURL`.
+pub(crate) fn is_autoconfig_flag_enabled(default_conn_settings: Option<&[u8]>) -> bool {
+    match default_conn_settings {
+        Some(bytes) if bytes.len() >= 9 => (bytes[8] & 0x04) != 0,
+        _ => true,
+    }
+}
+
 /// Read `Software\Microsoft\Windows\CurrentVersion\Internet Settings` for the active desktop user
 /// (Session-0 `LocalSystem`-safe via `HKEY_USERS\<ActiveUserSID>`).
 #[cfg(windows)]
 pub fn read_proxy_evidence() -> AccessEvidenceRaw {
-    let Some(settings) =
-        open_interactive_user_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
-    else {
+    let Some(settings) = open_interactive_user_subkey(
+        r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+    ) else {
         return AccessEvidenceRaw::default();
     };
     let enabled: u32 = settings.get_value("ProxyEnable").unwrap_or(0);
@@ -651,10 +844,21 @@ pub fn read_proxy_evidence() -> AccessEvidenceRaw {
             Some(value)
         }
     };
+    let mut autoconfig = read_opt("AutoConfigURL");
+    if autoconfig.is_some() {
+        let conn_bytes = settings
+            .open_subkey_with_flags("Connections", winreg::enums::KEY_READ)
+            .ok()
+            .and_then(|conn| conn.get_raw_value("DefaultConnectionSettings").ok())
+            .map(|v| v.bytes);
+        if !is_autoconfig_flag_enabled(conn_bytes.as_deref()) {
+            autoconfig = None;
+        }
+    }
     AccessEvidenceRaw {
         enable: enabled != 0,
         server: read_opt("ProxyServer"),
-        autoconfig: read_opt("AutoConfigURL"),
+        autoconfig,
         overrides: read_opt("ProxyOverride"),
     }
 }
@@ -676,13 +880,71 @@ unsafe fn pwstr_units(p: windows::core::PWSTR) -> Vec<u16> {
     core::slice::from_raw_parts(p.0, len).to_vec()
 }
 
-/// Detect active Up TUN adapter using `IpHelper::GetAdaptersAddresses`.
+/// Returns `true` if a unicast IP on a candidate TUN interface is routable (excluding unspecified,
+/// loopback, IPv4 APIPA `169.254.0.0/16`, IPv6 link-local `fe80::/10`, and multicast/broadcast).
+pub(crate) fn is_usable_tun_unicast_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !v4.is_unspecified()
+                && !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_multicast()
+                && !v4.is_broadcast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_usable_tun_unicast_ip(std::net::IpAddr::V4(v4));
+            }
+            let seg0 = v6.segments()[0];
+            !v6.is_unspecified()
+                && !v6.is_loopback()
+                && !v6.is_multicast()
+                && (seg0 & 0xffc0) != 0xfe80
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe fn adapter_has_usable_unicast(
+    mut cur: *mut windows::Win32::NetworkManagement::IpHelper::IP_ADAPTER_UNICAST_ADDRESS_LH,
+) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+
+    let mut guard = 0usize;
+    while !cur.is_null() && guard < 256 {
+        guard += 1;
+        let ua = &*cur;
+        let ptr = ua.Address.lpSockaddr.cast::<u8>();
+        let len = ua.Address.iSockaddrLength as usize;
+        if !ptr.is_null() && len >= 2 {
+            let bytes = core::slice::from_raw_parts(ptr, len);
+            let family = u16::from_ne_bytes([bytes[0], bytes[1]]);
+            if family == AF_INET.0 && len >= 8 {
+                let v4 = Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
+                if is_usable_tun_unicast_ip(IpAddr::V4(v4)) {
+                    return true;
+                }
+            } else if family == AF_INET6.0 && len >= 24 {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&bytes[8..24]);
+                let v6 = Ipv6Addr::from(octets);
+                if is_usable_tun_unicast_ip(IpAddr::V6(v6)) {
+                    return true;
+                }
+            }
+        }
+        cur = ua.Next;
+    }
+    false
+}
+
+/// Detect active Up TUN adapter with at least one usable unicast IP using `IpHelper::GetAdaptersAddresses`.
 #[cfg(windows)]
 pub fn detect_tun_adapter() -> Option<String> {
     use windows::Win32::NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
-        GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, GET_ADAPTERS_ADDRESSES_FLAGS,
-        IP_ADAPTER_ADDRESSES_LH,
+        GAA_FLAG_SKIP_MULTICAST, GET_ADAPTERS_ADDRESSES_FLAGS, IP_ADAPTER_ADDRESSES_LH,
     };
     use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 
@@ -690,12 +952,9 @@ pub fn detect_tun_adapter() -> Option<String> {
     const ERROR_BUFFER_OVERFLOW: u32 = 111;
 
     let flags = GET_ADAPTERS_ADDRESSES_FLAGS(
-        GAA_FLAG_SKIP_UNICAST.0
-            | GAA_FLAG_SKIP_ANYCAST.0
-            | GAA_FLAG_SKIP_MULTICAST.0
-            | GAA_FLAG_SKIP_DNS_SERVER.0,
+        GAA_FLAG_SKIP_ANYCAST.0 | GAA_FLAG_SKIP_MULTICAST.0 | GAA_FLAG_SKIP_DNS_SERVER.0,
     );
-    let mut size: u32 = 15 * 1024;
+    let mut size: u32 = 32 * 1024;
     for _ in 0..4 {
         let mut buffer: Vec<u64> = vec![0; (size as usize).div_ceil(8)];
         let rc = unsafe {
@@ -714,7 +973,9 @@ pub fn detect_tun_adapter() -> Option<String> {
                 let adapter = unsafe { &*current };
                 let desc = wide_to_string(&unsafe { pwstr_units(adapter.Description) });
                 let friendly = wide_to_string(&unsafe { pwstr_units(adapter.FriendlyName) });
-                candidates.push((desc, friendly, adapter.OperStatus == IfOperStatusUp));
+                let is_up = adapter.OperStatus == IfOperStatusUp
+                    && unsafe { adapter_has_usable_unicast(adapter.FirstUnicastAddress) };
+                candidates.push((desc, friendly, is_up));
                 current = adapter.Next;
             }
             return select_tun(&candidates);
@@ -735,11 +996,7 @@ pub fn detect_tun_adapter() -> Option<String> {
 #[cfg(windows)]
 pub fn inspect_access_path(monitored_hosts: &[String]) -> (AccessPath, AccessInfo) {
     let evidence = read_proxy_evidence();
-    let tun = if evidence.enable || evidence.autoconfig.is_some() {
-        None
-    } else {
-        detect_tun_adapter()
-    };
+    let tun = detect_tun_adapter();
     let path = verdict(&evidence, tun, monitored_hosts);
     let info = AccessInfo::from(&path);
     (path, info)
@@ -887,6 +1144,94 @@ mod tests {
             select_tun(&[("Ethernet 2".into(), "Clash TUN".into(), true)]).as_deref(),
             Some("Clash TUN")
         );
+        // Split-tunnel mesh VPNs using generic Wintun description must NEVER bypass exclusion!
+        assert_eq!(
+            select_tun(&[
+                ("Wintun Userspace Tunnel".into(), "Tailscale".into(), true),
+                (
+                    "Wintun Userspace Tunnel".into(),
+                    "ZeroTier One".into(),
+                    true
+                ),
+                ("Wintun Userspace Tunnel".into(), "EasyTier".into(), true),
+                ("Wintun Userspace Tunnel".into(), "Sparkle TUN".into(), true),
+            ])
+            .as_deref(),
+            Some("Wintun Userspace Tunnel")
+        );
+        assert!(is_tun_name("sing-tun"));
+        assert!(is_tun_name("tun0"));
+        assert!(is_tun_name("tun"));
+        assert!(!is_tun_name("iTunes"));
+    }
+
+    #[test]
+    fn entra_id_sid_stale_pac_apipa_unicast_and_simultaneous_socks_tun() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        // 1. Entra ID / Azure AD SID (`S-1-12-1-*`) + AD/local (`S-1-5-21-*`)
+        assert!(is_interactive_user_sid("S-1-5-21-123456-789-1001"));
+        assert!(is_interactive_user_sid(
+            "S-1-12-1-2045678901-1098765432-2345678901-3456789012"
+        ));
+        assert!(!is_interactive_user_sid("S-1-12-1-2045678901_Classes"));
+        assert!(!is_interactive_user_sid("S-1-5-18"));
+
+        // 2. Stale `AutoConfigURL` cleared when `DefaultConnectionSettings[8] & 0x04 == 0`
+        let mut blob_off = [0u8; 12];
+        blob_off[0] = 0x46;
+        blob_off[8] = 0x03; // DIRECT | PROXY, AUTO_PROXY_URL (0x04) cleared
+        assert!(!is_autoconfig_flag_enabled(Some(&blob_off)));
+
+        let mut blob_on = blob_off;
+        blob_on[8] = 0x05; // DIRECT | AUTO_PROXY_URL
+        assert!(is_autoconfig_flag_enabled(Some(&blob_on)));
+        assert!(is_autoconfig_flag_enabled(Some(&[0x46, 0x00])));
+        assert!(is_autoconfig_flag_enabled(None));
+
+        // 3. Dead TAP-Windows APIPA (`169.254.x.x`) & IPv6 link-local (`fe80::`) rejected
+        assert!(!is_usable_tun_unicast_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 12, 34
+        ))));
+        assert!(!is_usable_tun_unicast_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!is_usable_tun_unicast_ip("fe80::1".parse().unwrap()));
+        assert!(!is_usable_tun_unicast_ip("::1".parse().unwrap()));
+        assert!(is_usable_tun_unicast_ip(IpAddr::V4(Ipv4Addr::new(
+            198, 18, 0, 1
+        ))));
+        assert!(is_usable_tun_unicast_ip(
+            "fdfe:dcba:9876::1".parse().unwrap()
+        ));
+
+        // 4. Simultaneous SOCKS-only / empty ProxyServer + active TUN -> AccessPath::Tun
+        assert_eq!(
+            verdict(
+                &ev(true, Some("socks=127.0.0.1:1080")),
+                Some("Mihomo".into()),
+                &hosts()
+            ),
+            AccessPath::Tun {
+                adapter: "Mihomo".into()
+            }
+        );
+        assert_eq!(
+            verdict(&ev(true, None), Some("sing-tun".into()), &hosts()),
+            AccessPath::Tun {
+                adapter: "sing-tun".into()
+            }
+        );
+
+        // 5. Chromium `<-loopback>` and `*.` local rules do not trigger bypass risk
+        let mut e = ev(true, Some("127.0.0.1:7890"));
+        e.overrides = Some("<local>;<-loopback>;*.;127.0.0.1;192.168.1.*".into());
+        assert_eq!(
+            verdict(&e, None, &hosts()),
+            AccessPath::SystemProxy {
+                addr: "127.0.0.1:7890".into()
+            }
+        );
+        assert!(!bypass_hits_host("*.", "claude.ai"));
+        assert!(bypass_hits_host("*.*", "claude.ai"));
     }
 
     #[test]

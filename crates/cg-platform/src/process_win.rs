@@ -146,6 +146,9 @@ pub fn path_under_dir_l(exe_path_l: &str, dir_l: &str) -> bool {
 fn is_claude_cli_path_l(exe_path_l: &str) -> bool {
     exe_path_l.contains(r"\claude\claude-code\")
         || exe_path_l.contains(r"\.local\bin\claude")
+        || exe_path_l.contains(r"\.claude\local\")
+        || exe_path_l.contains(r"\scoop\apps\claude-code\")
+        || exe_path_l.contains(r"\.bun\bin\claude")
         || exe_path_l.contains(r"@anthropic-ai\claude-code")
         || exe_path_l.contains("@anthropic-ai/claude-code")
         || exe_path_l.contains("claude-code-win32")
@@ -174,9 +177,11 @@ pub fn gui_agent_matches(
         }
         "chatgpt" => {
             exe_name_l == "chatgpt.exe"
+                || exe_name_l == "chatgpt classic.exe"
                 || exe_path_l.contains(r"\windowsapps\openai.codex_")
                 || exe_path_l.contains(r"\windowsapps\openai.chatgpt")
                 || exe_path_l.contains(r"\programs\chatgpt\")
+                || exe_path_l.contains(r"\programs\chatgpt classic\")
                 || exe_path_l.contains(r"\programs\codex\")
         }
         "antigravity" => {
@@ -204,7 +209,8 @@ pub fn cli_agent_matches(id: &str, exe_name_l: &str, exe_path_l: &str, cmd_l: &s
         "codex" => {
             let in_msix_or_gui = exe_path_l.contains(r"\windowsapps\")
                 || exe_path_l.contains(r"\programs\codex\")
-                || exe_path_l.contains(r"\programs\chatgpt\");
+                || exe_path_l.contains(r"\programs\chatgpt\")
+                || exe_path_l.contains(r"\programs\chatgpt classic\");
             !in_msix_or_gui
                 && (exe_name_l.starts_with("codex")
                     || cmd_l.contains(r"@openai\codex")
@@ -355,7 +361,10 @@ pub fn is_live_root_chatgpt_codex_gui(
     if !is_chatgpt_codex_dir_or_gui(p, chatgpt_dirs_l) {
         return false;
     }
-    if p.name_l != "chatgpt.exe" && p.name_l != "codex.exe" {
+    if !matches!(
+        p.name_l.as_str(),
+        "chatgpt.exe" | "chatgpt classic.exe" | "codex.exe"
+    ) {
         return false;
     }
     if p.path_l.contains(r"\resources\codex.exe") {
@@ -365,7 +374,10 @@ pub fn is_live_root_chatgpt_codex_gui(
         return false;
     }
     if let Some(parent) = by_pid.get(&p.ppid) {
-        if parent.name_l == "chatgpt.exe" || parent.name_l == "codex.exe" {
+        if matches!(
+            parent.name_l.as_str(),
+            "chatgpt.exe" | "chatgpt classic.exe" | "codex.exe"
+        ) {
             return false;
         }
     }
@@ -1240,8 +1252,95 @@ fn find_windowsapps_dir(prefix: &str) -> Option<PathBuf> {
 fn is_skipped_system_user_dir(name: &str) -> bool {
     matches!(
         name.trim().to_ascii_lowercase().as_str(),
-        "public" | "default" | "default user" | "all users"
+        "public"
+            | "default"
+            | "default user"
+            | "all users"
+            | "systemprofile"
+            | "localservice"
+            | "networkservice"
     )
+}
+
+fn is_systemprofile_path(path: &Path) -> bool {
+    let key = normalize_path_key_l(path);
+    key.ends_with(r"\system32\config\systemprofile")
+        || key.ends_with(r"\syswow64\config\systemprofile")
+}
+
+pub(crate) fn expand_profile_image_path_with_drive(raw: &str, system_drive: &str) -> PathBuf {
+    let trimmed = raw.trim().trim_matches('"').trim();
+    let drive = system_drive.trim().trim_end_matches(['\\', '/']);
+    let sys_drive_tok = "%systemdrive%";
+    if trimmed.len() >= sys_drive_tok.len()
+        && trimmed[..sys_drive_tok.len()].eq_ignore_ascii_case(sys_drive_tok)
+    {
+        return PathBuf::from(format!("{drive}{}", &trimmed[sys_drive_tok.len()..]));
+    }
+    PathBuf::from(trimmed)
+}
+
+fn expand_profile_image_path(raw: &str) -> PathBuf {
+    let drive = std::env::var("SystemDrive")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "C:".to_string());
+    expand_profile_image_path_with_drive(raw, &drive)
+}
+
+#[cfg(windows)]
+fn profile_list_entries() -> Vec<(String, PathBuf)> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let Ok(profile_list) = hklm.open_subkey_with_flags(
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList",
+        KEY_READ,
+    ) else {
+        return Vec::new();
+    };
+
+    let active_sid = crate::access_win::active_interactive_user_sid();
+    let mut entries: Vec<(bool, String, String, PathBuf)> = Vec::new();
+
+    for sid in profile_list.enum_keys().flatten() {
+        if !crate::access_win::is_interactive_user_sid(&sid) {
+            continue;
+        }
+        let Ok(sub) = profile_list.open_subkey_with_flags(&sid, KEY_READ) else {
+            continue;
+        };
+        let Ok(raw_img) = sub.get_value::<String, _>("ProfileImagePath") else {
+            continue;
+        };
+        let path = expand_profile_image_path(&raw_img);
+        if !path.is_dir() || is_systemprofile_path(&path) {
+            continue;
+        }
+        if let Some(fname) = path.file_name().map(|n| n.to_string_lossy()) {
+            if is_skipped_system_user_dir(&fname) {
+                continue;
+            }
+        }
+        let is_active = active_sid
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(&sid));
+        let sort_key = normalize_path_key_l(&path);
+        entries.push((is_active, sort_key, sid, path));
+    }
+
+    // Active console/RDP user first (`!is_active` == false < true), then deterministic path order.
+    entries.sort_by(|a, b| (!a.0).cmp(&(!b.0)).then_with(|| a.1.cmp(&b.1)));
+    entries
+        .into_iter()
+        .map(|(_, _, sid, path)| (sid, path))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn profile_list_entries() -> Vec<(String, PathBuf)> {
+    Vec::new()
 }
 
 fn users_root_dir() -> PathBuf {
@@ -1274,7 +1373,7 @@ fn collect_sorted_user_homes(users_root: &Path) -> Vec<PathBuf> {
     entries.into_iter().map(|(_, p)| p).collect()
 }
 
-/// Testable resolver collecting per-user `%LOCALAPPDATA%\<subdir>` paths across current env and `C:\Users\*`.
+/// Testable resolver collecting per-user `%LOCALAPPDATA%\<subdir>` paths across explicit roots.
 pub fn per_user_local_app_subdirs_from_roots(
     local_app_data: Option<&Path>,
     user_profile: Option<&Path>,
@@ -1311,17 +1410,36 @@ pub fn per_user_local_app_subdirs_from_roots(
     dirs
 }
 
-/// Collect per-user `AppData\Local\<subdir>` directories across current user env and `C:\Users\*`.
+/// Collect per-user `AppData\Local\<subdir>` directories across `ProfileList` (active user first),
+/// current interactive user env, and `C:\Users\*`.
 pub fn per_user_local_app_subdirs(rel_subdirs: &[&str]) -> Vec<PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
-    let users_root = users_root_dir();
-    per_user_local_app_subdirs_from_roots(
-        local.as_deref(),
-        profile.as_deref(),
-        Some(&users_root),
-        rel_subdirs,
-    )
+    let mut local_bases = Vec::new();
+    if !crate::access_win::is_session_zero() {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            if !is_systemprofile_path(&local) {
+                local_bases.push(local);
+            }
+        }
+    }
+    for home in user_home_dirs() {
+        local_bases.push(home.join("AppData").join("Local"));
+    }
+
+    let mut seen_keys = HashSet::new();
+    let mut dirs = Vec::new();
+    for base in local_bases {
+        for sub in rel_subdirs {
+            let dir = base.join(sub);
+            if !dir.is_dir() {
+                continue;
+            }
+            let key = normalize_path_key_l(&dir);
+            if seen_keys.insert(key) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
 }
 
 /// Collect deduplicated user home directories (`%USERPROFILE%` + `C:\Users\*`), supporting `LocalSystem`.
@@ -1332,7 +1450,10 @@ pub fn user_home_dirs_from_roots(
     let mut homes = Vec::new();
     let mut seen = HashSet::new();
     if let Some(profile) = user_profile {
-        if profile.is_dir() && seen.insert(normalize_path_key_l(profile)) {
+        if profile.is_dir()
+            && !is_systemprofile_path(profile)
+            && seen.insert(normalize_path_key_l(profile))
+        {
             homes.push(profile.to_path_buf());
         }
     }
@@ -1346,10 +1467,162 @@ pub fn user_home_dirs_from_roots(
     homes
 }
 
-fn user_home_dirs() -> Vec<PathBuf> {
-    let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+/// Collect real interactive user homes: `ProfileList` (with `active_interactive_user_sid` first),
+/// followed by `%USERPROFILE%` (non-`systemprofile`) and `C:\Users\*` fallback.
+pub fn user_home_dirs() -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    let mut seen = HashSet::new();
+
+    for (_, path) in profile_list_entries() {
+        let key = normalize_path_key_l(&path);
+        if !key.is_empty() && seen.insert(key) {
+            homes.push(path);
+        }
+    }
+    if !crate::access_win::is_session_zero() {
+        if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+            if profile.is_dir() && !is_systemprofile_path(&profile) {
+                let key = normalize_path_key_l(&profile);
+                if !key.is_empty() && seen.insert(key) {
+                    homes.push(profile);
+                }
+            }
+        }
+    }
     let users_root = users_root_dir();
-    user_home_dirs_from_roots(profile.as_deref(), Some(&users_root))
+    for home in collect_sorted_user_homes(&users_root) {
+        let key = normalize_path_key_l(&home);
+        if !key.is_empty() && seen.insert(key) {
+            homes.push(home);
+        }
+    }
+    homes
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UninstallRecord {
+    pub key_name: String,
+    pub display_name: String,
+    pub display_version: Option<String>,
+    pub install_dir: Option<PathBuf>,
+}
+
+pub(crate) fn extract_install_dir_from_uninstall_values(
+    install_location: Option<&str>,
+    display_icon: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(loc) = install_location
+        .map(|s| s.trim().trim_matches('"').trim())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(PathBuf::from(loc));
+    }
+    let icon = display_icon?.trim();
+    if icon.is_empty() {
+        return None;
+    }
+    let without_index = match icon.rsplit_once(',') {
+        Some((before, idx))
+            if !idx.trim().is_empty()
+                && idx
+                    .trim()
+                    .trim_start_matches('-')
+                    .bytes()
+                    .all(|b| b.is_ascii_digit()) =>
+        {
+            before.trim()
+        }
+        _ => icon,
+    };
+    let clean = without_index.trim_matches('"').trim();
+    if !clean.to_ascii_lowercase().ends_with(".exe") {
+        return None;
+    }
+    Path::new(clean).parent().map(Path::to_path_buf)
+}
+
+#[cfg(windows)]
+fn scan_uninstall_subkey(hive: &winreg::RegKey, subkey_path: &str, out: &mut Vec<UninstallRecord>) {
+    use winreg::enums::KEY_READ;
+
+    let Ok(uninstall) = hive.open_subkey_with_flags(subkey_path, KEY_READ) else {
+        return;
+    };
+    for key_name in uninstall.enum_keys().flatten() {
+        let Ok(sub) = uninstall.open_subkey_with_flags(&key_name, KEY_READ) else {
+            continue;
+        };
+        let display_name: String = sub.get_value("DisplayName").unwrap_or_default();
+        if display_name.trim().is_empty() && key_name.trim().is_empty() {
+            continue;
+        }
+        let display_version: Option<String> = sub
+            .get_value::<String, _>("DisplayVersion")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let install_location: Option<String> = sub.get_value("InstallLocation").ok();
+        let display_icon: Option<String> = sub.get_value("DisplayIcon").ok();
+        let install_dir = extract_install_dir_from_uninstall_values(
+            install_location.as_deref(),
+            display_icon.as_deref(),
+        );
+        out.push(UninstallRecord {
+            key_name,
+            display_name: display_name.trim().to_string(),
+            display_version,
+            install_dir,
+        });
+    }
+}
+
+#[cfg(windows)]
+fn scan_uninstall_records() -> Vec<UninstallRecord> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS};
+    use winreg::RegKey;
+
+    const UNINSTALL_MACHINE: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+    const UNINSTALL_WOW64: &str =
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
+    const UNINSTALL_USER: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall";
+
+    let mut out = Vec::new();
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    scan_uninstall_subkey(&hklm, UNINSTALL_MACHINE, &mut out);
+    scan_uninstall_subkey(&hklm, UNINSTALL_WOW64, &mut out);
+
+    if !crate::access_win::is_session_zero() {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        scan_uninstall_subkey(&hkcu, UNINSTALL_USER, &mut out);
+    }
+
+    let hku = RegKey::predef(HKEY_USERS);
+    let active_sid = crate::access_win::active_interactive_user_sid();
+    if let Some(ref sid) = active_sid {
+        if let Ok(sid_key) = hku.open_subkey(sid) {
+            scan_uninstall_subkey(&sid_key, UNINSTALL_USER, &mut out);
+        }
+    }
+    for sid in hku.enum_keys().flatten() {
+        if !is_valid_user_sid_subkey(&sid) {
+            continue;
+        }
+        if active_sid
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(&sid))
+        {
+            continue;
+        }
+        if let Ok(sid_key) = hku.open_subkey(&sid) {
+            scan_uninstall_subkey(&sid_key, UNINSTALL_USER, &mut out);
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn scan_uninstall_records() -> Vec<UninstallRecord> {
+    Vec::new()
 }
 
 fn merge_covered_dirs(primary: Vec<PathBuf>, extra: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -1370,22 +1643,51 @@ pub fn claude_covered_dirs() -> Vec<PathBuf> {
         find_windowsapps_dir("Claude_"),
     );
     let per_user = per_user_local_app_subdirs(&["AnthropicClaude", r"Programs\claude"]);
-    merge_covered_dirs(msix, per_user)
+    let mut reg_dirs = Vec::new();
+    for rec in scan_uninstall_records() {
+        let dn = rec.display_name.to_ascii_lowercase();
+        let kn = rec.key_name.to_ascii_lowercase();
+        if (dn == "claude" || dn.contains("anthropicclaude") || kn.contains("anthropicclaude"))
+            && !dn.contains("claudeguard")
+            && !dn.contains("claude code")
+        {
+            if let Some(dir) = rec.install_dir.filter(|d| d.is_dir()) {
+                reg_dirs.push(dir);
+            }
+        }
+    }
+    merge_covered_dirs(merge_covered_dirs(msix, per_user), reg_dirs)
 }
 
 pub fn chatgpt_covered_dirs() -> Vec<PathBuf> {
     let mut pkgs = registered_package_dirs("OpenAI.Codex_");
     pkgs.extend(registered_package_dirs("OpenAI.ChatGPT_"));
+    pkgs.extend(registered_package_dirs("OpenAI.ChatGPT-Desktop_"));
     let pkgs = dedup_and_sort_packages(pkgs);
 
     let mut msix = covered_dirs_from(&pkgs, find_windowsapps_dir("OpenAI.Codex_"));
-    if let Some(fallback_gpt) = find_windowsapps_dir("OpenAI.ChatGPT_") {
-        if !contains_path_ci(&msix, &fallback_gpt) {
-            msix.push(fallback_gpt);
+    for fallback_prefix in ["OpenAI.ChatGPT_", "OpenAI.ChatGPT-Desktop_"] {
+        if let Some(fallback_gpt) = find_windowsapps_dir(fallback_prefix) {
+            if !contains_path_ci(&msix, &fallback_gpt) {
+                msix.push(fallback_gpt);
+            }
         }
     }
-    let per_user = per_user_local_app_subdirs(&[r"Programs\ChatGPT", r"Programs\Codex"]);
-    merge_covered_dirs(msix, per_user)
+    let per_user = per_user_local_app_subdirs(&[
+        r"Programs\ChatGPT",
+        r"Programs\ChatGPT Classic",
+        r"Programs\Codex",
+    ]);
+    let mut reg_dirs = Vec::new();
+    for rec in scan_uninstall_records() {
+        let dn = rec.display_name.to_ascii_lowercase();
+        if dn.contains("chatgpt") || dn == "codex" || dn == "openai codex" {
+            if let Some(dir) = rec.install_dir.filter(|d| d.is_dir()) {
+                reg_dirs.push(dir);
+            }
+        }
+    }
+    merge_covered_dirs(merge_covered_dirs(msix, per_user), reg_dirs)
 }
 
 /// Testable multi-user Antigravity directory resolver supporting `LocalSystem` Windows Services
@@ -1403,12 +1705,43 @@ pub fn antigravity_covered_dirs_from_roots(
     )
 }
 
-/// Discover all Antigravity installation directories across current user env and `C:\Users\*`.
+/// Discover all Antigravity installation directories across `ProfileList` user homes, `C:\Users\*`,
+/// and custom WinReg `Uninstall` install locations (e.g. `D:\Antigravity`, `E:\Programs\Antigravity`).
 pub fn antigravity_covered_dirs() -> Vec<PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
-    let users_root = users_root_dir();
-    antigravity_covered_dirs_from_roots(local.as_deref(), profile.as_deref(), Some(&users_root))
+    let per_user =
+        per_user_local_app_subdirs(&[r"Programs\antigravity", r"Programs\Antigravity IDE"]);
+    let mut reg_dirs = Vec::new();
+    for rec in scan_uninstall_records() {
+        let dn = rec.display_name.to_ascii_lowercase();
+        let kn = rec.key_name.to_ascii_lowercase();
+        if (dn.contains("antigravity") || kn.contains("antigravity"))
+            && !dn.contains("desktop-cn")
+            && !dn.contains("launcher")
+        {
+            if let Some(dir) = rec.install_dir.filter(|d| {
+                d.is_dir()
+                    && (d.join("Antigravity.exe").is_file()
+                        || d.join("Antigravity IDE.exe").is_file()
+                        || d.join("resources").is_dir())
+            }) {
+                reg_dirs.push(dir);
+            }
+        }
+    }
+    for env_key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(pf) = std::env::var_os(env_key).map(PathBuf::from) {
+            for sub in ["Antigravity", "Antigravity IDE"] {
+                let d = pf.join(sub);
+                if d.is_dir()
+                    && (d.join("Antigravity.exe").is_file()
+                        || d.join("Antigravity IDE.exe").is_file())
+                {
+                    reg_dirs.push(d);
+                }
+            }
+        }
+    }
+    merge_covered_dirs(per_user, reg_dirs)
 }
 
 /// Discover all covered executables inside `dirs` up to `max_depth = 5`, placing main GUI
@@ -1436,15 +1769,396 @@ pub fn discover_antigravity_exes_in(local_app_data: Option<&Path>) -> Vec<PathBu
     discover_antigravity_exes_from_dirs(&dirs)
 }
 
+fn push_unique_dir(out: &mut Vec<PathBuf>, dir: PathBuf) {
+    if !dir.as_os_str().is_empty() && !contains_path_ci(out, &dir) {
+        out.push(dir);
+    }
+}
+
+fn expand_user_tokens(raw: &str, home: &Path) -> PathBuf {
+    let trimmed = raw.trim().trim_matches(['"', '\'']).trim();
+    if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix(r"~\"))
+    {
+        return home.join(rest);
+    }
+    if trimmed == "~" {
+        return home.to_path_buf();
+    }
+    let replace_ci = |input: &str, tok: &str, replacement: &str| -> String {
+        let low = input.to_ascii_lowercase();
+        let tok_l = tok.to_ascii_lowercase();
+        if let Some(pos) = low.find(&tok_l) {
+            format!(
+                "{}{}{}",
+                &input[..pos],
+                replacement,
+                &input[pos + tok.len()..]
+            )
+        } else {
+            input.to_string()
+        }
+    };
+    let home_s = home.to_string_lossy();
+    let appdata_s = home
+        .join("AppData")
+        .join("Roaming")
+        .to_string_lossy()
+        .into_owned();
+    let local_s = home
+        .join("AppData")
+        .join("Local")
+        .to_string_lossy()
+        .into_owned();
+    let mut expanded = replace_ci(trimmed, "%USERPROFILE%", &home_s);
+    expanded = replace_ci(&expanded, "${USERPROFILE}", &home_s);
+    expanded = replace_ci(&expanded, "%APPDATA%", &appdata_s);
+    expanded = replace_ci(&expanded, "%LOCALAPPDATA%", &local_s);
+    PathBuf::from(expanded)
+}
+
+pub(crate) fn parse_npmrc_prefix(npmrc_text: &str, home: &Path) -> Option<PathBuf> {
+    let mut found = None;
+    for raw_line in npmrc_text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim().eq_ignore_ascii_case("prefix") {
+            let val = v.trim();
+            if !val.is_empty() {
+                found = Some(expand_user_tokens(val, home));
+            }
+        }
+    }
+    found
+}
+
+fn collect_versioned_node_modules(base: &Path, sub_tail: Option<&str>, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let nm = match sub_tail {
+            Some(tail) => p.join(tail).join("node_modules"),
+            None => p.join("node_modules"),
+        };
+        push_unique_dir(out, nm);
+    }
+}
+
+pub(crate) fn collect_node_roots_from_env_pairs(
+    pairs: &[(&str, &str)],
+    home: &Path,
+    node_modules_roots: &mut Vec<PathBuf>,
+    volta_pkg_roots: &mut Vec<PathBuf>,
+) {
+    for (k, raw_v) in pairs {
+        let v = raw_v.trim();
+        if v.is_empty() {
+            continue;
+        }
+        let kl = k.trim().to_ascii_lowercase();
+        match kl.as_str() {
+            "npm_config_prefix" => {
+                let p = expand_user_tokens(v, home);
+                push_unique_dir(node_modules_roots, p.join("node_modules"));
+                push_unique_dir(node_modules_roots, p.join("lib").join("node_modules"));
+            }
+            "nvm_symlink" => {
+                let p = expand_user_tokens(v, home);
+                push_unique_dir(node_modules_roots, p.join("node_modules"));
+            }
+            "nvm_home" => {
+                let p = expand_user_tokens(v, home);
+                push_unique_dir(node_modules_roots, p.join("node_modules"));
+                collect_versioned_node_modules(&p, None, node_modules_roots);
+            }
+            "fnm_dir" => {
+                let p = expand_user_tokens(v, home);
+                collect_versioned_node_modules(
+                    &p.join("node-versions"),
+                    Some("installation"),
+                    node_modules_roots,
+                );
+            }
+            "pnpm_home" => {
+                let p = expand_user_tokens(v, home);
+                push_unique_dir(
+                    node_modules_roots,
+                    p.join("global").join("5").join("node_modules"),
+                );
+                collect_versioned_node_modules(&p.join("global"), None, node_modules_roots);
+                push_unique_dir(node_modules_roots, p.join("node_modules"));
+            }
+            "volta_home" => {
+                let p = expand_user_tokens(v, home);
+                push_unique_dir(
+                    volta_pkg_roots,
+                    p.join("tools").join("image").join("packages"),
+                );
+            }
+            "bun_install" => {
+                let p = expand_user_tokens(v, home);
+                push_unique_dir(
+                    node_modules_roots,
+                    p.join("install").join("global").join("node_modules"),
+                );
+            }
+            "path" => {
+                for seg in v.split(';') {
+                    let clean = seg.trim().trim_matches('"').trim();
+                    if clean.is_empty() {
+                        continue;
+                    }
+                    let low = clean.to_ascii_lowercase();
+                    if low.contains("nodejs") || low.contains("npm") {
+                        let p = expand_user_tokens(clean, home);
+                        push_unique_dir(node_modules_roots, p.join("node_modules"));
+                        if p.file_name()
+                            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("bin"))
+                        {
+                            if let Some(parent) = p.parent() {
+                                push_unique_dir(node_modules_roots, parent.join("node_modules"));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(windows)]
+fn read_user_env_pairs_for_home(home: &Path) -> Vec<(String, String)> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_USERS, KEY_READ};
+    use winreg::RegKey;
+
+    const ENV_KEYS: &[&str] = &[
+        "NPM_CONFIG_PREFIX",
+        "NVM_SYMLINK",
+        "NVM_HOME",
+        "FNM_DIR",
+        "PNPM_HOME",
+        "VOLTA_HOME",
+        "BUN_INSTALL",
+        "Path",
+    ];
+
+    let home_key = normalize_path_key_l(home);
+    if home_key.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let read_from_env_subkey = |env_key: &winreg::RegKey, dst: &mut Vec<(String, String)>| {
+        for &name in ENV_KEYS {
+            if let Ok(val) = env_key.get_value::<String, _>(name) {
+                if !val.trim().is_empty() {
+                    dst.push((name.to_string(), val));
+                }
+            }
+        }
+    };
+
+    for (sid, prof_path) in profile_list_entries() {
+        if normalize_path_key_l(&prof_path) == home_key {
+            let hku = RegKey::predef(HKEY_USERS);
+            if let Ok(env_reg) = hku.open_subkey_with_flags(format!(r"{sid}\Environment"), KEY_READ)
+            {
+                read_from_env_subkey(&env_reg, &mut out);
+                return out;
+            }
+        }
+    }
+
+    if !crate::access_win::is_session_zero() {
+        if let Some(cur_prof) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+            if normalize_path_key_l(&cur_prof) == home_key {
+                let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+                if let Ok(env_reg) = hkcu.open_subkey_with_flags("Environment", KEY_READ) {
+                    read_from_env_subkey(&env_reg, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn read_user_env_pairs_for_home(_home: &Path) -> Vec<(String, String)> {
+    Vec::new()
+}
+
+fn candidate_cli_package_dirs_for_home(home: &Path, scope: &str, pkg: &str) -> Vec<PathBuf> {
+    let roaming = home.join("AppData").join("Roaming");
+    let local = home.join("AppData").join("Local");
+
+    let mut nm_roots = Vec::new();
+    let mut volta_roots = Vec::new();
+
+    // 1. Default Windows npm global
+    push_unique_dir(&mut nm_roots, roaming.join("npm").join("node_modules"));
+
+    // 2. `<home>\.npmrc` (`prefix=`)
+    if let Ok(npmrc) = std::fs::read_to_string(home.join(".npmrc")) {
+        if let Some(prefix) = parse_npmrc_prefix(&npmrc, home) {
+            push_unique_dir(&mut nm_roots, prefix.join("node_modules"));
+            push_unique_dir(&mut nm_roots, prefix.join("lib").join("node_modules"));
+        }
+    }
+
+    // 3. Per-user `HKU\<SID>\Environment` (matched strictly to `home` via ProfileList)
+    let env_owned = read_user_env_pairs_for_home(home);
+    if !env_owned.is_empty() {
+        let refs: Vec<(&str, &str)> = env_owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        collect_node_roots_from_env_pairs(&refs, home, &mut nm_roots, &mut volta_roots);
+    }
+
+    // 4. NVM for Windows (`<AppData|LocalAppData>\nvm\v*\node_modules`)
+    for nvm_base in [roaming.join("nvm"), local.join("nvm")] {
+        collect_versioned_node_modules(&nvm_base, None, &mut nm_roots);
+    }
+
+    // 5. fnm (`<AppData|LocalAppData>\fnm\node-versions\v*\installation\node_modules` + `.fnm`)
+    for fnm_base in [
+        roaming.join("fnm").join("node-versions"),
+        local.join("fnm").join("node-versions"),
+        home.join(".fnm").join("node-versions"),
+    ] {
+        collect_versioned_node_modules(&fnm_base, Some("installation"), &mut nm_roots);
+    }
+
+    // 6. Volta (`<LocalAppData>\Volta\tools\image\packages`)
+    push_unique_dir(
+        &mut volta_roots,
+        local
+            .join("Volta")
+            .join("tools")
+            .join("image")
+            .join("packages"),
+    );
+
+    // 7. pnpm global (`<LocalAppData>\pnpm\global\5\node_modules`)
+    push_unique_dir(
+        &mut nm_roots,
+        local
+            .join("pnpm")
+            .join("global")
+            .join("5")
+            .join("node_modules"),
+    );
+    collect_versioned_node_modules(&local.join("pnpm").join("global"), None, &mut nm_roots);
+
+    // 8. Bun global (`<home>\.bun\install\global\node_modules`)
+    push_unique_dir(
+        &mut nm_roots,
+        home.join(".bun")
+            .join("install")
+            .join("global")
+            .join("node_modules"),
+    );
+
+    // 9. Claude local (`<home>\.claude\local\node_modules`)
+    push_unique_dir(
+        &mut nm_roots,
+        home.join(".claude").join("local").join("node_modules"),
+    );
+
+    let mut pkg_dirs = Vec::new();
+    for nm in nm_roots {
+        push_unique_dir(&mut pkg_dirs, nm.join(scope).join(pkg));
+    }
+    for vr in volta_roots {
+        push_unique_dir(&mut pkg_dirs, vr.join(scope).join(pkg));
+        push_unique_dir(
+            &mut pkg_dirs,
+            vr.join(scope)
+                .join(pkg)
+                .join("node_modules")
+                .join(scope)
+                .join(pkg),
+        );
+        push_unique_dir(&mut pkg_dirs, vr.join("node_modules").join(scope).join(pkg));
+    }
+    pkg_dirs
+}
+
+pub(crate) fn scan_scoop_app_version(scoop_root: &Path, app_name: &str, best: &mut Option<String>) {
+    let app_dir = scoop_root.join("apps").join(app_name);
+    if !app_dir.is_dir() {
+        return;
+    }
+    if let Some(v) = read_package_json_version(&app_dir.join("current").join("manifest.json")) {
+        pick_newer_version(best, &v);
+    }
+    if let Ok(rd) = std::fs::read_dir(&app_dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if let Some(v) = read_package_json_version(&p.join("manifest.json")) {
+                    pick_newer_version(best, &v);
+                }
+            }
+        }
+    }
+}
+
+fn program_data_scoop_root() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map(|pd| PathBuf::from(pd).join("scoop"))
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData\scoop"))
+}
+
+pub(crate) fn read_cargo_crates2_version(
+    crates2_path: &Path,
+    crate_names: &[&str],
+) -> Option<String> {
+    let raw = std::fs::read_to_string(crates2_path).ok()?;
+    let root: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let installs = root.get("installs")?.as_object()?;
+    let mut best = None;
+    for key in installs.keys() {
+        let mut parts = key.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let Some(ver) = parts.next() else {
+            continue;
+        };
+        if crate_names.iter().any(|c| name.eq_ignore_ascii_case(c)) {
+            pick_newer_version(&mut best, ver);
+        }
+    }
+    best
+}
+
 /// Testable standalone CLI native executable discovery across explicit user home roots.
 pub fn discover_cli_exes_in_homes(cli_id: &str, homes: &[PathBuf]) -> Vec<PathBuf> {
     let mut exes = Vec::new();
     match cli_id {
         "claude-code" => {
             for home in homes {
-                let local_claude = home.join(".local").join("bin").join("claude.exe");
-                if local_claude.is_file() && !contains_path_ci(&exes, &local_claude) {
-                    exes.push(local_claude);
+                for direct_claude in [
+                    home.join(".local").join("bin").join("claude.exe"),
+                    home.join(".claude").join("local").join("claude.exe"),
+                    home.join(".bun").join("bin").join("claude.exe"),
+                ] {
+                    if direct_claude.is_file() && !contains_path_ci(&exes, &direct_claude) {
+                        exes.push(direct_claude);
+                    }
                 }
                 let roaming_cc = home
                     .join("AppData")
@@ -1452,30 +2166,29 @@ pub fn discover_cli_exes_in_homes(cli_id: &str, homes: &[PathBuf]) -> Vec<PathBu
                     .join("Claude")
                     .join("claude-code");
                 collect_exes_matching(&roaming_cc, 0, 4, &|n| n == "claude.exe", &mut exes);
-                let npm_cc = home
-                    .join("AppData")
-                    .join("Roaming")
-                    .join("npm")
-                    .join("node_modules")
-                    .join("@anthropic-ai")
-                    .join("claude-code");
-                collect_exes_matching(&npm_cc, 0, 5, &|n| n == "claude.exe", &mut exes);
+                for pkg_dir in
+                    candidate_cli_package_dirs_for_home(home, "@anthropic-ai", "claude-code")
+                {
+                    collect_exes_matching(&pkg_dir, 0, 6, &|n| n == "claude.exe", &mut exes);
+                }
+                let scoop_cc = home.join("scoop").join("apps").join("claude-code");
+                collect_exes_matching(&scoop_cc, 0, 4, &|n| n == "claude.exe", &mut exes);
             }
         }
         "codex" => {
             for home in homes {
-                let npm_codex = home
-                    .join("AppData")
-                    .join("Roaming")
-                    .join("npm")
-                    .join("node_modules")
-                    .join("@openai")
-                    .join("codex");
-                collect_exes_matching(&npm_codex, 0, 8, &|n| n.starts_with("codex"), &mut exes);
-                let local_bin = home.join(".local").join("bin");
-                collect_exes_matching(&local_bin, 0, 0, &|n| n.starts_with("codex"), &mut exes);
-                let cargo_bin = home.join(".cargo").join("bin");
-                collect_exes_matching(&cargo_bin, 0, 0, &|n| n.starts_with("codex"), &mut exes);
+                for pkg_dir in candidate_cli_package_dirs_for_home(home, "@openai", "codex") {
+                    collect_exes_matching(&pkg_dir, 0, 8, &|n| n.starts_with("codex"), &mut exes);
+                }
+                for bin_dir in [
+                    home.join(".local").join("bin"),
+                    home.join(".cargo").join("bin"),
+                    home.join(".bun").join("bin"),
+                ] {
+                    collect_exes_matching(&bin_dir, 0, 0, &|n| n.starts_with("codex"), &mut exes);
+                }
+                let scoop_codex = home.join("scoop").join("apps").join("codex");
+                collect_exes_matching(&scoop_codex, 0, 4, &|n| n.starts_with("codex"), &mut exes);
             }
         }
         _ => {}
@@ -1483,9 +2196,32 @@ pub fn discover_cli_exes_in_homes(cli_id: &str, homes: &[PathBuf]) -> Vec<PathBu
     exes
 }
 
-/// Discover standalone native CLI binaries for `claude-code` or `codex` across all user homes.
+/// Discover standalone native CLI binaries for `claude-code` or `codex` across all user homes and global Scoop.
 pub fn discover_cli_exes(cli_id: &str) -> Vec<PathBuf> {
-    discover_cli_exes_in_homes(cli_id, &user_home_dirs())
+    let mut exes = discover_cli_exes_in_homes(cli_id, &user_home_dirs());
+    let global_scoop = program_data_scoop_root();
+    match cli_id {
+        "claude-code" => {
+            collect_exes_matching(
+                &global_scoop.join("apps").join("claude-code"),
+                0,
+                4,
+                &|n| n == "claude.exe",
+                &mut exes,
+            );
+        }
+        "codex" => {
+            collect_exes_matching(
+                &global_scoop.join("apps").join("codex"),
+                0,
+                4,
+                &|n| n.starts_with("codex"),
+                &mut exes,
+            );
+        }
+        _ => {}
+    }
+    exes
 }
 
 /// Testable deep (`max_depth = 12`) Claude covered executable discovery + standalone `claude-code` CLI.
@@ -1521,8 +2257,10 @@ pub fn discover_chatgpt_exes_from_dirs_and_homes(
     for dir in dirs {
         for primary in [
             dir.join("app").join("ChatGPT.exe"),
+            dir.join("app").join("ChatGPT Classic.exe"),
             dir.join("app").join("Codex.exe"),
             dir.join("ChatGPT.exe"),
+            dir.join("ChatGPT Classic.exe"),
             dir.join("Codex.exe"),
         ] {
             if primary.is_file() && !contains_path_ci(&exes, &primary) {
@@ -1574,9 +2312,9 @@ pub fn resolve_app_id(prefix: &str, app_name: &str, fallback: &str) -> String {
 pub fn read_pe_file_version(path: &Path) -> Option<String> {
     use core::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
-    use windows::core::{PCWSTR, w};
+    use windows::core::{w, PCWSTR};
     use windows::Win32::Storage::FileSystem::{
-        GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FIXEDFILEINFO, VerQueryValueW,
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
     };
 
     if !path.is_file() {
@@ -1590,8 +2328,13 @@ pub fn read_pe_file_version(path: &Path) -> Option<String> {
     }
     let mut buf = vec![0u8; size as usize];
     unsafe {
-        if GetFileVersionInfoW(PCWSTR(wide.as_ptr()), 0, size, buf.as_mut_ptr().cast::<c_void>())
-            .is_err()
+        if GetFileVersionInfoW(
+            PCWSTR(wide.as_ptr()),
+            0,
+            size,
+            buf.as_mut_ptr().cast::<c_void>(),
+        )
+        .is_err()
         {
             return None;
         }
@@ -1627,15 +2370,33 @@ pub fn read_pe_file_version(_path: &Path) -> Option<String> {
     None
 }
 
+fn is_numeric_version_str(clean: &str) -> bool {
+    !clean.is_empty()
+        && clean.as_bytes()[0].is_ascii_digit()
+        && clean.split(['-', '+']).next().is_some_and(|core| {
+            !core.is_empty() && core.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        })
+}
+
+fn semver_tuple(clean: &str) -> Vec<u64> {
+    clean
+        .split(['-', '+'])
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .map(|p| p.parse::<u64>().unwrap_or(0))
+        .collect()
+}
+
 fn pick_newer_version(best: &mut Option<String>, candidate: &str) {
     let clean = candidate.trim().trim_start_matches(['v', 'V']).trim();
-    if clean.is_empty() || version_key(clean).is_empty() {
+    if !is_numeric_version_str(clean) {
         return;
     }
     match best {
         None => *best = Some(clean.to_string()),
         Some(prev) => {
-            if version_key(clean) > version_key(prev) {
+            if semver_tuple(clean) > semver_tuple(prev) {
                 *best = Some(clean.to_string());
             }
         }
@@ -1648,7 +2409,7 @@ fn read_package_json_version(pkg_json: &Path) -> Option<String> {
     val.get("version")
         .and_then(|v| v.as_str())
         .map(|s| s.trim().trim_start_matches(['v', 'V']).to_string())
-        .filter(|s| !s.is_empty() && !version_key(s).is_empty())
+        .filter(|s| is_numeric_version_str(s))
 }
 
 fn scan_versioned_claude_code_dir(root: &Path, best: &mut Option<String>) {
@@ -1661,43 +2422,117 @@ fn scan_versioned_claude_code_dir(root: &Path, best: &mut Option<String>) {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        if version_key(&name).is_empty() {
+        if !is_numeric_version_str(name.trim().trim_start_matches(['v', 'V'])) {
             continue;
         }
         let has_bin = p.join("claude.exe").is_file()
-            || std::fs::read_dir(&p)
-                .ok()
-                .is_some_and(|mut sub| {
-                    sub.any(|e| {
-                        e.ok()
-                            .is_some_and(|se| se.path().join("claude.exe").is_file())
-                    })
-                });
+            || std::fs::read_dir(&p).ok().is_some_and(|mut sub| {
+                sub.any(|e| {
+                    e.ok()
+                        .is_some_and(|se| se.path().join("claude.exe").is_file())
+                })
+            });
         if has_bin {
             pick_newer_version(best, &name);
         }
     }
 }
 
-/// Detect installed Claude Desktop version (MSIX registry/folder or non-MSIX PE FileVersion).
-pub fn installed_claude_desktop_version() -> Option<String> {
-    if let Some(msix) = installed_msix_version("Claude_") {
-        return Some(msix);
-    }
+pub(crate) fn installed_claude_desktop_version_in_dirs(dirs: &[PathBuf]) -> Option<String> {
     let mut best = None;
-    for dir in per_user_local_app_subdirs(&["AnthropicClaude", r"Programs\Claude"]) {
+    for dir in dirs {
         for exe in [dir.join("Claude.exe"), dir.join("app").join("Claude.exe")] {
             if let Some(v) = read_pe_file_version(&exe) {
                 pick_newer_version(&mut best, &v);
+            }
+        }
+        // Squirrel layout: `AnthropicClaude\app-0.9.3\claude.exe`
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                let low = name.to_ascii_lowercase();
+                if let Some(ver_seg) = low.strip_prefix("app-") {
+                    let sub_exe = p.join("claude.exe");
+                    if let Some(pe_v) = read_pe_file_version(&sub_exe) {
+                        pick_newer_version(&mut best, &pe_v);
+                    } else if let Some(pkg_v) = read_package_json_version(
+                        &p.join("resources").join("app").join("package.json"),
+                    ) {
+                        pick_newer_version(&mut best, &pkg_v);
+                    } else if sub_exe.is_file() {
+                        pick_newer_version(&mut best, ver_seg);
+                    }
+                }
             }
         }
     }
     best
 }
 
-/// Detect installed ChatGPT / Codex Desktop MSIX version.
+/// Detect installed Claude Desktop version (MSIX registry/folder, Squirrel `AnthropicClaude\app-*\claude.exe`, or Uninstall registry).
+pub fn installed_claude_desktop_version() -> Option<String> {
+    if let Some(msix) = installed_msix_version("Claude_") {
+        return Some(msix);
+    }
+    let mut best = installed_claude_desktop_version_in_dirs(&per_user_local_app_subdirs(&[
+        "AnthropicClaude",
+        r"Programs\Claude",
+    ]));
+    for rec in scan_uninstall_records() {
+        let dn = rec.display_name.to_ascii_lowercase();
+        let kn = rec.key_name.to_ascii_lowercase();
+        if (dn == "claude" || dn.contains("anthropicclaude") || kn.contains("anthropicclaude"))
+            && !dn.contains("claudeguard")
+            && !dn.contains("claude code")
+        {
+            if let Some(ref dv) = rec.display_version {
+                pick_newer_version(&mut best, dv);
+            }
+            if let Some(ref dir) = rec.install_dir {
+                if let Some(v) =
+                    installed_claude_desktop_version_in_dirs(core::slice::from_ref(dir))
+                {
+                    pick_newer_version(&mut best, &v);
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Detect installed OpenAI Codex Desktop (`26.x`) version without mixing `1.2026.x` from `OpenAI.ChatGPT-Desktop_`.
 pub fn installed_codex_desktop_version() -> Option<String> {
-    installed_msix_version("OpenAI.Codex_").or_else(|| installed_msix_version("OpenAI.ChatGPT_"))
+    if let Some(msix) = installed_msix_version("OpenAI.Codex_") {
+        return Some(msix);
+    }
+    let mut best = None;
+    for dir in per_user_local_app_subdirs(&[r"Programs\Codex"]) {
+        for exe in [dir.join("Codex.exe"), dir.join("app").join("Codex.exe")] {
+            if let Some(v) = read_pe_file_version(&exe) {
+                pick_newer_version(&mut best, &v);
+            }
+        }
+    }
+    for rec in scan_uninstall_records() {
+        let dn = rec.display_name.trim().to_ascii_lowercase();
+        if dn == "codex" || dn == "openai codex" {
+            if let Some(ref dv) = rec.display_version {
+                pick_newer_version(&mut best, dv);
+            }
+            if let Some(ref dir) = rec.install_dir {
+                for exe in [dir.join("Codex.exe"), dir.join("app").join("Codex.exe")] {
+                    if let Some(v) = read_pe_file_version(&exe) {
+                        pick_newer_version(&mut best, &v);
+                    }
+                }
+            }
+        }
+    }
+    best
 }
 
 /// Testable detector reading newest installed `@anthropic-ai/claude-code` / native `claude-code` version.
@@ -1711,49 +2546,18 @@ pub fn installed_claude_code_version_in_homes(homes: &[PathBuf]) -> Option<Strin
             .join("claude-code");
         scan_versioned_claude_code_dir(&roaming_cc, &mut best);
 
-        let pkg_json = home
-            .join("AppData")
-            .join("Roaming")
-            .join("npm")
-            .join("node_modules")
-            .join("@anthropic-ai")
-            .join("claude-code")
-            .join("package.json");
-        if let Some(v) = read_package_json_version(&pkg_json) {
-            pick_newer_version(&mut best, &v);
+        for pkg_dir in candidate_cli_package_dirs_for_home(home, "@anthropic-ai", "claude-code") {
+            if let Some(v) = read_package_json_version(&pkg_dir.join("package.json")) {
+                pick_newer_version(&mut best, &v);
+            }
         }
 
-        let local_exe = home.join(".local").join("bin").join("claude.exe");
-        if let Some(v) = read_pe_file_version(&local_exe) {
-            pick_newer_version(&mut best, &v);
-        }
-    }
-    best
-}
+        scan_scoop_app_version(&home.join("scoop"), "claude-code", &mut best);
 
-/// Detect installed Claude Code CLI version across user homes.
-pub fn installed_claude_code_version() -> Option<String> {
-    installed_claude_code_version_in_homes(&user_home_dirs())
-}
-
-/// Testable detector reading newest installed `@openai/codex` / native `codex` CLI version.
-pub fn installed_codex_cli_version_in_homes(homes: &[PathBuf]) -> Option<String> {
-    let mut best = None;
-    for home in homes {
-        let pkg_json = home
-            .join("AppData")
-            .join("Roaming")
-            .join("npm")
-            .join("node_modules")
-            .join("@openai")
-            .join("codex")
-            .join("package.json");
-        if let Some(v) = read_package_json_version(&pkg_json) {
-            pick_newer_version(&mut best, &v);
-        }
         for bin_exe in [
-            home.join(".local").join("bin").join("codex.exe"),
-            home.join(".cargo").join("bin").join("codex.exe"),
+            home.join(".local").join("bin").join("claude.exe"),
+            home.join(".claude").join("local").join("claude.exe"),
+            home.join(".bun").join("bin").join("claude.exe"),
         ] {
             if let Some(v) = read_pe_file_version(&bin_exe) {
                 pick_newer_version(&mut best, &v);
@@ -1763,9 +2567,55 @@ pub fn installed_codex_cli_version_in_homes(homes: &[PathBuf]) -> Option<String>
     best
 }
 
-/// Detect installed Codex CLI version across user homes.
+/// Detect installed Claude Code CLI version across user homes and global Scoop.
+pub fn installed_claude_code_version() -> Option<String> {
+    let mut best = installed_claude_code_version_in_homes(&user_home_dirs());
+    scan_scoop_app_version(&program_data_scoop_root(), "claude-code", &mut best);
+    best
+}
+
+/// Testable detector reading newest installed `@openai/codex` / native `codex` CLI version.
+pub fn installed_codex_cli_version_in_homes(homes: &[PathBuf]) -> Option<String> {
+    let mut best = None;
+    for home in homes {
+        for pkg_dir in candidate_cli_package_dirs_for_home(home, "@openai", "codex") {
+            if let Some(v) = read_package_json_version(&pkg_dir.join("package.json")) {
+                pick_newer_version(&mut best, &v);
+            }
+        }
+
+        scan_scoop_app_version(&home.join("scoop"), "codex", &mut best);
+
+        for bin_exe in [
+            home.join(".local").join("bin").join("codex.exe"),
+            home.join(".bun").join("bin").join("codex.exe"),
+        ] {
+            if let Some(v) = read_pe_file_version(&bin_exe) {
+                pick_newer_version(&mut best, &v);
+            }
+        }
+
+        let cargo_bin = home.join(".cargo").join("bin");
+        let cargo_exe = cargo_bin.join("codex.exe");
+        if let Some(pe_ver) = read_pe_file_version(&cargo_exe) {
+            pick_newer_version(&mut best, &pe_ver);
+        } else if !cargo_bin.is_dir() || cargo_exe.is_file() {
+            if let Some(cargo_ver) = read_cargo_crates2_version(
+                &home.join(".cargo").join(".crates2.json"),
+                &["codex-cli", "codex"],
+            ) {
+                pick_newer_version(&mut best, &cargo_ver);
+            }
+        }
+    }
+    best
+}
+
+/// Detect installed Codex CLI version across user homes and global Scoop.
 pub fn installed_codex_cli_version() -> Option<String> {
-    installed_codex_cli_version_in_homes(&user_home_dirs())
+    let mut best = installed_codex_cli_version_in_homes(&user_home_dirs());
+    scan_scoop_app_version(&program_data_scoop_root(), "codex", &mut best);
+    best
 }
 
 fn parse_app_update_url(yml_text: &str) -> Option<String> {
@@ -1782,38 +2632,53 @@ fn parse_app_update_url(yml_text: &str) -> Option<String> {
 }
 
 /// Testable detector returning `(ide_version, updater_base_url)` from Antigravity install roots.
-pub fn installed_antigravity_ide_info_in_dirs(dirs: &[PathBuf]) -> (Option<String>, Option<String>) {
-    let mut best_ver = None;
-    let mut updater_url = None;
+pub fn installed_antigravity_ide_info_in_dirs(
+    dirs: &[PathBuf],
+) -> (Option<String>, Option<String>) {
+    let mut best_ver: Option<String> = None;
+    let mut updater_url: Option<String> = None;
 
     for dir in dirs {
         if !dir.is_dir() {
             continue;
         }
+        let mut dir_ver: Option<String> = None;
         for exe_name in ["Antigravity.exe", "Antigravity IDE.exe"] {
             let exe = dir.join(exe_name);
             if let Some(v) = read_pe_file_version(&exe) {
-                pick_newer_version(&mut best_ver, &v);
+                pick_newer_version(&mut dir_ver, &v);
             }
         }
-        if best_ver.is_none() {
+        if dir_ver.is_none() {
             if let Some(v) =
                 read_package_json_version(&dir.join("resources").join("app").join("package.json"))
             {
-                pick_newer_version(&mut best_ver, &v);
+                pick_newer_version(&mut dir_ver, &v);
             }
         }
-        if best_ver.is_none() {
+        if dir_ver.is_none() {
             if let Ok(raw) = std::fs::read_to_string(dir.join("version")) {
-                pick_newer_version(&mut best_ver, &raw);
+                pick_newer_version(&mut dir_ver, &raw);
             }
         }
-        if updater_url.is_none() {
-            if let Ok(yml) =
-                std::fs::read_to_string(dir.join("resources").join("app-update.yml"))
-            {
-                updater_url = parse_app_update_url(&yml);
+        let dir_url = std::fs::read_to_string(dir.join("resources").join("app-update.yml"))
+            .ok()
+            .and_then(|yml| parse_app_update_url(&yml));
+
+        if let Some(ref dv) = dir_ver {
+            let is_newer = best_ver
+                .as_deref()
+                .is_none_or(|prev| semver_tuple(dv) > semver_tuple(prev));
+            if is_newer {
+                best_ver = Some(dv.clone());
+                if dir_url.is_some() {
+                    updater_url = dir_url;
+                }
+            } else if updater_url.is_none() && dir_url.is_some() {
+                updater_url = dir_url;
             }
+        } else if updater_url.is_none() && dir_url.is_some() {
+            updater_url = dir_url;
         }
     }
     (best_ver, updater_url)
@@ -1824,20 +2689,79 @@ pub fn installed_antigravity_ide_info() -> (Option<String>, Option<String>) {
     installed_antigravity_ide_info_in_dirs(&antigravity_covered_dirs())
 }
 
-/// Testable detector reading newest installed Antigravity plugin version from
-/// `<home>\.gemini\config\plugins\<dir>\plugin.json` (or `package.json`).
+fn plugin_folder_matches(folder_l: &str, patterns: &[&str]) -> bool {
+    patterns.iter().any(|raw_pat| {
+        let pat = raw_pat.trim().to_ascii_lowercase();
+        if pat.is_empty() {
+            return false;
+        }
+        folder_l == pat
+            || folder_l.starts_with(&format!("{pat}-"))
+            || folder_l.starts_with(&format!("{pat}_"))
+            || folder_l.starts_with(&format!("{pat}."))
+            || folder_l.contains(&format!(".{pat}-"))
+            || folder_l.ends_with(&format!(".{pat}"))
+    })
+}
+
+fn plugin_manifest_name_matches(manifest_name: &str, patterns: &[&str]) -> bool {
+    let low = manifest_name.trim().to_ascii_lowercase();
+    let stripped = low.rsplit('/').next().unwrap_or(&low);
+    patterns.iter().any(|raw_pat| {
+        let pat = raw_pat.trim().to_ascii_lowercase();
+        !pat.is_empty() && (low == pat || stripped == pat)
+    })
+}
+
+/// Testable detector reading newest installed Antigravity plugin/extension version across
+/// `.gemini\config\plugins`, `.antigravity\extensions`, and `.gemini\antigravity\extensions`.
 pub fn installed_antigravity_plugin_version_in_homes(
     plugin_dirs: &[&str],
     homes: &[PathBuf],
 ) -> Option<String> {
+    let manifest_rel_paths: [&Path; 4] = [
+        Path::new("plugin.json"),
+        Path::new("package.json"),
+        Path::new(".gemini-plugin/plugin.json"),
+        Path::new(".claude-plugin/plugin.json"),
+    ];
     let mut best = None;
+
     for home in homes {
-        let base = home.join(".gemini").join("config").join("plugins");
-        for dir_name in plugin_dirs {
-            let root = base.join(dir_name);
-            for manifest in ["plugin.json", "package.json"] {
-                if let Some(v) = read_package_json_version(&root.join(manifest)) {
-                    pick_newer_version(&mut best, &v);
+        let bases = [
+            home.join(".gemini").join("config").join("plugins"),
+            home.join(".antigravity").join("extensions"),
+            home.join(".gemini").join("antigravity").join("extensions"),
+        ];
+        for base in &bases {
+            let Ok(rd) = std::fs::read_dir(base) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let root = entry.path();
+                if !root.is_dir() {
+                    continue;
+                }
+                let folder_l = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                let folder_matched = plugin_folder_matches(&folder_l, plugin_dirs);
+
+                for rel in &manifest_rel_paths {
+                    let mf = root.join(rel);
+                    let Ok(raw) = std::fs::read_to_string(&mf) else {
+                        continue;
+                    };
+                    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                        continue;
+                    };
+                    let name_matched = val
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|n| plugin_manifest_name_matches(n, plugin_dirs));
+                    if folder_matched || name_matched {
+                        if let Some(ver) = val.get("version").and_then(|v| v.as_str()) {
+                            pick_newer_version(&mut best, ver);
+                        }
+                    }
                 }
             }
         }
@@ -1873,65 +2797,124 @@ fn unix_secs_to_ymd(secs: u64) -> String {
     format!("{year:04}.{m:02}.{d:02}")
 }
 
+/// Zero-dependency Electron ASAR header inspector verifying whether `resources\app.asar`
+/// actually contains `Silas-02/antigravity-desktop-cn` injected localization/monitor files.
+pub fn asar_contains_cn_patch(asar_path: &Path) -> bool {
+    use std::io::Read;
+
+    const MAX_HEADER_JSON_BYTES: usize = 8 * 1024 * 1024;
+    let Ok(mut file) = std::fs::File::open(asar_path) else {
+        return false;
+    };
+    let mut prefix = [0u8; 16];
+    if file.read_exact(&mut prefix).is_err() {
+        return false;
+    }
+    let header_json_len =
+        u32::from_le_bytes([prefix[12], prefix[13], prefix[14], prefix[15]]) as usize;
+    if header_json_len == 0 || header_json_len > MAX_HEADER_JSON_BYTES {
+        return false;
+    }
+    let mut header_bytes = vec![0u8; header_json_len];
+    if file.read_exact(&mut header_bytes).is_err() {
+        return false;
+    }
+    let header = String::from_utf8_lossy(&header_bytes);
+    header.contains("subframeLocalizationPreload.js")
+        || header.contains("contextMonitor.js")
+        || header.contains("context_monitor.js")
+        || header.contains("localization")
+}
+
+fn file_mtime_secs(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+fn read_cn_explicit_version(dir: &Path) -> Option<String> {
+    let mut found = None;
+    for text_file in ["antigravity-desktop-cn.version", ".cn-version"] {
+        if let Ok(raw) = std::fs::read_to_string(dir.join(text_file)) {
+            pick_newer_version(&mut found, &raw);
+        }
+    }
+    if let Some(v) = read_package_json_version(&dir.join("cn-patch.json")) {
+        pick_newer_version(&mut found, &v);
+    }
+    found
+}
+
 /// Testable detector checking whether `Silas-02/antigravity-desktop-cn` localization patch is
-/// applied inside Antigravity install dirs (returns explicit version or patch date `YYYY.MM.DD`).
+/// ACTUALLY active in live `resources\app` or live `resources\app.asar` (never false-positiving
+/// on a stale `app.asar.bak` left behind after an IDE update!).
 pub fn installed_antigravity_cn_version_in_dirs(dirs: &[PathBuf]) -> Option<String> {
     let mut best = None;
     for dir in dirs {
         if !dir.is_dir() {
             continue;
         }
-        let app_dir = dir.join("resources").join("app");
         let res_dir = dir.join("resources");
-        for ver_file in [
-            app_dir.join("antigravity-desktop-cn.version"),
-            res_dir.join("antigravity-desktop-cn.version"),
-        ] {
-            if let Ok(raw) = std::fs::read_to_string(&ver_file) {
-                pick_newer_version(&mut best, &raw);
-            }
-        }
-        if best.is_some() {
-            continue;
-        }
-        // Detect injected localization files (`context_monitor.js` or `app.asar.bak` + patched preload)
-        let markers = [
+        let app_dir = res_dir.join("app");
+        let asar_path = res_dir.join("app.asar");
+
+        // 1. Check live unpacked `resources\app` markers / version manifests
+        let mut dir_ver = read_cn_explicit_version(&app_dir);
+        let mut unpacked_mtime: Option<u64> = None;
+        for js_marker in [
+            app_dir.join("subframeLocalizationPreload.js"),
+            app_dir.join("contextMonitor.js"),
             app_dir.join("context_monitor.js"),
             app_dir.join("cn_dict.js"),
-            res_dir.join("app.asar.bak"),
-        ];
-        let mut marker_mtime: Option<u64> = None;
-        for m in &markers {
-            if let Ok(meta) = std::fs::metadata(m) {
-                if let Ok(modified) = meta.modified() {
-                    if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
-                        marker_mtime = Some(marker_mtime.map_or(dur.as_secs(), |p| p.max(dur.as_secs())));
-                    }
-                }
+        ] {
+            if let Some(secs) = file_mtime_secs(&js_marker) {
+                unpacked_mtime = Some(unpacked_mtime.map_or(secs, |prev| prev.max(secs)));
             }
         }
-        if marker_mtime.is_none() {
+        if unpacked_mtime.is_none() {
             let preload = app_dir.join("preload.js");
             if let Ok(txt) = std::fs::read_to_string(&preload) {
                 if txt.contains("antigravity-desktop-cn")
+                    || txt.contains("subframeLocalizationPreload")
+                    || txt.contains("contextMonitor")
                     || txt.contains("context_monitor")
+                    || txt.contains("localization")
                     || txt.contains("中文汉化")
                 {
-                    if let Ok(meta) = std::fs::metadata(&preload) {
-                        if let Ok(dur) = meta
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .ok_or(())
-                        {
-                            marker_mtime = Some(dur.as_secs());
-                        }
-                    }
+                    unpacked_mtime = file_mtime_secs(&preload);
                 }
             }
         }
-        if let Some(secs) = marker_mtime {
-            pick_newer_version(&mut best, &unix_secs_to_ymd(secs));
+        let unpacked_active = dir_ver.is_some() || unpacked_mtime.is_some();
+
+        // 2. Check live `resources\app.asar` header
+        let asar_active = asar_contains_cn_patch(&asar_path);
+
+        if !unpacked_active && !asar_active {
+            // Even if `app.asar.bak` or a stale file in `resources\` exists, live app is NOT patched!
+            continue;
+        }
+
+        if dir_ver.is_none() {
+            dir_ver = read_cn_explicit_version(&res_dir);
+        }
+        if dir_ver.is_none() {
+            // Prefer live `resources\app.asar` mtime (patch apply date), NOT `app.asar.bak`!
+            let secs = if asar_active {
+                file_mtime_secs(&asar_path)
+            } else {
+                unpacked_mtime
+            };
+            if let Some(s) = secs {
+                dir_ver = Some(unix_secs_to_ymd(s));
+            }
+        }
+        if let Some(ref v) = dir_ver {
+            pick_newer_version(&mut best, v);
         }
     }
     best
@@ -4079,7 +5062,11 @@ mod tests {
             .join("@anthropic-ai")
             .join("claude-code");
         std::fs::create_dir_all(&npm_cc).unwrap();
-        std::fs::write(npm_cc.join("package.json"), r#"{"name":"@anthropic-ai/claude-code","version":"2.1.284"}"#).unwrap();
+        std::fs::write(
+            npm_cc.join("package.json"),
+            r#"{"name":"@anthropic-ai/claude-code","version":"2.1.284"}"#,
+        )
+        .unwrap();
         assert_eq!(
             installed_claude_code_version_in_homes(std::slice::from_ref(&home)).as_deref(),
             Some("2.1.308")
@@ -4094,7 +5081,11 @@ mod tests {
             .join("@openai")
             .join("codex");
         std::fs::create_dir_all(&npm_codex).unwrap();
-        std::fs::write(npm_codex.join("package.json"), r#"{"name":"@openai/codex","version":"0.158.0"}"#).unwrap();
+        std::fs::write(
+            npm_codex.join("package.json"),
+            r#"{"name":"@openai/codex","version":"0.158.0"}"#,
+        )
+        .unwrap();
         assert_eq!(
             installed_codex_cli_version_in_homes(std::slice::from_ref(&home)).as_deref(),
             Some("0.158.0")
@@ -4126,5 +5117,309 @@ mod tests {
                 assert!(read_pe_file_version(k32).is_some());
             }
         }
+    }
+
+    fn build_synthetic_asar(header_json: &str) -> Vec<u8> {
+        let json_bytes = header_json.as_bytes();
+        let json_len = json_bytes.len() as u32;
+        let padded_len = (json_len + 3) & !3;
+        let mut out = Vec::with_capacity(16 + padded_len as usize);
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&(padded_len + 8).to_le_bytes());
+        out.extend_from_slice(&(padded_len + 4).to_le_bytes());
+        out.extend_from_slice(&json_len.to_le_bytes());
+        out.extend_from_slice(json_bytes);
+        out.resize(16 + padded_len as usize, 0);
+        out
+    }
+
+    #[test]
+    fn chatgpt_classic_live_root_never_swept_as_orphan_and_discovered_primary() {
+        let gpt_msix =
+            r"c:\program files\windowsapps\openai.chatgpt-desktop_1.2026.70.0_x64__2p2nqsd0c76g0";
+        let mk = |pid: u32, ppid: u32, name: &str, path: &str, cmd: &str| ProcInfo {
+            pid,
+            ppid,
+            name_l: name.to_string(),
+            path_l: path.to_string(),
+            cmd_l: cmd.to_string(),
+            start_time: 7000 + pid as u64,
+        };
+
+        let procs = vec![
+            mk(10, 1, "explorer.exe", r"c:\windows\explorer.exe", ""),
+            mk(
+                500,
+                10,
+                "chatgpt classic.exe",
+                &format!(r"{gpt_msix}\app\chatgpt classic.exe"),
+                &format!(r#""{gpt_msix}\app\chatgpt classic.exe""#),
+            ),
+            mk(
+                501,
+                500,
+                "chatgpt classic.exe",
+                &format!(r"{gpt_msix}\app\chatgpt classic.exe"),
+                "--type=renderer",
+            ),
+            mk(
+                502,
+                500,
+                "chatgpt classic.exe",
+                &format!(r"{gpt_msix}\app\chatgpt classic.exe"),
+                "--type=gpu-process",
+            ),
+        ];
+
+        assert!(gui_agent_matches(
+            "chatgpt",
+            "chatgpt classic.exe",
+            &procs[1].path_l,
+            None
+        ));
+        // Live `ChatGPT Classic.exe` window + children MUST have ZERO orphans!
+        assert!(pick_chatgpt_codex_orphans(&procs, &[gpt_msix.to_string()]).is_empty());
+        let snap =
+            build_process_snapshot_from_table(procs, &[], &[gpt_msix.to_string()], &[], 1234);
+        assert_eq!(snap.gui_counts.get("chatgpt"), Some(&3));
+        assert!(!snap.orphan_counts.contains_key("chatgpt"));
+
+        // Primary executable discovery includes `app\ChatGPT Classic.exe`
+        let root = unique_temp_dir("gpt-classic");
+        let pkg = root.join("OpenAI.ChatGPT-Desktop_1.2026.70.0_x64__2p2nqsd0c76g0");
+        std::fs::create_dir_all(pkg.join("app")).unwrap();
+        std::fs::write(pkg.join("app").join("ChatGPT Classic.exe"), b"exe").unwrap();
+        let exes = discover_chatgpt_exes_from_dirs_and_homes(&[pkg], &[]);
+        assert!(exes[0].ends_with(r"app\ChatGPT Classic.exe"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn asar_cn_patch_verification_rejects_stale_bak_and_uses_live_asar_mtime() {
+        let root = unique_temp_dir("asar-cn");
+
+        // 1. Stale `app.asar.bak` + unpatched `app.asar` (after IDE update) -> MUST return `None`!
+        let wiped_dir = root.join("ag-wiped");
+        std::fs::create_dir_all(wiped_dir.join("resources")).unwrap();
+        let unpatched_asar =
+            build_synthetic_asar(r#"{"files":{"main.js":{"size":10,"offset":"0"}}}"#);
+        std::fs::write(
+            wiped_dir.join("resources").join("app.asar"),
+            &unpatched_asar,
+        )
+        .unwrap();
+        std::fs::write(
+            wiped_dir.join("resources").join("app.asar.bak"),
+            b"old-backup",
+        )
+        .unwrap();
+        std::fs::write(
+            wiped_dir
+                .join("resources")
+                .join("antigravity-desktop-cn.version"),
+            "1.5.0",
+        )
+        .unwrap();
+        assert!(!asar_contains_cn_patch(
+            &wiped_dir.join("resources").join("app.asar")
+        ));
+        assert!(
+            installed_antigravity_cn_version_in_dirs(std::slice::from_ref(&wiped_dir)).is_none()
+        );
+
+        // 2. Patched `app.asar` containing `subframeLocalizationPreload.js` -> verified active!
+        let patched_dir = root.join("ag-patched");
+        std::fs::create_dir_all(patched_dir.join("resources")).unwrap();
+        let patched_asar = build_synthetic_asar(
+            r#"{"files":{"subframeLocalizationPreload.js":{"size":42,"offset":"0"}}}"#,
+        );
+        let live_asar_path = patched_dir.join("resources").join("app.asar");
+        let bak_asar_path = patched_dir.join("resources").join("app.asar.bak");
+        std::fs::write(&live_asar_path, &patched_asar).unwrap();
+        std::fs::write(&bak_asar_path, &unpatched_asar).unwrap();
+
+        // Set `app.asar.bak` mtime to 2024-01-15 and live `app.asar` mtime to 2026-03-20
+        let bak_time = UNIX_EPOCH + Duration::from_secs(1_705_320_000); // 2024.01.15
+        let live_time = UNIX_EPOCH + Duration::from_secs(1_773_990_000); // 2026.03.20
+        if let Ok(f_bak) = std::fs::File::options().write(true).open(&bak_asar_path) {
+            let _ = f_bak.set_times(std::fs::FileTimes::new().set_modified(bak_time));
+        }
+        if let Ok(f_live) = std::fs::File::options().write(true).open(&live_asar_path) {
+            let _ = f_live.set_times(std::fs::FileTimes::new().set_modified(live_time));
+        }
+
+        assert!(asar_contains_cn_patch(&live_asar_path));
+        assert_eq!(
+            installed_antigravity_cn_version_in_dirs(&[wiped_dir, patched_dir]).as_deref(),
+            Some("2026.03.20")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn multi_manager_cli_cargo_crates2_squirrel_and_plugin_manifests_discovered() {
+        let root = unique_temp_dir("multi-mgr");
+        let home = root.join("DevUser");
+
+        // 1. `.npmrc` custom prefix + pnpm + fnm + Volta + Bun + Scoop + `.claude\local` + `.cargo\.crates2.json`
+        let custom_npm = root.join("custom-npm-global");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join(".npmrc"),
+            format!("; comment\nprefix=\"{}\"\n", custom_npm.display()),
+        )
+        .unwrap();
+        let npmrc_cc = custom_npm
+            .join("node_modules")
+            .join("@anthropic-ai")
+            .join("claude-code");
+        std::fs::create_dir_all(&npmrc_cc).unwrap();
+        std::fs::write(npmrc_cc.join("package.json"), r#"{"version":"2.2.10"}"#).unwrap();
+
+        let pnpm_cc = home
+            .join("AppData")
+            .join("Local")
+            .join("pnpm")
+            .join("global")
+            .join("5")
+            .join("node_modules")
+            .join("@anthropic-ai")
+            .join("claude-code");
+        std::fs::create_dir_all(&pnpm_cc).unwrap();
+        std::fs::write(pnpm_cc.join("package.json"), r#"{"version":"2.3.5"}"#).unwrap();
+        std::fs::write(pnpm_cc.join("claude.exe"), b"exe").unwrap();
+
+        // Scoop claude-code (2.4.0 > 2.3.5)
+        let scoop_cc = home
+            .join("scoop")
+            .join("apps")
+            .join("claude-code")
+            .join("current");
+        std::fs::create_dir_all(&scoop_cc).unwrap();
+        std::fs::write(scoop_cc.join("manifest.json"), r#"{"version":"2.4.0"}"#).unwrap();
+        std::fs::write(scoop_cc.join("claude.exe"), b"exe").unwrap();
+
+        assert_eq!(
+            installed_claude_code_version_in_homes(std::slice::from_ref(&home)).as_deref(),
+            Some("2.4.0")
+        );
+        let cc_exes = discover_cli_exes_in_homes("claude-code", std::slice::from_ref(&home));
+        assert_eq!(cc_exes.len(), 2);
+
+        // Cargo `.crates2.json` fallback when `codex.exe` has no Win32 PE VERSIONINFO
+        let cargo_bin = home.join(".cargo").join("bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        std::fs::write(cargo_bin.join("codex.exe"), b"rust-bin-no-pe-ver").unwrap();
+        std::fs::write(
+            home.join(".cargo").join(".crates2.json"),
+            r#"{"installs":{"codex-cli 0.162.0 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["codex.exe"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            installed_codex_cli_version_in_homes(std::slice::from_ref(&home)).as_deref(),
+            Some("0.162.0")
+        );
+
+        // Env pair root extraction (`FNM_DIR`, `VOLTA_HOME`, `Path` with `nodejs`)
+        let mut nm_roots = Vec::new();
+        let mut volta_roots = Vec::new();
+        collect_node_roots_from_env_pairs(
+            &[
+                ("VOLTA_HOME", r"D:\Volta"),
+                ("Path", r"C:\Windows\System32;D:\Program Files\nodejs"),
+            ],
+            &home,
+            &mut nm_roots,
+            &mut volta_roots,
+        );
+        assert!(volta_roots.contains(&PathBuf::from(r"D:\Volta\tools\image\packages")));
+        assert!(nm_roots.contains(&PathBuf::from(r"D:\Program Files\nodejs\node_modules")));
+
+        // 2. Squirrel Claude Desktop `AnthropicClaude\app-*\claude.exe` + Uninstall helper + ProfileImagePath
+        let sq_claude = root.join("AnthropicClaude");
+        let sq_app = sq_claude.join("app-1.14.2");
+        std::fs::create_dir_all(&sq_app).unwrap();
+        std::fs::write(sq_app.join("claude.exe"), b"squirrel-bin").unwrap();
+        assert_eq!(
+            installed_claude_desktop_version_in_dirs(&[sq_claude]).as_deref(),
+            Some("1.14.2")
+        );
+        assert_eq!(
+            expand_profile_image_path_with_drive(r"%SystemDrive%\Users\Alice", "D:"),
+            PathBuf::from(r"D:\Users\Alice")
+        );
+        assert_eq!(
+            extract_install_dir_from_uninstall_values(
+                None,
+                Some(r#""D:\Apps\Antigravity\Antigravity.exe",0"#)
+            ),
+            Some(PathBuf::from(r"D:\Apps\Antigravity"))
+        );
+
+        // 3. Multi-dir `installed_antigravity_ide_info_in_dirs` updates BOTH best_ver and updater_url
+        let ag_old = root.join("ag-old");
+        let ag_new = root.join("ag-new");
+        for (d, ver, url) in [
+            (&ag_old, "2.30.0", "https://old.example.invalid/feed/"),
+            (&ag_new, "2.36.1", "https://new.example.invalid/feed/"),
+        ] {
+            std::fs::create_dir_all(d.join("resources").join("app")).unwrap();
+            std::fs::write(
+                d.join("resources").join("app").join("package.json"),
+                format!(r#"{{"version":"{ver}"}}"#),
+            )
+            .unwrap();
+            std::fs::write(
+                d.join("resources").join("app-update.yml"),
+                format!("url: {url}\n"),
+            )
+            .unwrap();
+        }
+        let (best_ag_ver, best_ag_url) = installed_antigravity_ide_info_in_dirs(&[ag_old, ag_new]);
+        assert_eq!(best_ag_ver.as_deref(), Some("2.36.1"));
+        assert_eq!(
+            best_ag_url.as_deref(),
+            Some("https://new.example.invalid/feed")
+        );
+
+        // 4. Antigravity plugins across `.antigravity\extensions`, `.gemini\antigravity\extensions`, and `.gemini-plugin/plugin.json`
+        let ext_um = home
+            .join(".antigravity")
+            .join("extensions")
+            .join("silas.antigravity-usage-monitor-1.8.4");
+        std::fs::create_dir_all(&ext_um).unwrap();
+        std::fs::write(ext_um.join("package.json"), r#"{"version":"1.8.4"}"#).unwrap();
+
+        let ext_cap = home
+            .join(".gemini")
+            .join("antigravity")
+            .join("extensions")
+            .join("custom-folder")
+            .join(".gemini-plugin");
+        std::fs::create_dir_all(&ext_cap).unwrap();
+        std::fs::write(
+            ext_cap.join("plugin.json"),
+            r#"{"name":"@ikaros/agy-capsule","version":"0.9.2"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            installed_antigravity_plugin_version_in_homes(
+                &["usage-monitor", "antigravity-usage-monitor"],
+                std::slice::from_ref(&home)
+            )
+            .as_deref(),
+            Some("1.8.4")
+        );
+        assert_eq!(
+            installed_antigravity_plugin_version_in_homes(
+                &["agy-capsule"],
+                std::slice::from_ref(&home)
+            )
+            .as_deref(),
+            Some("0.9.2")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

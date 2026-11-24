@@ -32,32 +32,59 @@ pub struct TcpConn {
     pub port: u16,
 }
 
-/// TUN fake-ip range: `198.18.0.0/15` (RFC 2544 benchmarking block used by Clash/Mihomo/sing-box).
+/// TUN fake-ip ranges: `198.18.0.0/15` (RFC 2544) and `28.0.0.0/8` (Clash/Mihomo/sing-box/Surge).
 pub fn is_fake_ip_v4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
-    o[0] == 198 && (o[1] == 18 || o[1] == 19)
+    (o[0] == 198 && (o[1] == 18 || o[1] == 19)) || o[0] == 28
 }
 
-/// Normalize dual-stack IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to `IpAddr::V4` when possible.
+fn ipv4_from_v6_compat(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    // RFC 6052 Well-Known Prefix NAT64 (`64:ff9b::/96`)
+    let seg = v6.segments();
+    if seg[0] == 0x0064
+        && seg[1] == 0xff9b
+        && seg[2] == 0
+        && seg[3] == 0
+        && seg[4] == 0
+        && seg[5] == 0
+    {
+        return Some(Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            seg[6] as u8,
+            (seg[7] >> 8) as u8,
+            seg[7] as u8,
+        ));
+    }
+    None
+}
+
+/// Normalize dual-stack IPv4-mapped IPv6 (`::ffff:a.b.c.d`) and NAT64 (`64:ff9b::/96`) to `IpAddr::V4`.
 pub fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(v4) => IpAddr::V4(v4),
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+        IpAddr::V6(v6) => match ipv4_from_v6_compat(v6) {
             Some(v4) => IpAddr::V4(v4),
             None => IpAddr::V6(v6),
         },
     }
 }
 
-/// Whether `ip` (including `::ffff:198.18.0.0/15`) falls in the TUN fake-ip block.
+/// Whether `ip` falls in a TUN fake-ip block (`198.18.0.0/15`, `28.0.0.0/8`, `fdfe:dcba:9876::/48`, `fc00::/18`).
 pub fn is_fake_ip_addr(ip: IpAddr) -> bool {
     match canonical_ip(ip) {
         IpAddr::V4(v4) => is_fake_ip_v4(v4),
-        IpAddr::V6(_) => false,
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            (seg[0] == 0xfdfe && seg[1] == 0xdcba && seg[2] == 0x9876)
+                || (seg[0] == 0xfc00 && (seg[1] & 0xc000) == 0)
+        }
     }
 }
 
-/// Private / loopback / link-local / CGNAT / unspecified IPv4 check.
+/// Private / loopback / link-local / CGNAT / multicast / Class E (`240.0.0.0/4`) / unspecified IPv4 check.
 pub fn is_local_v4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     ip.is_loopback()
@@ -67,12 +94,13 @@ pub fn is_local_v4(ip: Ipv4Addr) -> bool {
         || ip.is_multicast()
         || (o[0] == 100 && (64..=127).contains(&o[1]))
         || o[0] == 0
+        || o[0] >= 240
 }
 
 /// Private / loopback / link-local (`fe80::/10`) / ULA (`fc00::/7`) / unspecified IPv6 check.
 pub fn is_local_v6(ip: Ipv6Addr) -> bool {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return is_local_v4(v4);
+    if let Some(v4) = ipv4_from_v6_compat(ip) {
+        return is_local_v4(v4) || is_fake_ip_v4(v4);
     }
     let seg0 = ip.segments()[0];
     let is_ula = (seg0 & 0xfe00) == 0xfc00;
@@ -544,6 +572,50 @@ mod tests {
             assert!(!r.applicable, "{path} must not be applicable");
             assert_eq!(r.direct_total, 0);
         }
+    }
+
+    #[test]
+    fn nat64_28_slash_8_and_ipv6_fake_ip_pools_handled_cleanly() {
+        // 28.0.0.0/8 fake-ip & Class E 240.0.0.0/4 local
+        assert!(is_fake_ip_v4(Ipv4Addr::new(28, 1, 2, 3)));
+        assert!(is_local_v4(Ipv4Addr::new(240, 0, 0, 1)));
+        assert_eq!(
+            classify(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1)), 443, 7890),
+            Remote::Local
+        );
+
+        // NAT64 `64:ff9b::/96` unwraps embedded IPv4
+        let nat64_pub: IpAddr = "64:ff9b::198.51.100.98".parse().unwrap();
+        assert_eq!(
+            canonical_ip(nat64_pub),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 98))
+        );
+        assert_eq!(classify(nat64_pub, 443, 7890), Remote::Public);
+
+        let nat64_fake: IpAddr = "64:ff9b::28.0.0.9".parse().unwrap();
+        assert!(is_fake_ip_addr(nat64_fake));
+        assert_eq!(classify(nat64_fake, 443, 7890), Remote::Local);
+
+        // Mihomo `fdfe:dcba:9876::/48` & sing-box `fc00::/18` fake-ip vs standard `fd00::1` ULA
+        let mihomo_v6: Ipv6Addr = "fdfe:dcba:9876::12".parse().unwrap();
+        let singbox_v6: Ipv6Addr = "fc00:3fff::1".parse().unwrap();
+        let ula_lan_v6: Ipv6Addr = "fd00::1".parse().unwrap();
+        assert!(is_fake_ip_addr(IpAddr::V6(mihomo_v6)));
+        assert!(is_fake_ip_addr(IpAddr::V6(singbox_v6)));
+        assert!(!is_fake_ip_addr(IpAddr::V6(ula_lan_v6)));
+        assert!(!is_fake_ip_addr("fc00:4000::1".parse().unwrap()));
+        assert_eq!(classify(IpAddr::V6(ula_lan_v6), 443, 7890), Remote::Local);
+
+        let mut agents = HashMap::new();
+        agents.insert(10u32, "Claude".to_string());
+        let conns = vec![
+            conn_v6(10, mihomo_v6, 443),
+            conn_v4(10, [198, 51, 100, 98], 443),
+        ];
+        let r = fold(&conns, &agents, 7890, &access("system_proxy"), 4000);
+        assert!(!r.applicable);
+        assert_eq!(r.direct_total, 0);
+        assert!(r.note.contains("TUN 接管"));
     }
 
     #[cfg(windows)]

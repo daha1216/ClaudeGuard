@@ -41,19 +41,48 @@ pub fn parse_body_bytes(
 pub fn parse_anchor_text(kind: AnchorKind, body: &str, status: Option<u16>) -> ProbeResult {
     let body = cap_str(body);
     let parsed = match kind {
-        AnchorKind::Auto => return parse_auto(body),
+        AnchorKind::Auto => {
+            let mut res = parse_auto(body);
+            res.status = status;
+            if res.parsed_as == kind_tag(AnchorKind::Reachability)
+                && let Some(code) = status
+            {
+                res.detail = format!("有响应（HTTP {code}），但未识别到出口信息");
+            }
+            return res;
+        }
         AnchorKind::Trace => parse_trace(body),
         AnchorKind::JsonIp => parse_json_ip(body),
         AnchorKind::GeminiRegion => parse_gemini_region(body),
         AnchorKind::Reachability => Some(parse_reachability(status)),
     };
-    parsed.unwrap_or_else(|| ProbeResult {
-        reachable: true,
-        status,
-        parsed_as: kind_tag(kind).into(),
-        detail: format!("{}解析失败，未识别到出口信息", kind.label()),
-        ..ProbeResult::default()
-    })
+    match parsed {
+        Some(mut res) => {
+            res.status = status;
+            res
+        }
+        None => ProbeResult {
+            reachable: true,
+            status,
+            parsed_as: kind_tag(kind).into(),
+            detail: format!("{}解析失败，未识别到出口信息", kind.label()),
+            ..ProbeResult::default()
+        },
+    }
+}
+
+fn is_sentinel_region(code: &str) -> bool {
+    matches!(
+        code.trim().to_ascii_uppercase().as_str(),
+        "XX" | "T1" | "ZZ"
+    )
+}
+
+fn normalize_valid_country(raw: &str) -> Option<String> {
+    if is_sentinel_region(raw) {
+        return None;
+    }
+    normalize_region(raw).filter(|c| !is_sentinel_region(c))
 }
 
 /// Constructs a reachability-only probe result (any HTTP response status passes).
@@ -97,7 +126,7 @@ pub fn parse_trace(text: &str) -> Option<ProbeResult> {
     }
 
     let raw_region = loc;
-    let country = raw_region.as_deref().and_then(normalize_region);
+    let country = raw_region.as_deref().and_then(normalize_valid_country);
     let city = colo
         .as_deref()
         .and_then(geo::by_colo)
@@ -131,6 +160,19 @@ pub fn parse_json_ip(text: &str) -> Option<ProbeResult> {
     if let Some(data) = top.get("data").and_then(|v| v.as_object()) {
         objects.push(data);
     }
+    for nested_key in ["location", "geo"] {
+        if let Some(sub) = top.get(nested_key).and_then(|v| v.as_object()) {
+            objects.push(sub);
+        }
+        if let Some(sub) = top
+            .get("data")
+            .and_then(|v| v.as_object())
+            .and_then(|d| d.get(nested_key))
+            .and_then(|v| v.as_object())
+        {
+            objects.push(sub);
+        }
+    }
     let pick = |keys: &[&str]| -> Option<String> {
         for object in &objects {
             for key in keys {
@@ -145,14 +187,34 @@ pub fn parse_json_ip(text: &str) -> Option<ProbeResult> {
         None
     };
 
+    let region_keys = ["country", "country_code", "loc", "region"];
+    let mut normalized_pair: Option<(String, String)> = None;
+    'outer: for object in &objects {
+        for key in &region_keys {
+            if let Some(val) = object.get(*key).and_then(|v| v.as_str()) {
+                let trimmed = val.trim();
+                if let Some(code) = normalize_valid_country(trimmed) {
+                    normalized_pair = Some((trimmed.to_string(), code));
+                    break 'outer;
+                }
+            }
+        }
+    }
+
     let ip = pick(&["ip", "ip_address", "query", "origin"]).and_then(|raw| normalize_ip(&raw));
-    let raw_region = pick(&["country", "country_code", "loc", "region"]);
+    let (raw_region, country) = match normalized_pair {
+        Some((raw, code)) => (Some(raw), Some(code)),
+        None => {
+            let raw = pick(&region_keys);
+            let code = raw.as_deref().and_then(normalize_valid_country);
+            (raw, code)
+        }
+    };
     let city = pick(&["city"]);
     if ip.is_none() && raw_region.is_none() {
         return None;
     }
 
-    let country = raw_region.as_deref().and_then(normalize_region);
     let detail = format!(
         "JSON：ip={}，地区={}",
         ip.as_deref().unwrap_or("-"),
@@ -183,7 +245,7 @@ pub fn parse_gemini_region(text: &str) -> Option<ProbeResult> {
             continue;
         }
         let raw = rest[..3].to_string();
-        let country = normalize_region(&raw);
+        let country = normalize_valid_country(&raw);
         let detail = match &country {
             Some(code) => format!("页面地区标记：{raw} → {code}"),
             None => format!("页面地区标记：{raw}（无法归一）"),
@@ -333,5 +395,50 @@ mod tests {
         assert_eq!(p.ip.as_deref(), Some("198.51.100.98"));
         assert!(parse_json_ip(r#"{"city":"Los Angeles"}"#).is_none());
         assert!(parse_json_ip(r#"["198.51.100.98"]"#).is_none());
+    }
+
+    #[test]
+    fn auto_preserves_http_status_nested_location_geo_and_ignores_sentinel_regions() {
+        let auto_fallback = parse_anchor_text(AnchorKind::Auto, "<html>ok</html>", Some(204));
+        assert_eq!(auto_fallback.parsed_as, "reachability");
+        assert_eq!(auto_fallback.status, Some(204));
+        assert!(auto_fallback.detail.contains("204"));
+
+        let auto_trace = parse_anchor_text(
+            AnchorKind::Auto,
+            "ip=198.51.100.98\nloc=US\ncolo=LAX\n",
+            Some(200),
+        );
+        assert_eq!(auto_trace.parsed_as, "trace");
+        assert_eq!(auto_trace.status, Some(200));
+
+        // Nested `location` and `geo` JSON objects
+        let loc_json =
+            r#"{"ip":"198.51.100.98","location":{"country_code":"sg","city":"Singapore"}}"#;
+        let p_loc = parse_json_ip(loc_json).expect("location");
+        assert_eq!(p_loc.ip.as_deref(), Some("198.51.100.98"));
+        assert_eq!(p_loc.country.as_deref(), Some("SG"));
+        assert_eq!(p_loc.city.as_deref(), Some("Singapore"));
+
+        let geo_json = r#"{"ip":"203.0.113.45","geo":{"country":"JPN","city":"Tokyo"}}"#;
+        let p_geo = parse_json_ip(geo_json).expect("geo");
+        assert_eq!(p_geo.ip.as_deref(), Some("203.0.113.45"));
+        assert_eq!(p_geo.country.as_deref(), Some("JP"));
+        assert_eq!(p_geo.city.as_deref(), Some("Tokyo"));
+
+        // Cloudflare sentinel regions XX / T1 / ZZ must produce `country: None`
+        for sentinel in ["XX", "T1", "ZZ"] {
+            let body = format!("ip=198.51.100.98\nloc={sentinel}\ncolo=LAX\n");
+            let tr = parse_trace(&body).expect("trace sentinel");
+            assert_eq!(tr.raw_region.as_deref(), Some(sentinel));
+            assert!(
+                tr.country.is_none(),
+                "sentinel {sentinel} must not become country"
+            );
+
+            let jb = format!(r#"{{"ip":"198.51.100.98","country_code":"{sentinel}"}}"#);
+            let jp = parse_json_ip(&jb).expect("json sentinel");
+            assert!(jp.country.is_none());
+        }
     }
 }
