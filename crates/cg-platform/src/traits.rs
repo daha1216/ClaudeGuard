@@ -564,6 +564,13 @@ impl PlatformDriver for UnsupportedPlatformDriver {
         ))
     }
 
+    fn discover_cli_exes(&self, _cli_id: &str) -> PlatformResult<Vec<PathBuf>> {
+        Err(PlatformError::unsupported(
+            "process_guard",
+            "non-Windows platform",
+        ))
+    }
+
     fn kill_gui_agent(&self, _agent_id: &str) -> PlatformResult<Vec<ProcessIdentity>> {
         Err(PlatformError::unsupported(
             "process_guard",
@@ -571,7 +578,21 @@ impl PlatformDriver for UnsupportedPlatformDriver {
         ))
     }
 
+    fn kill_cli_agent(&self, _cli_id: &str) -> PlatformResult<Vec<ProcessIdentity>> {
+        Err(PlatformError::unsupported(
+            "process_guard",
+            "non-Windows platform",
+        ))
+    }
+
     fn sweep_claude(&self, _mode: SweepMode) -> PlatformResult<SweepReport> {
+        Err(PlatformError::unsupported(
+            "process_guard",
+            "non-Windows platform",
+        ))
+    }
+
+    fn sweep_all_orphans(&self) -> PlatformResult<SweepReport> {
         Err(PlatformError::unsupported(
             "process_guard",
             "non-Windows platform",
@@ -676,6 +697,15 @@ mod tests {
             .unwrap_err()
             .is_unsupported());
         assert!(drv.is_elevated().unwrap_err().is_unsupported());
+        assert!(drv
+            .discover_cli_exes("claude-code")
+            .unwrap_err()
+            .is_unsupported());
+        assert!(drv
+            .kill_cli_agent("claude-code")
+            .unwrap_err()
+            .is_unsupported());
+        assert!(drv.sweep_all_orphans().unwrap_err().is_unsupported());
         assert!(drv.send_toast("t", "b").unwrap_err().is_unsupported());
         assert!(drv.protect_secret(b"x").unwrap_err().is_unsupported());
     }

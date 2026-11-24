@@ -10,6 +10,7 @@ use std::time::Duration;
 use cg_protocol::{MihomoNodeInfo, MihomoStatus};
 
 const DEFAULT_LOOPBACK_PORTS: [u16; 3] = [9090, 9097, 9091];
+const MAX_CANDIDATE_NODES: usize = 64;
 const PREFERRED_GROUPS: [&str; 9] = [
     "claude",
     "ai",
@@ -28,27 +29,41 @@ pub struct ControllerEndpoint {
     pub secret: Option<String>,
 }
 
+fn strip_ascii_prefix_ci<'a>(s: &'a str, prefix_ascii: &str) -> Option<&'a str> {
+    if !prefix_ascii.is_ascii() {
+        return None;
+    }
+    let head = s.as_bytes().get(..prefix_ascii.len())?;
+    head.eq_ignore_ascii_case(prefix_ascii.as_bytes())
+        .then(|| s.get(prefix_ascii.len()..))
+        .flatten()
+}
+
 /// Validates and normalizes an `external-controller` value into a loopback HTTP base URL.
 pub fn normalize_loopback_controller(raw: &str) -> Option<String> {
-    let trimmed = raw
-        .trim()
-        .trim_matches('"')
-        .trim_matches('\'')
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .trim_end_matches('/');
+    let mut trimmed = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if let Some(rest) = strip_ascii_prefix_ci(trimmed, "http://")
+        .or_else(|| strip_ascii_prefix_ci(trimmed, "https://"))
+    {
+        trimmed = rest;
+    }
+    let trimmed = trimmed.trim_end_matches('/');
     if trimmed.is_empty() {
         return None;
     }
-    let normalized = if let Some(port) = trimmed.strip_prefix(':') {
+    let normalized = if let Some(port) = trimmed.strip_prefix(":::") {
+        format!("[::1]:{port}")
+    } else if let Some(port) = trimmed.strip_prefix("[::]:") {
+        format!("[::1]:{port}")
+    } else if let Some(port) = trimmed.strip_prefix(':') {
         format!("127.0.0.1:{port}")
     } else if let Some(rest) = trimmed.strip_prefix("0.0.0.0:") {
         format!("127.0.0.1:{rest}")
-    } else if trimmed.starts_with("127.0.0.1:")
-        || trimmed.starts_with("localhost:")
-        || trimmed.starts_with("[::1]:")
+    } else if strip_ascii_prefix_ci(trimmed, "127.0.0.1:").is_some()
+        || strip_ascii_prefix_ci(trimmed, "localhost:").is_some()
+        || strip_ascii_prefix_ci(trimmed, "[::1]:").is_some()
     {
-        trimmed.to_string()
+        trimmed.to_ascii_lowercase()
     } else {
         return None;
     };
@@ -105,15 +120,17 @@ fn parse_yaml_scalar(raw: &str) -> String {
             break;
         }
     }
-    s[..end].trim().to_string()
+    s.get(..end).unwrap_or(s).trim().to_string()
 }
 
 /// Lightweight zero-dependency YAML line parser for `external-controller` and `secret`.
 pub fn parse_clash_yaml_controller(content: &str) -> Option<ControllerEndpoint> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let mut ctrl: Option<String> = None;
     let mut secret: Option<String> = None;
 
     for raw_line in content.lines() {
+        let raw_line = raw_line.strip_prefix('\u{feff}').unwrap_or(raw_line);
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -136,6 +153,33 @@ pub fn parse_clash_yaml_controller(content: &str) -> Option<ControllerEndpoint> 
     }
 
     ctrl.map(|base_url| ControllerEndpoint { base_url, secret })
+}
+
+/// Detects whether a Clash/Mihomo YAML config defines a non-empty `external-controller-pipe:`
+/// (e.g. Clash Verge Rev v2+ Named Pipe mode when TCP `external-controller` is disabled).
+pub fn parse_clash_yaml_pipe(content: &str) -> Option<String> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let mut pipe: Option<String> = None;
+    for raw_line in content.lines() {
+        let raw_line = raw_line.strip_prefix('\u{feff}').unwrap_or(raw_line);
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if raw_line.starts_with(' ') || raw_line.starts_with('\t') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("external-controller-pipe:") {
+            let val = parse_yaml_scalar(rest);
+            if !val.is_empty()
+                && !val.eq_ignore_ascii_case("null")
+                && !val.eq_ignore_ascii_case("~")
+            {
+                pipe = Some(val);
+            }
+        }
+    }
+    pipe
 }
 
 pub(crate) fn candidate_config_paths_for_homes(homes: &[PathBuf]) -> Vec<PathBuf> {
@@ -206,16 +250,26 @@ pub(crate) fn dedup_endpoints(from_configs: Vec<ControllerEndpoint>) -> Vec<Cont
     found
 }
 
-fn discover_endpoints() -> Vec<ControllerEndpoint> {
+fn discover_endpoints_and_pipe() -> (Vec<ControllerEndpoint>, Option<String>) {
     let mut raw = Vec::new();
+    let mut pipe_hint: Option<String> = None;
     for path in candidate_config_paths() {
         if let Ok(text) = fs::read_to_string(&path) {
             if let Some(ep) = parse_clash_yaml_controller(&text) {
                 raw.push(ep);
             }
+            if pipe_hint.is_none() {
+                pipe_hint = parse_clash_yaml_pipe(&text);
+            }
         }
     }
-    dedup_endpoints(raw)
+    (dedup_endpoints(raw), pipe_hint)
+}
+
+fn pipe_only_diagnostic_note(pipe_name: &str) -> String {
+    format!(
+        "检测到本机代理启用了命名管道控制接口（external-controller-pipe: {pipe_name}），未开启本地 HTTP 外部控制端口（可在代理设置中开启 127.0.0.1:9090/9097）"
+    )
 }
 
 fn build_loopback_agent() -> ureq::Agent {
@@ -331,11 +385,24 @@ pub fn parse_proxies_json(
                     name: name.to_string(),
                     delay_ms: node_delay(name),
                 });
-                if candidates.len() >= 12 {
+                if candidates.len() >= MAX_CANDIDATE_NODES {
                     break;
                 }
             }
         }
+    }
+    if !active_node.is_empty()
+        && !active_node.eq_ignore_ascii_case("DIRECT")
+        && !active_node.eq_ignore_ascii_case("REJECT")
+        && !candidates.iter().any(|c| c.name == active_node)
+    {
+        if candidates.len() >= MAX_CANDIDATE_NODES {
+            let _ = candidates.pop();
+        }
+        candidates.push(MihomoNodeInfo {
+            name: active_node.clone(),
+            delay_ms: active_delay_ms,
+        });
     }
 
     let note = if active_node.is_empty() {
@@ -361,7 +428,8 @@ pub fn parse_proxies_json(
 /// Probes discovered loopback Mihomo/Clash controllers and returns live node status.
 pub fn inspect_mihomo() -> MihomoStatus {
     let agent = build_loopback_agent();
-    for ep in discover_endpoints() {
+    let (endpoints, pipe_hint) = discover_endpoints_and_pipe();
+    for ep in endpoints {
         let ver_url = format!("{}/version", ep.base_url);
         let Ok(ver_resp) = apply_auth(agent.get(&ver_url), ep.secret.as_deref()).call() else {
             continue;
@@ -397,10 +465,15 @@ pub fn inspect_mihomo() -> MihomoStatus {
         }
     }
 
+    let note = match pipe_hint {
+        Some(pipe_name) => pipe_only_diagnostic_note(&pipe_name),
+        None => {
+            "未检测到本机 Mihomo / Clash 外部控制接口（支持 127.0.0.1:9090/9097 自动发现）".into()
+        }
+    };
     MihomoStatus {
         available: false,
-        note: "未检测到本机 Mihomo / Clash 外部控制接口（支持 127.0.0.1:9090/9097 自动发现）"
-            .into(),
+        note,
         ..MihomoStatus::default()
     }
 }
@@ -417,22 +490,47 @@ fn percent_encode_segment(raw: &str) -> String {
     out
 }
 
-/// Switches the active proxy node in a Selector group and optionally closes active connections
-/// (`DELETE /connections`) so leaked sockets terminate immediately.
-pub fn switch_mihomo_node(
+pub(crate) fn switch_mihomo_node_on_endpoints(
+    endpoints: &[ControllerEndpoint],
+    pipe_hint: Option<&str>,
     group: &str,
     node: &str,
     close_connections: bool,
 ) -> Result<String, String> {
-    let group = group.trim();
-    let node = node.trim();
-    if group.is_empty() || node.is_empty() {
+    if group.trim().is_empty() || node.trim().is_empty() {
         return Err("策略组名称与目标节点名称均不能为空".into());
     }
     let agent = build_loopback_agent();
-    let mut last_err = "未检测到可用的本机 Mihomo / Clash 外部控制接口".to_string();
+    let mut last_err = match pipe_hint {
+        Some(pipe_name) => pipe_only_diagnostic_note(pipe_name),
+        None => "未检测到可用的本机 Mihomo / Clash 外部控制接口".to_string(),
+    };
 
-    for ep in discover_endpoints() {
+    for ep in endpoints {
+        // Verify this loopback endpoint actually speaks Clash/Mihomo `GET /version` == 200
+        // before sending `PUT /proxies/{group}` or `DELETE /connections` with `Authorization`.
+        let ver_url = format!("{}/version", ep.base_url);
+        let ver_resp = match apply_auth(agent.get(&ver_url), ep.secret.as_deref()).call() {
+            Ok(r) if r.status() == 200 => r,
+            Err(ureq::Error::Status(401 | 403, _)) => {
+                last_err = "控制接口鉴权失败（secret 不匹配）".to_string();
+                continue;
+            }
+            _ => continue,
+        };
+        let ver_body = ver_resp.into_string().unwrap_or_default();
+        let valid_version = serde_json::from_str::<serde_json::Value>(&ver_body)
+            .ok()
+            .and_then(|v| {
+                v.get("version")
+                    .and_then(|s| s.as_str())
+                    .map(|s| !s.is_empty())
+            })
+            .unwrap_or(false);
+        if !valid_version {
+            continue;
+        }
+
         let put_url = format!("{}/proxies/{}", ep.base_url, percent_encode_segment(group));
         let payload = serde_json::json!({ "name": node }).to_string();
         match apply_auth(agent.put(&put_url), ep.secret.as_deref())
@@ -465,6 +563,26 @@ pub fn switch_mihomo_node(
     }
 
     Err(last_err)
+}
+
+/// Switches the active proxy node in a Selector group and optionally closes active connections
+/// (`DELETE /connections`) so leaked sockets terminate immediately.
+pub fn switch_mihomo_node(
+    group: &str,
+    node: &str,
+    close_connections: bool,
+) -> Result<String, String> {
+    if group.trim().is_empty() || node.trim().is_empty() {
+        return Err("策略组名称与目标节点名称均不能为空".into());
+    }
+    let (endpoints, pipe_hint) = discover_endpoints_and_pipe();
+    switch_mihomo_node_on_endpoints(
+        &endpoints,
+        pipe_hint.as_deref(),
+        group,
+        node,
+        close_connections,
+    )
 }
 
 /// Inspects a single YAML config file path (primarily for unit tests).
@@ -603,5 +721,147 @@ secret: "my-local-secret"
                 "missing candidate config path suffix {expected_suffix}"
             );
         }
+    }
+
+    #[test]
+    fn bom_ipv6_wildcard_pipe_note_64_candidates_and_version_gated_untrimmed_switch() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // 1. UTF-8 BOM on first line + `[::]:port` / `:::port`
+        let bom_yaml = "\u{feff}external-controller: \"[::]:9097\"\nsecret: \"bom-sec\"\n";
+        let ep_bom = parse_clash_yaml_controller(bom_yaml).expect("parse BOM yaml");
+        assert_eq!(ep_bom.base_url, "http://[::1]:9097");
+        assert_eq!(ep_bom.secret.as_deref(), Some("bom-sec"));
+        assert_eq!(
+            normalize_loopback_controller(":::9090").as_deref(),
+            Some("http://[::1]:9090")
+        );
+
+        // 2. Named pipe diagnostic detection (`external-controller-pipe:`)
+        let pipe_yaml = "\u{feff}external-controller-pipe: \\\\.\\pipe\\verge-mihomo\n";
+        assert_eq!(
+            parse_clash_yaml_pipe(pipe_yaml).as_deref(),
+            Some(r"\\.\pipe\verge-mihomo")
+        );
+        let pipe_err = switch_mihomo_node_on_endpoints(
+            &[],
+            Some(r"\\.\pipe\verge-mihomo"),
+            "Proxy",
+            "US-01",
+            false,
+        )
+        .unwrap_err();
+        assert!(pipe_err.contains("external-controller-pipe"));
+
+        // 3. Candidate limit 64 + active_node beyond #64 is always included
+        let mut all_nodes = vec!["\"DIRECT\"".to_string()];
+        for i in 1..=70 {
+            all_nodes.push(format!("\"Node-{i:02}\""));
+        }
+        let big_json = format!(
+            r#"{{"proxies":{{"Node-70":{{"type":"VLESS","history":[{{"delay":31}}]}},"Proxy":{{"type":"Selector","now":"Node-70","all":[{}]}}}}}}"#,
+            all_nodes.join(",")
+        );
+        let st = parse_proxies_json("http://127.0.0.1:9090", "Mihomo", &big_json).unwrap();
+        assert_eq!(st.candidates.len(), 64);
+        assert!(
+            st.candidates
+                .iter()
+                .any(|c| c.name == "Node-70" && c.delay_ms == Some(31)),
+            "active_node must always be included even past index 64"
+        );
+
+        // 4. `switch_mihomo_node` checks `GET /version` before `PUT` and preserves untrimmed spaces
+        let non_mihomo = TcpListener::bind("127.0.0.1:0").unwrap();
+        let non_mihomo_addr = non_mihomo.local_addr().unwrap();
+        let h_non = std::thread::spawn(move || {
+            let mut req_count = 0usize;
+            if let Ok((mut sock, _)) = non_mihomo.accept() {
+                req_count += 1;
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+            req_count
+        });
+
+        let real_mihomo = TcpListener::bind("127.0.0.1:0").unwrap();
+        let real_addr = real_mihomo.local_addr().unwrap();
+        let h_real = std::thread::spawn(move || {
+            let mut put_req = String::new();
+            for step in 0..2 {
+                if let Ok((mut sock, _)) = real_mihomo.accept() {
+                    let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut raw_bytes = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    loop {
+                        match sock.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                raw_bytes.extend_from_slice(&buf[..n]);
+                                let cur = String::from_utf8_lossy(&raw_bytes);
+                                if step == 0 && cur.contains("\r\n\r\n") {
+                                    break;
+                                }
+                                if step == 1 && cur.contains("\r\n\r\n") && cur.ends_with('}') {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let raw = String::from_utf8_lossy(&raw_bytes).into_owned();
+                    if step == 0 {
+                        let body = r#"{"meta":true,"version":"v1.19.0"}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes());
+                    } else {
+                        put_req = raw;
+                        let _ = sock.write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                }
+            }
+            put_req
+        });
+
+        let msg = switch_mihomo_node_on_endpoints(
+            &[
+                ControllerEndpoint {
+                    base_url: format!("http://{non_mihomo_addr}"),
+                    secret: Some("sec-1".into()),
+                },
+                ControllerEndpoint {
+                    base_url: format!("http://{real_addr}"),
+                    secret: Some("sec-2".into()),
+                },
+            ],
+            None,
+            " 节点选择 ",
+            " US 01 ",
+            false,
+        )
+        .expect("switch on verified Mihomo endpoint");
+        assert!(msg.contains("[ 节点选择 ]") && msg.contains("「 US 01 」"));
+        assert_eq!(
+            h_non.join().unwrap(),
+            1,
+            "non-Mihomo server must never receive PUT"
+        );
+        let captured_put = h_real.join().unwrap();
+        assert!(
+            captured_put.contains("PUT /proxies/%20%E8%8A%82%E7%82%B9%E9%80%89%E6%8B%A9%20 "),
+            "group leading/trailing spaces must be preserved: {captured_put}"
+        );
+        assert!(
+            captured_put.contains(r#"{"name":" US 01 "}"#),
+            "node leading/trailing spaces must be preserved: {captured_put}"
+        );
     }
 }

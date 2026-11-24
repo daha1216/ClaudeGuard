@@ -51,13 +51,93 @@ pub fn lockdown_rule_name(agent_id: &str) -> String {
     format!("{LOCKDOWN_RULE_PREFIX} ({agent_id})")
 }
 
+fn strip_ascii_prefix_ci<'a>(s: &'a str, prefix_ascii: &str) -> Option<&'a str> {
+    if !prefix_ascii.is_ascii() {
+        return None;
+    }
+    let head = s.as_bytes().get(..prefix_ascii.len())?;
+    head.eq_ignore_ascii_case(prefix_ascii.as_bytes())
+        .then(|| s.get(prefix_ascii.len()..))
+        .flatten()
+}
+
+fn strip_verbatim_win32_prefix(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(unc) = strip_ascii_prefix_ci(trimmed, r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(dos) = trimmed.strip_prefix(r"\\?\") {
+        dos.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Resolve an executable path via `GetFinalPathNameByHandleW(..., VOLUME_NAME_DOS)` on Windows
+/// (stripping `\\?\` / `\\?\UNC\` so `INetFwRule::SetApplicationName` never rejects extended-length
+/// or junction paths), falling back to prefix-stripped path in mock/offline tests.
+pub fn resolve_program_path_for_firewall(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, GetFinalPathNameByHandleW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, VOLUME_NAME_DOS,
+        };
+
+        struct HandleGuard(HANDLE);
+        impl Drop for HandleGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        if let Ok(h) = unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                None,
+            )
+        } {
+            if h != INVALID_HANDLE_VALUE {
+                let _guard = HandleGuard(h);
+                let mut buf = vec![0u16; 4096];
+                let len =
+                    unsafe { GetFinalPathNameByHandleW(h, &mut buf, VOLUME_NAME_DOS) } as usize;
+                if len > 0 && len < buf.len() {
+                    let resolved = String::from_utf16_lossy(&buf[..len]);
+                    let cleaned = strip_verbatim_win32_prefix(&resolved).replace('/', "\\");
+                    if !cleaned.is_empty() {
+                        return PathBuf::from(cleaned);
+                    }
+                }
+            }
+        }
+    }
+
+    let fallback = strip_verbatim_win32_prefix(&path.to_string_lossy()).replace('/', "\\");
+    PathBuf::from(fallback)
+}
+
 /// Build desired Inbound + Outbound block rules for an agent's discovered executables.
 pub fn agent_quarantine_specs(agent_id: &str, exes: &[PathBuf]) -> Vec<FirewallRuleSpec> {
     let (name_out, name_in) = quarantine_rule_names(agent_id);
     let mut specs = Vec::with_capacity(exes.len() * 2);
     for exe in exes {
-        specs.push(FirewallRuleSpec::block_out(name_out.clone(), exe.clone()));
-        specs.push(FirewallRuleSpec::block_in(name_in.clone(), exe.clone()));
+        let resolved = resolve_program_path_for_firewall(exe);
+        specs.push(FirewallRuleSpec::block_out(
+            name_out.clone(),
+            resolved.clone(),
+        ));
+        specs.push(FirewallRuleSpec::block_in(name_in.clone(), resolved));
     }
     specs
 }
@@ -66,7 +146,9 @@ pub fn agent_quarantine_specs(agent_id: &str, exes: &[PathBuf]) -> Vec<FirewallR
 pub fn agent_lockdown_specs(agent_id: &str, exes: &[PathBuf]) -> Vec<FirewallRuleSpec> {
     let name = lockdown_rule_name(agent_id);
     exes.iter()
-        .map(|exe| FirewallRuleSpec::block_out(name.clone(), exe.clone()))
+        .map(|exe| {
+            FirewallRuleSpec::block_out(name.clone(), resolve_program_path_for_firewall(exe))
+        })
         .collect()
 }
 
@@ -77,7 +159,9 @@ pub fn global_cut_spec() -> FirewallRuleSpec {
 
 /// Normalize executable paths for case-insensitive, separator-consistent rule comparison.
 pub fn normalize_program_path(raw: &str) -> String {
-    raw.trim().replace('/', "\\").to_ascii_lowercase()
+    strip_verbatim_win32_prefix(raw)
+        .replace('/', "\\")
+        .to_ascii_lowercase()
 }
 
 /// Pure predicate: does an observed OS rule satisfy a desired `FirewallRuleSpec`?
@@ -93,8 +177,9 @@ pub fn rule_matches_spec(record: &FirewallRuleRecord, spec: &FirewallRuleSpec) -
     }
     match &spec.program {
         Some(path) => {
+            let resolved = resolve_program_path_for_firewall(path);
             normalize_program_path(&record.program)
-                == normalize_program_path(&path.to_string_lossy())
+                == normalize_program_path(&resolved.to_string_lossy())
         }
         None => record.program.trim().is_empty(),
     }
@@ -170,20 +255,46 @@ pub fn release_agent(engine: &dyn FirewallEngine, agent_id: &str) -> PlatformRes
     engine.remove_rules_by_name(&names)
 }
 
-/// Apply per-agent outbound lockdown rules (`ClaudeGuard Lockdown (<agent>)`) and verify.
+pub(crate) fn is_prunable_managed_rule_name(name_lower: &str) -> bool {
+    let n = name_lower.trim();
+    n.starts_with(&LOCKDOWN_RULE_PREFIX.to_ascii_lowercase())
+        || n.starts_with(&FW_RULE_OUT.to_ascii_lowercase())
+        || n.starts_with(&FW_RULE_IN.to_ascii_lowercase())
+}
+
+/// Apply per-agent outbound lockdown rules (`ClaudeGuard Lockdown (<agent>)`), prune stale
+/// `KNOWN_GUI_AGENT_IDS` lockdown rules not in `agent_exes`, and verify.
 pub fn apply_lockdown(
     engine: &dyn FirewallEngine,
     agent_exes: &[(String, Vec<PathBuf>)],
 ) -> PlatformResult<Coverage> {
     let mut specs = Vec::new();
+    let mut active_ids: HashSet<String> = HashSet::new();
     for (agent_id, exes) in agent_exes {
-        specs.extend(agent_lockdown_specs(agent_id, exes));
+        if !exes.is_empty() {
+            active_ids.insert(agent_id.trim().to_ascii_lowercase());
+            specs.extend(agent_lockdown_specs(agent_id, exes));
+        }
     }
+
+    let stale_names: Vec<String> = cg_protocol::KNOWN_GUI_AGENT_IDS
+        .iter()
+        .filter(|id| !active_ids.contains(&id.to_ascii_lowercase()))
+        .map(|id| lockdown_rule_name(id))
+        .collect();
+
     if specs.is_empty() {
+        if !stale_names.is_empty() {
+            let _ = engine.remove_rules_by_name(&stale_names);
+        }
         return Ok(Coverage::default());
     }
     let _ = engine.ensure_profiles_enabled()?;
-    engine.ensure_rules(&specs)
+    let cov = engine.ensure_rules(&specs)?;
+    if !stale_names.is_empty() {
+        let _ = engine.remove_rules_by_name(&stale_names);
+    }
+    Ok(cov)
 }
 
 /// Clear all `ClaudeGuard Lockdown*` rules idempotently and verify.
@@ -420,6 +531,16 @@ mod win_impl {
             Ok(out)
         }
 
+        pub(crate) fn enumerate_com_rules_with_prefix(
+            rules: &INetFwRules,
+            prefix: &str,
+        ) -> PlatformResult<Vec<(INetFwRule, FirewallRuleRecord)>> {
+            let prefix_l = prefix.trim().to_ascii_lowercase();
+            Self::enumerate_matching(rules, |name| {
+                prefix_l.is_empty() || name.trim().to_ascii_lowercase().starts_with(&prefix_l)
+            })
+        }
+
         fn add_single_rule(rules: &INetFwRules, spec: &FirewallRuleSpec) -> PlatformResult<()> {
             let rule: INetFwRule = unsafe { CoCreateInstance(&NetFwRule, None, CLSCTX_ALL) }
                 .map_err(|e| map_win_err(e, "CoCreateInstance(NetFwRule)"))?;
@@ -427,7 +548,14 @@ mod win_impl {
                 rule.SetName(&BSTR::from(&spec.name))
                     .map_err(|e| map_win_err(e, "INetFwRule::SetName"))?;
                 if let Some(prog) = &spec.program {
-                    let prog_str = prog.to_string_lossy();
+                    let resolved = resolve_program_path_for_firewall(prog);
+                    let prog_str = resolved.to_string_lossy();
+                    if prog_str.trim().is_empty() {
+                        return Err(PlatformError::InvalidInput(
+                            "refusing to add per-app firewall rule with empty ApplicationName"
+                                .to_string(),
+                        ));
+                    }
                     rule.SetApplicationName(&BSTR::from(prog_str.as_ref()))
                         .map_err(|e| map_win_err(e, "INetFwRule::SetApplicationName"))?;
                 }
@@ -560,7 +688,7 @@ mod win_impl {
                 return Ok(build_coverage(None, desired, 0));
             };
             let before: Vec<FirewallRuleRecord> =
-                before_pairs.into_iter().map(|(_, rec)| rec).collect();
+                before_pairs.iter().map(|(_, rec)| rec.clone()).collect();
 
             let mut added = 0usize;
             let mut last_err: Option<PlatformError> = None;
@@ -574,6 +702,30 @@ mod win_impl {
                 }
             }
 
+            // Prune pre-existing rules sharing any managed Lockdown/Quarantine rule name in `desired`
+            // whose `program` / direction / action no longer matches `desired` (add-first, zero gap).
+            if last_err.is_none() {
+                let managed_names: HashSet<String> = desired
+                    .iter()
+                    .map(|s| s.name.trim().to_ascii_lowercase())
+                    .filter(|n| is_prunable_managed_rule_name(n))
+                    .collect();
+                if !managed_names.is_empty() {
+                    let pid = std::process::id();
+                    for (seq, (rule, rec)) in before_pairs.iter().enumerate() {
+                        let rec_name_l = rec.name.trim().to_ascii_lowercase();
+                        if managed_names.contains(&rec_name_l)
+                            && !desired.iter().any(|s| rule_matches_spec(rec, s))
+                        {
+                            let sentinel = format!("__CG_PRUNE_{pid}_{seq}");
+                            if unsafe { rule.SetName(&BSTR::from(&sentinel)) }.is_ok() {
+                                let _ = unsafe { rules.Remove(&BSTR::from(&sentinel)) };
+                            }
+                        }
+                    }
+                }
+            }
+
             let after = Self::enumerate_matching(&rules, |name| {
                 name.trim()
                     .to_ascii_lowercase()
@@ -583,7 +735,7 @@ mod win_impl {
             .map(|pairs| pairs.into_iter().map(|(_, rec)| rec).collect::<Vec<_>>());
 
             let cov = build_coverage(after.as_deref(), desired, added);
-            if !cov.query_ok {
+            if !cov.complete() {
                 if let Some(err) = last_err {
                     return Err(err);
                 }
@@ -800,6 +952,11 @@ mod tests {
             let mut added = 0usize;
             {
                 let mut rules = self.rules.lock().unwrap();
+                let managed_names: HashSet<String> = desired
+                    .iter()
+                    .map(|s| s.name.trim().to_ascii_lowercase())
+                    .filter(|n| is_prunable_managed_rule_name(n))
+                    .collect();
                 for spec in desired {
                     if !rules.iter().any(|r| rule_matches_spec(r, spec)) {
                         rules.push(FirewallRuleRecord {
@@ -807,7 +964,11 @@ mod tests {
                             program: spec
                                 .program
                                 .as_ref()
-                                .map(|p| p.to_string_lossy().to_string())
+                                .map(|p| {
+                                    resolve_program_path_for_firewall(p)
+                                        .to_string_lossy()
+                                        .to_string()
+                                })
                                 .unwrap_or_default(),
                             direction: spec.direction,
                             action: spec.action,
@@ -816,6 +977,13 @@ mod tests {
                         });
                         added += 1;
                     }
+                }
+                if !managed_names.is_empty() {
+                    rules.retain(|r| {
+                        let name_l = r.name.trim().to_ascii_lowercase();
+                        !managed_names.contains(&name_l)
+                            || desired.iter().any(|s| rule_matches_spec(r, s))
+                    });
                 }
             }
             let after = self.enumerate_rules(CG_RULE_PREFIX).ok();
@@ -1061,6 +1229,74 @@ mod tests {
         assert!(clear_lockdown(engine.as_ref()).unwrap().clean());
         assert!(clear_global_cut(engine.as_ref()).unwrap().clean());
         assert!(engine.enumerate_rules(CG_RULE_PREFIX).unwrap().is_empty());
+    }
+
+    #[test]
+    fn verbatim_prefix_stripping_stale_agent_lockdown_and_program_upgrade_pruning() {
+        assert_eq!(
+            normalize_program_path(r"\\?\C:\Program Files\WindowsApps\Claude\claude.exe"),
+            r"c:\program files\windowsapps\claude\claude.exe"
+        );
+        assert_eq!(
+            normalize_program_path(r"\\?\UNC\Server\Share\Claude.exe"),
+            r"\\server\share\claude.exe"
+        );
+
+        let engine = Arc::new(MockFirewall::with_profiles(true, true, true));
+        // 1. Lockdown on both claude & chatgpt, then re-apply with ONLY claude (upgraded exe path!)
+        let _ = apply_lockdown(
+            engine.as_ref(),
+            &[
+                (
+                    "claude".into(),
+                    vec![PathBuf::from(r"\\?\C:\Apps\Claude_v1\claude.exe")],
+                ),
+                (
+                    "chatgpt".into(),
+                    vec![PathBuf::from(r"C:\Apps\ChatGPT\chatgpt.exe")],
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(lockdown_status(engine.as_ref()).rules, 2);
+
+        let cov2 = apply_lockdown(
+            engine.as_ref(),
+            &[(
+                "claude".into(),
+                vec![PathBuf::from(r"C:\Apps\Claude_v2\claude.exe")],
+            )],
+        )
+        .unwrap();
+        assert!(cov2.complete());
+        let remaining = engine.enumerate_rules(LOCKDOWN_RULE_PREFIX).unwrap();
+        // `chatgpt` lockdown rule removed AND `Claude_v1\claude.exe` pruned in favor of `Claude_v2\claude.exe`!
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "ClaudeGuard Lockdown (claude)");
+        assert_eq!(
+            normalize_program_path(&remaining[0].program),
+            r"c:\apps\claude_v2\claude.exe"
+        );
+
+        // 2. Quarantine upgrade also prunes stale v1 program under same Block Out/In rule names
+        let _ = quarantine_agent(
+            engine.as_ref(),
+            "claude",
+            &[PathBuf::from(r"C:\Apps\Claude_v1\claude.exe")],
+        )
+        .unwrap();
+        let q2 = quarantine_agent(
+            engine.as_ref(),
+            "claude",
+            &[PathBuf::from(r"C:\Apps\Claude_v2\claude.exe")],
+        )
+        .unwrap();
+        assert!(q2.complete());
+        let q_rules = engine.enumerate_rules("ClaudeGuard Block").unwrap();
+        assert_eq!(q_rules.len(), 2);
+        assert!(q_rules
+            .iter()
+            .all(|r| normalize_program_path(&r.program) == r"c:\apps\claude_v2\claude.exe"));
     }
 
     #[cfg(windows)]
