@@ -15,7 +15,9 @@ pub fn evaluate(target: &Target, probe: &ProbeResult) -> Evaluation {
 /// Evaluates a single target probe under the requested [`PolicyPreset`].
 ///
 /// Invariants (`CONTRACT-v3.10.md` D4 & `AGENTS.md` #1-3):
-/// - `AnchorKind::Reachability`: passes on any HTTP response (`probe.reachable`), fails otherwise.
+/// - `AnchorKind::Reachability`: passes on any HTTP response (`probe.reachable`); transport/network
+///   failure returns `PolicyVerdict::Unverified` (blocks Launch Gate & holds Flow A recovery,
+///   never falsely trips or kills running apps on proxy jitter).
 /// - Missing info / transport failure -> `PolicyVerdict::Unverified` (never `Fail`, never trips).
 /// - Empty allowlist (`expect_ips.is_empty() && expect_regions.is_empty()`) -> NEVER passes
 ///   (except `Reachability`): returns `Fail` when egress info is present, `Unverified` if missing.
@@ -36,7 +38,11 @@ pub fn evaluate_with_preset(
                 Some("reachability".into()),
             )
         } else {
-            eval(PolicyVerdict::Fail, "不可达", None)
+            eval(
+                PolicyVerdict::Unverified,
+                format!("经代理暂不可达（{}）", network_reason(probe)),
+                None,
+            )
         };
     }
 
@@ -321,10 +327,11 @@ mod tests {
             evaluate_with_preset(&t, &probe(None, None), PolicyPreset::StrictStaticIp).verdict,
             PolicyVerdict::Pass
         );
-        assert_eq!(
-            evaluate(&t, &ProbeResult::failed("timeout")).verdict,
-            PolicyVerdict::Fail
-        );
+        // Proxy/network jitter on Reachability evaluates to Unverified so it blocks launch
+        // and warns the user without falsely tripping or killing running apps.
+        let timeout_eval = evaluate(&t, &ProbeResult::failed("timeout"));
+        assert_eq!(timeout_eval.verdict, PolicyVerdict::Unverified);
+        assert!(timeout_eval.reason.contains("暂不可达"));
     }
 
     #[test]

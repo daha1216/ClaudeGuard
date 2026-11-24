@@ -114,6 +114,14 @@ pub struct Config {
     pub kill_cli_on_fail: bool,
     #[serde(default = "default_true")]
     pub quarantine_on_fail: bool,
+    /// Suppress automatic trip/isolation when proxy access is intact and the observed egress IP
+    /// has not changed from the last verified compliant baseline under the current config revision.
+    #[serde(default = "default_true")]
+    pub suppress_trip_when_ip_unchanged: bool,
+    /// Observe-only mode: keep read-only probing, alerts, timeline, and launch-gate checks active
+    /// without executing automatic trip isolation, process kills, or auto-lockdown.
+    #[serde(default)]
+    pub monitor_only: bool,
     #[serde(default)]
     pub cut_mode: CutMode,
     #[serde(default = "default_true")]
@@ -195,6 +203,8 @@ impl Default for Config {
             kill_on_fail: true,
             kill_cli_on_fail: true,
             quarantine_on_fail: true,
+            suppress_trip_when_ip_unchanged: true,
+            monitor_only: false,
             cut_mode: CutMode::Off,
             lockdown_on_uncovered: true,
             sweep_on_exit: true,
@@ -555,16 +565,26 @@ mod tests {
     fn kill_cli_on_fail_defaults_true_and_roundtrips() {
         let def = Config::default();
         assert!(def.kill_cli_on_fail);
+        assert!(def.suppress_trip_when_ip_unchanged);
+        assert!(!def.monitor_only);
 
         let omitted: Config = serde_json::from_str(r#"{"version":4}"#).expect("omitted field");
         assert!(omitted.kill_cli_on_fail);
+        assert!(omitted.suppress_trip_when_ip_unchanged);
+        assert!(!omitted.monitor_only);
 
-        let disabled: Config =
-            serde_json::from_str(r#"{"version":4,"kill_cli_on_fail":false}"#).expect("false");
+        let disabled: Config = serde_json::from_str(
+            r#"{"version":4,"kill_cli_on_fail":false,"suppress_trip_when_ip_unchanged":false,"monitor_only":true}"#,
+        )
+        .expect("custom breaker flags");
         assert!(!disabled.kill_cli_on_fail);
+        assert!(!disabled.suppress_trip_when_ip_unchanged);
+        assert!(disabled.monitor_only);
         let json = serde_json::to_string(&disabled).expect("serialize");
         let back = Config::from_json_str(&json).expect("roundtrip");
         assert!(!back.kill_cli_on_fail);
+        assert!(!back.suppress_trip_when_ip_unchanged);
+        assert!(back.monitor_only);
     }
 
     #[test]

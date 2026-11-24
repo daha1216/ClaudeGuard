@@ -386,6 +386,47 @@ pub trait ProbeRunner: Send + Sync {
     ) -> (AccessEvidence, Vec<(String, ProbeResult)>);
 }
 
+const PROBE_JITTER_RETRY_DELAY: Duration = Duration::from_millis(350);
+
+/// Probe a single target over `route`, absorbing one transient proxy/TLS blip when the initial
+/// transport error occurs fast enough to retry inside the original timeout budget.
+/// Strictly reuses the exact same `ProbeRoute` (never falls back to direct).
+fn probe_target_with_jitter_retry(route: &ProbeRoute, target: &Target) -> ProbeResult {
+    let timeout = Duration::from_secs(target.timeout_secs.clamp(3, 60));
+    let started = Instant::now();
+    let first = probe_http::probe_url(route, &target.anchor_url, timeout, anchors::MAX_BODY_BYTES);
+    let resp = match first {
+        Ok(resp) => Ok(resp),
+        Err(first_err) => {
+            let elapsed = started.elapsed();
+            if !matches!(route, ProbeRoute::Skip(_)) && elapsed < timeout / 2 {
+                std::thread::sleep(PROBE_JITTER_RETRY_DELAY);
+                let remaining = timeout
+                    .saturating_sub(started.elapsed())
+                    .max(Duration::from_secs(2));
+                probe_http::probe_url(
+                    route,
+                    &target.anchor_url,
+                    remaining,
+                    anchors::MAX_BODY_BYTES,
+                )
+                .or(Err(first_err))
+            } else {
+                Err(first_err)
+            }
+        }
+    };
+    match resp {
+        Ok(resp) => anchors::parse_body_bytes(
+            target.anchor_kind,
+            resp.body.as_bytes(),
+            Some(resp.status),
+            resp.latency_ms,
+        ),
+        Err(err) => ProbeResult::failed(err.to_string()),
+    }
+}
+
 /// Production [`ProbeRunner`] using `cg_platform` access inspection + `NetworkPolicy` HTTP probes + `cg_core` parsers.
 #[derive(Debug, Default)]
 pub struct PlatformProbeRunner;
@@ -416,21 +457,7 @@ impl ProbeRunner for PlatformProbeRunner {
             for target in enabled {
                 let r = &route;
                 handles.push(scope.spawn(move || {
-                    let timeout = Duration::from_secs(target.timeout_secs.clamp(3, 60));
-                    let probe = match probe_http::probe_url(
-                        r,
-                        &target.anchor_url,
-                        timeout,
-                        anchors::MAX_BODY_BYTES,
-                    ) {
-                        Ok(resp) => anchors::parse_body_bytes(
-                            target.anchor_kind,
-                            resp.body.as_bytes(),
-                            Some(resp.status),
-                            resp.latency_ms,
-                        ),
-                        Err(err) => ProbeResult::failed(err.to_string()),
-                    };
+                    let probe = probe_target_with_jitter_retry(r, target);
                     (target.id.clone(), probe)
                 }));
             }
@@ -5427,5 +5454,42 @@ mod tests {
             "SaveConfig while Disarmed must NOT write firewall leak shield rules"
         );
         coord2.shutdown();
+    }
+
+    #[test]
+    fn monitor_only_prevents_killing_antigravity_through_coordinator() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(ControllableDriver::new());
+        let pass = Arc::new(AtomicBool::new(true));
+        let runner = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: pass.clone(),
+            ip_on_pass: "198.51.100.98".into(),
+        });
+        let recovery = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
+        let coord = boot_actor(dir.path(), driver.clone(), runner, recovery);
+
+        let mut cfg = make_cfg("US");
+        cfg.monitor_only = true;
+        cfg.guarded_agents = vec!["claude".into(), "chatgpt".into(), "antigravity".into()];
+        assert!(matches!(
+            coord.dispatch(PipeRequest::CompleteOnboarding { config: cfg }),
+            PipeResponse::Ack { .. }
+        ));
+
+        // Flip to non-compliant CN IP and recheck -> must NOT isolate or kill in monitor_only mode.
+        pass.store(false, Ordering::Release);
+        assert!(matches!(
+            coord.dispatch(PipeRequest::RecheckNow { target_id: None }),
+            PipeResponse::Ack { .. }
+        ));
+        let snap = coord.snapshot();
+        assert_eq!(snap.protection, ProtectionState::Monitoring);
+        assert!(snap.tripped.is_none());
+        assert!(driver.gui_killed_calls.lock().unwrap().is_empty());
+        assert!(snap.launch_error.contains("仅监测"));
+
+        coord.shutdown();
     }
 }
