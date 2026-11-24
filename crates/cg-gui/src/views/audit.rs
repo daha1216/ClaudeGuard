@@ -9,7 +9,7 @@ use crate::app::{ActionScope, AppController, ConsoleWindowView};
 use crate::assets::ui_icon;
 use crate::motion::PageChoreo;
 use crate::protocol::{LogLevel, PipeRequest, TimelineStatus, UiLabelExt};
-use crate::state::{ConsoleProjection, format_unix_hm};
+use crate::state::{ConsoleProjection, format_unix_hm, format_unix_ymdhms};
 use crate::theme::ThemePalette;
 use crate::widgets::controls::{
     ButtonKind, action_button, bento_card_bloom, inset_box, mono_tabular, spinning_ui_icon,
@@ -43,6 +43,7 @@ pub fn render_audit_page(
 
     let ctrl_clear = ctrl.clone();
     let ctrl_refresh = ctrl.clone();
+    let ctrl_copy_batch = ctrl.clone();
     let ctrl_export = ctrl.clone();
     let ctrl_reset_all = ctrl.clone();
     let ctrl_clear_search = ctrl.clone();
@@ -160,6 +161,7 @@ pub fn render_audit_page(
         .cloned()
         .collect();
     let log_count = logs.len();
+    let logs_for_batch_copy = logs.clone();
     let selected_log = selected_log_id.and_then(|id| logs.iter().find(|l| l.id == id).cloned());
     let palette_for_list = p;
 
@@ -614,6 +616,45 @@ pub fn render_audit_page(
                                 })
                                 .child(
                                     action_button(
+                                        "audit-copy-filtered",
+                                        "复制筛选结果",
+                                        ButtonKind::Secondary,
+                                        log_count > 0,
+                                        p,
+                                    )
+                                    .h(px(28.))
+                                    .px(px(10.))
+                                    .when(log_count > 0, |b| {
+                                        b.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _, _, cx| {
+                                                let count = logs_for_batch_copy.len();
+                                                let text = logs_for_batch_copy
+                                                    .iter()
+                                                    .map(|entry| {
+                                                        format!(
+                                                            "[{}] [{}] [{}] {}",
+                                                            format_unix_ymdhms(entry.timestamp),
+                                                            entry.level.label(),
+                                                            entry.category,
+                                                            entry.message
+                                                        )
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                                    .join("\n");
+                                                ctrl_copy_batch.update(cx, |c, cx| {
+                                                    c.copy_to_clipboard(
+                                                        text,
+                                                        &format!(" {count} 条筛选日志"),
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                        )
+                                    }),
+                                )
+                                .child(
+                                    action_button(
                                         "audit-export-diag",
                                         if export_busy {
                                             "导出中…"
@@ -647,7 +688,7 @@ pub fn render_audit_page(
                 .when_some(selected_log, |col, entry| {
                     let full_text = format!(
                         "[{}] [{}] [{}] {}",
-                        format_unix_hm(entry.timestamp),
+                        format_unix_ymdhms(entry.timestamp),
                         entry.level.label(),
                         entry.category,
                         entry.message

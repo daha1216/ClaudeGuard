@@ -40,14 +40,87 @@ pub fn clamp_utf16_range(text: &str, range: Range<usize>) -> Range<usize> {
     utf16_index_from_byte(text, start)..utf16_index_from_byte(text, end)
 }
 
+/// Maximum characters retained in a single-line `TextEditState` so multi-MB clipboard pastes
+/// never stall DirectWrite text shaping or layout.
+pub const MAX_SINGLE_LINE_CHARS: usize = 4096;
+
+/// Returns the longest prefix of `s` containing at most `max_chars` Unicode scalar values,
+/// snapping back to the nearest extended grapheme boundary whenever possible so emoji ZWJ
+/// sequences and combining marks are never torn in half.
+fn slice_within_char_budget(s: &str, max_chars: usize) -> &str {
+    if max_chars == 0 || s.is_empty() {
+        return "";
+    }
+    let mut total_chars = 0usize;
+    let mut safe_end = 0usize;
+    for (idx, grapheme) in s.grapheme_indices(true) {
+        let g_chars = grapheme.chars().count();
+        if total_chars + g_chars > max_chars {
+            if safe_end == 0 && g_chars > 64 {
+                // Pathological single grapheme exceeding 64 scalar chars (e.g. Zalgo combining run):
+                // fall back to a clean UTF-8 `char` boundary.
+                let fallback_end = s
+                    .char_indices()
+                    .nth(max_chars)
+                    .map(|(b, _)| b)
+                    .unwrap_or(s.len());
+                return &s[..fallback_end];
+            }
+            return &s[..safe_end];
+        }
+        total_chars += g_chars;
+        safe_end = idx + grapheme.len();
+    }
+    s
+}
+
 pub fn sanitize_input(raw: &str) -> String {
-    raw.chars()
-        .filter_map(|c| match c {
-            '\r' | '\n' | '\t' => Some(' '),
-            c if c.is_control() => None,
-            c => Some(c),
-        })
-        .collect()
+    // Collect a tiny margin past `MAX_SINGLE_LINE_CHARS` so multi-codepoint graphemes right at
+    // the cap can be evaluated cleanly without allocating or scanning multi-MB clipboard blobs.
+    const SCAN_CAP: usize = MAX_SINGLE_LINE_CHARS + 32;
+    let mut out = String::with_capacity(raw.len().min(MAX_SINGLE_LINE_CHARS));
+    let mut emitted = 0usize;
+    let mut prev_was_newline = false;
+
+    for ch in raw.chars() {
+        match ch {
+            '\r' | '\n' => {
+                if !prev_was_newline {
+                    if emitted >= SCAN_CAP {
+                        break;
+                    }
+                    out.push(' ');
+                    emitted += 1;
+                    prev_was_newline = true;
+                }
+            }
+            '\t' => {
+                prev_was_newline = false;
+                if emitted >= SCAN_CAP {
+                    break;
+                }
+                out.push(' ');
+                emitted += 1;
+            }
+            c if c.is_control() => {
+                prev_was_newline = false;
+            }
+            c => {
+                prev_was_newline = false;
+                if emitted >= SCAN_CAP {
+                    break;
+                }
+                out.push(c);
+                emitted += 1;
+            }
+        }
+    }
+
+    if emitted > MAX_SINGLE_LINE_CHARS {
+        let trimmed_len = slice_within_char_budget(&out, MAX_SINGLE_LINE_CHARS).len();
+        out.truncate(trimmed_len);
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -220,8 +293,15 @@ impl TextEditState {
         if inserted.is_empty() {
             return false;
         }
-        let range = self.selection.clone();
-        self.replace_range(range, &inserted);
+        let range = self.clamp_range(self.selection.clone());
+        let (start, actual_utf16) = self.replace_range_inner(range.clone(), &inserted);
+        if actual_utf16 == 0 && range.is_empty() {
+            return false;
+        }
+        let end = start + actual_utf16;
+        self.marked = None;
+        self.selection = end..end;
+        self.cursor = end;
         true
     }
 
@@ -231,9 +311,9 @@ impl TextEditState {
             .or_else(|| self.marked.clone())
             .unwrap_or_else(|| self.selection.clone());
         let inserted = sanitize_input(text);
-        let start = self.replace_range_inner(range, &inserted);
+        let (start, actual_utf16) = self.replace_range_inner(range, &inserted);
         self.marked = None;
-        let end = start + utf16_len(&inserted);
+        let end = start + actual_utf16;
         self.selection = end..end;
         self.cursor = end;
     }
@@ -249,11 +329,10 @@ impl TextEditState {
             .or_else(|| self.marked.clone())
             .unwrap_or_else(|| self.selection.clone());
         let inserted = sanitize_input(text);
-        let start = self.replace_range_inner(range, &inserted);
-        let inserted_len = utf16_len(&inserted);
+        let (start, inserted_len) = self.replace_range_inner(range, &inserted);
         let end = start + inserted_len;
 
-        if inserted.is_empty() {
+        if inserted_len == 0 {
             self.marked = None;
             self.selection = start..start;
             self.cursor = start;
@@ -274,18 +353,23 @@ impl TextEditState {
 
     fn replace_range(&mut self, range: Range<usize>, inserted: &str) {
         let range = self.clamp_range(range);
-        let start = self.replace_range_inner(range, inserted);
-        let end = start + utf16_len(inserted);
+        let (start, actual_utf16) = self.replace_range_inner(range, inserted);
+        let end = start + actual_utf16;
         self.marked = None;
         self.selection = end..end;
         self.cursor = end;
     }
 
-    fn replace_range_inner(&mut self, range: Range<usize>, inserted: &str) -> usize {
+    fn replace_range_inner(&mut self, range: Range<usize>, inserted: &str) -> (usize, usize) {
         let start_byte = byte_index_from_utf16(&self.text, range.start);
         let end_byte = byte_index_from_utf16(&self.text, range.end);
-        self.text.replace_range(start_byte..end_byte, inserted);
-        utf16_index_from_byte(&self.text, start_byte)
+        let kept_chars =
+            self.text[..start_byte].chars().count() + self.text[end_byte..].chars().count();
+        let budget = MAX_SINGLE_LINE_CHARS.saturating_sub(kept_chars);
+        let bounded = slice_within_char_budget(inserted, budget);
+        let actual_utf16 = utf16_len(bounded);
+        self.text.replace_range(start_byte..end_byte, bounded);
+        (utf16_index_from_byte(&self.text, start_byte), actual_utf16)
     }
 
     fn move_cursor_to(&mut self, target: usize, extend: bool) {
@@ -348,5 +432,32 @@ mod tests {
         state.replace_text_in_range(None, "你");
         assert_eq!(state.text(), "a你");
         assert_eq!(state.marked_range(), None);
+    }
+
+    #[test]
+    fn sanitize_input_collapses_crlf_and_consecutive_newlines() {
+        assert_eq!(sanitize_input("US\r\nJP\r\n\r\nSG"), "US JP SG");
+        assert_eq!(
+            sanitize_input("line1\n\n\nline2\r\rline3"),
+            "line1 line2 line3"
+        );
+        assert_eq!(sanitize_input("a\tb\x07c"), "a bc");
+    }
+
+    #[test]
+    fn caps_single_line_paste_at_max_chars_preserving_grapheme_boundaries() {
+        let huge = "x".repeat(MAX_SINGLE_LINE_CHARS + 50_000);
+        let mut state = TextEditState::from_text(&huge);
+        assert_eq!(state.text().chars().count(), MAX_SINGLE_LINE_CHARS);
+        assert!(!state.insert_text("more"));
+        assert_eq!(state.text().chars().count(), MAX_SINGLE_LINE_CHARS);
+
+        // Multi-codepoint ZWJ emoji grapheme (`👨‍👩‍👧` = 5 scalar chars) straddling the 4096 boundary
+        // must not be torn into partial ZWJ fragments.
+        let prefix = "a".repeat(MAX_SINGLE_LINE_CHARS - 3);
+        let mut emoji_state = TextEditState::from_text(&prefix);
+        let _ = emoji_state.insert_text("👨‍👩‍👧tail");
+        assert_eq!(emoji_state.text(), prefix);
+        assert!(emoji_state.text().chars().count() <= MAX_SINGLE_LINE_CHARS);
     }
 }

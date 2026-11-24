@@ -48,7 +48,9 @@ actions!([
     DraftCut,
     DraftCopy,
     DraftSubmit,
-    DraftCancel
+    DraftCancel,
+    DraftTabNext,
+    DraftTabPrev
 ]);
 
 /// Global palette snapshot read by `DraftTextInput` during layout/paint.
@@ -92,6 +94,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-x", DraftCut, Some("DraftTextInput")),
         KeyBinding::new("enter", DraftSubmit, Some("DraftTextInput")),
         KeyBinding::new("escape", DraftCancel, Some("DraftTextInput")),
+        KeyBinding::new("tab", DraftTabNext, Some("DraftTextInput")),
+        KeyBinding::new("shift-tab", DraftTabPrev, Some("DraftTextInput")),
     ]);
 }
 
@@ -619,6 +623,14 @@ impl DraftTextInput {
         }
     }
 
+    fn on_tab_next(&mut self, _: &DraftTabNext, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus_next(cx);
+    }
+
+    fn on_tab_prev(&mut self, _: &DraftTabPrev, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus_prev(cx);
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -695,7 +707,14 @@ impl DraftTextInput {
         let local_x = position.x - bounds.left() + px(self.scroll_x);
         let byte = line.closest_index_for_x(local_x);
         if self.masked {
-            let char_idx = line.text[..byte.min(line.text.len())].chars().count();
+            if self.state.text().is_empty() || !line.text.starts_with('•') {
+                return 0;
+            }
+            let mut clamped = byte.min(line.text.len());
+            while !line.text.is_char_boundary(clamped) {
+                clamped -= 1;
+            }
+            let char_idx = line.text[..clamped].chars().count();
             let raw_char_byte = self
                 .state
                 .text()
@@ -705,6 +724,9 @@ impl DraftTextInput {
                 .unwrap_or_else(|| self.state.text().len());
             utf16_index_from_byte(self.state.text(), raw_char_byte)
         } else {
+            if self.state.text().is_empty() {
+                return 0;
+            }
             utf16_index_from_byte(self.state.text(), byte)
         }
     }
@@ -809,7 +831,15 @@ impl EntityInputHandler for DraftTextInput {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let last_layout = self.last_layout.as_ref()?;
-        if !self.masked && last_layout.text != self.state.text() {
+        if self.masked {
+            let expected_len = self.state.text().chars().count() * '•'.len_utf8();
+            if self.state.text().is_empty()
+                || last_layout.text.len() != expected_len
+                || !last_layout.text.starts_with('•')
+            {
+                return None;
+            }
+        } else if last_layout.text != self.state.text() {
             return None;
         }
         let start = byte_index_from_utf16(self.state.text(), range_utf16.start);
@@ -856,9 +886,14 @@ impl EntityInputHandler for DraftTextInput {
         let last_layout = self.last_layout.as_ref()?;
         let byte = last_layout.closest_index_for_x(line_point.x + px(self.scroll_x));
         if self.masked {
-            let char_idx = last_layout.text[..byte.min(last_layout.text.len())]
-                .chars()
-                .count();
+            if self.state.text().is_empty() || !last_layout.text.starts_with('•') {
+                return Some(0);
+            }
+            let mut clamped = byte.min(last_layout.text.len());
+            while !last_layout.text.is_char_boundary(clamped) {
+                clamped -= 1;
+            }
+            let char_idx = last_layout.text[..clamped].chars().count();
             let raw_byte = self
                 .state
                 .text()
@@ -868,6 +903,9 @@ impl EntityInputHandler for DraftTextInput {
                 .unwrap_or_else(|| self.state.text().len());
             Some(utf16_index_from_byte(self.state.text(), raw_byte))
         } else {
+            if self.state.text().is_empty() {
+                return Some(0);
+            }
             Some(utf16_index_from_byte(self.state.text(), byte))
         }
     }
@@ -1197,6 +1235,8 @@ impl Render for DraftTextInput {
             .on_action(cx.listener(Self::on_cut))
             .on_action(cx.listener(Self::on_submit))
             .on_action(cx.listener(Self::on_cancel))
+            .on_action(cx.listener(Self::on_tab_next))
+            .on_action(cx.listener(Self::on_tab_prev))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

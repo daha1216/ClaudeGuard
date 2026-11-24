@@ -82,9 +82,9 @@ pub fn render_environment_page(
     let is_syncing_shield = ctrl_r.is_scope_busy(&ActionScope::SyncLeakShield);
     let is_aligning_env = ctrl_r.is_scope_busy(&ActionScope::EnvAlign);
 
-    let quic_on = ctrl_r.effective_toggle("sh-quic-sw", cfg.leak_shield_quic);
-    let dns_on = ctrl_r.effective_toggle("sh-dns-sw", cfg.leak_shield_dns_doh);
-    let ipv6_on = ctrl_r.effective_toggle("sh-ipv6-sw", cfg.leak_shield_ipv6);
+    let quic_on = ctrl_r.effective_toggle("sh-quic", cfg.leak_shield_quic);
+    let dns_on = ctrl_r.effective_toggle("sh-dns", cfg.leak_shield_dns_doh);
+    let ipv6_on = ctrl_r.effective_toggle("sh-ipv6", cfg.leak_shield_ipv6);
     let leak_watch_on = ctrl_r.effective_toggle("env-leak-watch", cfg.leak_watch);
     let leak_trip_on = ctrl_r.effective_toggle("env-leak-trip", cfg.leak_trip);
     let env_check_on = ctrl_r.effective_toggle("env-check-sw", cfg.env_check);
@@ -255,7 +255,7 @@ pub fn render_environment_page(
                                             let next = !quic_on;
                                             ctrl_q.update(cx, |c, cx| {
                                                 c.save_toggle_patch(
-                                                    "sh-quic-sw",
+                                                    "sh-quic",
                                                     next,
                                                     move |x| x.leak_shield_quic = next,
                                                     "QUIC 护盾已更新",
@@ -279,7 +279,7 @@ pub fn render_environment_page(
                                             let next = !dns_on;
                                             ctrl_d.update(cx, |c, cx| {
                                                 c.save_toggle_patch(
-                                                    "sh-dns-sw",
+                                                    "sh-dns",
                                                     next,
                                                     move |x| x.leak_shield_dns_doh = next,
                                                     "DNS / DoH 护盾已更新",
@@ -302,7 +302,7 @@ pub fn render_environment_page(
                                         let next = !ipv6_on;
                                         ctrl_v.update(cx, |c, cx| {
                                             c.save_toggle_patch(
-                                                "sh-ipv6-sw",
+                                                "sh-ipv6",
                                                 next,
                                                 move |x| x.leak_shield_ipv6 = next,
                                                 "IPv6 护盾已更新",
