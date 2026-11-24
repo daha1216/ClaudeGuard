@@ -27,10 +27,180 @@ pub const JOURNAL_FILE: &str = "journal.json";
 /// Current WAL schema version.
 pub const JOURNAL_VERSION: u32 = 4;
 
-/// Prefix required for all firewall rules managed by ClaudeGuard.
+/// Prefix required for primary firewall rules managed by ClaudeGuard.
 pub const MANAGED_RULE_PREFIX: &str = "ClaudeGuard ";
 
+/// Prefix required for 4-Vector Leak Shield firewall rules managed by ClaudeGuard.
+pub const MANAGED_SHIELD_RULE_PREFIX: &str = "ClaudeGuard-Shield-";
+
+/// Protected DACL applied to `%ProgramData%\ClaudeGuard` (`SYSTEM` + `Administrators` Full Access only).
+pub const DATA_DIR_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
 static TX_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Returns true when `meta` indicates a symlink, junction, or Win32 reparse point (`0x0400`).
+pub fn is_reparse_point_metadata(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            || meta.file_type().is_symlink()
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+/// Inspects `symlink_metadata` across every existing non-root prefix of `path`.
+pub fn has_reparse_point_in_chain(path: &Path) -> bool {
+    for anc in path.ancestors() {
+        if anc.as_os_str().is_empty() || anc.parent().is_none() {
+            continue;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(anc) {
+            if is_reparse_point_metadata(&meta) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn normalize_path_cmp(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn is_default_programdata_claudeguard_dir(dir: &Path) -> bool {
+    let Some(pd) = non_empty_env("ProgramData").or_else(|| non_empty_env("PROGRAMDATA")) else {
+        return false;
+    };
+    let expected = PathBuf::from(pd).join("ClaudeGuard");
+    normalize_path_cmp(dir) == normalize_path_cmp(&expected)
+}
+
+#[cfg(windows)]
+fn apply_protected_system_admin_dacl(dir: &Path) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, BOOL, HLOCAL, NO_ERROR};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+
+    struct SdGuard(PSECURITY_DESCRIPTOR);
+    impl Drop for SdGuard {
+        fn drop(&mut self) {
+            if !self.0 .0.is_null() {
+                unsafe {
+                    let _ = LocalFree(HLOCAL(self.0 .0));
+                }
+            }
+        }
+    }
+
+    let sddl_w: Vec<u16> = OsStr::new(DATA_DIR_SDDL)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl_w.as_ptr()),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+    }
+    .map_err(|e| format!("ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {e}"))?;
+    let _sd_guard = SdGuard(sd);
+
+    let mut dacl_present = BOOL(0);
+    let mut dacl_ptr: *mut ACL = std::ptr::null_mut();
+    let mut dacl_defaulted = BOOL(0);
+    unsafe { GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl_ptr, &mut dacl_defaulted) }
+        .map_err(|e| format!("GetSecurityDescriptorDacl failed: {e}"))?;
+    if !dacl_present.as_bool() || dacl_ptr.is_null() {
+        return Err("parsed DATA_DIR_SDDL did not contain a valid DACL".to_string());
+    }
+
+    let dir_w: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(dir_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            PSID::default(),
+            PSID::default(),
+            Some(dacl_ptr.cast_const()),
+            None,
+        )
+    };
+    if status != NO_ERROR {
+        return Err(format!(
+            "SetNamedSecurityInfoW failed on {}: win32 error {}",
+            dir.display(),
+            status.0
+        ));
+    }
+    Ok(())
+}
+
+/// Ensures `dir` exists, is NOT a symlink/junction reparse point, and when running as `SYSTEM`
+/// or elevated on the default `%ProgramData%\ClaudeGuard` path, applies `DATA_DIR_SDDL`.
+pub fn ensure_secure_data_dir(dir: &Path) -> Result<(), String> {
+    if let Ok(meta) = std::fs::symlink_metadata(dir) {
+        if is_reparse_point_metadata(&meta) {
+            return Err(format!(
+                "refusing to use reparse point / symlink data directory: {}",
+                dir.display()
+            ));
+        }
+    }
+    let is_default_pd = is_default_programdata_claudeguard_dir(dir);
+    if is_default_pd && has_reparse_point_in_chain(dir) {
+        return Err(format!(
+            "refusing to use ProgramData path containing a reparse point: {}",
+            dir.display()
+        ));
+    }
+
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("failed to create data directory {}: {e}", dir.display()))?;
+
+    let post_meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| format!("failed to inspect data directory {}: {e}", dir.display()))?;
+    if is_reparse_point_metadata(&post_meta) || !post_meta.is_dir() {
+        return Err(format!(
+            "data directory {} is not a regular directory",
+            dir.display()
+        ));
+    }
+
+    #[cfg(windows)]
+    if is_default_pd
+        && (cg_platform::access_win::is_session_zero()
+            || cg_platform::access_win::is_elevated().unwrap_or(false))
+    {
+        apply_protected_system_admin_dacl(dir)?;
+    }
+
+    Ok(())
+}
 
 /// Resolves the ClaudeGuard daemon data directory (`%ProgramData%\ClaudeGuard` primary).
 ///
@@ -242,11 +412,53 @@ pub enum LoadedJournal {
     Unreadable(String),
 }
 
-/// Validates that a firewall rule name belongs strictly to ClaudeGuard.
+/// Validates that a firewall rule name belongs strictly to ClaudeGuard (`"ClaudeGuard "` or `"ClaudeGuard-Shield-"`).
 pub fn is_managed_firewall_rule(name: &str) -> bool {
-    name.starts_with(MANAGED_RULE_PREFIX)
-        && name.len() > MANAGED_RULE_PREFIX.len()
-        && !name.contains(['\r', '\n', '\0'])
+    let valid_prefix = (name.starts_with(MANAGED_RULE_PREFIX)
+        && name.len() > MANAGED_RULE_PREFIX.len())
+        || (name.starts_with(MANAGED_SHIELD_RULE_PREFIX)
+            && name.len() > MANAGED_SHIELD_RULE_PREFIX.len());
+    valid_prefix && !name.contains(['\r', '\n', '\0'])
+}
+
+/// Returns true if `step` represents a `ClaudeGuard Lockdown (...)` firewall rule.
+pub fn is_lockdown_step(step: &PlannedStep) -> bool {
+    matches!(
+        &step.action,
+        WalAction::AddFirewallRule { rule_name, .. }
+            if rule_name.starts_with("ClaudeGuard Lockdown (")
+    )
+}
+
+fn merge_baselines(existing: &BaselineState, incoming: &BaselineState) -> BaselineState {
+    let mut rules = existing.firewall_rules_present.clone();
+    for r in &incoming.firewall_rules_present {
+        if !rules.contains(r) {
+            rules.push(r.clone());
+        }
+    }
+    let mut nics = existing.enabled_nics.clone();
+    for n in &incoming.enabled_nics {
+        if !nics.iter().any(|e| e.guid.eq_ignore_ascii_case(&n.guid)) {
+            nics.push(n.clone());
+        }
+    }
+    BaselineState {
+        firewall_rules_present: rules,
+        enabled_nics: nics,
+        timezone_key: existing
+            .timezone_key
+            .clone()
+            .or_else(|| incoming.timezone_key.clone()),
+        location_lat: existing
+            .location_lat
+            .clone()
+            .or_else(|| incoming.location_lat.clone()),
+        location_lon: existing
+            .location_lon
+            .clone()
+            .or_else(|| incoming.location_lon.clone()),
+    }
 }
 
 /// Validates an adapter GUID (`8-4-4-4-12` hex, with or without `{}` braces).
@@ -363,14 +575,99 @@ impl JournalStore {
         self.save_atomic(journal)
     }
 
+    /// Writes a new uncommitted WAL transaction while preserving coexisting `BaselineState`
+    /// and active steps from `Lockdown` / `Isolation` when both layers are active (`H-04`).
+    pub fn begin_coexisting_tx(
+        &self,
+        epoch: u64,
+        kind: TxKind,
+        new_steps: Vec<PlannedStep>,
+        fallback_baseline: BaselineState,
+        preserve_lockdown: bool,
+        preserve_non_lockdown: bool,
+    ) -> Result<RecoveryJournal, String> {
+        let existing = match self.load() {
+            LoadedJournal::Uncommitted(j) | LoadedJournal::Committed(j) => Some(j),
+            _ => None,
+        };
+        let mut merged_steps: Vec<PlannedStep> = Vec::new();
+        let baseline = if let Some(prev) = existing {
+            let b = merge_baselines(&prev.baseline, &fallback_baseline);
+            for step in prev.planned_steps {
+                let is_ld = is_lockdown_step(&step);
+                let keep = (is_ld && preserve_lockdown) || (!is_ld && preserve_non_lockdown);
+                if keep && !merged_steps.iter().any(|s| s.action == step.action) {
+                    merged_steps.push(step);
+                }
+            }
+            b
+        } else {
+            fallback_baseline
+        };
+
+        let had_preserved = !merged_steps.is_empty();
+        for step in new_steps {
+            if !merged_steps.iter().any(|s| s.action == step.action) {
+                merged_steps.push(step);
+            }
+        }
+        for (idx, step) in merged_steps.iter_mut().enumerate() {
+            step.step_id = (idx as u32).saturating_add(1);
+        }
+        let effective_kind = if had_preserved {
+            TxKind::Composite
+        } else {
+            kind
+        };
+        self.begin_tx(epoch, effective_kind, merged_steps, baseline)
+    }
+
+    /// Retains only still-active coexisting steps (`Lockdown` vs `Isolation`) on disk,
+    /// clearing `journal.json` ONLY when neither layer remains active (`H-04`).
+    pub fn retain_coexisting_committed(
+        &self,
+        epoch: u64,
+        keep_lockdown: bool,
+        keep_non_lockdown: bool,
+    ) -> Result<(), String> {
+        if !keep_lockdown && !keep_non_lockdown {
+            return self.clear();
+        }
+        let existing = match self.load() {
+            LoadedJournal::Uncommitted(j) | LoadedJournal::Committed(j) => j,
+            LoadedJournal::NotFound => return Ok(()),
+            LoadedJournal::Corrupt(e) | LoadedJournal::Unreadable(e) => return Err(e),
+        };
+        let mut kept: Vec<PlannedStep> = existing
+            .planned_steps
+            .into_iter()
+            .filter(|s| {
+                let is_ld = is_lockdown_step(s);
+                (is_ld && keep_lockdown) || (!is_ld && keep_non_lockdown)
+            })
+            .collect();
+        for (idx, step) in kept.iter_mut().enumerate() {
+            step.step_id = (idx as u32).saturating_add(1);
+        }
+        let baseline_has_data = !existing.baseline.enabled_nics.is_empty()
+            || existing.baseline.timezone_key.is_some()
+            || existing.baseline.location_lat.is_some()
+            || existing.baseline.location_lon.is_some();
+        if kept.is_empty() && !baseline_has_data {
+            return self.clear();
+        }
+        let kind = if keep_lockdown && !keep_non_lockdown {
+            TxKind::Lockdown
+        } else {
+            existing.kind
+        };
+        let mut updated = RecoveryJournal::new(epoch, kind, kept, existing.baseline);
+        self.commit_tx(&mut updated)
+    }
+
     /// Atomically serializes, `sync_all`s, and renames `journal.json` via `tempfile`.
     pub fn save_atomic(&self, journal: &RecoveryJournal) -> Result<(), String> {
-        std::fs::create_dir_all(&self.dir).map_err(|e| {
-            format!(
-                "failed to create journal directory {}: {e}",
-                self.dir.display()
-            )
-        })?;
+        ensure_secure_data_dir(&self.dir)?;
         let target = self.path();
         let body = serde_json::to_vec_pretty(journal)
             .map_err(|e| format!("failed to serialize WAL journal: {e}"))?;
@@ -533,11 +830,11 @@ impl RecoveryExecutor for PlatformRecoveryExecutor {
     }
 
     fn clear_all_managed_firewall_rules(&self) -> Result<usize, String> {
-        match self
-            .driver
-            .firewall()
-            .remove_rules_with_prefix("ClaudeGuard")
-        {
+        let managed = self.list_managed_firewall_rules()?;
+        if managed.is_empty() {
+            return Ok(0);
+        }
+        match self.driver.firewall().remove_rules_by_name(&managed) {
             Ok(report) if report.clean() => Ok(report.removed),
             Ok(report) => Err(format!(
                 "managed firewall cleanup incomplete (query_ok={}, remaining={})",
@@ -561,11 +858,13 @@ impl RecoveryExecutor for PlatformRecoveryExecutor {
 
     fn restore_timezone(&self, tz_key: &str) -> Result<(), String> {
         match self.driver.read_env_info() {
-            Ok(info) if info.tz_key.eq_ignore_ascii_case(tz_key) => Ok(()),
-            Ok(info) => Err(format!(
-                "timezone restoration from '{}' to '{tz_key}' is unsupported without elevated tz helper",
-                info.tz_key
-            )),
+            Ok(info) if info.tz_key.eq_ignore_ascii_case(tz_key) => return Ok(()),
+            Ok(_) => {}
+            Err(PlatformError::Unsupported { .. }) => return Ok(()),
+            Err(_) => {}
+        }
+        match cg_platform::env_win::set_windows_timezone(tz_key) {
+            Ok(_) => Ok(()),
             Err(PlatformError::Unsupported { .. }) => Ok(()),
             Err(err) => Err(err.to_string()),
         }
@@ -1331,5 +1630,91 @@ pub(crate) mod tests {
             vec!["ClaudeGuard Cut All".to_string()]
         );
         assert!(store.path().exists());
+    }
+
+    #[test]
+    fn managed_rule_filter_accepts_leak_shield_prefix_and_coexisting_tx_preserves_baseline() {
+        assert!(is_managed_firewall_rule("ClaudeGuard Lockdown (claude)"));
+        assert!(is_managed_firewall_rule("ClaudeGuard-Shield-QUIC-claude-0"));
+        assert!(!is_managed_firewall_rule("ClaudeGuard-Shield-"));
+        assert!(!is_managed_firewall_rule("ClaudeGuard "));
+        assert!(!is_managed_firewall_rule("ClaudeGuardUnrelated"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = JournalStore::new(dir.path());
+        let baseline = BaselineState {
+            firewall_rules_present: Vec::new(),
+            enabled_nics: vec![NicSnapshot {
+                guid: "{6f1c2f9a-1b2c-4d5e-8f90-1234567890ab}".into(),
+                name: "Ethernet".into(),
+            }],
+            timezone_key: Some("China Standard Time".into()),
+            location_lat: Some("31.2304".into()),
+            location_lon: Some("121.4737".into()),
+        };
+
+        let mut ld_tx = store
+            .begin_coexisting_tx(
+                1,
+                TxKind::Lockdown,
+                vec![PlannedStep {
+                    step_id: 1,
+                    description: "lockdown claude".into(),
+                    action: WalAction::AddFirewallRule {
+                        rule_name: "ClaudeGuard Lockdown (claude)".into(),
+                        program: Some(r"C:\Apps\Claude\claude.exe".into()),
+                        direction: FirewallDirection::Outbound,
+                    },
+                }],
+                baseline.clone(),
+                false,
+                true,
+            )
+            .unwrap();
+        store.commit_tx(&mut ld_tx).unwrap();
+
+        // Coexisting Isolation preserves both Lockdown step and original BaselineState.
+        let mut iso_tx = store
+            .begin_coexisting_tx(
+                2,
+                TxKind::Quarantine,
+                vec![PlannedStep {
+                    step_id: 1,
+                    description: "quarantine claude".into(),
+                    action: WalAction::AddFirewallRule {
+                        rule_name: "ClaudeGuard Block Out (claude)".into(),
+                        program: Some(r"C:\Apps\Claude\claude.exe".into()),
+                        direction: FirewallDirection::Outbound,
+                    },
+                }],
+                BaselineState::default(),
+                true,
+                false,
+            )
+            .unwrap();
+        store.commit_tx(&mut iso_tx).unwrap();
+        assert_eq!(iso_tx.planned_steps.len(), 2);
+        assert_eq!(
+            iso_tx.baseline.timezone_key.as_deref(),
+            Some("China Standard Time")
+        );
+
+        // Releasing Isolation while Lockdown remains active keeps Lockdown WAL on disk!
+        store.retain_coexisting_committed(3, true, false).unwrap();
+        match store.load() {
+            LoadedJournal::Committed(j) => {
+                assert_eq!(j.planned_steps.len(), 1);
+                assert!(is_lockdown_step(&j.planned_steps[0]));
+                assert_eq!(
+                    j.baseline.timezone_key.as_deref(),
+                    Some("China Standard Time")
+                );
+            }
+            other => panic!("expected Committed lockdown journal, got {other:?}"),
+        }
+
+        // Clearing Lockdown when Isolation is also inactive removes journal.json cleanly.
+        store.retain_coexisting_committed(4, false, false).unwrap();
+        assert!(!store.path().exists());
     }
 }

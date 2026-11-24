@@ -69,6 +69,8 @@ pub enum ActorControl {
 /// Telemetry bundle computed off-thread and published into [`GuardEngine`].
 #[derive(Clone, Debug)]
 pub struct TelemetryBundle {
+    pub cfg_rev: u64,
+    pub runtime_epoch: u64,
     pub agents: Vec<AgentRuntimeStatus>,
     pub leak: LeakReport,
     pub leak_shield: LeakShieldStatus,
@@ -87,6 +89,7 @@ pub enum CoordinatorEvent {
         reply: SyncSender<PipeResponse>,
     },
     Tick,
+    SystemResumed,
     RoundFinished {
         cfg_rev: u64,
         runtime_epoch: u64,
@@ -115,6 +118,8 @@ pub enum CoordinatorEvent {
         reply: SyncSender<PipeResponse>,
     },
     MihomoSwitchFinished {
+        cfg_rev: u64,
+        runtime_epoch: u64,
         result: Result<String, String>,
         mihomo: MihomoStatus,
         now_secs: u64,
@@ -223,6 +228,13 @@ impl CoordinatorHandle {
     pub fn try_tick(&self) {
         if !self.stopped.load(Ordering::Acquire) {
             let _ = self.tx.try_send(CoordinatorEvent::Tick);
+        }
+    }
+
+    /// Notifies the coordinator that Windows resumed from sleep/hibernate (`PBT_APMRESUME*`).
+    pub fn notify_system_resumed(&self) {
+        if !self.stopped.load(Ordering::Acquire) {
+            let _ = self.tx.try_send(CoordinatorEvent::SystemResumed);
         }
     }
 

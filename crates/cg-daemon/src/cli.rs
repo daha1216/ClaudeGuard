@@ -372,8 +372,15 @@ fn run_restore(
 fn should_fallback_offline(err: &PipeError) -> bool {
     matches!(
         err,
-        PipeError::NotFound(_) | PipeError::BusyTimeout(_) | PipeError::UnsupportedPlatform
+        PipeError::NotFound(_)
+            | PipeError::BusyTimeout(_)
+            | PipeError::Disconnected
+            | PipeError::UnsupportedPlatform
     )
+}
+
+fn is_cli_elevated() -> bool {
+    cg_platform::access_win::is_elevated().unwrap_or(true)
 }
 
 fn run_offline_restore(
@@ -383,25 +390,40 @@ fn run_offline_restore(
 ) -> CliOutput {
     let store = JournalStore::new(data_dir);
     let report = journal::heal_offline(&store, offline_executor);
+    let _ = cg_platform::leak_shield_win::clear_leak_shield();
+    let env_rollback_err = crate::diagnostics::rollback_env_alignment(data_dir).err();
+
     let mut disarm_marked = false;
     let mut disarm_error = None;
 
-    if report.ok && report.verified {
+    if report.ok && report.verified && env_rollback_err.is_none() {
         match disarm::mark_disarmed(data_dir, "claudeguard-cli --restore (offline)") {
             Ok(()) => disarm_marked = true,
             Err(err) => disarm_error = Some(err),
         }
     }
 
-    let ok = report.ok && report.verified && disarm_error.is_none();
+    let ok = report.ok && report.verified && env_rollback_err.is_none() && disarm_error.is_none();
+    let elevated = is_cli_elevated();
+    let elevation_hint = if !ok && !elevated {
+        Some(
+            "离线清理防火墙规则或还原系统设置需要管理员权限，请以管理员身份重新运行 `claudeguard-cli --restore` (Administrator privileges required: please re-run `claudeguard-cli --restore` in an elevated terminal).".to_string(),
+        )
+    } else {
+        None
+    };
+
     let stderr = if ok {
         None
     } else {
-        Some(
-            disarm_error
-                .clone()
-                .unwrap_or_else(|| report.summary.clone()),
-        )
+        let base_err = disarm_error
+            .clone()
+            .or_else(|| env_rollback_err.clone())
+            .unwrap_or_else(|| report.summary.clone());
+        Some(match &elevation_hint {
+            Some(hint) => format!("{base_err}\n{hint}"),
+            None => base_err,
+        })
     };
 
     CliOutput {
@@ -410,6 +432,9 @@ fn run_offline_restore(
             "ok": ok,
             "mode": "offline_wal",
             "verified": report.verified,
+            "elevated": elevated,
+            "elevation_hint": elevation_hint,
+            "env_rollback_error": env_rollback_err,
             "disarm_marked": disarm_marked,
             "disarm_error": disarm_error,
             "pipe_fallback_reason": pipe_note,
@@ -799,6 +824,7 @@ mod tests {
         assert_eq!(online_json["ok"], true);
         assert_eq!(rt.coordinator().snapshot().lifecycle, Lifecycle::Disarmed);
         assert!(exec.state.lock().unwrap().firewall_rules.is_empty());
+        assert!(should_fallback_offline(&PipeError::Disconnected));
 
         rt.shutdown_graceful(StopBehavior::PreserveFailClosed)
             .unwrap();

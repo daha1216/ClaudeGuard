@@ -82,11 +82,36 @@ Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 Filename: "{app}\{#MyAppDaemonExeName}"; Parameters: "--install-service --start"; StatusMsg: "Registering and starting {#MyServiceName}..."; Flags: runhidden waituntilterminated
 ; Launch normal-privilege GPUI desktop client under the original logged-in user token.
 Filename: "{app}\{#MyAppGuiExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent shellexec runasoriginaluser
+; Restore normal-privilege tray client during silent upgrades when autostart is enabled.
+Filename: "{app}\{#MyAppGuiExeName}"; Parameters: "--tray"; Tasks: autostart; Check: WizardSilent; Flags: nowait shellexec runasoriginaluser
 
 [Code]
 var
   ExecResultCode: Integer;
   RestoreResultCode: Integer;
+
+procedure CleanupStagingWaiters();
+var
+  StagingDir: String;
+  FindRec: TFindRec;
+begin
+  StagingDir := ExpandConstant('{commonappdata}\ClaudeGuard\staging');
+  if DirExists(StagingDir) then
+  begin
+    if FindFirst(StagingDir + '\cg-v3-waiter-*.exe', FindRec) then
+    begin
+      try
+        repeat
+          if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then
+            DeleteFile(StagingDir + '\' + FindRec.Name);
+        until not FindNext(FindRec);
+      finally
+        FindClose(FindRec);
+      end;
+    end;
+    RemoveDir(StagingDir);
+  end;
+end;
 
 procedure StopLegacyAndCurrentProcesses();
 var
@@ -117,6 +142,14 @@ begin
   Result := '';
 end;
 
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    CleanupStagingWaiters();
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   CliPath: String;
@@ -141,11 +174,11 @@ begin
 
     if not RestoreOk then
     begin
-      if MsgBox('Failed to verify that ClaudeGuard network and firewall isolation rules were restored.' + #13#10 + #13#10 +
+      if SuppressibleMsgBox('Failed to verify that ClaudeGuard network and firewall isolation rules were restored.' + #13#10 + #13#10 +
                 'Continuing uninstall could leave firewall block rules active and block AI apps.' + #13#10 +
                 'Recommended: cancel uninstall and run manually:' + #13#10 + '    ' + CliPath + ' --restore' + #13#10 + #13#10 +
                 'Continue uninstall anyway?',
-                mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDNO then
+                mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDNO then
         Abort;
     end;
 

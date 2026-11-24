@@ -1,8 +1,10 @@
 //! Redacted `.zip` support bundle exporter & rollback-safe OS environment alignment store.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use tempfile::NamedTempFile;
 
 use cg_core::redact::{mask_snapshot, redact};
 use cg_platform::{env_win, process_win, zip_util};
@@ -10,6 +12,7 @@ use cg_protocol::{AppliedEnv, GuardSnapshot};
 use serde::{Deserialize, Serialize};
 
 const ENV_BACKUP_FILE: &str = "env_backup.json";
+const MAX_DIAGNOSTIC_ARCHIVES: usize = 10;
 
 /// Persisted pre-alignment OS snapshot so timezone & Sensor location always roll back cleanly.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,19 +24,30 @@ pub struct EnvBackup {
     pub applied: AppliedEnv,
 }
 
+/// Inspects `symlink_metadata` across every existing prefix of `path` to detect junctions/symlinks.
+pub fn has_reparse_point_in_chain(path: &Path) -> bool {
+    crate::journal::has_reparse_point_in_chain(path)
+}
+
 pub fn load_env_backup(data_dir: &Path) -> Option<EnvBackup> {
     let raw = fs::read_to_string(data_dir.join(ENV_BACKUP_FILE)).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
 pub fn save_env_backup(data_dir: &Path, backup: &EnvBackup) -> Result<(), String> {
-    fs::create_dir_all(data_dir).map_err(|e| format!("创建数据目录失败：{e}"))?;
+    crate::journal::ensure_secure_data_dir(data_dir)?;
     let path = data_dir.join(ENV_BACKUP_FILE);
-    let tmp = path.with_extension("json.tmp");
     let bytes =
         serde_json::to_vec_pretty(backup).map_err(|e| format!("序列化环境备份失败：{e}"))?;
-    fs::write(&tmp, &bytes).map_err(|e| format!("写入环境备份临时文件失败：{e}"))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("落盘环境备份失败：{e}"))?;
+    let mut tmp =
+        NamedTempFile::new_in(data_dir).map_err(|e| format!("创建环境备份临时文件失败：{e}"))?;
+    tmp.write_all(&bytes)
+        .map_err(|e| format!("写入环境备份临时文件失败：{e}"))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("同步环境备份临时文件失败：{e}"))?;
+    tmp.persist(&path)
+        .map_err(|e| format!("落盘环境备份失败：{}", e.error))?;
     Ok(())
 }
 
@@ -184,6 +198,7 @@ fn discover_interactive_user_home() -> Option<PathBuf> {
                 if let Some(home) = anc.parent() {
                     if home.is_dir()
                         && !is_system_profile_path(home)
+                        && !has_reparse_point_in_chain(home)
                         && !candidates.iter().any(|c| c == home)
                     {
                         candidates.push(home.to_path_buf());
@@ -214,6 +229,7 @@ fn discover_interactive_user_home() -> Option<PathBuf> {
                 lower.as_str(),
                 "public" | "default" | "default user" | "all users"
             ) || is_system_profile_path(&p)
+                || has_reparse_point_in_chain(&p)
             {
                 continue;
             }
@@ -227,8 +243,8 @@ fn discover_interactive_user_home() -> Option<PathBuf> {
     }
 
     candidates.sort_by(|a, b| {
-        let a_desk = a.join("Desktop").is_dir();
-        let b_desk = b.join("Desktop").is_dir();
+        let a_desk = a.join("Desktop").is_dir() && !has_reparse_point_in_chain(&a.join("Desktop"));
+        let b_desk = b.join("Desktop").is_dir() && !has_reparse_point_in_chain(&b.join("Desktop"));
         b_desk
             .cmp(&a_desk)
             .then_with(|| profile_recency(b).cmp(&profile_recency(a)))
@@ -245,10 +261,10 @@ fn resolve_diagnostics_dir_with(
     let is_session0_system = user_profile.is_some_and(is_system_profile_path);
     if let Some(profile) = user_profile.filter(|p| !is_system_profile_path(p)) {
         let desktop = profile.join("Desktop");
-        if desktop.is_dir() {
+        if desktop.is_dir() && !has_reparse_point_in_chain(&desktop) {
             return desktop;
         }
-        if profile.is_dir() {
+        if profile.is_dir() && !has_reparse_point_in_chain(profile) {
             return profile.to_path_buf();
         }
     }
@@ -256,14 +272,14 @@ fn resolve_diagnostics_dir_with(
     if is_session0_system || user_profile.is_none() {
         if let Some(home) = interactive_home.filter(|h| !is_system_profile_path(h)) {
             let desktop = home.join("Desktop");
-            if desktop.is_dir() {
+            if desktop.is_dir() && !has_reparse_point_in_chain(&desktop) {
                 return desktop;
             }
-            if home.is_dir() {
+            if home.is_dir() && !has_reparse_point_in_chain(home) {
                 return home.to_path_buf();
             }
         }
-        if is_session0_system {
+        if is_session0_system && !has_reparse_point_in_chain(temp_dir) {
             return temp_dir.to_path_buf();
         }
     }
@@ -271,8 +287,8 @@ fn resolve_diagnostics_dir_with(
     data_dir.join("diagnostics")
 }
 
-/// Picks a user-accessible output directory (`Desktop` if writable, interactive user home under
-/// Session-0 `LocalSystem`, `env::temp_dir()` fallback for `systemprofile`, otherwise `<data_dir>\diagnostics`).
+/// Picks a user-accessible output directory (`Desktop` if writable and free of reparse points,
+/// interactive user home under Session-0 `LocalSystem`, `env::temp_dir()` fallback, otherwise `<data_dir>\diagnostics`).
 fn resolve_diagnostics_dir(data_dir: &Path) -> PathBuf {
     let user_profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
     let interactive = if user_profile.as_deref().is_none_or(is_system_profile_path) {
@@ -289,7 +305,157 @@ fn resolve_diagnostics_dir(data_dir: &Path) -> PathBuf {
     )
 }
 
-/// Builds a strictly redacted `.zip` diagnostic bundle containing zero raw IPs or credentials.
+/// Scrubs `\Users\<username>\` (and `/Users/<username>/`) segments to `<REDACTED>` using
+/// guaranteed UTF-8 char boundaries (`char_indices`).
+fn scrub_user_profile_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut seg_start = 0usize;
+    let mut prev_was_users = false;
+
+    for (idx, ch) in text.char_indices() {
+        if ch == '\\' || ch == '/' {
+            let seg = &text[seg_start..idx];
+            if prev_was_users && !seg.is_empty() {
+                out.push_str("<REDACTED>");
+            } else {
+                out.push_str(seg);
+            }
+            out.push(ch);
+            prev_was_users = seg.eq_ignore_ascii_case("Users");
+            seg_start = idx + ch.len_utf8();
+        }
+    }
+
+    let tail = &text[seg_start..];
+    if prev_was_users && !tail.is_empty() {
+        out.push_str("<REDACTED>");
+    } else {
+        out.push_str(tail);
+    }
+    out
+}
+
+/// Scrubs `scheme://user:pass@host` or `user:pass@host` credentials from proxy host/address strings.
+fn scrub_proxy_credentials(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some((scheme, rest)) = trimmed.split_once("://") {
+        let (auth, suffix) = match rest.find(['/', '?', '#']) {
+            Some(pos) => (&rest[..pos], &rest[pos..]),
+            None => (rest, ""),
+        };
+        if let Some((_userinfo, hostport)) = auth.rsplit_once('@') {
+            return format!("{scheme}://<REDACTED>@{hostport}{suffix}");
+        }
+        return trimmed.to_string();
+    }
+    let (auth, suffix) = match trimmed.find(['/', '?', '#']) {
+        Some(pos) => (&trimmed[..pos], &trimmed[pos..]),
+        None => (trimmed, ""),
+    };
+    if let Some((_userinfo, hostport)) = auth.rsplit_once('@') {
+        return format!("<REDACTED>@{hostport}{suffix}");
+    }
+    trimmed.to_string()
+}
+
+/// Scrubs `scheme://user:pass@` URL credentials embedded inside free-form log/note text.
+fn scrub_credentials_in_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((before, after_scheme)) = rest.split_once("://") {
+        out.push_str(before);
+        out.push_str("://");
+        let end = after_scheme
+            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '\'' | ')'))
+            .unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..end];
+        if let Some((_userinfo, hostport)) = authority.rsplit_once('@') {
+            out.push_str("<REDACTED>@");
+            out.push_str(hostport);
+        } else {
+            out.push_str(authority);
+        }
+        rest = &after_scheme[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn prune_diagnostics_archives(dir: &Path, keep: usize) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut archives: Vec<(SystemTime, String, PathBuf)> = rd
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("ClaudeGuard-Diagnostics-") || !name.ends_with(".zip") {
+                return None;
+            }
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path).ok()?;
+            if crate::journal::is_reparse_point_metadata(&meta) || !meta.is_file() {
+                return None;
+            }
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((mtime, name, path))
+        })
+        .collect();
+
+    if archives.len() <= keep {
+        return;
+    }
+    archives.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let remove_count = archives.len() - keep;
+    for (_, _, old_path) in archives.into_iter().take(remove_count) {
+        let _ = fs::remove_file(old_path);
+    }
+}
+
+fn write_diagnostics_zip_create_new(
+    out_dir: &Path,
+    now_secs: u64,
+    zip_bytes: &[u8],
+) -> Result<PathBuf, String> {
+    let mut last_err: Option<std::io::Error> = None;
+    for suffix in 0..=16u32 {
+        let filename = if suffix == 0 {
+            format!("ClaudeGuard-Diagnostics-{now_secs}.zip")
+        } else {
+            format!("ClaudeGuard-Diagnostics-{now_secs}-{suffix}.zip")
+        };
+        let candidate = out_dir.join(filename);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(zip_bytes).and_then(|()| file.sync_all()) {
+                    drop(file);
+                    let _ = fs::remove_file(&candidate);
+                    return Err(format!("写入诊断压缩包失败：{e}"));
+                }
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(format!("创建诊断压缩包失败：{e}")),
+        }
+    }
+    Err(format!(
+        "创建诊断压缩包失败（同名文件冲突超过上限）：{}",
+        last_err.map(|e| e.to_string()).unwrap_or_default()
+    ))
+}
+
+/// Builds a strictly redacted `.zip` diagnostic bundle containing zero raw IPs, coordinates,
+/// usernames, city/colo identifiers, or proxy credentials.
 pub fn export_redacted_diagnostics_zip(
     data_dir: &Path,
     snap: &GuardSnapshot,
@@ -297,6 +463,53 @@ pub fn export_redacted_diagnostics_zip(
     explicit_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
     let mut masked = mask_snapshot(snap);
+
+    // 1. Scrub proxy credentials across config, access evidence, and antigravity_proxy.
+    masked.config.proxy_host = scrub_proxy_credentials(&masked.config.proxy_host);
+    if let Some(addr) = masked.access.proxy_addr.as_deref() {
+        masked.access.proxy_addr = Some(scrub_proxy_credentials(addr));
+    }
+    masked.access.note = scrub_user_profile_paths(&scrub_credentials_in_text(&masked.access.note));
+    if let Some(ph) = masked.antigravity_proxy.proxy_host.as_deref() {
+        masked.antigravity_proxy.proxy_host = Some(scrub_proxy_credentials(ph));
+    }
+
+    // 2. Scrub `\Users\<username>\` in agent install paths and antigravity_dir.
+    for agent in &mut masked.agents {
+        agent.install_paths = agent
+            .install_paths
+            .iter()
+            .map(|p| scrub_user_profile_paths(p))
+            .collect();
+    }
+    if let Some(ag_dir) = masked.antigravity_proxy.antigravity_dir.as_deref() {
+        masked.antigravity_proxy.antigravity_dir = Some(scrub_user_profile_paths(ag_dir));
+    }
+    masked.antigravity_proxy.summary = scrub_user_profile_paths(&scrub_credentials_in_text(
+        &masked.antigravity_proxy.summary,
+    ));
+
+    // 3. Redact env_applied coordinates (`lat_from`, `lon_from`, `lat_to`, `lon_to` -> `"0.0"`) and city/colo.
+    if let Some(applied) = &mut masked.env_applied {
+        if applied.lat_from.is_some() {
+            applied.lat_from = Some("0.0".to_string());
+        }
+        if applied.lon_from.is_some() {
+            applied.lon_from = Some("0.0".to_string());
+        }
+        if !applied.lat_to.is_empty() {
+            applied.lat_to = "0.0".to_string();
+        }
+        if !applied.lon_to.is_empty() {
+            applied.lon_to = "0.0".to_string();
+        }
+        applied.city.clear();
+    }
+    masked.env.egress_colo = None;
+    masked.env.expect_city = None;
+    masked.env.note = redact(&masked.env.note, false);
+
+    // 4. Redact target IPs, matched rules, and clear fine-grained colo/city location hints.
     for t in &mut masked.config.targets {
         t.expect_ips = t.expect_ips.iter().map(|ip| redact(ip, false)).collect();
     }
@@ -305,14 +518,33 @@ pub fn export_redacted_diagnostics_zip(
         if let Some(rule) = t.matched_rule.as_deref() {
             t.matched_rule = Some(redact(rule, false));
         }
+        t.colo = None;
+        t.city = None;
+    }
+
+    for item in &mut masked.self_check.items {
+        item.detail = scrub_user_profile_paths(&scrub_credentials_in_text(&item.detail));
+    }
+    for toast in &mut masked.recent_toasts {
+        toast.body =
+            scrub_user_profile_paths(&scrub_credentials_in_text(&redact(&toast.body, false)));
+    }
+
+    let mut logs_txt = String::new();
+    for entry in &mut masked.recent_logs {
+        let clean =
+            scrub_user_profile_paths(&scrub_credentials_in_text(&redact(&entry.message, false)));
+        entry.message = clean.clone();
+        logs_txt.push_str(&format!(
+            "[{}] {:?} [{}] {}\n",
+            entry.timestamp, entry.level, entry.category, clean
+        ));
     }
 
     let snap_json =
         serde_json::to_vec_pretty(&masked).map_err(|e| format!("序列化脱敏快照失败：{e}"))?;
-
     let cfg_json = serde_json::to_vec_pretty(&masked.config)
         .map_err(|e| format!("序列化脱敏配置失败：{e}"))?;
-
     let self_check_json = serde_json::to_vec_pretty(&masked.self_check)
         .map_err(|e| format!("序列化防线自检失败：{e}"))?;
     let shield_json = serde_json::to_vec_pretty(&masked.leak_shield)
@@ -321,15 +553,6 @@ pub fn export_redacted_diagnostics_zip(
         .map_err(|e| format!("序列化代理内核状态失败：{e}"))?;
     let feishu_json = serde_json::to_vec_pretty(&masked.feishu)
         .map_err(|e| format!("序列化飞书状态失败：{e}"))?;
-
-    let mut logs_txt = String::new();
-    for entry in &masked.recent_logs {
-        let msg = redact(&entry.message, false);
-        logs_txt.push_str(&format!(
-            "[{}] {:?} [{}] {}\n",
-            entry.timestamp, entry.level, entry.category, msg
-        ));
-    }
 
     let zip_bytes = zip_util::build_zip_archive(&[
         ("snapshot_redacted.json", &snap_json),
@@ -341,30 +564,82 @@ pub fn export_redacted_diagnostics_zip(
         ("audit_logs.txt", logs_txt.as_bytes()),
     ])?;
 
-    let out_dir = explicit_dir
+    let fallback_dir = data_dir.join("diagnostics");
+    let mut out_dir = explicit_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| resolve_diagnostics_dir(data_dir));
-    fs::create_dir_all(&out_dir).map_err(|e| format!("创建诊断导出目录失败：{e}"))?;
 
-    let filename = format!("ClaudeGuard-Diagnostics-{now_secs}.zip");
-    let out_path = out_dir.join(filename);
-    fs::write(&out_path, &zip_bytes).map_err(|e| format!("写入诊断压缩包失败：{e}"))?;
+    if has_reparse_point_in_chain(&out_dir) {
+        out_dir = fallback_dir.clone();
+    }
+
+    let using_fallback = out_dir == fallback_dir;
+    if using_fallback {
+        crate::journal::ensure_secure_data_dir(data_dir)?;
+    }
+    if has_reparse_point_in_chain(&out_dir) {
+        return Err("拒绝向包含符号链接或重解析点的目录写入诊断压缩包".into());
+    }
+    fs::create_dir_all(&out_dir).map_err(|e| format!("创建诊断导出目录失败：{e}"))?;
+    if has_reparse_point_in_chain(&out_dir) {
+        return Err("检测到诊断导出目录存在符号链接或目录联接，已拒绝写入".into());
+    }
+
+    let out_path = write_diagnostics_zip_create_new(&out_dir, now_secs, &zip_bytes)?;
+    if using_fallback {
+        prune_diagnostics_archives(&fallback_dir, MAX_DIAGNOSTIC_ARCHIVES);
+    }
     Ok(out_path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cg_protocol::{LogEntry, LogLevel, TargetState, TargetStatus};
+    use cg_protocol::{
+        AgentKind, AgentRuntimeStatus, LogEntry, LogLevel, TargetState, TargetStatus,
+    };
     use tempfile::tempdir;
 
     #[test]
-    fn exported_diagnostics_zip_redacts_all_ips_and_is_valid_zip() {
+    fn exported_diagnostics_zip_redacts_ips_coords_usernames_credentials_and_colos() {
         let dir = tempdir().unwrap();
         let mut snap = GuardSnapshot {
-            version: "4.0.0".into(),
+            version: "4.1.2".into(),
             ..GuardSnapshot::default()
         };
+        snap.config.proxy_host = "http://alice:s3cr3tPass@127.0.0.1:7890".into();
+        snap.access.proxy_addr = Some("http://bob:topSecret@127.0.0.1:7890".into());
+        snap.access.note = "系统代理 http://bob:topSecret@127.0.0.1:7890".into();
+        snap.antigravity_proxy.antigravity_dir =
+            Some(r"C:\Users\alice_secret\AppData\Local\Programs\Antigravity IDE".into());
+        snap.antigravity_proxy.proxy_host = Some("socks5://user1:pw2@127.0.0.1:7890".into());
+        snap.agents.push(AgentRuntimeStatus {
+            id: "claude".into(),
+            name: "Claude".into(),
+            kind: AgentKind::Gui,
+            installed: true,
+            guarded: true,
+            running_count: 1,
+            orphan_count: 0,
+            quarantined: false,
+            firewall_rules: 0,
+            install_paths: vec![
+                r"C:\Users\alice_secret\AppData\Local\AnthropicClaude\claude.exe".into(),
+            ],
+        });
+        snap.env_applied = Some(AppliedEnv {
+            at: 1700000000,
+            city: "Los Angeles".into(),
+            tz_from: "China Standard Time".into(),
+            tz_to: "Pacific Standard Time".into(),
+            lat_from: Some("31.2304".into()),
+            lon_from: Some("121.4737".into()),
+            lat_to: "34.0522".into(),
+            lon_to: "-118.2437".into(),
+        });
+        snap.env.egress_colo = Some("LAX".into());
+        snap.env.expect_city = Some("Los Angeles".into());
+
         let mut t = cg_protocol::default_builtin_targets(&["198.51.100.98".into()], &["US".into()])
             .into_iter()
             .next()
@@ -372,6 +647,8 @@ mod tests {
         t.id = "claude".into();
         let mut ts = TargetStatus::from_target(&t, TargetState::Pass);
         ts.ip = Some("198.51.100.98".into());
+        ts.colo = Some("LAX".into());
+        ts.city = Some("Los Angeles".into());
         ts.matched_rule = Some("198.51.100.98".into());
         ts.reason = "出口 198.51.100.98 通过".into();
         snap.config.targets =
@@ -382,7 +659,7 @@ mod tests {
             timestamp: 1000,
             level: LogLevel::Info,
             category: "probe".into(),
-            message: "检测到真实出口 203.0.113.45 异常".into(),
+            message: r"检测到真实出口 203.0.113.45 路径 C:\Users\alice_secret\claude.exe 代理 http://u:p@127.0.0.1:7890".into(),
         });
 
         let out = export_redacted_diagnostics_zip(dir.path(), &snap, 1700000000, Some(dir.path()))
@@ -392,13 +669,126 @@ mod tests {
         let (_, snap_entry) =
             zip_util::extract_file_from_zip(&raw, "snapshot_redacted.json").expect("read snap");
         let snap_text = String::from_utf8(snap_entry).unwrap();
-        assert!(!snap_text.contains("198.51.100.98"));
-        assert!(!snap_text.contains("203.0.113.45"));
+        for forbidden in [
+            "198.51.100.98",
+            "203.0.113.45",
+            "alice_secret",
+            "s3cr3tPass",
+            "topSecret",
+            "user1:pw2",
+            "u:p@",
+            "31.2304",
+            "121.4737",
+            "34.0522",
+            "-118.2437",
+            "Los Angeles",
+            "\"LAX\"",
+        ] {
+            assert!(
+                !snap_text.contains(forbidden),
+                "snapshot_redacted.json leaked '{forbidden}': {snap_text}"
+            );
+        }
+        let parsed_snap: GuardSnapshot = serde_json::from_str(&snap_text).unwrap();
+        let applied = parsed_snap.env_applied.unwrap();
+        assert_eq!(applied.lat_from.as_deref(), Some("0.0"));
+        assert_eq!(applied.lon_from.as_deref(), Some("0.0"));
+        assert_eq!(applied.lat_to, "0.0");
+        assert_eq!(applied.lon_to, "0.0");
+        assert!(parsed_snap.agents[0].install_paths[0].contains(r"\Users\<REDACTED>\"));
+        assert!(parsed_snap
+            .antigravity_proxy
+            .antigravity_dir
+            .unwrap()
+            .contains(r"\Users\<REDACTED>\"));
+        assert!(parsed_snap.targets[0].colo.is_none());
+        assert!(parsed_snap.targets[0].city.is_none());
+        assert!(parsed_snap.env.egress_colo.is_none());
+        assert!(parsed_snap.env.expect_city.is_none());
 
         let (_, logs_entry) =
             zip_util::extract_file_from_zip(&raw, "audit_logs.txt").expect("read logs");
         let logs_text = String::from_utf8(logs_entry).unwrap();
         assert!(!logs_text.contains("203.0.113.45"));
+        assert!(!logs_text.contains("alice_secret"));
+        assert!(!logs_text.contains("u:p@"));
+    }
+
+    #[test]
+    fn create_new_collision_suffix_never_overwrites_existing_and_fallback_prunes_to_10() {
+        let root = tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        let export_dir = root.path().join("out");
+        fs::create_dir_all(&export_dir).unwrap();
+
+        let pre_existing = export_dir.join("ClaudeGuard-Diagnostics-1700000100.zip");
+        fs::write(&pre_existing, b"DO_NOT_OVERWRITE").unwrap();
+
+        let snap = GuardSnapshot::default();
+        let second =
+            export_redacted_diagnostics_zip(&data_dir, &snap, 1700000100, Some(&export_dir))
+                .expect("collision suffix -1");
+        assert_eq!(
+            second.file_name().unwrap().to_string_lossy(),
+            "ClaudeGuard-Diagnostics-1700000100-1.zip"
+        );
+        assert_eq!(fs::read(&pre_existing).unwrap(), b"DO_NOT_OVERWRITE");
+
+        // Verify fallback `<data_dir>\diagnostics` prunes archives to keep at most 10.
+        let fallback_dir = data_dir.join("diagnostics");
+        for ts in 1..=14u64 {
+            let _ = export_redacted_diagnostics_zip(
+                &data_dir,
+                &snap,
+                1700001000 + ts,
+                Some(&fallback_dir),
+            )
+            .unwrap();
+        }
+        let remaining: Vec<_> = fs::read_dir(&fallback_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".zip"))
+            .collect();
+        assert_eq!(remaining.len(), MAX_DIAGNOSTIC_ARCHIVES);
+
+        // Windows junction on Desktop must be detected and routed to `<data_dir>\diagnostics`.
+        #[cfg(windows)]
+        {
+            let target_dir = root.path().join("sensitive_target");
+            fs::create_dir_all(&target_dir).unwrap();
+            let user_home = root.path().join("Users").join("bob");
+            fs::create_dir_all(&user_home).unwrap();
+            let junction_desktop = user_home.join("Desktop");
+            let status = std::process::Command::new("cmd.exe")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &junction_desktop.to_string_lossy(),
+                    &target_dir.to_string_lossy(),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if status.is_ok_and(|s| s.success()) {
+                assert!(has_reparse_point_in_chain(&junction_desktop));
+                assert!(has_reparse_point_in_chain(&junction_desktop.join("sub")));
+                let redirected = export_redacted_diagnostics_zip(
+                    &data_dir,
+                    &snap,
+                    1700009999,
+                    Some(&junction_desktop),
+                )
+                .expect("junction desktop must fall back safely to data_dir/diagnostics");
+                assert!(redirected.starts_with(&fallback_dir));
+                assert!(
+                    fs::read_dir(&target_dir).unwrap().next().is_none(),
+                    "must never write files through Desktop junction target"
+                );
+                let _ = fs::remove_dir(&junction_desktop);
+            }
+        }
     }
 
     #[test]
@@ -417,7 +807,7 @@ mod tests {
 
         // Session-0 LocalSystem resolves to active interactive user's Desktop when available.
         assert_eq!(
-            resolve_diagnostics_dir_with(Some(sys_profile), Some(&user_home), &data_dir, &temp_dir,),
+            resolve_diagnostics_dir_with(Some(sys_profile), Some(&user_home), &data_dir, &temp_dir),
             user_desktop
         );
 

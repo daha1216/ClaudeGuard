@@ -4,10 +4,10 @@
 //! - Constructs Win32 `SECURITY_ATTRIBUTES` from SDDL
 //!   `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)` so normal-privilege GUI/CLI users
 //!   can connect without UAC while anonymous/network accounts lack access.
-//! - Creates pipes with `PIPE_REJECT_REMOTE_CLIENTS` so remote SMB clients are rejected.
-//! - Uses 4-byte little-endian `u32` framing (max 4 MiB) + UTF-8 JSON.
-//! - Serves `GetSnapshot` in O(1) directly from `Arc<RwLock<SnapshotPayload>>` and
-//!   routes mutations through the single-writer [`CoordinatorHandle`].
+//! - Creates pipes with `PIPE_REJECT_REMOTE_CLIENTS` and bounded `MAX_PIPE_INSTANCES = 16`.
+//! - Enforces `256 KiB` cap on incoming client request frames (while allowing `4 MiB` outgoing
+//!   snapshot responses) and `15_000 ms` overlapped I/O deadlines on both server and client.
+//! - Rejects mutating IPC requests from non-active Windows sessions when running in Session 0.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,6 +24,34 @@ use crate::protocol::{
 /// - `BA` (Builtin Administrators): Generic All
 /// - `AU` (Authenticated Users / interactive desktop user): Generic Read + Generic Write
 pub const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)";
+
+/// Bounded Named Pipe instance limit (`CRIT-04`).
+pub const MAX_PIPE_INSTANCES: u32 = 16;
+
+/// Maximum incoming request frame payload accepted by `PipeServer` (`256 KiB`).
+pub const MAX_REQUEST_FRAME_BYTES: usize = 256 * 1024;
+
+/// Returns true for read-only / non-mutating [`PipeRequest`] variants permitted across sessions.
+pub fn is_readonly_pipe_request(req: &PipeRequest) -> bool {
+    matches!(
+        req,
+        PipeRequest::GetSnapshot
+            | PipeRequest::CheckLaunchGate { .. }
+            | PipeRequest::QueryLogs { .. }
+    )
+}
+
+/// Pure helper evaluating whether `client_session` is authorized to issue mutating requests
+/// when the daemon is running as a Session-0 Windows Service.
+pub fn is_authorized_client_session(
+    client_session: u32,
+    active_console_session: u32,
+    active_wts_sessions: &[u32],
+) -> bool {
+    client_session == 0
+        || (active_console_session != u32::MAX && client_session == active_console_session)
+        || active_wts_sessions.contains(&client_session)
+}
 
 /// Normalizes a pipe name to `\\.\pipe\<name>`.
 pub fn normalize_pipe_name(raw: &str) -> String {
@@ -103,15 +131,16 @@ impl From<FrameError> for PipeError {
 #[cfg(windows)]
 mod win_impl {
     use super::*;
-    use std::ffi::OsStr;
+    use std::ffi::{c_void, OsStr};
     use std::os::windows::ffi::OsStrExt;
     use std::sync::mpsc;
+    use std::time::{Duration, Instant};
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{
         CloseHandle, LocalFree, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND,
         ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
         ERROR_PIPE_NOT_CONNECTED, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL,
-        INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0, WIN32_ERROR,
+        INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT, WIN32_ERROR,
     };
     use windows::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -123,14 +152,88 @@ mod win_impl {
         PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
     };
     use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, WaitNamedPipeW,
-        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-        PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientSessionId,
+        WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
     use windows::Win32::System::Threading::{
-        CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, INFINITE,
+        CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
     };
     use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+
+    const MAX_CLIENT_WORKERS: usize = 16;
+    const PIPE_IO_TIMEOUT_MS: u32 = 15_000;
+    const CLIENT_CALL_TIMEOUT_MS: u32 = 15_000;
+    const WTS_ACTIVE_STATE: i32 = 0;
+
+    #[repr(C)]
+    struct WtsSessionInfoW {
+        session_id: u32,
+        win_station_name: *mut u16,
+        state: i32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn WTSGetActiveConsoleSessionId() -> u32;
+    }
+
+    #[link(name = "wtsapi32")]
+    unsafe extern "system" {
+        fn WTSEnumerateSessionsW(
+            h_server: *mut c_void,
+            reserved: u32,
+            version: u32,
+            pp_session_info: *mut *mut WtsSessionInfoW,
+            p_count: *mut u32,
+        ) -> i32;
+        fn WTSFreeMemory(p_memory: *mut c_void);
+    }
+
+    struct WtsMemGuard(*mut c_void);
+
+    impl Drop for WtsMemGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    WTSFreeMemory(self.0);
+                }
+            }
+        }
+    }
+
+    fn active_wts_session_ids() -> Vec<u32> {
+        let mut ptr: *mut WtsSessionInfoW = std::ptr::null_mut();
+        let mut count: u32 = 0;
+        let ok = unsafe { WTSEnumerateSessionsW(std::ptr::null_mut(), 0, 1, &mut ptr, &mut count) };
+        if ok == 0 || ptr.is_null() {
+            return Vec::new();
+        }
+        let _guard = WtsMemGuard(ptr.cast::<c_void>());
+        let slice = unsafe { std::slice::from_raw_parts(ptr, count as usize) };
+        slice
+            .iter()
+            .filter(|s| s.state == WTS_ACTIVE_STATE)
+            .map(|s| s.session_id)
+            .collect()
+    }
+
+    fn check_session_zero_caller_allowed(pipe: HANDLE) -> Result<(), String> {
+        let mut client_session: u32 = u32::MAX;
+        unsafe { GetNamedPipeClientSessionId(pipe, &mut client_session) }
+            .map_err(|e| format!("failed to query client session ID: {e}"))?;
+        let active_console = unsafe { WTSGetActiveConsoleSessionId() };
+        if client_session == 0 || (active_console != u32::MAX && client_session == active_console) {
+            return Ok(());
+        }
+        let active_wts = active_wts_session_ids();
+        if is_authorized_client_session(client_session, active_console, &active_wts) {
+            Ok(())
+        } else {
+            Err(format!(
+                "access denied: mutating IPC request from inactive Windows session {client_session} rejected"
+            ))
+        }
+    }
 
     fn to_wide_null(s: &str) -> Vec<u16> {
         OsStr::new(s)
@@ -286,7 +389,7 @@ mod win_impl {
                 PCWSTR(pipe_wide.as_ptr()),
                 open_mode,
                 pipe_mode,
-                PIPE_UNLIMITED_INSTANCES,
+                MAX_PIPE_INSTANCES,
                 65_536,
                 65_536,
                 5_000,
@@ -361,12 +464,22 @@ mod win_impl {
                 }
                 Err(e) if win32_code(&e) == ERROR_IO_PENDING => {
                     let handles = [io_event, shutdown_event];
-                    let wait = unsafe { WaitForMultipleObjects(&handles, FALSE, INFINITE) };
+                    let wait =
+                        unsafe { WaitForMultipleObjects(&handles, FALSE, PIPE_IO_TIMEOUT_MS) };
                     if wait == WAIT_OBJECT_0 {
                         let mut n = 0u32;
                         unsafe { GetOverlappedResult(pipe, &overlapped, &mut n, FALSE) }
                             .map_err(|err| map_win32_err(&err, "GetOverlappedResult(read)"))?;
                         n as usize
+                    } else if wait == WAIT_TIMEOUT {
+                        unsafe {
+                            let _ = CancelIoEx(pipe, Some(&overlapped));
+                            let mut n = 0u32;
+                            let _ = GetOverlappedResult(pipe, &overlapped, &mut n, TRUE);
+                        }
+                        return Err(PipeError::BusyTimeout(format!(
+                            "pipe read timed out after {PIPE_IO_TIMEOUT_MS}ms"
+                        )));
                     } else {
                         unsafe {
                             let _ = CancelIoEx(pipe, Some(&overlapped));
@@ -410,12 +523,22 @@ mod win_impl {
                 }
                 Err(e) if win32_code(&e) == ERROR_IO_PENDING => {
                     let handles = [io_event, shutdown_event];
-                    let wait = unsafe { WaitForMultipleObjects(&handles, FALSE, INFINITE) };
+                    let wait =
+                        unsafe { WaitForMultipleObjects(&handles, FALSE, PIPE_IO_TIMEOUT_MS) };
                     if wait == WAIT_OBJECT_0 {
                         let mut n = 0u32;
                         unsafe { GetOverlappedResult(pipe, &overlapped, &mut n, FALSE) }
                             .map_err(|err| map_win32_err(&err, "GetOverlappedResult(write)"))?;
                         n as usize
+                    } else if wait == WAIT_TIMEOUT {
+                        unsafe {
+                            let _ = CancelIoEx(pipe, Some(&overlapped));
+                            let mut n = 0u32;
+                            let _ = GetOverlappedResult(pipe, &overlapped, &mut n, TRUE);
+                        }
+                        return Err(PipeError::BusyTimeout(format!(
+                            "pipe write timed out after {PIPE_IO_TIMEOUT_MS}ms"
+                        )));
                     } else {
                         unsafe {
                             let _ = CancelIoEx(pipe, Some(&overlapped));
@@ -435,7 +558,20 @@ mod win_impl {
         Ok(())
     }
 
-    fn validate_len(len: usize) -> Result<(), PipeError> {
+    fn validate_request_len(len: usize) -> Result<(), PipeError> {
+        if len == 0 {
+            return Err(PipeError::Frame(FrameError::ZeroLength));
+        }
+        if len > MAX_REQUEST_FRAME_BYTES {
+            return Err(PipeError::Frame(FrameError::TooLarge {
+                len,
+                max: MAX_REQUEST_FRAME_BYTES,
+            }));
+        }
+        Ok(())
+    }
+
+    fn validate_response_len(len: usize) -> Result<(), PipeError> {
         if len == 0 {
             return Err(PipeError::Frame(FrameError::ZeroLength));
         }
@@ -456,7 +592,7 @@ mod win_impl {
         let mut header = [0u8; 4];
         read_exact_overlapped(pipe, io_event, shutdown_event, &mut header)?;
         let len = u32::from_le_bytes(header) as usize;
-        validate_len(len)?;
+        validate_request_len(len)?;
         let mut payload = vec![0u8; len];
         read_exact_overlapped(pipe, io_event, shutdown_event, &mut payload)?;
         Ok(payload)
@@ -473,6 +609,7 @@ mod win_impl {
             }
             return;
         };
+        let in_session_zero = cg_platform::access_win::is_session_zero();
 
         loop {
             if shutdown_event.raw().is_invalid() {
@@ -488,7 +625,20 @@ mod win_impl {
             };
 
             let response = match serde_json::from_slice::<PipeRequest>(&payload) {
-                Ok(req) => coordinator.dispatch(req),
+                Ok(req) => {
+                    if in_session_zero && !is_readonly_pipe_request(&req) {
+                        match check_session_zero_caller_allowed(pipe.raw()) {
+                            Ok(()) => coordinator.dispatch(req),
+                            Err(msg) => PipeResponse::Error {
+                                code: ErrorCode::Unsupported,
+                                message: msg,
+                                receipt: None,
+                            },
+                        }
+                    } else {
+                        coordinator.dispatch(req)
+                    }
+                }
                 Err(err) => PipeResponse::Error {
                     code: ErrorCode::InvalidRequest,
                     message: format!("invalid request JSON: {err}"),
@@ -520,6 +670,33 @@ mod win_impl {
 
         unsafe {
             let _ = DisconnectNamedPipe(pipe.raw());
+        }
+    }
+
+    fn next_pipe_instance_with_retry(
+        pipe_wide: &[u16],
+        sd_guard: &SecurityDescriptorGuard,
+        thread_stopped: &AtomicBool,
+        shutdown_event: HANDLE,
+        client_workers: &mut Vec<JoinHandle<()>>,
+    ) -> Option<OwnedHandle> {
+        loop {
+            if thread_stopped.load(Ordering::Acquire) {
+                return None;
+            }
+            client_workers.retain(|h| !h.is_finished());
+            match create_pipe_instance(pipe_wide, sd_guard, false) {
+                Ok(next_pipe) => return Some(next_pipe),
+                Err(_) => {
+                    if thread_stopped.load(Ordering::Acquire) {
+                        return None;
+                    }
+                    let wait = unsafe { WaitForSingleObject(shutdown_event, 100) };
+                    if wait == WAIT_OBJECT_0 {
+                        return None;
+                    }
+                }
+            }
         }
     }
 
@@ -574,7 +751,8 @@ mod win_impl {
 
                     let _ = ready_tx.send(Ok(()));
 
-                    let mut client_workers: Vec<JoinHandle<()>> = Vec::new();
+                    let mut client_workers: Vec<JoinHandle<()>> =
+                        Vec::with_capacity(MAX_CLIENT_WORKERS);
                     loop {
                         if thread_stopped.load(Ordering::Acquire) {
                             break;
@@ -587,36 +765,53 @@ mod win_impl {
                         ) {
                             Ok(()) => {
                                 let connected_pipe = current_pipe;
-                                let c_coord = coordinator.clone();
-                                let c_shutdown = thread_shutdown.clone();
-                                let worker = std::thread::Builder::new()
-                                    .name("cg-pipe-client".to_string())
-                                    .spawn(move || {
-                                        serve_client_connection(connected_pipe, c_shutdown, c_coord)
-                                    })
-                                    .ok();
-                                if let Some(w) = worker {
-                                    client_workers.push(w);
-                                }
                                 client_workers.retain(|h| !h.is_finished());
+                                if client_workers.len() >= MAX_CLIENT_WORKERS {
+                                    unsafe {
+                                        let _ = DisconnectNamedPipe(connected_pipe.raw());
+                                    }
+                                    drop(connected_pipe);
+                                } else {
+                                    let c_coord = coordinator.clone();
+                                    let c_shutdown = thread_shutdown.clone();
+                                    let worker = std::thread::Builder::new()
+                                        .name("cg-pipe-client".to_string())
+                                        .spawn(move || {
+                                            serve_client_connection(
+                                                connected_pipe,
+                                                c_shutdown,
+                                                c_coord,
+                                            )
+                                        })
+                                        .ok();
+                                    if let Some(w) = worker {
+                                        client_workers.push(w);
+                                    }
+                                }
 
-                                if thread_stopped.load(Ordering::Acquire) {
+                                let Some(next_pipe) = next_pipe_instance_with_retry(
+                                    &pipe_wide,
+                                    &sd_guard,
+                                    &thread_stopped,
+                                    thread_shutdown.raw(),
+                                    &mut client_workers,
+                                ) else {
                                     break;
-                                }
-                                match create_pipe_instance(&pipe_wide, &sd_guard, false) {
-                                    Ok(next_pipe) => current_pipe = next_pipe,
-                                    Err(_) => break,
-                                }
+                                };
+                                current_pipe = next_pipe;
                             }
                             Err(PipeError::ShuttingDown) => break,
                             Err(_) => {
-                                if thread_stopped.load(Ordering::Acquire) {
+                                let Some(next_pipe) = next_pipe_instance_with_retry(
+                                    &pipe_wide,
+                                    &sd_guard,
+                                    &thread_stopped,
+                                    thread_shutdown.raw(),
+                                    &mut client_workers,
+                                ) else {
                                     break;
-                                }
-                                match create_pipe_instance(&pipe_wide, &sd_guard, false) {
-                                    Ok(next_pipe) => current_pipe = next_pipe,
-                                    Err(_) => break,
-                                }
+                                };
+                                current_pipe = next_pipe;
                             }
                         }
                     }
@@ -655,11 +850,16 @@ mod win_impl {
             &self.pipe_name
         }
 
-        /// Signals the server to stop accepting connections and joins all IPC threads.
-        pub fn shutdown(&self) {
+        /// Signals all overlapped accept/client operations to cancel immediately without blocking.
+        pub fn signal_stop(&self) {
             if !self.stopped.swap(true, Ordering::AcqRel) {
                 self.shutdown_event.signal();
             }
+        }
+
+        /// Signals the server to stop accepting connections and joins all IPC threads.
+        pub fn shutdown(&self) {
+            self.signal_stop();
             if let Ok(mut guard) = self.accept_thread.lock() {
                 if let Some(handle) = guard.take() {
                     let _ = handle.join();
@@ -674,9 +874,11 @@ mod win_impl {
         }
     }
 
-    /// Synchronous Windows Named Pipe IPC client.
+    /// Overlapped deadline-bounded Windows Named Pipe IPC client.
     pub struct PipeClient {
         handle: OwnedHandle,
+        io_event: SharedEvent,
+        call_timeout_ms: u32,
     }
 
     impl PipeClient {
@@ -684,8 +886,7 @@ mod win_impl {
         pub fn connect(pipe_name: &str, timeout_ms: u32) -> Result<Self, PipeError> {
             let normalized = normalize_pipe_name(pipe_name);
             let wide = to_wide_null(&normalized);
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
+            let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
 
             loop {
                 let res = unsafe {
@@ -695,19 +896,26 @@ mod win_impl {
                         FILE_SHARE_NONE,
                         None,
                         OPEN_EXISTING,
-                        FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                        FILE_ATTRIBUTE_NORMAL
+                            | FILE_FLAG_OVERLAPPED
+                            | SECURITY_SQOS_PRESENT
+                            | SECURITY_IDENTIFICATION,
                         HANDLE::default(),
                     )
                 };
                 match res {
                     Ok(handle) => {
+                        let owned = OwnedHandle(handle);
+                        let io_event = SharedEvent::new_manual_reset()?;
                         return Ok(Self {
-                            handle: OwnedHandle(handle),
-                        })
+                            handle: owned,
+                            io_event,
+                            call_timeout_ms: CLIENT_CALL_TIMEOUT_MS,
+                        });
                     }
                     Err(e) if win32_code(&e) == ERROR_PIPE_BUSY => {
                         let remaining = deadline
-                            .saturating_duration_since(std::time::Instant::now())
+                            .saturating_duration_since(Instant::now())
                             .as_millis() as u32;
                         if remaining == 0 {
                             return Err(PipeError::BusyTimeout(format!(
@@ -717,7 +925,7 @@ mod win_impl {
                         let wait_slice = remaining.clamp(1, 250);
                         let waited = unsafe { WaitNamedPipeW(PCWSTR(wide.as_ptr()), wait_slice) };
                         if !waited.as_bool() {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            std::thread::sleep(Duration::from_millis(10));
                         }
                     }
                     Err(e) => return Err(map_win32_err(&e, &format!("CreateFileW({normalized})"))),
@@ -725,47 +933,183 @@ mod win_impl {
             }
         }
 
-        /// Sends one [`PipeRequest`] and waits for its [`PipeResponse`].
+        /// Overrides the per-call overlapped I/O deadline in milliseconds (default: `15_000` ms).
+        pub fn set_call_timeout_ms(&mut self, timeout_ms: u32) {
+            self.call_timeout_ms = timeout_ms.max(1);
+        }
+
+        /// Sends one [`PipeRequest`] and waits for its [`PipeResponse`] within `call_timeout_ms`.
         pub fn call(&mut self, req: &PipeRequest) -> Result<PipeResponse, PipeError> {
             let encoded = encode_frame(req)?;
-            self.write_all_sync(&encoded)?;
+            let deadline =
+                Instant::now() + Duration::from_millis(u64::from(self.call_timeout_ms.max(1)));
+            self.write_all_overlapped(&encoded, deadline)?;
 
             let mut header = [0u8; 4];
-            self.read_exact_sync(&mut header)?;
+            self.read_exact_overlapped(&mut header, deadline)?;
             let len = u32::from_le_bytes(header) as usize;
-            validate_len(len)?;
+            validate_response_len(len)?;
             let mut payload = vec![0u8; len];
-            self.read_exact_sync(&mut payload)?;
+            self.read_exact_overlapped(&mut payload, deadline)?;
             serde_json::from_slice(&payload)
                 .map_err(|e| PipeError::Frame(FrameError::DecodeFailed(e.to_string())))
         }
 
-        fn write_all_sync(&self, mut buf: &[u8]) -> Result<(), PipeError> {
+        fn remaining_ms(&self, deadline: Instant) -> Result<u32, PipeError> {
+            let rem = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis();
+            if rem == 0 {
+                return Err(PipeError::BusyTimeout(format!(
+                    "pipe client call timed out after {}ms",
+                    self.call_timeout_ms
+                )));
+            }
+            Ok(rem.min(u128::from(u32::MAX - 1)) as u32)
+        }
+
+        fn write_all_overlapped(&self, mut buf: &[u8], deadline: Instant) -> Result<(), PipeError> {
             while !buf.is_empty() {
-                let mut written = 0u32;
+                let wait_ms = self.remaining_ms(deadline)?;
                 unsafe {
-                    WriteFile(self.handle.raw(), Some(buf), Some(&mut written), None)
-                        .map_err(|e| map_win32_err(&e, "client WriteFile"))?;
+                    let _ = ResetEvent(self.io_event.raw());
                 }
+                let mut overlapped = OVERLAPPED {
+                    hEvent: self.io_event.raw(),
+                    ..Default::default()
+                };
+                let res =
+                    unsafe { WriteFile(self.handle.raw(), Some(buf), None, Some(&mut overlapped)) };
+                let written = match res {
+                    Ok(()) => {
+                        let mut n = 0u32;
+                        unsafe {
+                            GetOverlappedResult(self.handle.raw(), &overlapped, &mut n, FALSE)
+                        }
+                        .map_err(|e| map_win32_err(&e, "client GetOverlappedResult(write)"))?;
+                        n as usize
+                    }
+                    Err(e) if win32_code(&e) == ERROR_IO_PENDING => {
+                        let wait = unsafe { WaitForSingleObject(self.io_event.raw(), wait_ms) };
+                        if wait == WAIT_OBJECT_0 {
+                            let mut n = 0u32;
+                            unsafe {
+                                GetOverlappedResult(self.handle.raw(), &overlapped, &mut n, FALSE)
+                            }
+                            .map_err(|err| {
+                                map_win32_err(&err, "client GetOverlappedResult(write)")
+                            })?;
+                            n as usize
+                        } else if wait == WAIT_TIMEOUT {
+                            unsafe {
+                                let _ = CancelIoEx(self.handle.raw(), Some(&overlapped));
+                                let mut n = 0u32;
+                                let _ = GetOverlappedResult(
+                                    self.handle.raw(),
+                                    &overlapped,
+                                    &mut n,
+                                    TRUE,
+                                );
+                            }
+                            return Err(PipeError::BusyTimeout(format!(
+                                "pipe client write timed out after {}ms",
+                                self.call_timeout_ms
+                            )));
+                        } else {
+                            unsafe {
+                                let _ = CancelIoEx(self.handle.raw(), Some(&overlapped));
+                                let mut n = 0u32;
+                                let _ = GetOverlappedResult(
+                                    self.handle.raw(),
+                                    &overlapped,
+                                    &mut n,
+                                    TRUE,
+                                );
+                            }
+                            return Err(PipeError::Disconnected);
+                        }
+                    }
+                    Err(e) => return Err(map_win32_err(&e, "client WriteFile")),
+                };
                 if written == 0 {
                     return Err(PipeError::Disconnected);
                 }
-                buf = &buf[written as usize..];
+                buf = &buf[written..];
             }
             Ok(())
         }
 
-        fn read_exact_sync(&self, mut buf: &mut [u8]) -> Result<(), PipeError> {
+        fn read_exact_overlapped(
+            &self,
+            mut buf: &mut [u8],
+            deadline: Instant,
+        ) -> Result<(), PipeError> {
             while !buf.is_empty() {
-                let mut read = 0u32;
+                let wait_ms = self.remaining_ms(deadline)?;
                 unsafe {
-                    ReadFile(self.handle.raw(), Some(buf), Some(&mut read), None)
-                        .map_err(|e| map_win32_err(&e, "client ReadFile"))?;
+                    let _ = ResetEvent(self.io_event.raw());
                 }
+                let mut overlapped = OVERLAPPED {
+                    hEvent: self.io_event.raw(),
+                    ..Default::default()
+                };
+                let res =
+                    unsafe { ReadFile(self.handle.raw(), Some(buf), None, Some(&mut overlapped)) };
+                let read = match res {
+                    Ok(()) => {
+                        let mut n = 0u32;
+                        unsafe {
+                            GetOverlappedResult(self.handle.raw(), &overlapped, &mut n, FALSE)
+                        }
+                        .map_err(|e| map_win32_err(&e, "client GetOverlappedResult(read)"))?;
+                        n as usize
+                    }
+                    Err(e) if win32_code(&e) == ERROR_IO_PENDING => {
+                        let wait = unsafe { WaitForSingleObject(self.io_event.raw(), wait_ms) };
+                        if wait == WAIT_OBJECT_0 {
+                            let mut n = 0u32;
+                            unsafe {
+                                GetOverlappedResult(self.handle.raw(), &overlapped, &mut n, FALSE)
+                            }
+                            .map_err(|err| {
+                                map_win32_err(&err, "client GetOverlappedResult(read)")
+                            })?;
+                            n as usize
+                        } else if wait == WAIT_TIMEOUT {
+                            unsafe {
+                                let _ = CancelIoEx(self.handle.raw(), Some(&overlapped));
+                                let mut n = 0u32;
+                                let _ = GetOverlappedResult(
+                                    self.handle.raw(),
+                                    &overlapped,
+                                    &mut n,
+                                    TRUE,
+                                );
+                            }
+                            return Err(PipeError::BusyTimeout(format!(
+                                "pipe client read timed out after {}ms",
+                                self.call_timeout_ms
+                            )));
+                        } else {
+                            unsafe {
+                                let _ = CancelIoEx(self.handle.raw(), Some(&overlapped));
+                                let mut n = 0u32;
+                                let _ = GetOverlappedResult(
+                                    self.handle.raw(),
+                                    &overlapped,
+                                    &mut n,
+                                    TRUE,
+                                );
+                            }
+                            return Err(PipeError::Disconnected);
+                        }
+                    }
+                    Err(e) => return Err(map_win32_err(&e, "client ReadFile")),
+                };
                 if read == 0 {
                     return Err(PipeError::Disconnected);
                 }
-                buf = &mut buf[read as usize..];
+                buf = &mut buf[read..];
             }
             Ok(())
         }
@@ -814,6 +1158,8 @@ mod stub_impl {
             &self.pipe_name
         }
 
+        pub fn signal_stop(&self) {}
+
         pub fn shutdown(&self) {}
     }
 
@@ -823,6 +1169,8 @@ mod stub_impl {
         pub fn connect(_pipe_name: &str, _timeout_ms: u32) -> Result<Self, PipeError> {
             Err(PipeError::UnsupportedPlatform)
         }
+
+        pub fn set_call_timeout_ms(&mut self, _timeout_ms: u32) {}
 
         pub fn call(&mut self, _req: &PipeRequest) -> Result<PipeResponse, PipeError> {
             Err(PipeError::UnsupportedPlatform)
@@ -911,6 +1259,15 @@ mod tests {
                                 snapshot: Some(Box::new(self.state.clone())),
                             }
                         }
+                        PipeRequest::RecheckNow {
+                            target_id: Some(ref tid),
+                        } if tid == "slow" => {
+                            std::thread::sleep(std::time::Duration::from_millis(250));
+                            PipeResponse::Ack {
+                                receipt: None,
+                                snapshot: Some(Box::new(self.state.clone())),
+                            }
+                        }
                         other => PipeResponse::Error {
                             code: ErrorCode::IllegalState,
                             message: format!("unhandled test request: {other:?}"),
@@ -938,6 +1295,66 @@ mod tests {
         drop(guard);
 
         assert!(build_pipe_security_attributes("NOT_VALID_SDDL").is_err());
+    }
+
+    #[test]
+    fn session_authorization_and_request_cap_and_overlapped_client_timeout() {
+        assert!(is_readonly_pipe_request(&PipeRequest::GetSnapshot));
+        assert!(is_readonly_pipe_request(&PipeRequest::CheckLaunchGate {
+            agent_id: None
+        }));
+        assert!(is_readonly_pipe_request(&PipeRequest::QueryLogs {
+            since_ts: None,
+            until_ts: None,
+            limit: None,
+            query: None,
+        }));
+        assert!(!is_readonly_pipe_request(&PipeRequest::Rearm));
+        assert!(!is_readonly_pipe_request(
+            &PipeRequest::DisarmAndRestoreFlowB { reason: None }
+        ));
+
+        assert!(is_authorized_client_session(0, 1, &[1]));
+        assert!(is_authorized_client_session(1, 1, &[]));
+        assert!(is_authorized_client_session(3, u32::MAX, &[3]));
+        assert!(!is_authorized_client_session(2, 1, &[1]));
+
+        let initial = GuardSnapshot::default();
+        let coord = start_coordinator(initial.clone(), Box::new(MockPipeActor { state: initial }));
+        let pipe = unique_test_pipe();
+        let server = PipeServer::start(&pipe, coord.clone()).expect("start PipeServer");
+
+        // 1) Overlapped PipeClient call timeout cancels cleanly without hanging.
+        let mut slow_client = PipeClient::connect(&pipe, 1000).expect("connect slow client");
+        slow_client.set_call_timeout_ms(60);
+        let timeout_err = slow_client
+            .call(&PipeRequest::RecheckNow {
+                target_id: Some("slow".into()),
+            })
+            .expect_err("must time out");
+        assert!(matches!(timeout_err, PipeError::BusyTimeout(_)));
+        drop(slow_client);
+
+        // 2) Oversized request (> 256 KiB) is rejected and disconnected by PipeServer, while server stays alive.
+        let oversized_cfg = Config {
+            proxy_host: "x".repeat(MAX_REQUEST_FRAME_BYTES + 4096),
+            ..Config::default()
+        };
+        let mut bad_client = PipeClient::connect(&pipe, 1000).expect("connect oversized client");
+        assert!(bad_client
+            .call(&PipeRequest::SaveConfig {
+                config: oversized_cfg
+            })
+            .is_err());
+        drop(bad_client);
+
+        // Server continues serving subsequent healthy clients after rejecting oversized frame.
+        let ok =
+            send_request(&pipe, &PipeRequest::GetSnapshot, 2000).expect("server still healthy");
+        assert!(matches!(ok, PipeResponse::Snapshot { .. }));
+
+        server.shutdown();
+        coord.shutdown();
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Real Wave-2 daemon engine actor wiring `cg-core::GuardEngine`, `cg-platform::PlatformDriver`,
 //! `JournalStore`, `ConfigStore`, `TimelineAggregator`, and background monitor/telemetry loops.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
@@ -16,6 +16,7 @@ use cg_core::engine::{
 };
 use cg_core::envcheck;
 use cg_core::onboarding;
+use cg_core::policy;
 use cg_core::timeline::BUCKETS_48;
 use cg_core::TimelineAggregator;
 use cg_platform::access_win::{self, AccessPath};
@@ -55,6 +56,23 @@ pub const TIMELINE_FILE: &str = "timeline.json";
 const DEFAULT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(10);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 const AUTO_UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(20 * 60);
+const WAKE_GRACE_DURATION: Duration = Duration::from_secs(20);
+
+struct InFlightGuard(Arc<AtomicBool>);
+
+impl InFlightGuard {
+    fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag.clone()))
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 fn fallback_proxy_route(cfg: &Config) -> ProbeRoute {
     let policy = NetworkPolicy::with_proxy(&cfg.proxy_host, cfg.proxy_port);
@@ -62,6 +80,20 @@ fn fallback_proxy_route(cfg: &Config) -> ProbeRoute {
         probe_http::Route::Proxy(addr) => ProbeRoute::Proxy(addr),
         probe_http::Route::Direct => ProbeRoute::Direct,
     }
+}
+
+fn monitored_hosts_for_slice(cfg: &Config, targets: &[Target]) -> Vec<String> {
+    if targets.len() == cfg.targets.len()
+        && targets
+            .iter()
+            .zip(cfg.targets.iter())
+            .all(|(a, b)| a.id == b.id && a.enabled == b.enabled && a.anchor_url == b.anchor_url)
+    {
+        return cg_core::access::monitored_hosts(cfg);
+    }
+    let mut tmp = cfg.clone();
+    tmp.targets = targets.to_vec();
+    cg_core::access::monitored_hosts(&tmp)
 }
 
 fn resolve_access_and_route(
@@ -72,12 +104,7 @@ fn resolve_access_and_route(
     enforce_access_path: bool,
     now_secs: u64,
 ) -> (AccessEvidence, ProbeRoute) {
-    let hosts: Vec<String> = targets
-        .iter()
-        .filter(|t| t.enabled)
-        .map(|t| t.host().to_ascii_lowercase())
-        .filter(|h| !h.is_empty())
-        .collect();
+    let hosts = monitored_hosts_for_slice(cfg, targets);
 
     let caps = driver.capabilities();
     if caps.access_path_inspection {
@@ -530,14 +557,26 @@ pub struct RealEngineActor {
     data_dir: PathBuf,
     process_scanner: Arc<ProcessScanner>,
     cached_agents: Vec<AgentRuntimeStatus>,
+    synced_agent_exes: BTreeMap<String, Vec<PathBuf>>,
     event_tx: SyncSender<CoordinatorEvent>,
     probe_tx: SyncSender<ProbeJob>,
     _probe_worker: Option<JoinHandle<()>>,
     recheck_waiters: Vec<SyncSender<PipeResponse>>,
     launch_waiters: Vec<(Option<String>, SyncSender<PipeResponse>)>,
     last_rejected: Option<(ErrorCode, String)>,
+    mutation_error: Option<String>,
+    pause_deadline: Option<Instant>,
+    wake_grace_until: Option<Instant>,
+    wake_timer_active: Arc<AtomicBool>,
     stopping_ready: bool,
     feishu: Arc<FeishuNotifier>,
+    feishu_flush_in_flight: Arc<AtomicBool>,
+    single_recheck_in_flight: Arc<AtomicBool>,
+    onboarding_probe_in_flight: Arc<AtomicBool>,
+    update_check_in_flight: Arc<AtomicBool>,
+    feishu_test_in_flight: Arc<AtomicBool>,
+    mihomo_switch_in_flight: Arc<AtomicBool>,
+    ag_repair_in_flight: Arc<AtomicBool>,
     recent_toasts: VecDeque<ToastNotificationEvent>,
     toast_seq: u64,
     leak_shield: LeakShieldStatus,
@@ -573,6 +612,7 @@ impl RealEngineActor {
         leak_shield_syncer: LeakShieldSyncFn,
     ) -> BootstrappedActor {
         let now = now_unix_secs();
+        let _ = journal::ensure_secure_data_dir(&data_dir);
         let journal = JournalStore::new(&data_dir);
         let heal_report = journal::heal_on_startup(&journal, &*recovery_executor);
 
@@ -580,7 +620,26 @@ impl RealEngineActor {
         let _ = config_store.backup_legacy_once();
         let (cfg, corrupt_err) = match config_store.load_readonly() {
             LoadedConfig::NotFound => (Config::default(), None),
-            LoadedConfig::Loaded(outcome) => (outcome.config, None),
+            LoadedConfig::Loaded(outcome) => {
+                let mut loaded = outcome.config;
+                match cg_core::targets::validate(loaded.targets.clone()) {
+                    Ok(valid_targets) => {
+                        loaded.targets = valid_targets;
+                        (loaded, None)
+                    }
+                    Err(val_err) => {
+                        if let Ok(raw) = std::fs::read_to_string(config_store.path()) {
+                            let _ = config_store.backup_corrupt_once(&raw);
+                        }
+                        (
+                            Config::default(),
+                            Some(format!(
+                                "配置文件校验未通过，已隔离并恢复安全默认配置：{val_err}"
+                            )),
+                        )
+                    }
+                }
+            }
             LoadedConfig::Corrupt { error, raw } => {
                 let _ = config_store.backup_corrupt_once(&raw);
                 (Config::default(), Some(error))
@@ -595,6 +654,12 @@ impl RealEngineActor {
         engine.timeline = timeline;
 
         let disarmed_reason = disarm::read_disarmed(&data_dir).ok().flatten();
+        if disarmed_reason.is_some() {
+            if caps.app_quarantine {
+                let _ = leak_shield_win::clear_leak_shield();
+            }
+            let _ = diagnostics::rollback_env_alignment(&data_dir);
+        }
         let wal_pending = !heal_report.ok || !heal_report.verified;
         let wal_corrupt = heal_report.status == HealStatus::CorruptJournal;
         let last_error = if wal_pending {
@@ -629,6 +694,15 @@ impl RealEngineActor {
             &[],
             engine.tripped.as_ref(),
         );
+        let mut synced_agent_exes = BTreeMap::new();
+        for a in &cached_agents {
+            if a.kind == AgentKind::Gui {
+                synced_agent_exes.insert(
+                    a.id.clone(),
+                    a.install_paths.iter().map(PathBuf::from).collect(),
+                );
+            }
+        }
         let mut init_ag_proxy = driver.inspect_antigravity_proxy(
             engine.config.proxy_port,
             engine.config.last_seen_antigravity_version.as_deref(),
@@ -669,17 +743,18 @@ impl RealEngineActor {
                     });
                 }
             })
-            .expect("failed to spawn probe worker thread");
+            .ok();
 
         let feishu = Arc::new(FeishuNotifier::load(&data_dir));
         if let Some(env_backup) = diagnostics::load_env_backup(&data_dir) {
             engine.env_applied = Some(env_backup.applied);
         }
-        let init_shield = if caps.app_quarantine && init_fw_query_ok {
-            leak_shield_win::inspect_leak_shield()
-        } else {
-            LeakShieldStatus::default()
-        };
+        let init_shield =
+            if caps.app_quarantine && init_fw_query_ok && engine.lifecycle != Lifecycle::Disarmed {
+                leak_shield_win::inspect_leak_shield()
+            } else {
+                LeakShieldStatus::default()
+            };
         let mut actor = Self {
             engine,
             driver,
@@ -692,14 +767,26 @@ impl RealEngineActor {
             data_dir,
             process_scanner: process_scanner.clone(),
             cached_agents,
+            synced_agent_exes,
             event_tx,
             probe_tx,
-            _probe_worker: Some(probe_worker),
+            _probe_worker: probe_worker,
             recheck_waiters: Vec::new(),
             launch_waiters: Vec::new(),
             last_rejected: None,
+            mutation_error: None,
+            pause_deadline: None,
+            wake_grace_until: None,
+            wake_timer_active: Arc::new(AtomicBool::new(false)),
             stopping_ready: false,
             feishu,
+            feishu_flush_in_flight: Arc::new(AtomicBool::new(false)),
+            single_recheck_in_flight: Arc::new(AtomicBool::new(false)),
+            onboarding_probe_in_flight: Arc::new(AtomicBool::new(false)),
+            update_check_in_flight: Arc::new(AtomicBool::new(false)),
+            feishu_test_in_flight: Arc::new(AtomicBool::new(false)),
+            mihomo_switch_in_flight: Arc::new(AtomicBool::new(false)),
+            ag_repair_in_flight: Arc::new(AtomicBool::new(false)),
             recent_toasts: VecDeque::new(),
             toast_seq: 0,
             leak_shield: init_shield,
@@ -768,7 +855,10 @@ impl RealEngineActor {
     fn sync_leak_shield_rules(&mut self, now: u64) -> Result<OperationReceipt, PlatformError> {
         let mut exes = Vec::new();
         for agent in &self.engine.config.guarded_agents {
-            for p in self.driver.discover_agent_exes(agent).unwrap_or_default() {
+            let discovered = self.driver.discover_agent_exes(agent).unwrap_or_default();
+            self.synced_agent_exes
+                .insert(agent.clone(), discovered.clone());
+            for p in discovered {
                 if !exes.contains(&p) {
                     exes.push(p);
                 }
@@ -795,8 +885,255 @@ impl RealEngineActor {
         Ok(receipt)
     }
 
+    fn sync_monotonic_pause(&mut self, now: u64) {
+        let Some(deadline) = self.pause_deadline else {
+            return;
+        };
+        let now_inst = Instant::now();
+        if let Some(rem) = deadline.checked_duration_since(now_inst) {
+            if !rem.is_zero() {
+                let secs = rem.as_secs().max(1);
+                self.engine.paused_until = Some(now.saturating_add(secs));
+                return;
+            }
+        }
+        self.pause_deadline = None;
+        if self.engine.paused_until.is_some() {
+            self.engine.paused_until = Some(now);
+        }
+    }
+
+    fn in_wake_grace(&self, now: u64) -> bool {
+        self.wake_grace_until
+            .is_some_and(|deadline| Instant::now() < deadline)
+            || self.engine.is_in_resume_grace(now)
+    }
+
+    fn poll_wake_grace_expiry(&mut self, now: u64) -> bool {
+        if let Some(deadline) = self.wake_grace_until {
+            if Instant::now() >= deadline {
+                self.wake_grace_until = None;
+                self.engine.resume_grace_until = None;
+                self.engine.push_log(
+                    now,
+                    LogLevel::Info,
+                    "power",
+                    "睡眠唤醒宽限窗口已结束，立即发起合规检测",
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    fn spawn_feishu_flush_if_idle(&self) {
+        let Some(guard) = InFlightGuard::try_acquire(&self.feishu_flush_in_flight) else {
+            return;
+        };
+        let feishu = self.feishu.clone();
+        let policy = NetworkPolicy::direct();
+        let _ = std::thread::Builder::new()
+            .name("cg-feishu-flush".to_string())
+            .spawn(move || {
+                let _guard = guard;
+                let _ = feishu.flush_due(&policy);
+            });
+    }
+
+    /// Unified notification emitter used by both `EffectCommand::Notify` and `launch_blocked` (`H-08`).
+    fn emit_notification(&mut self, class: &str, title: &str, body: &str, now: u64) {
+        if !self.engine.config.notify.is_on(class) {
+            return;
+        }
+        let safe_body = cg_core::redact::redact(body, self.engine.config.notify.include_egress);
+        self.toast_seq = self.toast_seq.saturating_add(1);
+        if self.recent_toasts.len() >= 16 {
+            self.recent_toasts.pop_front();
+        }
+        self.recent_toasts.push_back(ToastNotificationEvent {
+            seq: self.toast_seq,
+            timestamp: now,
+            class: class.to_string(),
+            title: title.to_string(),
+            body: safe_body.clone(),
+        });
+
+        if !access_win::is_session_zero() {
+            let drv = self.driver.clone();
+            let t_title = title.to_string();
+            let t_body = safe_body.clone();
+            let _ = std::thread::Builder::new()
+                .name("cg-toast".to_string())
+                .spawn(move || {
+                    let _ = drv.send_toast(&t_title, &t_body);
+                });
+        }
+
+        if self.feishu.enqueue(class, title, &safe_body) {
+            self.spawn_feishu_flush_if_idle();
+        }
+    }
+
+    fn resync_guarded_agents_on_path_change(&mut self, agents: &[AgentRuntimeStatus], now: u64) {
+        if self.engine.lifecycle == Lifecycle::Stopping {
+            return;
+        }
+        let mut changed_guarded = Vec::new();
+        for status in agents {
+            if status.kind != AgentKind::Gui {
+                continue;
+            }
+            let next_exes: Vec<PathBuf> = status.install_paths.iter().map(PathBuf::from).collect();
+            let prev_same = self
+                .synced_agent_exes
+                .get(&status.id)
+                .is_some_and(|prev| prev == &next_exes);
+            if !prev_same {
+                self.synced_agent_exes
+                    .insert(status.id.clone(), next_exes.clone());
+                if self
+                    .engine
+                    .config
+                    .guarded_agents
+                    .iter()
+                    .any(|g| g == &status.id)
+                {
+                    changed_guarded.push((status.id.clone(), next_exes));
+                }
+            }
+        }
+        if changed_guarded.is_empty() || !self.driver.capabilities().app_quarantine {
+            return;
+        }
+
+        let names: Vec<String> = changed_guarded.iter().map(|(id, _)| id.clone()).collect();
+        self.engine.push_log(
+            now,
+            LogLevel::Audit,
+            "msix",
+            &format!(
+                "检测到受保护客户端安装路径变更（{}），正在自动重同步防火墙/护盾规则",
+                names.join(", ")
+            ),
+        );
+
+        // 1. Re-sync active app quarantine rules & WAL if currently isolated.
+        if self.engine.protection.is_isolated() && self.engine.config.quarantine_on_fail {
+            let mut new_steps = Vec::new();
+            let mut step_id = 1u32;
+            for (agent_id, exes) in &changed_guarded {
+                if exes.is_empty() {
+                    continue;
+                }
+                let (out_name, in_name) = firewall_com::quarantine_rule_names(agent_id);
+                for exe in exes {
+                    let exe_str = exe.to_string_lossy().to_string();
+                    new_steps.push(PlannedStep {
+                        step_id,
+                        description: format!("resync quarantine outbound {agent_id}"),
+                        action: WalAction::AddFirewallRule {
+                            rule_name: out_name.clone(),
+                            program: Some(exe_str.clone()),
+                            direction: FirewallDirection::Outbound,
+                        },
+                    });
+                    step_id += 1;
+                    new_steps.push(PlannedStep {
+                        step_id,
+                        description: format!("resync quarantine inbound {agent_id}"),
+                        action: WalAction::AddFirewallRule {
+                            rule_name: in_name.clone(),
+                            program: Some(exe_str),
+                            direction: FirewallDirection::Inbound,
+                        },
+                    });
+                    step_id += 1;
+                }
+            }
+            if !new_steps.is_empty() {
+                if let Ok(mut tx) = self.journal.begin_coexisting_tx(
+                    self.engine.runtime_epoch,
+                    TxKind::Quarantine,
+                    new_steps,
+                    BaselineState::default(),
+                    self.engine.lockdown_applied == Some(true),
+                    true,
+                ) {
+                    for (agent_id, exes) in &changed_guarded {
+                        if !exes.is_empty() {
+                            let _ = firewall_com::quarantine_agent(
+                                self.driver.firewall(),
+                                agent_id,
+                                exes,
+                            );
+                        }
+                    }
+                    let _ = self.journal.commit_tx(&mut tx);
+                }
+            }
+        }
+
+        // 2. Re-sync active lockdown rules if lockdown is currently applied.
+        if self.engine.lockdown_applied == Some(true) {
+            let mut all_exes = Vec::new();
+            let mut ld_steps = Vec::new();
+            let mut step_id = 1u32;
+            for agent in &self.engine.config.guarded_agents {
+                let exes = self
+                    .synced_agent_exes
+                    .get(agent)
+                    .cloned()
+                    .unwrap_or_else(|| self.driver.discover_agent_exes(agent).unwrap_or_default());
+                if !exes.is_empty() {
+                    let rule_name = firewall_com::lockdown_rule_name(agent);
+                    for exe in &exes {
+                        ld_steps.push(PlannedStep {
+                            step_id,
+                            description: format!("resync lockdown outbound {agent}"),
+                            action: WalAction::AddFirewallRule {
+                                rule_name: rule_name.clone(),
+                                program: Some(exe.to_string_lossy().to_string()),
+                                direction: FirewallDirection::Outbound,
+                            },
+                        });
+                        step_id += 1;
+                    }
+                    all_exes.push((agent.clone(), exes));
+                }
+            }
+            if !all_exes.is_empty() {
+                if let Ok(mut tx) = self.journal.begin_coexisting_tx(
+                    self.engine.runtime_epoch,
+                    TxKind::Lockdown,
+                    ld_steps,
+                    BaselineState::default(),
+                    false,
+                    self.engine.protection.is_isolated(),
+                ) {
+                    let _ = firewall_com::apply_lockdown(self.driver.firewall(), &all_exes);
+                    let _ = self.journal.commit_tx(&mut tx);
+                }
+            }
+        }
+
+        // 3. Re-sync 4-Vector Leak Shield rules if armed and any vector is enabled.
+        if self.engine.lifecycle == Lifecycle::Armed
+            && (self.engine.config.leak_shield_quic
+                || self.engine.config.leak_shield_dns_doh
+                || self.engine.config.leak_shield_ipv6)
+        {
+            let _ = self.sync_leak_shield_rules(now);
+        }
+    }
+
     fn build_snapshot(&self, now: u64) -> GuardSnapshot {
         let mut snap = self.engine.to_snapshot(now, self.cached_agents.clone());
+        if let Some(deadline) = self.pause_deadline {
+            snap.paused_until = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|rem| !rem.is_zero())
+                .map(|rem| now.saturating_add(rem.as_secs().max(1)));
+        }
         snap.recent_toasts = self.recent_toasts.iter().cloned().collect();
         snap.feishu = self.feishu.status();
         snap.leak_shield = self.leak_shield.clone();
@@ -811,6 +1148,7 @@ impl RealEngineActor {
     }
 
     fn step_and_run(&mut self, event: EngineEvent, now: u64) {
+        self.sync_monotonic_pause(now);
         let state = std::mem::replace(
             &mut self.engine,
             EngineState::new(Config::default(), false, false, now),
@@ -916,6 +1254,7 @@ impl RealEngineActor {
                 }
                 EffectCommand::ClearDisarmMarker => {
                     let res = disarm::clear_disarmed(&self.data_dir);
+                    let err_clone = res.as_ref().err().cloned();
                     self.step_and_run(
                         EngineEvent::RearmPersisted {
                             ok: res.is_ok(),
@@ -923,6 +1262,9 @@ impl RealEngineActor {
                         },
                         now,
                     );
+                    if let Some(err) = err_clone {
+                        self.mutation_error = Some(err);
+                    }
                 }
                 EffectCommand::PersistConfig {
                     config,
@@ -939,6 +1281,7 @@ impl RealEngineActor {
                         );
                     }
                     Err(err) => {
+                        self.mutation_error = Some(err.clone());
                         self.step_and_run(
                             EngineEvent::ConfigPersisted {
                                 ok: false,
@@ -956,48 +1299,23 @@ impl RealEngineActor {
                 }
                 EffectCommand::ClearWal => {
                     self.active_journal = None;
-                    let _ = self.journal.clear();
+                    let keep_lockdown = self.engine.lockdown_applied == Some(true);
+                    let keep_isolated = self.engine.protection.is_isolated();
+                    if !keep_lockdown && !keep_isolated {
+                        let _ = self.journal.clear();
+                    } else {
+                        let _ = self.journal.retain_coexisting_committed(
+                            self.engine.runtime_epoch,
+                            keep_lockdown,
+                            keep_isolated,
+                        );
+                    }
                 }
                 EffectCommand::PersistTimeline => {
                     let _ = self.engine.timeline.save_to(&self.timeline_path);
                 }
                 EffectCommand::Notify { class, title, body } => {
-                    if self.engine.config.notify.is_on(&class) {
-                        let safe_body = cg_core::redact::redact(
-                            &body,
-                            self.engine.config.notify.include_egress,
-                        );
-                        // Always enqueue into the Session-1 GUI toast relay ring so Session-0
-                        // Windows Service notifications reliably surface on the user's desktop.
-                        self.toast_seq = self.toast_seq.saturating_add(1);
-                        if self.recent_toasts.len() >= 16 {
-                            self.recent_toasts.pop_front();
-                        }
-                        self.recent_toasts.push_back(ToastNotificationEvent {
-                            seq: self.toast_seq,
-                            timestamp: now,
-                            class: class.clone(),
-                            title: title.clone(),
-                            body: safe_body.clone(),
-                        });
-
-                        if !access_win::is_session_zero() {
-                            let drv = self.driver.clone();
-                            let t_title = title.clone();
-                            let t_body = safe_body.clone();
-                            std::thread::spawn(move || {
-                                let _ = drv.send_toast(&t_title, &t_body);
-                            });
-                        }
-
-                        if self.feishu.enqueue(&class, &title, &safe_body) {
-                            let feishu = self.feishu.clone();
-                            let policy = NetworkPolicy::direct();
-                            std::thread::spawn(move || {
-                                let _ = feishu.flush_due(&policy);
-                            });
-                        }
-                    }
+                    self.emit_notification(&class, &title, &body, now);
                 }
                 EffectCommand::AuditLog { .. } => {}
                 EffectCommand::RequestRejected { code, reason } => {
@@ -1020,6 +1338,7 @@ impl RealEngineActor {
             let mut step_id = 1u32;
             for agent in agents {
                 let exes = self.driver.discover_agent_exes(agent).unwrap_or_default();
+                self.synced_agent_exes.insert(agent.clone(), exes.clone());
                 if !exes.is_empty() {
                     let rule_name = firewall_com::lockdown_rule_name(agent);
                     for exe in &exes {
@@ -1066,17 +1385,21 @@ impl RealEngineActor {
                 return;
             }
 
-            match self.journal.begin_tx(
+            match self.journal.begin_coexisting_tx(
                 self.engine.runtime_epoch,
                 TxKind::Lockdown,
                 steps,
                 BaselineState::default(),
+                false,
+                self.engine.protection.is_isolated(),
             ) {
                 Ok(tx) => self.active_journal = Some(tx),
                 Err(err) => {
+                    let msg = format!("WAL begin_tx failed: {err}");
                     receipt.status = OperationStatus::Failed;
-                    receipt.error = Some(format!("WAL begin_tx failed: {err}"));
+                    receipt.error = Some(msg.clone());
                     if manual {
+                        self.mutation_error = Some(msg);
                         self.step_and_run(
                             EngineEvent::ManualLockdownCompleted {
                                 on: true,
@@ -1118,9 +1441,13 @@ impl RealEngineActor {
             } else {
                 OperationStatus::Failed
             };
-            receipt.error = err_msg;
+            receipt.error = err_msg.clone();
 
             if manual {
+                if !confirmed || !status.query_ok {
+                    self.mutation_error =
+                        Some(err_msg.unwrap_or_else(|| "手动封锁核验未通过".to_string()));
+                }
                 self.step_and_run(
                     EngineEvent::ManualLockdownCompleted {
                         on: true,
@@ -1155,11 +1482,15 @@ impl RealEngineActor {
             if let Err(err) = clear_res {
                 receipt.error = Some(err.to_string());
             }
-            if confirmed && !self.engine.protection.is_isolated() {
-                let _ = self.journal.clear();
-                self.active_journal = None;
-            }
             if manual {
+                if !confirmed || !status.query_ok {
+                    self.mutation_error = Some(
+                        receipt
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "解除手动封锁核验未通过".to_string()),
+                    );
+                }
                 self.step_and_run(
                     EngineEvent::ManualLockdownCompleted {
                         on: false,
@@ -1180,6 +1511,20 @@ impl RealEngineActor {
                     },
                     now,
                 );
+            }
+            if confirmed {
+                self.active_journal = None;
+                let keep_lockdown = self.engine.lockdown_applied == Some(true);
+                let keep_isolated = self.engine.protection.is_isolated();
+                if !keep_lockdown && !keep_isolated {
+                    let _ = self.journal.clear();
+                } else {
+                    let _ = self.journal.retain_coexisting_committed(
+                        self.engine.runtime_epoch,
+                        keep_lockdown,
+                        keep_isolated,
+                    );
+                }
             }
         }
     }
@@ -1216,6 +1561,7 @@ impl RealEngineActor {
         if quarantine_on_fail {
             for agent in agents {
                 let exes = self.driver.discover_agent_exes(agent).unwrap_or_default();
+                self.synced_agent_exes.insert(agent.clone(), exes.clone());
                 let (out_name, in_name) = firewall_com::quarantine_rule_names(agent);
                 for exe in &exes {
                     let exe_str = exe.to_string_lossy().to_string();
@@ -1254,12 +1600,14 @@ impl RealEngineActor {
             });
         }
 
-        // Write & sync_all WAL BEFORE mutating processes/firewall.
-        match self.journal.begin_tx(
+        // Write & sync_all WAL BEFORE mutating processes/firewall, preserving active Lockdown/Baseline (`H-04`).
+        match self.journal.begin_coexisting_tx(
             runtime_epoch,
             TxKind::Composite,
             planned_steps,
             BaselineState::default(),
+            self.engine.lockdown_applied == Some(true),
+            false,
         ) {
             Ok(tx) => self.active_journal = Some(tx),
             Err(err) => {
@@ -1496,6 +1844,14 @@ impl RealEngineActor {
         if !app_isolation_intact {
             receipt.error = Some("应用级隔离规则不完整，拒绝开放业务网络".into());
         }
+        if !receipt.status.is_verified_or_na() || !app_isolation_intact {
+            self.mutation_error = Some(
+                receipt
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "流程 A 恢复业务网络未核验成功".to_string()),
+            );
+        }
 
         self.step_and_run(
             EngineEvent::FlowANetworkRestored {
@@ -1510,7 +1866,24 @@ impl RealEngineActor {
     fn run_flow_a_app_release(&mut self, tx_id: &str, runtime_epoch: u64, now: u64) {
         let mut receipt = OperationReceipt::new(tx_id, OperationStatus::Unknown);
         let mut all_ok = true;
-        let agents = self.engine.config.guarded_agents.clone();
+        // H-02: Release ALL known GUI agent IDs (plus any configured/quarantined IDs) so agents
+        // unchecked while tripped never remain permanently quarantined in Windows Firewall.
+        let mut agents: Vec<String> = cg_protocol::KNOWN_GUI_AGENT_IDS
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect();
+        for g in &self.engine.config.guarded_agents {
+            if !agents.contains(g) {
+                agents.push(g.clone());
+            }
+        }
+        if let Some(ref trip) = self.engine.tripped {
+            for q in &trip.quarantined_agents {
+                if !agents.contains(q) {
+                    agents.push(q.clone());
+                }
+            }
+        }
 
         for agent in &agents {
             match firewall_com::release_agent(self.driver.firewall(), agent) {
@@ -1614,10 +1987,14 @@ impl RealEngineActor {
 
         if !heal.ok || !heal.verified {
             receipt.error = Some(heal.summary.clone());
+            if !is_stopping {
+                self.mutation_error = Some(heal.summary.clone());
+            }
         } else if !is_stopping {
             if let Err(err) = disarm::mark_disarmed(&self.data_dir, reason) {
                 receipt.status = OperationStatus::Failed;
-                receipt.error = Some(err);
+                receipt.error = Some(err.clone());
+                self.mutation_error = Some(err);
             }
         }
 
@@ -1692,14 +2069,7 @@ impl RealEngineActor {
                 });
             }
             if let Some(reason) = blocked_reason {
-                if self.engine.config.notify.is_on("launch_blocked") {
-                    let safe_body =
-                        cg_core::redact::redact(&reason, self.engine.config.notify.include_egress);
-                    let drv = self.driver.clone();
-                    std::thread::spawn(move || {
-                        let _ = drv.send_toast("ClaudeGuard 已阻止启动", &safe_body);
-                    });
-                }
+                self.emit_notification("launch_blocked", "ClaudeGuard 已阻止启动", &reason, now);
             }
         }
     }
@@ -1712,6 +2082,15 @@ impl RealEngineActor {
     ) {
         let now = now_unix_secs();
         self.last_rejected = None;
+        self.mutation_error = None;
+        if self.poll_wake_grace_expiry(now) && self.engine.lifecycle == Lifecycle::Armed {
+            self.step_and_run(
+                EngineEvent::StartRound {
+                    purpose: CheckPurpose::Monitor,
+                },
+                now,
+            );
+        }
 
         match req {
             PipeRequest::GetSnapshot => {
@@ -1769,6 +2148,17 @@ impl RealEngineActor {
                         return;
                     }
 
+                    let Some(in_flight) =
+                        InFlightGuard::try_acquire(&self.single_recheck_in_flight)
+                    else {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::Busy,
+                            message: "单目标复检正在执行，请稍后再试".into(),
+                            receipt: None,
+                        });
+                        return;
+                    };
+
                     let cfg = self.engine.config.clone();
                     let cfg_rev = self.engine.cfg_rev;
                     let runtime_epoch = self.engine.runtime_epoch;
@@ -1780,32 +2170,49 @@ impl RealEngineActor {
                     let event_tx = self.event_tx.clone();
                     let tid = target.id.clone();
 
-                    std::thread::spawn(move || {
-                        let ts = now_unix_secs();
-                        let (access, probes) = runner.inspect_and_probe(
-                            &*driver,
-                            &cfg,
-                            cfg_rev,
-                            &[target],
-                            enforce_access,
-                            skip_network,
-                            ts,
-                        );
-                        let probe = probes
-                            .into_iter()
-                            .find(|(id, _)| id == &tid)
-                            .map(|(_, p)| p)
-                            .unwrap_or_else(|| ProbeResult::failed("未收到目标探测结果"));
-                        let _ = event_tx.send(CoordinatorEvent::SingleTargetProbed {
-                            cfg_rev,
-                            runtime_epoch,
-                            target_id: tid,
-                            access,
-                            probe,
-                            now_secs: now_unix_secs(),
-                            reply,
-                        });
-                    });
+                    let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                    let worker_reply = reply_cell.clone();
+                    if std::thread::Builder::new()
+                        .name("cg-single-recheck".to_string())
+                        .spawn(move || {
+                            let _guard = in_flight;
+                            let ts = now_unix_secs();
+                            let (access, probes) = runner.inspect_and_probe(
+                                &*driver,
+                                &cfg,
+                                cfg_rev,
+                                &[target],
+                                enforce_access,
+                                skip_network,
+                                ts,
+                            );
+                            let probe = probes
+                                .into_iter()
+                                .find(|(id, _)| id == &tid)
+                                .map(|(_, p)| p)
+                                .unwrap_or_else(|| ProbeResult::failed("未收到目标探测结果"));
+                            if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
+                                let _ = event_tx.send(CoordinatorEvent::SingleTargetProbed {
+                                    cfg_rev,
+                                    runtime_epoch,
+                                    target_id: tid,
+                                    access,
+                                    probe,
+                                    now_secs: now_unix_secs(),
+                                    reply: tx,
+                                });
+                            }
+                        })
+                        .is_err()
+                    {
+                        if let Some(tx) = reply_cell.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = tx.send(PipeResponse::Error {
+                                code: ErrorCode::Busy,
+                                message: "创建单目标复检工作线程失败，请稍后重试".into(),
+                                receipt: None,
+                            });
+                        }
+                    }
                     return;
                 }
 
@@ -1881,6 +2288,12 @@ impl RealEngineActor {
             }
             PipeRequest::Pause { duration_secs } => {
                 self.step_and_run(EngineEvent::Pause { duration_secs }, now);
+                if self.last_rejected.is_none() {
+                    self.pause_deadline = match duration_secs {
+                        Some(secs) if secs > 0 => Some(Instant::now() + Duration::from_secs(secs)),
+                        _ => None,
+                    };
+                }
                 let snap = self.publish_snapshot(snapshot_store, now);
                 self.send_mutation_reply(reply, snap);
             }
@@ -1904,10 +2317,15 @@ impl RealEngineActor {
                     },
                     now,
                 );
+                if self.last_rejected.is_none() {
+                    self.pause_deadline = None;
+                }
                 if was_unconfigured && self.last_rejected.is_none() {
                     let heal = journal::heal_offline(&self.journal, &*self.recovery_executor);
-                    if heal.ok && heal.verified {
-                        let _ = disarm::mark_disarmed(&self.data_dir, &reason_text);
+                    if !heal.ok || !heal.verified {
+                        self.mutation_error = Some(heal.summary);
+                    } else if let Err(err) = disarm::mark_disarmed(&self.data_dir, &reason_text) {
+                        self.mutation_error = Some(err);
                     }
                 }
                 let snap = self.publish_snapshot(snapshot_store, now);
@@ -1921,6 +2339,7 @@ impl RealEngineActor {
                 self.send_mutation_reply(reply, snap);
             }
             PipeRequest::CheckLaunchGate { agent_id } => {
+                self.sync_monotonic_pause(now);
                 let decision = GuardEngine::evaluate_launch_gate_for_agent(
                     &self.engine,
                     agent_id.as_deref(),
@@ -1928,19 +2347,15 @@ impl RealEngineActor {
                 );
                 let snap = self.publish_snapshot(snapshot_store, now);
                 if decision.allowed || !decision.requires_recheck {
-                    if !decision.allowed
-                        && self.engine.lifecycle == Lifecycle::Armed
-                        && self.engine.config.notify.is_on("launch_blocked")
-                    {
-                        let safe_body = cg_core::redact::redact(
+                    if !decision.allowed && self.engine.lifecycle == Lifecycle::Armed {
+                        self.emit_notification(
+                            "launch_blocked",
+                            "ClaudeGuard 已阻止启动",
                             &decision.reason,
-                            self.engine.config.notify.include_egress,
+                            now,
                         );
-                        let drv = self.driver.clone();
-                        std::thread::spawn(move || {
-                            let _ = drv.send_toast("ClaudeGuard 已阻止启动", &safe_body);
-                        });
                     }
+                    let snap = self.publish_snapshot(snapshot_store, now);
                     let _ = reply.send(PipeResponse::LaunchGate {
                         allowed: decision.allowed,
                         reason: decision.reason,
@@ -1981,6 +2396,20 @@ impl RealEngineActor {
                 }
             }
             PipeRequest::SweepOrphans => {
+                if matches!(
+                    self.engine.lifecycle,
+                    Lifecycle::Unconfigured | Lifecycle::Disarmed | Lifecycle::Stopping
+                ) {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: format!(
+                            "当前生命周期（{}）不允许执行孤儿进程清理",
+                            self.engine.lifecycle.label()
+                        ),
+                        receipt: None,
+                    });
+                    return;
+                }
                 let mut receipt =
                     OperationReceipt::new(format!("sweep-{now}"), OperationStatus::Verified);
                 match self.driver.sweep_all_orphans() {
@@ -2034,13 +2463,25 @@ impl RealEngineActor {
                 });
             }
             PipeRequest::ProbeOnboarding => {
+                let Some(in_flight) = InFlightGuard::try_acquire(&self.onboarding_probe_in_flight)
+                else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "向导探测正在进行中，请稍候".into(),
+                        receipt: None,
+                    });
+                    return;
+                };
                 let driver = self.driver.clone();
                 let probe_runner = self.probe_runner.clone();
                 let cfg = self.engine.config.clone();
                 let cfg_rev = self.engine.cfg_rev;
-                std::thread::Builder::new()
+                let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                let worker_reply = reply_cell.clone();
+                if std::thread::Builder::new()
                     .name("cg-onboarding-probe".to_string())
                     .spawn(move || {
+                        let _guard = in_flight;
                         let probe = probe_onboarding_with(
                             &*driver,
                             &*probe_runner,
@@ -2048,15 +2489,30 @@ impl RealEngineActor {
                             cfg_rev,
                             now_unix_secs(),
                         );
-                        let _ = reply.send(PipeResponse::OnboardingProbe { probe });
+                        if let Ok(mut g) = worker_reply.lock() {
+                            if let Some(tx) = g.take() {
+                                let _ = tx.send(PipeResponse::OnboardingProbe { probe });
+                            }
+                        }
                     })
-                    .expect("failed to spawn onboarding probe worker thread");
+                    .is_err()
+                {
+                    if let Ok(mut g) = reply_cell.lock() {
+                        if let Some(tx) = g.take() {
+                            let _ = tx.send(PipeResponse::Error {
+                                code: ErrorCode::Busy,
+                                message: "创建向导探测工作线程失败，请稍后重试".into(),
+                                receipt: None,
+                            });
+                        }
+                    }
+                }
             }
             PipeRequest::CompleteOnboarding { config } => {
                 self.step_and_run(EngineEvent::CompleteOnboarding { config }, now);
                 let rejected = self.last_rejected.is_some();
-                let err_empty = self.engine.last_error.is_empty();
-                if !rejected && err_empty && self.engine.lifecycle == Lifecycle::Armed {
+                let persisted_ok = self.mutation_error.is_none();
+                if !rejected && persisted_ok && self.engine.lifecycle == Lifecycle::Armed {
                     if self.driver.capabilities().app_quarantine
                         && (self.engine.config.leak_shield_quic
                             || self.engine.config.leak_shield_dns_doh
@@ -2136,6 +2592,16 @@ impl RealEngineActor {
                     return;
                 }
 
+                let Some(in_flight) = InFlightGuard::try_acquire(&self.update_check_in_flight)
+                else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "更新检查正在进行中，请稍候".into(),
+                        receipt: None,
+                    });
+                    return;
+                };
+
                 let driver = self.driver.clone();
                 let cfg = self.engine.config.clone();
                 let cfg_rev = self.engine.cfg_rev;
@@ -2143,10 +2609,13 @@ impl RealEngineActor {
                 let ag_proxy = self.engine.antigravity_proxy.clone();
                 let prev_updates = self.engine.updates.clone();
                 let event_tx = self.event_tx.clone();
+                let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                let worker_reply = reply_cell.clone();
 
-                std::thread::Builder::new()
+                if std::thread::Builder::new()
                     .name("cg-update-check".to_string())
                     .spawn(move || {
+                        let _guard = in_flight;
                         let ts = now_unix_secs();
                         let (_access, route) = resolve_access_and_route(
                             &*driver,
@@ -2174,19 +2643,45 @@ impl RealEngineActor {
                                 ts,
                             ),
                         };
+                        let tx_opt = worker_reply.lock().ok().and_then(|mut g| g.take());
                         let _ = event_tx.send(CoordinatorEvent::UpdatesChecked {
                             summary: Box::new(summary),
                             component: normalized_component,
                             now_secs: now_unix_secs(),
-                            reply: Some(reply),
+                            reply: tx_opt,
                         });
                     })
-                    .expect("failed to spawn update check worker thread");
+                    .is_err()
+                {
+                    if let Ok(mut g) = reply_cell.lock() {
+                        if let Some(tx) = g.take() {
+                            let _ = tx.send(PipeResponse::Error {
+                                code: ErrorCode::Busy,
+                                message: "创建更新检查工作线程失败，请稍后重试".into(),
+                                receipt: None,
+                            });
+                        }
+                    }
+                }
             }
             PipeRequest::ForceKillAgent {
                 agent_id,
                 include_cli,
             } => {
+                if matches!(
+                    self.engine.lifecycle,
+                    Lifecycle::Unconfigured | Lifecycle::Disarmed | Lifecycle::Stopping
+                ) {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: format!(
+                            "当前生命周期（{}）不允许强制终止应用进程",
+                            self.engine.lifecycle.label()
+                        ),
+                        receipt: None,
+                    });
+                    return;
+                }
                 let (gui_targets, cli_targets): (Vec<String>, Vec<&'static str>) =
                     match agent_id.as_deref().map(str::trim) {
                         None => {
@@ -2343,17 +2838,44 @@ impl RealEngineActor {
                 }
             },
             PipeRequest::TestFeishu { webhook, secret } => {
+                let Some(in_flight) = InFlightGuard::try_acquire(&self.feishu_test_in_flight)
+                else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "飞书连通性测试正在进行中，请稍候".into(),
+                        receipt: None,
+                    });
+                    return;
+                };
                 let feishu = self.feishu.clone();
                 let event_tx = self.event_tx.clone();
                 let policy = NetworkPolicy::direct();
-                std::thread::spawn(move || {
-                    let result = feishu.send_test(&policy, webhook.as_deref(), secret.as_deref());
-                    let _ = event_tx.send(CoordinatorEvent::FeishuTestFinished {
-                        result,
-                        now_secs: now_unix_secs(),
-                        reply,
-                    });
-                });
+                let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                let worker_reply = reply_cell.clone();
+                if std::thread::Builder::new()
+                    .name("cg-feishu-test".to_string())
+                    .spawn(move || {
+                        let _guard = in_flight;
+                        let result =
+                            feishu.send_test(&policy, webhook.as_deref(), secret.as_deref());
+                        if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = event_tx.send(CoordinatorEvent::FeishuTestFinished {
+                                result,
+                                now_secs: now_unix_secs(),
+                                reply: tx,
+                            });
+                        }
+                    })
+                    .is_err()
+                {
+                    if let Some(tx) = reply_cell.lock().ok().and_then(|mut g| g.take()) {
+                        let _ = tx.send(PipeResponse::Error {
+                            code: ErrorCode::Busy,
+                            message: "创建飞书测试工作线程失败，请稍后重试".into(),
+                            receipt: None,
+                        });
+                    }
+                }
             }
             PipeRequest::SyncLeakShield => {
                 if !self.driver.capabilities().app_quarantine {
@@ -2387,17 +2909,48 @@ impl RealEngineActor {
                 node,
                 close_connections,
             } => {
-                let event_tx = self.event_tx.clone();
-                std::thread::spawn(move || {
-                    let result = mihomo_win::switch_mihomo_node(&group, &node, close_connections);
-                    let mihomo = mihomo_win::inspect_mihomo();
-                    let _ = event_tx.send(CoordinatorEvent::MihomoSwitchFinished {
-                        result,
-                        mihomo,
-                        now_secs: now_unix_secs(),
-                        reply,
+                let Some(in_flight) = InFlightGuard::try_acquire(&self.mihomo_switch_in_flight)
+                else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "代理节点切换正在执行，请稍候".into(),
+                        receipt: None,
                     });
-                });
+                    return;
+                };
+                let cfg_rev = self.engine.cfg_rev;
+                let runtime_epoch = self.engine.runtime_epoch;
+                let event_tx = self.event_tx.clone();
+                let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                let worker_reply = reply_cell.clone();
+                if std::thread::Builder::new()
+                    .name("cg-mihomo-switch".to_string())
+                    .spawn(move || {
+                        let _guard = in_flight;
+                        let result =
+                            mihomo_win::switch_mihomo_node(&group, &node, close_connections);
+                        let mihomo = mihomo_win::inspect_mihomo();
+                        if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = event_tx.send(CoordinatorEvent::MihomoSwitchFinished {
+                                cfg_rev,
+                                runtime_epoch,
+                                result,
+                                mihomo,
+                                now_secs: now_unix_secs(),
+                                reply: tx,
+                            });
+                        }
+                    })
+                    .is_err()
+                {
+                    if let Some(tx) = reply_cell.lock().ok().and_then(|mut g| g.take()) {
+                        let _ = tx.send(PipeResponse::Error {
+                            code: ErrorCode::Busy,
+                            message: "创建节点切换工作线程失败，请稍后重试".into(),
+                            receipt: None,
+                        });
+                    }
+                }
             }
             PipeRequest::RepairAntigravityProxy => {
                 if self.engine.is_tripped() {
@@ -2409,6 +2962,14 @@ impl RealEngineActor {
                     });
                     return;
                 }
+                let Some(in_flight) = InFlightGuard::try_acquire(&self.ag_repair_in_flight) else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "反重力透明代理修复正在执行，请稍候".into(),
+                        receipt: None,
+                    });
+                    return;
+                };
                 let (_access, route) = resolve_access_and_route(
                     &*self.driver,
                     &self.engine.config,
@@ -2419,16 +2980,34 @@ impl RealEngineActor {
                 );
                 let proxy_port = self.engine.config.proxy_port;
                 let event_tx = self.event_tx.clone();
-                std::thread::spawn(move || {
-                    let res =
-                        antigravity_proxy_win::repair_antigravity_proxy(&route, proxy_port, None)
-                            .map(|r| r.summary);
-                    let _ = event_tx.send(CoordinatorEvent::AntigravityRepairFinished {
-                        result: res,
-                        now_secs: now_unix_secs(),
-                        reply,
-                    });
-                });
+                let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                let worker_reply = reply_cell.clone();
+                if std::thread::Builder::new()
+                    .name("cg-ag-repair".to_string())
+                    .spawn(move || {
+                        let _guard = in_flight;
+                        let res = antigravity_proxy_win::repair_antigravity_proxy(
+                            &route, proxy_port, None,
+                        )
+                        .map(|r| r.summary);
+                        if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = event_tx.send(CoordinatorEvent::AntigravityRepairFinished {
+                                result: res,
+                                now_secs: now_unix_secs(),
+                                reply: tx,
+                            });
+                        }
+                    })
+                    .is_err()
+                {
+                    if let Some(tx) = reply_cell.lock().ok().and_then(|mut g| g.take()) {
+                        let _ = tx.send(PipeResponse::Error {
+                            code: ErrorCode::Busy,
+                            message: "创建热修复工作线程失败，请稍后重试".into(),
+                            receipt: None,
+                        });
+                    }
+                }
             }
             PipeRequest::ApplyEnvAlignment {
                 align_tz,
@@ -2600,13 +3179,10 @@ impl RealEngineActor {
             });
             return;
         }
-        if !self.engine.last_error.is_empty()
-            && (self.engine.protection == ProtectionState::Degraded
-                || self.engine.last_error.contains("失败"))
-        {
+        if let Some(message) = self.mutation_error.take() {
             let _ = reply.send(PipeResponse::Error {
                 code: ErrorCode::IoFailed,
-                message: self.engine.last_error.clone(),
+                message,
                 receipt: self.engine.last_receipt.clone(),
             });
             return;
@@ -2652,13 +3228,7 @@ fn probe_onboarding_with(
     cfg_rev: u64,
     now: u64,
 ) -> OnboardingProbeResult {
-    let hosts: Vec<String> = cfg
-        .targets
-        .iter()
-        .filter(|t| t.enabled)
-        .map(|t| t.host().to_ascii_lowercase())
-        .filter(|h| !h.is_empty())
-        .collect();
+    let hosts = cg_core::access::monitored_hosts(cfg);
     let (access_ev, probe_route) = match driver.inspect_access_path(&hosts) {
         Ok((path, _)) => (
             path.to_protocol_evidence(now, cfg_rev),
@@ -2687,7 +3257,18 @@ fn probe_onboarding_with(
         cg_protocol::default_builtin_targets(&[], &[])
             .into_iter()
             .find(|t| t.id == "claude")
-            .expect("builtin claude target")
+            .unwrap_or(Target {
+                id: "claude".into(),
+                name: "Claude".into(),
+                builtin: true,
+                enabled: true,
+                anchor_url: "https://claude.ai/cdn-cgi/trace".into(),
+                anchor_kind: crate::protocol::AnchorKind::Trace,
+                expect_ips: Vec::new(),
+                expect_regions: Vec::new(),
+                timeout_secs: 12,
+                bind_agent: Some("claude".into()),
+            })
     });
 
     let probe = if access_ev.is_known() && !matches!(probe_route, ProbeRoute::Skip(_)) {
@@ -2780,15 +3361,29 @@ impl CoordinatorActor for RealEngineActor {
             }
             CoordinatorEvent::Tick => {
                 let now = now_unix_secs();
+                let _ = self.poll_wake_grace_expiry(now);
                 self.step_and_run(EngineEvent::Tick, now);
                 if self.feishu.status().queued > 0 {
-                    let feishu = self.feishu.clone();
-                    let policy = NetworkPolicy::direct();
-                    std::thread::spawn(move || {
-                        let _ = feishu.flush_due(&policy);
-                    });
+                    self.spawn_feishu_flush_if_idle();
                 }
                 let _ = self.publish_snapshot(ctx.snapshot, now);
+            }
+            CoordinatorEvent::SystemResumed => {
+                let now = now_unix_secs();
+                self.wake_grace_until = Some(Instant::now() + WAKE_GRACE_DURATION);
+                self.engine.notify_system_resumed(now);
+                let _ = self.publish_snapshot(ctx.snapshot, now);
+
+                if let Some(guard) = InFlightGuard::try_acquire(&self.wake_timer_active) {
+                    let tx = self.event_tx.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("cg-wake-grace".to_string())
+                        .spawn(move || {
+                            let _guard = guard;
+                            std::thread::sleep(WAKE_GRACE_DURATION + Duration::from_millis(50));
+                            let _ = tx.try_send(CoordinatorEvent::Tick);
+                        });
+                }
             }
             CoordinatorEvent::SingleTargetProbed {
                 cfg_rev,
@@ -2933,12 +3528,16 @@ impl CoordinatorActor for RealEngineActor {
                 }
             },
             CoordinatorEvent::MihomoSwitchFinished {
+                cfg_rev,
+                runtime_epoch,
                 result,
                 mihomo,
                 now_secs,
                 reply,
             } => {
                 self.mihomo = mihomo;
+                let stale =
+                    cfg_rev != self.engine.cfg_rev || runtime_epoch != self.engine.runtime_epoch;
                 match result {
                     Ok(detail) => {
                         let mut receipt = OperationReceipt::new(
@@ -2949,14 +3548,23 @@ impl CoordinatorActor for RealEngineActor {
                         receipt.push_item("mihomo_node", OperationStatus::Verified, detail.clone());
                         self.engine
                             .push_log(now_secs, LogLevel::Audit, "mihomo", &detail);
-                        if self.engine.is_tripped() {
-                            self.step_and_run(EngineEvent::RecoverSafeFlowA, now_secs);
-                        } else if self.engine.lifecycle == Lifecycle::Armed {
-                            self.step_and_run(
-                                EngineEvent::StartRound {
-                                    purpose: CheckPurpose::Manual,
-                                },
+                        if !stale {
+                            if self.engine.is_tripped() {
+                                self.step_and_run(EngineEvent::RecoverSafeFlowA, now_secs);
+                            } else if self.engine.lifecycle == Lifecycle::Armed {
+                                self.step_and_run(
+                                    EngineEvent::StartRound {
+                                        purpose: CheckPurpose::Manual,
+                                    },
+                                    now_secs,
+                                );
+                            }
+                        } else {
+                            self.engine.push_log(
                                 now_secs,
+                                LogLevel::Info,
+                                "mihomo",
+                                "节点切换期间守护代次或配置已变更，已跳过自动恢复触发",
                             );
                         }
                         self.engine.last_receipt = Some(receipt.clone());
@@ -2986,12 +3594,40 @@ impl CoordinatorActor for RealEngineActor {
                 cfg_rev,
                 runtime_epoch,
                 purpose,
-                access,
-                probes,
+                mut access,
+                mut probes,
                 now_secs,
             } => {
+                let _ = self.poll_wake_grace_expiry(now_secs);
                 let accepted_round =
                     cfg_rev == self.engine.cfg_rev && runtime_epoch == self.engine.runtime_epoch;
+                if accepted_round
+                    && purpose != CheckPurpose::Launch
+                    && !self.engine.is_tripped()
+                    && self.in_wake_grace(now_secs)
+                {
+                    let access_enforced = self.engine.network_isolation_supported
+                        && self.engine.config.enforce_access_path;
+                    let would_fail_probe = self.engine.config.targets.iter().any(|t| {
+                        if !t.enabled {
+                            return false;
+                        }
+                        let probe = probes
+                            .iter()
+                            .find(|(id, _)| id == &t.id)
+                            .map(|(_, p)| p.clone())
+                            .unwrap_or_else(|| ProbeResult::failed("wake grace"));
+                        policy::evaluate_with_preset(t, &probe, self.engine.config.preset).verdict
+                            == crate::protocol::PolicyVerdict::Fail
+                    });
+                    if (access_enforced && access.is_uncovered()) || would_fail_probe {
+                        access.level = AccessLevel::Unknown;
+                        access.note = "系统唤醒网络重连宽限期内（20s），暂缓熔断与自动封锁".into();
+                        for (_, p) in &mut probes {
+                            *p = ProbeResult::failed("系统唤醒重连宽限期内，等待下一轮复检");
+                        }
+                    }
+                }
                 self.step_and_run(
                     EngineEvent::RoundCompleted {
                         cfg_rev,
@@ -3010,12 +3646,33 @@ impl CoordinatorActor for RealEngineActor {
                 }
             }
             CoordinatorEvent::Telemetry(bundle) => {
+                let _ = self.poll_wake_grace_expiry(bundle.now_secs);
+                self.resync_guarded_agents_on_path_change(&bundle.agents, bundle.now_secs);
+
+                // H-07: Discard off-thread telemetry computed against a superseded cfg_rev or runtime_epoch
+                // so stale proxy_port / leak scans never trigger false PortMismatch or false leak-trips.
+                if bundle.cfg_rev != self.engine.cfg_rev
+                    || bundle.runtime_epoch != self.engine.runtime_epoch
+                {
+                    return ActorControl::Continue;
+                }
+
                 self.cached_agents = bundle.agents;
                 self.leak_shield = bundle.leak_shield;
                 self.mihomo = bundle.mihomo;
+                let effective_leak = if self.in_wake_grace(bundle.now_secs) && bundle.leak.leaked()
+                {
+                    LeakReport::not_applicable(
+                        "wake_grace",
+                        "系统唤醒网络重连宽限期内（20s），暂缓直连泄露熔断",
+                        bundle.now_secs,
+                    )
+                } else {
+                    bundle.leak
+                };
                 self.step_and_run(
                     EngineEvent::LeakUpdated {
-                        report: bundle.leak,
+                        report: effective_leak,
                     },
                     bundle.now_secs,
                 );
@@ -3083,41 +3740,86 @@ impl CoordinatorActor for RealEngineActor {
                     return ActorControl::Continue;
                 }
 
-                let mut next_summary = *summary;
+                let incoming = *summary;
                 let (check_cg, check_ag, normalized) =
                     parse_update_component_filter(component.as_deref())
                         .unwrap_or((true, true, None));
                 let check_client = |id: &str| component_matches_filter(normalized.as_deref(), id);
-                if !check_cg {
-                    next_summary.claudeguard = self.engine.updates.claudeguard.clone();
+
+                // H-07: Start from live `self.engine.updates` and merge ONLY slots actually checked in this job.
+                let mut next_summary = self.engine.updates.clone();
+                if incoming.claude_msix_version.is_some() {
+                    next_summary.claude_msix_version = incoming.claude_msix_version.clone();
                 }
-                if !check_ag {
-                    next_summary.antigravity_proxy = self.engine.updates.antigravity_proxy.clone();
+                if incoming.codex_msix_version.is_some() {
+                    next_summary.codex_msix_version = incoming.codex_msix_version.clone();
                 }
-                if !check_client("claude_desktop") {
-                    next_summary.claude_desktop = self.engine.updates.claude_desktop.clone();
-                }
-                if !check_client("claude_code") {
-                    next_summary.claude_code = self.engine.updates.claude_code.clone();
-                }
-                if !check_client("codex_desktop") {
-                    next_summary.codex_desktop = self.engine.updates.codex_desktop.clone();
-                }
-                if !check_client("codex_cli") {
-                    next_summary.codex_cli = self.engine.updates.codex_cli.clone();
-                }
-                if !check_client("antigravity_ide") {
-                    next_summary.antigravity_ide = self.engine.updates.antigravity_ide.clone();
-                }
-                if !check_client("antigravity_cn") {
-                    next_summary.antigravity_cn = self.engine.updates.antigravity_cn.clone();
-                }
-                if !check_client("ag_usage_monitor") {
-                    next_summary.ag_usage_monitor = self.engine.updates.ag_usage_monitor.clone();
-                }
-                if !check_client("ag_capsule") {
-                    next_summary.ag_capsule = self.engine.updates.ag_capsule.clone();
-                }
+                let merge_checked_slot = |checked: bool,
+                                          dst: &mut ComponentUpdateStatus,
+                                          inc: &ComponentUpdateStatus|
+                 -> bool {
+                    if !checked || inc.phase == UpdateCheckPhase::Idle || inc.checked_at.is_none() {
+                        return false;
+                    }
+                    if dst
+                        .checked_at
+                        .is_none_or(|prev| inc.checked_at >= Some(prev))
+                    {
+                        *dst = inc.clone();
+                    }
+                    true
+                };
+
+                let did_cg = merge_checked_slot(
+                    check_cg,
+                    &mut next_summary.claudeguard,
+                    &incoming.claudeguard,
+                );
+                let did_ag = merge_checked_slot(
+                    check_ag,
+                    &mut next_summary.antigravity_proxy,
+                    &incoming.antigravity_proxy,
+                );
+                let did_cd = merge_checked_slot(
+                    check_client("claude_desktop"),
+                    &mut next_summary.claude_desktop,
+                    &incoming.claude_desktop,
+                );
+                let did_cc = merge_checked_slot(
+                    check_client("claude_code"),
+                    &mut next_summary.claude_code,
+                    &incoming.claude_code,
+                );
+                let did_cxd = merge_checked_slot(
+                    check_client("codex_desktop"),
+                    &mut next_summary.codex_desktop,
+                    &incoming.codex_desktop,
+                );
+                let did_cxc = merge_checked_slot(
+                    check_client("codex_cli"),
+                    &mut next_summary.codex_cli,
+                    &incoming.codex_cli,
+                );
+                let did_ide = merge_checked_slot(
+                    check_client("antigravity_ide"),
+                    &mut next_summary.antigravity_ide,
+                    &incoming.antigravity_ide,
+                );
+                let did_cn = merge_checked_slot(
+                    check_client("antigravity_cn"),
+                    &mut next_summary.antigravity_cn,
+                    &incoming.antigravity_cn,
+                );
+                let did_um = merge_checked_slot(
+                    check_client("ag_usage_monitor"),
+                    &mut next_summary.ag_usage_monitor,
+                    &incoming.ag_usage_monitor,
+                );
+                let did_cap = merge_checked_slot(
+                    check_client("ag_capsule"),
+                    &mut next_summary.ag_capsule,
+                    &incoming.ag_capsule,
+                );
 
                 self.step_and_run(
                     EngineEvent::UpdatesChecked {
@@ -3165,52 +3867,16 @@ impl CoordinatorActor for RealEngineActor {
                             receipt.push_item(key, st, slot.note.clone());
                         };
 
-                    record_slot("claudeguard", check_cg, &next_summary.claudeguard);
-                    record_slot(
-                        "antigravity_proxy",
-                        check_ag,
-                        &next_summary.antigravity_proxy,
-                    );
-                    record_slot(
-                        "claude_desktop",
-                        check_client("claude_desktop"),
-                        &next_summary.claude_desktop,
-                    );
-                    record_slot(
-                        "claude_code",
-                        check_client("claude_code"),
-                        &next_summary.claude_code,
-                    );
-                    record_slot(
-                        "codex_desktop",
-                        check_client("codex_desktop"),
-                        &next_summary.codex_desktop,
-                    );
-                    record_slot(
-                        "codex_cli",
-                        check_client("codex_cli"),
-                        &next_summary.codex_cli,
-                    );
-                    record_slot(
-                        "antigravity_ide",
-                        check_client("antigravity_ide"),
-                        &next_summary.antigravity_ide,
-                    );
-                    record_slot(
-                        "antigravity_cn",
-                        check_client("antigravity_cn"),
-                        &next_summary.antigravity_cn,
-                    );
-                    record_slot(
-                        "ag_usage_monitor",
-                        check_client("ag_usage_monitor"),
-                        &next_summary.ag_usage_monitor,
-                    );
-                    record_slot(
-                        "ag_capsule",
-                        check_client("ag_capsule"),
-                        &next_summary.ag_capsule,
-                    );
+                    record_slot("claudeguard", did_cg, &next_summary.claudeguard);
+                    record_slot("antigravity_proxy", did_ag, &next_summary.antigravity_proxy);
+                    record_slot("claude_desktop", did_cd, &next_summary.claude_desktop);
+                    record_slot("claude_code", did_cc, &next_summary.claude_code);
+                    record_slot("codex_desktop", did_cxd, &next_summary.codex_desktop);
+                    record_slot("codex_cli", did_cxc, &next_summary.codex_cli);
+                    record_slot("antigravity_ide", did_ide, &next_summary.antigravity_ide);
+                    record_slot("antigravity_cn", did_cn, &next_summary.antigravity_cn);
+                    record_slot("ag_usage_monitor", did_um, &next_summary.ag_usage_monitor);
+                    record_slot("ag_capsule", did_cap, &next_summary.ag_capsule);
 
                     receipt.verified_scope = scope_parts.join(", ");
                     if failed_count == 0 {
@@ -3586,7 +4252,7 @@ impl BackgroundMonitorHandle {
                 } else {
                     Instant::now()
                 };
-                let mut last_telemetry = Instant::now() - telemetry_interval;
+                let mut last_telemetry: Option<Instant> = None;
                 let last_upd_check: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
                 let auto_upd_in_flight = Arc::new(AtomicBool::new(false));
                 let mut desktop_gone_since: Option<Instant> = None;
@@ -3600,7 +4266,7 @@ impl BackgroundMonitorHandle {
                         last_tick = Instant::now();
                     }
 
-                    if last_telemetry.elapsed() >= telemetry_interval {
+                    if last_telemetry.is_none_or(|t| t.elapsed() >= telemetry_interval) {
                         let now = now_unix_secs();
                         let procs = if driver.capabilities().process_guard {
                             process_scanner.refresh()
@@ -3670,6 +4336,8 @@ impl BackgroundMonitorHandle {
                         let mihomo = mihomo_win::inspect_mihomo();
 
                         coordinator.try_send_telemetry(TelemetryBundle {
+                            cfg_rev: snap.cfg_rev,
+                            runtime_epoch: snap.runtime_epoch,
                             agents,
                             leak,
                             leak_shield,
@@ -3776,7 +4444,7 @@ impl BackgroundMonitorHandle {
                             desktop_gone_since = None;
                         }
 
-                        last_telemetry = Instant::now();
+                        last_telemetry = Some(Instant::now());
                     }
 
                     let wait_dur = telemetry_interval.min(Duration::from_millis(500));
@@ -3789,12 +4457,12 @@ impl BackgroundMonitorHandle {
                     }
                 }
             })
-            .expect("failed to spawn monitor loop thread");
+            .ok();
 
         Self {
             stop_flag,
             stop_signal,
-            thread: Mutex::new(Some(thread)),
+            thread: Mutex::new(thread),
         }
     }
 
@@ -4637,7 +5305,10 @@ mod tests {
         healthy_ag.dll_valid = true;
         healthy_ag.version_changed_from = None;
         let journal = JournalStore::new(dir.path());
+        let cur_snap = coord.snapshot();
         coord.try_send_telemetry(TelemetryBundle {
+            cfg_rev: cur_snap.cfg_rev,
+            runtime_epoch: cur_snap.runtime_epoch,
             agents: Vec::new(),
             leak: LeakReport::not_applicable("mock", "mock", 1_700_000_200),
             leak_shield: LeakShieldStatus::default(),
@@ -4693,7 +5364,10 @@ mod tests {
         // Telemetry reports `MissingDll` before the paused Launch round finishes.
         let mut degraded_again = missing_dll;
         degraded_again.version_changed_from = None;
+        let cur_snap2 = coord.snapshot();
         coord.try_send_telemetry(TelemetryBundle {
+            cfg_rev: cur_snap2.cfg_rev,
+            runtime_epoch: cur_snap2.runtime_epoch,
             agents: Vec::new(),
             leak: LeakReport::not_applicable("mock", "mock", 1_700_000_205),
             leak_shield: LeakShieldStatus::default(),
@@ -4780,6 +5454,27 @@ mod tests {
         });
         let recovery = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
         let coord = boot_actor(dir.path(), driver.clone(), runner, recovery);
+
+        // M-04: Reject SweepOrphans and ForceKillAgent while Unconfigured.
+        match coord.dispatch(PipeRequest::SweepOrphans) {
+            PipeResponse::Error { code, .. } => assert_eq!(code, ErrorCode::IllegalState),
+            other => panic!("expected IllegalState in Unconfigured, got {other:?}"),
+        }
+        match coord.dispatch(PipeRequest::ForceKillAgent {
+            agent_id: None,
+            include_cli: true,
+        }) {
+            PipeResponse::Error { code, .. } => assert_eq!(code, ErrorCode::IllegalState),
+            other => panic!("expected IllegalState in Unconfigured, got {other:?}"),
+        }
+        assert_eq!(driver.sweep_all_calls.load(Ordering::Acquire), 0);
+
+        assert!(matches!(
+            coord.dispatch(PipeRequest::CompleteOnboarding {
+                config: make_cfg("US")
+            }),
+            PipeResponse::Ack { .. }
+        ));
 
         match coord.dispatch(PipeRequest::SweepOrphans) {
             PipeResponse::Ack { receipt, .. } => {
@@ -4905,7 +5600,10 @@ mod tests {
             Some(SelfCheckStatus::Disabled)
         );
 
+        let cur_snap = coord.snapshot();
         coord.try_send_telemetry(TelemetryBundle {
+            cfg_rev: cur_snap.cfg_rev,
+            runtime_epoch: cur_snap.runtime_epoch,
             agents,
             leak: LeakReport::not_applicable("mock", "mock", 1_700_000_500),
             leak_shield: LeakShieldStatus::default(),
@@ -5063,29 +5761,33 @@ mod tests {
 
         // Telemetry refresh with older/unpopulated summary must preserve GitHub release results.
         let journal = JournalStore::new(dir.path());
+        let tel_now = now_unix_secs();
         let sc = build_defense_self_check(
             &coord.snapshot().config,
             &*driver,
             &journal,
             true,
             &AntigravityProxyStatus::default(),
-            1_700_000_999,
+            tel_now,
         );
         let msix_only = UpdateSummary {
             claude_msix_version: Some("1.2.3.4".into()),
             codex_msix_version: Some("26.1.2.3".into()),
             ..Default::default()
         };
+        let cur_snap = coord.snapshot();
         coord.try_send_telemetry(TelemetryBundle {
+            cfg_rev: cur_snap.cfg_rev,
+            runtime_epoch: cur_snap.runtime_epoch,
             agents: Vec::new(),
-            leak: LeakReport::not_applicable("mock", "mock", 1_700_000_999),
+            leak: LeakReport::not_applicable("mock", "mock", tel_now),
             leak_shield: LeakShieldStatus::default(),
             mihomo: MihomoStatus::default(),
             env: EnvCheck::default(),
             antigravity_proxy: AntigravityProxyStatus::default(),
             self_check: sc,
             updates: Some(msix_only),
-            now_secs: 1_700_000_999,
+            now_secs: tel_now,
         });
         let _ = coord.dispatch(PipeRequest::QueryLogs {
             since_ts: None,
@@ -6233,6 +6935,309 @@ mod tests {
             "bootstrap must sync leak shield rules when Armed and any shield flag is true"
         );
         assert!(coord2.snapshot().leak_shield.quic_blocked);
+        coord2.shutdown();
+    }
+
+    #[test]
+    fn monitor_loop_handles_telemetry_interval_exceeding_uptime_without_panic_c01() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver: Arc<dyn PlatformDriver> = Arc::new(ControllableDriver::new());
+        let runner = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: Arc::new(AtomicBool::new(true)),
+            ip_on_pass: "198.51.100.98".into(),
+        });
+        let recovery = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
+        let coord = boot_actor(dir.path(), driver.clone(), runner, recovery);
+        let scanner = Arc::new(ProcessScanner::new(Duration::from_secs(5)));
+
+        // Huge 100-year interval is strictly larger than any OS uptime (`Instant::now() - interval` would panic!).
+        let huge_interval = Duration::from_secs(86_400 * 365 * 100);
+        let monitor = BackgroundMonitorHandle::start_with_intervals(
+            coord.clone(),
+            driver,
+            scanner,
+            dir.path().to_path_buf(),
+            false,
+            huge_interval,
+            huge_interval,
+        );
+        std::thread::sleep(Duration::from_millis(80));
+        monitor.shutdown();
+        coord.shutdown();
+    }
+
+    #[test]
+    fn msix_path_change_resyncs_quarantine_and_shield_and_flow_a_releases_all_known_agents() {
+        let shield_paths: Arc<Mutex<Vec<Vec<PathBuf>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sp_ref = shield_paths.clone();
+        let syncer: LeakShieldSyncFn = Arc::new(move |exes, quic, _, _| {
+            sp_ref.lock().unwrap().push(exes.to_vec());
+            Ok(LeakShieldStatus {
+                enabled: quic && !exes.is_empty(),
+                quic_blocked: quic && !exes.is_empty(),
+                active_rules: exes.len(),
+                summary: "synced".into(),
+                ..Default::default()
+            })
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(ControllableDriver::new());
+        let v1_claude = PathBuf::from(r"C:\Program Files\WindowsApps\Claude_6.28899\Claude.exe");
+        let v2_claude = PathBuf::from(r"C:\Program Files\WindowsApps\Claude_6.29000\Claude.exe");
+        let chatgpt_exe = PathBuf::from(r"C:\Program Files\WindowsApps\OpenAI.ChatGPT\ChatGPT.exe");
+        driver
+            .gui_exes
+            .lock()
+            .unwrap()
+            .insert("claude".into(), vec![v1_claude.clone()]);
+        driver
+            .gui_exes
+            .lock()
+            .unwrap()
+            .insert("chatgpt".into(), vec![chatgpt_exe.clone()]);
+
+        let pass = Arc::new(AtomicBool::new(false));
+        let runner = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: pass.clone(),
+            ip_on_pass: "198.51.100.98".into(),
+        });
+        let recovery = Arc::new(PlatformRecoveryExecutor::new(driver.clone()));
+        let d_path = dir.path().to_path_buf();
+        let drv_c = driver.clone();
+        let (coord, ()) = start_coordinator_with(|event_tx| {
+            let boot = RealEngineActor::bootstrap_with_syncer(
+                d_path, drv_c, runner, recovery, event_tx, syncer,
+            );
+            (boot.initial_snapshot, Box::new(boot.actor), ())
+        });
+
+        let mut cfg = make_cfg("US");
+        cfg.guarded_agents = vec!["claude".into(), "chatgpt".into()];
+        cfg.leak_shield_quic = true;
+        assert!(matches!(
+            coord.dispatch(PipeRequest::CompleteOnboarding {
+                config: cfg.clone()
+            }),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(matches!(
+            coord.dispatch(PipeRequest::RecheckNow { target_id: None }),
+            PipeResponse::Ack { .. }
+        ));
+        assert_eq!(coord.snapshot().protection, ProtectionState::Quarantined);
+
+        // Store silently updates Claude MSIX path to v2 while Quarantined!
+        driver
+            .gui_exes
+            .lock()
+            .unwrap()
+            .insert("claude".into(), vec![v2_claude.clone()]);
+        let cur = coord.snapshot();
+        let new_agents = build_agent_statuses(
+            &cur.config,
+            &CachedProcessSnapshot::default(),
+            &*driver,
+            &[],
+            cur.tripped.as_ref(),
+        );
+        coord.try_send_telemetry(TelemetryBundle {
+            cfg_rev: cur.cfg_rev,
+            runtime_epoch: cur.runtime_epoch,
+            agents: new_agents,
+            leak: LeakReport::not_applicable("mock", "mock", 1_700_001_000),
+            leak_shield: cur.leak_shield.clone(),
+            mihomo: MihomoStatus::default(),
+            env: EnvCheck::default(),
+            antigravity_proxy: AntigravityProxyStatus::default(),
+            self_check: DefenseSelfCheck::default(),
+            updates: None,
+            now_secs: 1_700_001_000,
+        });
+        let _ = coord.dispatch(PipeRequest::QueryLogs {
+            since_ts: None,
+            until_ts: None,
+            limit: Some(5),
+            query: None,
+        });
+
+        let rules_after_msix = driver.fw.enumerate_rules("ClaudeGuard Block").unwrap();
+        assert!(
+            rules_after_msix
+                .iter()
+                .any(|r| r.program.contains("Claude_6.29000")),
+            "MSIX update while quarantined must automatically bind firewall quarantine to new exe"
+        );
+        assert!(
+            shield_paths
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .contains(&v2_claude),
+            "MSIX update must automatically resync leak shield to new exe"
+        );
+
+        // H-02: Uncheck `chatgpt` from guarded_agents while tripped, then recover via Flow A -> `chatgpt` MUST still be released!
+        cfg.guarded_agents = vec!["claude".into()];
+        assert!(matches!(
+            coord.dispatch(PipeRequest::SaveConfig { config: cfg }),
+            PipeResponse::Ack { .. }
+        ));
+        pass.store(true, Ordering::Release);
+        assert!(matches!(
+            coord.dispatch(PipeRequest::RecoverSafeFlowA),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(matches!(
+            coord.dispatch(PipeRequest::RecheckNow { target_id: None }),
+            PipeResponse::Ack { .. }
+        ));
+        assert_eq!(coord.snapshot().protection, ProtectionState::Monitoring);
+        assert!(
+            driver
+                .fw
+                .enumerate_rules("ClaudeGuard Block")
+                .unwrap()
+                .is_empty(),
+            "Flow A must release ALL KNOWN_GUI_AGENT_IDS including agents unchecked while tripped"
+        );
+
+        coord.shutdown();
+    }
+
+    #[test]
+    fn stale_telemetry_discarded_and_pause_unaffected_by_stale_last_error_and_wake_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        // Plant a corrupt WAL journal so bootstrap enters Armed + Degraded with non-empty `last_error` (`M-02`).
+        std::fs::write(JournalStore::new(dir.path()).path(), "{corrupt-wal").unwrap();
+        let driver = Arc::new(ControllableDriver::new());
+        let runner = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: Arc::new(AtomicBool::new(true)),
+            ip_on_pass: "198.51.100.98".into(),
+        });
+        let recovery = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
+        let coord = boot_actor(dir.path(), driver, runner, recovery);
+
+        let boot_snap = coord.snapshot();
+        assert_eq!(boot_snap.lifecycle, Lifecycle::Armed);
+        assert_eq!(boot_snap.protection, ProtectionState::Degraded);
+        assert!(!boot_snap.last_error.is_empty());
+
+        // M-02: Valid `Pause` must return `Ack`, NOT `ErrorCode::IoFailed` from stale `last_error`!
+        match coord.dispatch(PipeRequest::Pause {
+            duration_secs: Some(60),
+        }) {
+            PipeResponse::Ack {
+                snapshot: Some(s), ..
+            } => {
+                assert!(s.paused_until.is_some());
+            }
+            other => panic!("Pause must succeed despite stale last_error, got {other:?}"),
+        }
+        assert!(matches!(
+            coord.dispatch(PipeRequest::Pause {
+                duration_secs: Some(0)
+            }),
+            PipeResponse::Ack { .. }
+        ));
+        coord.shutdown();
+
+        // H-07 + MED-02: Stale telemetry & post-wake 20s grace window suppress false leak-trips!
+        let dir2 = tempfile::tempdir().unwrap();
+        let driver2 = Arc::new(ControllableDriver::new());
+        let runner2 = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: Arc::new(AtomicBool::new(true)),
+            ip_on_pass: "198.51.100.98".into(),
+        });
+        let recovery2 = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
+        let coord2 = boot_actor(dir2.path(), driver2, runner2, recovery2);
+        let mut cfg = make_cfg("US");
+        cfg.leak_trip = true;
+        assert!(matches!(
+            coord2.dispatch(PipeRequest::CompleteOnboarding { config: cfg }),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(matches!(
+            coord2.dispatch(PipeRequest::RecheckNow { target_id: None }),
+            PipeResponse::Ack { .. }
+        ));
+        assert_eq!(coord2.snapshot().protection, ProtectionState::Monitoring);
+
+        let leaking = LeakReport {
+            applicable: true,
+            mode: "system_proxy".into(),
+            checked_at: 1_700_002_000,
+            agent_conns: 1,
+            proxied: 0,
+            local: 0,
+            direct: vec![crate::protocol::LeakConn {
+                pid: 999,
+                agent: "claude".into(),
+                remote: "203.0.113.77".into(),
+                port: 443,
+                is_mcp: false,
+            }],
+            direct_total: 1,
+            note: "direct leak".into(),
+        };
+
+        // 1) Stale cfg_rev telemetry with leak must be discarded without tripping!
+        coord2.try_send_telemetry(TelemetryBundle {
+            cfg_rev: 0,
+            runtime_epoch: coord2.snapshot().runtime_epoch,
+            agents: Vec::new(),
+            leak: leaking.clone(),
+            leak_shield: LeakShieldStatus::default(),
+            mihomo: MihomoStatus::default(),
+            env: EnvCheck::default(),
+            antigravity_proxy: AntigravityProxyStatus::default(),
+            self_check: DefenseSelfCheck::default(),
+            updates: None,
+            now_secs: 1_700_002_000,
+        });
+        let _ = coord2.dispatch(PipeRequest::QueryLogs {
+            since_ts: None,
+            until_ts: None,
+            limit: Some(1),
+            query: None,
+        });
+        assert!(coord2.snapshot().tripped.is_none());
+
+        // 2) SystemResumed enters 20s wake grace window -> fresh-rev leak telemetry is suppressed!
+        coord2.notify_system_resumed();
+        let cur = coord2.snapshot();
+        coord2.try_send_telemetry(TelemetryBundle {
+            cfg_rev: cur.cfg_rev,
+            runtime_epoch: cur.runtime_epoch,
+            agents: Vec::new(),
+            leak: leaking,
+            leak_shield: LeakShieldStatus::default(),
+            mihomo: MihomoStatus::default(),
+            env: EnvCheck::default(),
+            antigravity_proxy: AntigravityProxyStatus::default(),
+            self_check: DefenseSelfCheck::default(),
+            updates: None,
+            now_secs: now_unix_secs(),
+        });
+        let _ = coord2.dispatch(PipeRequest::QueryLogs {
+            since_ts: None,
+            until_ts: None,
+            limit: Some(5),
+            query: None,
+        });
+        assert!(
+            coord2.snapshot().tripped.is_none(),
+            "post-wake grace window must suppress false leak-trips while TUN/Wi-Fi reconnects"
+        );
         coord2.shutdown();
     }
 }

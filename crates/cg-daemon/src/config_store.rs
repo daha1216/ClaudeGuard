@@ -71,8 +71,11 @@ impl ConfigStore {
         if dst.exists() {
             return None;
         }
-        std::fs::create_dir_all(&self.dir).ok()?;
-        std::fs::write(&dst, raw.as_bytes()).ok()?;
+        crate::journal::ensure_secure_data_dir(&self.dir).ok()?;
+        let mut tmp = NamedTempFile::new_in(&self.dir).ok()?;
+        tmp.write_all(raw.as_bytes()).ok()?;
+        tmp.as_file().sync_all().ok()?;
+        tmp.persist(&dst).ok()?;
         Some(dst)
     }
 
@@ -81,11 +84,14 @@ impl ConfigStore {
         if raw.trim().is_empty() {
             return None;
         }
-        std::fs::create_dir_all(&self.dir).ok()?;
+        crate::journal::ensure_secure_data_dir(&self.dir).ok()?;
         let dst = self
             .dir
             .join(format!("config.corrupt.{}.json", now_unix_secs()));
-        std::fs::write(&dst, raw.as_bytes()).ok()?;
+        let mut tmp = NamedTempFile::new_in(&self.dir).ok()?;
+        tmp.write_all(raw.as_bytes()).ok()?;
+        tmp.as_file().sync_all().ok()?;
+        tmp.persist(&dst).ok()?;
         Some(dst)
     }
 
@@ -98,8 +104,7 @@ impl ConfigStore {
         normalized.migrate();
         normalized.targets = targets::validate(normalized.targets)?;
 
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|e| format!("failed to create config dir {}: {e}", self.dir.display()))?;
+        crate::journal::ensure_secure_data_dir(&self.dir)?;
 
         let json = serde_json::to_string_pretty(&normalized)
             .map_err(|e| format!("failed to serialize config: {e}"))?;

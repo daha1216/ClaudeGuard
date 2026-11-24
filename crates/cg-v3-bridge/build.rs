@@ -3,6 +3,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+type SdkVersion = (u32, u32, u32, u32);
+
+fn parse_sdk_version(name: &str) -> Option<SdkVersion> {
+    let mut parts = name.split('.');
+    let a = parts.next()?.parse().ok()?;
+    let b = parts.next()?.parse().ok()?;
+    let c = parts.next()?.parse().ok()?;
+    let d = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((a, b, c, d))
+}
+
 fn find_rc_exe() -> Option<PathBuf> {
     if let Ok(path) = env::var("PATH") {
         for dir in env::split_paths(&path) {
@@ -21,20 +35,20 @@ fn find_rc_exe() -> Option<PathBuf> {
         let Ok(entries) = fs::read_dir(&bin_root) else {
             continue;
         };
-        let mut candidates: Vec<(String, PathBuf)> = entries
+        let mut candidates: Vec<(Option<SdkVersion>, String, PathBuf)> = entries
             .filter_map(|e| e.ok())
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
                 let rc = e.path().join("x64").join("rc.exe");
                 if rc.is_file() {
-                    Some((name, rc))
+                    Some((parse_sdk_version(&name), name, rc))
                 } else {
                     None
                 }
             })
             .collect();
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
-        if let Some((_, rc)) = candidates.into_iter().next() {
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        if let Some((_, _, rc)) = candidates.into_iter().next() {
             return Some(rc);
         }
     }
