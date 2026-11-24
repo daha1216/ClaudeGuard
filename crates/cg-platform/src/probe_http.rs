@@ -67,6 +67,45 @@ impl Default for NetworkPolicy {
     }
 }
 
+/// Strip any leading proxy scheme (`http://`, `https://`, `socks5://`, `socks5h://`) and trailing
+/// path/slash so callers never produce `http://http://...` double-scheme URLs.
+fn strip_proxy_scheme_and_path(raw: &str) -> &str {
+    let mut s = raw.trim();
+    loop {
+        let matched = ["socks5h://", "socks5://", "https://", "http://"]
+            .into_iter()
+            .find(|scheme| {
+                s.get(..scheme.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+            });
+        if let Some(scheme) = matched {
+            s = s[scheme.len()..].trim_start();
+        } else {
+            break;
+        }
+    }
+    s.split('/').next().unwrap_or("").trim()
+}
+
+/// Strip leading scheme, trailing `/`, and any `:port` suffix from a `proxy_host` value.
+fn sanitize_proxy_host(raw: &str) -> &str {
+    let s = strip_proxy_scheme_and_path(raw);
+    if s.starts_with('[') {
+        if let Some((bracketed, port_part)) = s.rsplit_once(':') {
+            if bracketed.ends_with(']') && port_part.bytes().all(|b| b.is_ascii_digit()) {
+                return bracketed.trim();
+            }
+        }
+        return s;
+    }
+    if let Some((host_part, port_part)) = s.rsplit_once(':') {
+        if !host_part.contains(':') && port_part.bytes().all(|b| b.is_ascii_digit()) {
+            return host_part.trim();
+        }
+    }
+    s
+}
+
 impl NetworkPolicy {
     pub fn direct() -> Self {
         Self {
@@ -84,7 +123,7 @@ impl NetworkPolicy {
 
     /// Resolve the deterministic route from policy settings.
     pub fn route(&self) -> Route {
-        let host = self.proxy_host.trim();
+        let host = sanitize_proxy_host(&self.proxy_host);
         if host.is_empty() || self.proxy_port == 0 {
             Route::Direct
         } else {
@@ -105,12 +144,15 @@ pub enum ProbeRoute {
 /// Determine probe route purely from `AccessPath` (never probes directly on `Uncovered`/`Unknown`).
 pub fn plan_probe_route(access: &AccessPath) -> ProbeRoute {
     match access {
-        AccessPath::SystemProxy { addr } => ProbeRoute::Proxy(format!("http://{addr}")),
+        AccessPath::SystemProxy { addr } => {
+            let cleaned = strip_proxy_scheme_and_path(addr);
+            ProbeRoute::Proxy(format!("http://{cleaned}"))
+        }
         AccessPath::Tun { .. } => ProbeRoute::Direct,
         AccessPath::Uncovered => {
-            ProbeRoute::Skip("access path is uncovered; direct probe refused".to_string())
+            ProbeRoute::Skip("未开启系统代理且未检测到 TUN 网卡，已拒绝直连".to_string())
         }
-        AccessPath::Unknown { reason } => ProbeRoute::Skip(format!("access unknown: {reason}")),
+        AccessPath::Unknown { reason } => ProbeRoute::Skip(format!("接入路径未确认：{reason}")),
     }
 }
 
@@ -144,22 +186,34 @@ pub fn build_client(
     timeout: Duration,
 ) -> PlatformResult<ureq::Agent> {
     let mut builder = ureq::AgentBuilder::new()
+        .max_idle_connections(0)
         .timeout_connect(timeout)
         .try_proxy_from_env(false)
         .user_agent(PROBE_USER_AGENT);
 
     match intent {
         EgressIntent::Notify => {
-            return Ok(builder.redirects(0).timeout(timeout).build());
+            return Ok(builder
+                .redirects(0)
+                .timeout_read(timeout)
+                .timeout(timeout)
+                .build());
         }
         EgressIntent::Probe => {
-            builder = builder.redirects(MAX_PROBE_REDIRECTS).timeout(timeout);
+            builder = builder
+                .redirects(MAX_PROBE_REDIRECTS)
+                .timeout_read(timeout)
+                .timeout(timeout);
         }
         EgressIntent::UpdateCheck => {
-            builder = builder.redirects(0);
+            builder = builder.redirects(0).timeout_read(timeout).timeout(timeout);
         }
         EgressIntent::UpdateDownload => {
-            builder = builder.redirects(0);
+            builder = builder
+                .redirects(0)
+                .timeout_connect(Duration::from_secs(15))
+                .timeout_read(timeout)
+                .timeout(Duration::from_secs(600));
         }
         EgressIntent::ClientCheck => {
             builder = builder
@@ -198,6 +252,7 @@ pub fn probe_url(
     timeout: Duration,
     max_body_bytes: usize,
 ) -> PlatformResult<HttpProbeResponse> {
+    let connect_timeout = timeout.min(Duration::from_secs(5));
     let agent = match route {
         ProbeRoute::Skip(reason) => return Err(PlatformError::Network(reason.clone())),
         ProbeRoute::Proxy(proxy_url) => {
@@ -205,6 +260,9 @@ pub fn probe_url(
                 PlatformError::Network(proxy_required_error(&format!("代理地址无效：{e}")))
             })?;
             ureq::AgentBuilder::new()
+                .max_idle_connections(0)
+                .timeout_connect(connect_timeout)
+                .timeout_read(timeout)
                 .timeout(timeout)
                 .redirects(MAX_PROBE_REDIRECTS)
                 .try_proxy_from_env(false)
@@ -213,6 +271,9 @@ pub fn probe_url(
                 .build()
         }
         ProbeRoute::Direct => ureq::AgentBuilder::new()
+            .max_idle_connections(0)
+            .timeout_connect(connect_timeout)
+            .timeout_read(timeout)
             .timeout(timeout)
             .redirects(MAX_PROBE_REDIRECTS)
             .try_proxy_from_env(false)
@@ -235,10 +296,19 @@ pub fn probe_url(
 
     let status = resp.status();
     let mut buf = Vec::new();
-    let _ = resp
+    if let Err(io_err) = resp
         .into_reader()
         .take(max_body_bytes as u64)
-        .read_to_end(&mut buf);
+        .read_to_end(&mut buf)
+    {
+        if buf.is_empty() {
+            let detail = format!("读取响应体失败：{io_err}");
+            return Err(PlatformError::Network(match route {
+                ProbeRoute::Proxy(_) => proxy_required_error(&detail),
+                _ => detail,
+            }));
+        }
+    }
     let body = String::from_utf8_lossy(&buf).into_owned();
     Ok(HttpProbeResponse {
         status,
@@ -311,7 +381,7 @@ where
     let mut current = url.to_string();
     let mut hops = 0usize;
     let resp = loop {
-        let resp = match agent.get(&current).timeout(timeout).call() {
+        let resp = match agent.get(&current).call() {
             Ok(r) => r,
             Err(ureq::Error::Status(code, r)) if (300..400).contains(&code) => r,
             Err(err) => {
@@ -451,16 +521,18 @@ mod tests {
 
     #[test]
     fn uncovered_and_unknown_access_refuse_direct_probe() {
-        assert!(matches!(
-            plan_probe_route(&AccessPath::Uncovered),
-            ProbeRoute::Skip(_)
-        ));
-        assert!(matches!(
-            plan_probe_route(&AccessPath::Unknown {
-                reason: "PAC".into()
-            }),
-            ProbeRoute::Skip(_)
-        ));
+        let uncovered_route = plan_probe_route(&AccessPath::Uncovered);
+        assert_eq!(
+            uncovered_route,
+            ProbeRoute::Skip("未开启系统代理且未检测到 TUN 网卡，已拒绝直连".into())
+        );
+        let unknown_route = plan_probe_route(&AccessPath::Unknown {
+            reason: "PAC".into(),
+        });
+        assert_eq!(
+            unknown_route,
+            ProbeRoute::Skip("接入路径未确认：PAC".into())
+        );
         assert_eq!(
             plan_probe_route(&AccessPath::Tun {
                 adapter: "Mihomo".into()
@@ -473,15 +545,54 @@ mod tests {
             }),
             ProbeRoute::Proxy("http://127.0.0.1:7890".into())
         );
+        assert_eq!(
+            plan_probe_route(&AccessPath::SystemProxy {
+                addr: "http://198.51.100.10:7890/".into()
+            }),
+            ProbeRoute::Proxy("http://198.51.100.10:7890".into())
+        );
 
         let err = probe_url(
-            &plan_probe_route(&AccessPath::Uncovered),
+            &uncovered_route,
             "http://127.0.0.1:1/never",
             Duration::from_secs(1),
             1024,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("uncovered"));
+        assert!(err.to_string().contains("未开启系统代理"));
+        assert!(err.to_string().contains("已拒绝直连"));
+    }
+
+    #[test]
+    fn network_policy_route_strips_double_schemes_ports_and_slashes() {
+        assert_eq!(NetworkPolicy::direct().route(), Route::Direct);
+        assert_eq!(
+            NetworkPolicy::with_proxy("http://", 7890).route(),
+            Route::Direct
+        );
+        assert_eq!(
+            NetworkPolicy::with_proxy("198.51.100.10", 0).route(),
+            Route::Direct
+        );
+        for raw_host in [
+            "198.51.100.10",
+            "http://198.51.100.10",
+            "HTTP://http://198.51.100.10/",
+            "https://198.51.100.10:8080/",
+            "socks5://198.51.100.10:10808",
+            "socks5h://198.51.100.10:10809/",
+            "  http://198.51.100.10:7890/  ",
+        ] {
+            assert_eq!(
+                NetworkPolicy::with_proxy(raw_host, 7890).route(),
+                Route::Proxy("http://198.51.100.10:7890".into()),
+                "failed for input: {raw_host}"
+            );
+        }
+        assert_eq!(
+            NetworkPolicy::with_proxy("http://[::1]:1080/", 7890).route(),
+            Route::Proxy("http://[::1]:7890".into())
+        );
     }
 
     #[test]
