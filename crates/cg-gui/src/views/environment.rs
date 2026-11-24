@@ -17,9 +17,9 @@ use crate::state::{NavSection, project_antigravity_proxy_card};
 use crate::theme::{BadgeTone, ThemePalette};
 use crate::views::shared::{ag_diag_tile, page_guide_card, switch_row_gated};
 use crate::widgets::controls::{
-    ButtonKind, action_button, bento_card_bloom, icon_action_button, inset_box, mono_tabular,
-    offset_pane, spinning_ui_icon, status_dot, status_pill, subtab_bar, subtab_item, toggle_switch,
-    tone_tag,
+    ButtonKind, action_button, bento_card_bloom, inset_box, mono_tabular, offset_pane,
+    spinning_action_button, spinning_ui_icon, status_dot, status_pill, subtab_bar, subtab_item,
+    toggle_switch, tone_tag,
 };
 use gpui::{Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, rgb, rgba};
 
@@ -58,6 +58,7 @@ pub fn render_environment_page(
     let mask = ctrl_r.privacy_mask;
     let busy = ctrl_r.busy_action;
     let connected = ctrl_r.connected;
+    let tripped = snap.as_ref().is_some_and(|s| s.is_tripped());
     let can_act = connected && !busy;
 
     let cfg = snap.as_ref().map(|s| s.config.clone()).unwrap_or_default();
@@ -78,6 +79,8 @@ pub fn render_environment_page(
     let ag_issue = ag_proxy.installed && require_ag_proxy && !ag_proxy.is_ready_for_launch();
     let is_rechecking = ctrl_r.is_scope_busy(&ActionScope::RecheckAll);
     let is_repairing_ag = ctrl_r.is_scope_busy(&ActionScope::RepairAntigravity);
+    let is_syncing_shield = ctrl_r.is_scope_busy(&ActionScope::SyncLeakShield);
+    let is_aligning_env = ctrl_r.is_scope_busy(&ActionScope::EnvAlign);
 
     let quic_on = ctrl_r.effective_toggle("sh-quic-sw", cfg.leak_shield_quic);
     let dns_on = ctrl_r.effective_toggle("sh-dns-sw", cfg.leak_shield_dns_doh);
@@ -380,17 +383,23 @@ pub fn render_environment_page(
                                     "变更将于布防时自动生效"
                                 }),
                         )
-                        .child(
-                            icon_action_button(
+                        .child({
+                            let can_sync_shield = connected && !is_syncing_shield;
+                            spinning_action_button(
                                 "env-shield-sync",
                                 "icons/ui/refresh.svg",
-                                "同步规则",
+                                if is_syncing_shield {
+                                    "同步中…"
+                                } else {
+                                    "同步护盾规则"
+                                },
                                 ButtonKind::Primary,
-                                can_act,
+                                can_sync_shield,
+                                is_syncing_shield,
                                 p,
                             )
                             .h(px(28.))
-                            .when(can_act, |b| {
+                            .when(can_sync_shield, |b| {
                                 b.on_mouse_up(
                                     MouseButton::Left,
                                     cx.listener(move |_, _, _, cx| {
@@ -403,8 +412,8 @@ pub fn render_environment_page(
                                         });
                                     }),
                                 )
-                            }),
-                        ),
+                            })
+                        }),
                 );
 
             let mut leak_rows: Vec<Div> = if leak.direct.is_empty() {
@@ -771,6 +780,8 @@ pub fn render_environment_page(
                 guard_proxy_port: cfg.proxy_port,
                 require_ag_proxy,
                 privacy_mask: mask,
+                connected,
+                tripped,
                 can_act,
                 is_rechecking,
                 is_repairing: is_repairing_ag,
@@ -993,7 +1004,8 @@ pub fn render_environment_page(
                                 .items_center()
                                 .gap(px(8.))
                                 .child({
-                                    let can_rb = can_act && env_applied.is_some();
+                                    let can_rb =
+                                        connected && !is_aligning_env && env_applied.is_some();
                                     action_button(
                                         "env-rollback-btn",
                                         "还原原始环境",
@@ -1018,17 +1030,22 @@ pub fn render_environment_page(
                                     })
                                 })
                                 .child({
+                                    let can_align = connected && !is_aligning_env;
                                     let do_tz = env_align_tz_on || !env_align_loc_on;
                                     let do_loc = env_align_loc_on;
                                     action_button(
                                         "env-apply-align-btn",
-                                        "立即对齐出口",
+                                        if is_aligning_env {
+                                            "对齐中…"
+                                        } else {
+                                            "立即对齐出口"
+                                        },
                                         ButtonKind::Primary,
-                                        can_act,
+                                        can_align,
                                         p,
                                     )
                                     .h(px(28.))
-                                    .when(can_act, |b| {
+                                    .when(can_align, |b| {
                                         b.on_mouse_up(
                                             MouseButton::Left,
                                             cx.listener(move |_, _, _, cx| {
@@ -1096,6 +1113,8 @@ struct AgCardCtx<'a> {
     guard_proxy_port: u16,
     require_ag_proxy: bool,
     privacy_mask: bool,
+    connected: bool,
+    tripped: bool,
     can_act: bool,
     is_rechecking: bool,
     is_repairing: bool,
@@ -1114,10 +1133,13 @@ fn render_antigravity_proxy_card(
         guard_proxy_port,
         require_ag_proxy,
         privacy_mask,
+        connected,
+        tripped,
         can_act,
         is_rechecking,
         is_repairing,
     } = ctx;
+    let can_repair = connected && !tripped && ag.installed && !is_repairing;
     let vm = project_antigravity_proxy_card(ag, guard_proxy_port, privacy_mask, now_unix_secs());
     let show_degraded_alert = vm.is_degraded && require_ag_proxy;
     let (pill_label, pill_tone) = if !require_ag_proxy && ag.installed && !ag.is_ready_for_launch()
@@ -1478,21 +1500,23 @@ fn render_antigravity_proxy_card(
                         .child(
                             action_button(
                                 "env-ag-repair-btn",
-                                if is_repairing {
+                                if tripped {
+                                    "隔离期暂停"
+                                } else if is_repairing {
                                     "修复中…"
                                 } else {
                                     "下载并热修复"
                                 },
-                                if show_degraded_alert {
+                                if show_degraded_alert && !tripped {
                                     ButtonKind::Primary
                                 } else {
                                     ButtonKind::Secondary
                                 },
-                                can_act && ag.installed && !is_repairing,
+                                can_repair,
                                 p,
                             )
                             .h(px(29.))
-                            .when(can_act && ag.installed && !is_repairing, |b| {
+                            .when(can_repair, |b| {
                                 b.on_mouse_up(
                                     MouseButton::Left,
                                     cx.listener(move |_, _, _, cx| {

@@ -10,6 +10,7 @@ use crate::motion::spring_sheet;
 use crate::protocol::{ComponentUpdateStatus, PipeRequest, UpdateCheckPhase};
 use crate::state::format_relative_secs;
 use crate::theme::{BadgeTone, ThemePalette};
+use crate::views::updates::concise_update_error;
 use crate::widgets::controls::{
     ButtonKind, action_button, float_shadow, icon_action_button, mono_tabular,
     spinning_action_button, spinning_ui_icon, tone_tag,
@@ -114,14 +115,13 @@ pub fn render_plugins_modal(
     let ctrl_r = ctrl.read(cx);
     let snap = ctrl_r.snapshot.clone();
     let connected = ctrl_r.connected;
-    let busy = ctrl_r.busy_action;
     let active_cat = ctrl_r.plugin_category;
     let tripped = snap.as_ref().is_some_and(|s| s.is_tripped());
     let updates = snap.as_ref().map(|s| s.updates.clone()).unwrap_or_default();
     let now = now_unix_secs();
-    let can_check = connected && !busy && !tripped;
     let checking_all = ctrl_r.is_scope_busy(&ActionScope::UpdatesAll)
         || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("antigravity_plugins".into()));
+    let can_check_all = connected && !tripped && !checking_all;
     let total_up = count_plugin_updates(&updates);
     let total_failed = PLUGINS
         .iter()
@@ -225,14 +225,7 @@ pub fn render_plugins_modal(
             };
 
             let ver_line = if is_failed {
-                let note = slot.note.trim();
-                if note.is_empty() {
-                    "上游检测失败，请确认本地代理连通后重试".to_string()
-                } else if note.starts_with("检测失败") || note.starts_with("失败") {
-                    note.to_string()
-                } else {
-                    format!("检测失败：{note}")
-                }
+                format!("检测失败：{}", concise_update_error(&slot.note))
             } else if has_up {
                 if spec.is_repo_track {
                     format!("本地 {cur_str} → 上游 {lat_str}")
@@ -251,6 +244,7 @@ pub fn render_plugins_modal(
 
             let item_checking = checking_all
                 || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent(spec.comp_key.to_string()));
+            let item_can_check = connected && !tripped && !item_checking;
             let ctrl_chk = ctrl.clone();
             let ctrl_open = ctrl.clone();
             let comp_key = spec.comp_key.to_string();
@@ -338,7 +332,7 @@ pub fn render_plugins_modal(
                                         .text_size(px(11.5))
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(rgb(p.secondary_btn_text))
-                                        .when(can_check, |b| {
+                                        .when(item_can_check, |b| {
                                             b.cursor_pointer()
                                                 .hover(move |s| s.bg(rgb(chk_hover_bg)))
                                                 .active(|s| s.opacity(0.86))
@@ -360,7 +354,7 @@ pub fn render_plugins_modal(
                                                     }),
                                                 )
                                         })
-                                        .when(!can_check, |b| b.opacity(0.45))
+                                        .when(!item_can_check, |b| b.opacity(0.45))
                                         .child(spinning_ui_icon(
                                             gpui::ElementId::Name(
                                                 format!("plugin-chk-spin-{}", spec.id).into(),
@@ -428,7 +422,12 @@ pub fn render_plugins_modal(
     let ctrl_close = ctrl.clone();
     let ctrl_all = ctrl.clone();
 
-    let (summary_text, summary_color) = if total_up > 0 {
+    let (summary_text, summary_color) = if total_up > 0 && total_failed > 0 {
+        (
+            format!("{total_up} 项可更新 · {total_failed} 项失败"),
+            p.badge_warn.text,
+        )
+    } else if total_up > 0 {
         (format!("{total_up} 项可更新"), p.badge_warn.text)
     } else if total_failed > 0 {
         (format!("{total_failed} 项检测失败"), p.badge_fail.text)
@@ -575,14 +574,14 @@ pub fn render_plugins_modal(
                                             "全部检查"
                                         },
                                         ButtonKind::Primary,
-                                        can_check,
+                                        can_check_all,
                                         checking_all,
                                         p,
                                     )
                                     .h(px(27.))
                                     .px(px(10.))
                                     .text_size(px(11.5))
-                                    .when(can_check, |b| {
+                                    .when(can_check_all, |b| {
                                         b.on_mouse_up(
                                             MouseButton::Left,
                                             cx.listener(move |_, _, _, cx| {

@@ -54,6 +54,15 @@ use crate::protocol::{
 pub const TIMELINE_FILE: &str = "timeline.json";
 const DEFAULT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(10);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+const AUTO_UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(20 * 60);
+
+fn fallback_proxy_route(cfg: &Config) -> ProbeRoute {
+    let policy = NetworkPolicy::with_proxy(&cfg.proxy_host, cfg.proxy_port);
+    match policy.route() {
+        probe_http::Route::Proxy(addr) => ProbeRoute::Proxy(addr),
+        probe_http::Route::Direct => ProbeRoute::Direct,
+    }
+}
 
 fn resolve_access_and_route(
     driver: &dyn PlatformDriver,
@@ -71,12 +80,25 @@ fn resolve_access_and_route(
         .collect();
 
     let caps = driver.capabilities();
-    if caps.access_path_inspection && enforce_access_path {
+    if caps.access_path_inspection {
         match driver.inspect_access_path(&hosts) {
             Ok((access_path, _info)) => {
                 let ev = access_path.to_protocol_evidence(now_secs, cfg_rev);
-                let r = probe_http::plan_probe_route(&access_path);
-                (ev, r)
+                let route = match &access_path {
+                    AccessPath::SystemProxy { addr } => {
+                        if addr.contains("://") {
+                            ProbeRoute::Proxy(addr.clone())
+                        } else {
+                            ProbeRoute::Proxy(format!("http://{addr}"))
+                        }
+                    }
+                    AccessPath::Tun { .. } => ProbeRoute::Direct,
+                    _ => match probe_http::plan_probe_route(&access_path) {
+                        ProbeRoute::Skip(_) if !enforce_access_path => fallback_proxy_route(cfg),
+                        other => other,
+                    },
+                };
+                (ev, route)
             }
             Err(err) => {
                 let ev = AccessEvidence {
@@ -86,26 +108,23 @@ fn resolve_access_and_route(
                     note: err.to_string(),
                     ..AccessEvidence::default()
                 };
-                (ev, ProbeRoute::Skip(err.to_string()))
+                let route = if enforce_access_path {
+                    ProbeRoute::Skip(err.to_string())
+                } else {
+                    fallback_proxy_route(cfg)
+                };
+                (ev, route)
             }
         }
     } else {
-        let ev = match driver.inspect_access_path(&hosts) {
-            Ok((p, _)) => p.to_protocol_evidence(now_secs, cfg_rev),
-            Err(_) => AccessEvidence {
-                level: AccessLevel::Unknown,
-                observed_at: now_secs,
-                revision: cfg_rev,
-                note: "access inspection bypassed or unsupported".into(),
-                ..AccessEvidence::default()
-            },
+        let ev = AccessEvidence {
+            level: AccessLevel::Unknown,
+            observed_at: now_secs,
+            revision: cfg_rev,
+            note: "access inspection bypassed or unsupported".into(),
+            ..AccessEvidence::default()
         };
-        let policy = NetworkPolicy::with_proxy(&cfg.proxy_host, cfg.proxy_port);
-        let r = match policy.route() {
-            probe_http::Route::Proxy(addr) => ProbeRoute::Proxy(addr),
-            probe_http::Route::Direct => ProbeRoute::Direct,
-        };
-        (ev, r)
+        (ev, fallback_proxy_route(cfg))
     }
 }
 
@@ -134,29 +153,30 @@ fn hydrate_local_updates(
 }
 
 fn merge_slot(dst: &mut ComponentUpdateStatus, incoming: ComponentUpdateStatus) {
-    if incoming.installed_version.is_some() {
-        dst.installed_version = incoming.installed_version.clone();
-    }
     if incoming.checked_at > dst.checked_at
         || (dst.phase == UpdateCheckPhase::Idle && incoming.phase != UpdateCheckPhase::Idle)
     {
         *dst = incoming;
+    } else {
+        dst.installed_version = incoming.installed_version.clone();
+    }
+    if dst.id != "claudeguard"
+        && dst.installed_version.is_none()
+        && matches!(
+            dst.phase,
+            UpdateCheckPhase::UpToDate | UpdateCheckPhase::UpdateAvailable
+        )
+    {
+        dst.phase = UpdateCheckPhase::NotInstalled;
     }
 }
 
 fn merge_telemetry_updates(dst: &mut UpdateSummary, incoming: UpdateSummary) {
     dst.claude_msix_version = incoming.claude_msix_version;
     dst.codex_msix_version = incoming.codex_msix_version;
-    // Note: Keep installed_version cleared cleanly when uninstalled for antigravity_proxy / clients
-    dst.antigravity_proxy.installed_version = incoming.antigravity_proxy.installed_version.clone();
 
     merge_slot(&mut dst.claudeguard, incoming.claudeguard);
-    if incoming.antigravity_proxy.checked_at > dst.antigravity_proxy.checked_at
-        || (dst.antigravity_proxy.phase == UpdateCheckPhase::Idle
-            && incoming.antigravity_proxy.phase != UpdateCheckPhase::Idle)
-    {
-        dst.antigravity_proxy = incoming.antigravity_proxy;
-    }
+    merge_slot(&mut dst.antigravity_proxy, incoming.antigravity_proxy);
     merge_slot(&mut dst.claude_desktop, incoming.claude_desktop);
     merge_slot(&mut dst.claude_code, incoming.claude_code);
     merge_slot(&mut dst.codex_desktop, incoming.codex_desktop);
@@ -534,6 +554,24 @@ impl RealEngineActor {
         recovery_executor: Arc<dyn RecoveryExecutor>,
         probe_event_tx: SyncSender<CoordinatorEvent>,
     ) -> BootstrappedActor {
+        Self::bootstrap_with_syncer(
+            data_dir,
+            driver,
+            probe_runner,
+            recovery_executor,
+            probe_event_tx,
+            Arc::new(leak_shield_win::sync_leak_shield),
+        )
+    }
+
+    fn bootstrap_with_syncer(
+        data_dir: PathBuf,
+        driver: Arc<dyn PlatformDriver>,
+        probe_runner: Arc<dyn ProbeRunner>,
+        recovery_executor: Arc<dyn RecoveryExecutor>,
+        probe_event_tx: SyncSender<CoordinatorEvent>,
+        leak_shield_syncer: LeakShieldSyncFn,
+    ) -> BootstrappedActor {
         let now = now_unix_secs();
         let journal = JournalStore::new(&data_dir);
         let heal_report = journal::heal_on_startup(&journal, &*recovery_executor);
@@ -637,7 +675,7 @@ impl RealEngineActor {
         if let Some(env_backup) = diagnostics::load_env_backup(&data_dir) {
             engine.env_applied = Some(env_backup.applied);
         }
-        let init_shield = if caps.app_quarantine {
+        let init_shield = if caps.app_quarantine && init_fw_query_ok {
             leak_shield_win::inspect_leak_shield()
         } else {
             LeakShieldStatus::default()
@@ -665,7 +703,7 @@ impl RealEngineActor {
             recent_toasts: VecDeque::new(),
             toast_seq: 0,
             leak_shield: init_shield,
-            leak_shield_syncer: Arc::new(leak_shield_win::sync_leak_shield),
+            leak_shield_syncer,
             mihomo: MihomoStatus::default(),
         };
 
@@ -696,6 +734,21 @@ impl RealEngineActor {
             },
             now,
         );
+        if actor.engine.lifecycle == Lifecycle::Armed
+            && caps.app_quarantine
+            && (actor.engine.config.leak_shield_quic
+                || actor.engine.config.leak_shield_dns_doh
+                || actor.engine.config.leak_shield_ipv6)
+        {
+            if let Err(err) = actor.sync_leak_shield_rules(now) {
+                actor.engine.push_log(
+                    now,
+                    LogLevel::Warn,
+                    "shield",
+                    &format!("启动同步防泄露护盾规则失败：{err}"),
+                );
+            }
+        }
         let initial_snapshot = actor.build_snapshot(now);
 
         BootstrappedActor {
@@ -1981,14 +2034,43 @@ impl RealEngineActor {
                 });
             }
             PipeRequest::ProbeOnboarding => {
-                let probe = self.run_probe_onboarding(now);
-                let _ = reply.send(PipeResponse::OnboardingProbe { probe });
+                let driver = self.driver.clone();
+                let probe_runner = self.probe_runner.clone();
+                let cfg = self.engine.config.clone();
+                let cfg_rev = self.engine.cfg_rev;
+                std::thread::Builder::new()
+                    .name("cg-onboarding-probe".to_string())
+                    .spawn(move || {
+                        let probe = probe_onboarding_with(
+                            &*driver,
+                            &*probe_runner,
+                            &cfg,
+                            cfg_rev,
+                            now_unix_secs(),
+                        );
+                        let _ = reply.send(PipeResponse::OnboardingProbe { probe });
+                    })
+                    .expect("failed to spawn onboarding probe worker thread");
             }
             PipeRequest::CompleteOnboarding { config } => {
                 self.step_and_run(EngineEvent::CompleteOnboarding { config }, now);
                 let rejected = self.last_rejected.is_some();
                 let err_empty = self.engine.last_error.is_empty();
                 if !rejected && err_empty && self.engine.lifecycle == Lifecycle::Armed {
+                    if self.driver.capabilities().app_quarantine
+                        && (self.engine.config.leak_shield_quic
+                            || self.engine.config.leak_shield_dns_doh
+                            || self.engine.config.leak_shield_ipv6)
+                    {
+                        if let Err(err) = self.sync_leak_shield_rules(now) {
+                            self.engine.push_log(
+                                now,
+                                LogLevel::Warn,
+                                "shield",
+                                &format!("首次布防同步防泄露护盾规则失败：{err}"),
+                            );
+                        }
+                    }
                     self.step_and_run(
                         EngineEvent::StartRound {
                             purpose: CheckPurpose::Monitor,
@@ -2352,25 +2434,16 @@ impl RealEngineActor {
                 align_tz,
                 align_location,
             } => {
-                let place = self
-                    .engine
-                    .target_statuses
-                    .iter()
-                    .find(|t| t.state == crate::protocol::TargetState::Pass)
-                    .or_else(|| {
-                        self.engine
-                            .target_statuses
-                            .iter()
-                            .find(|t| t.country.is_some() || t.colo.is_some())
-                    })
-                    .and_then(|t| {
-                        cg_core::geo::resolve(t.colo.as_deref(), t.country.as_deref()).or_else(
-                            || match t.country.as_deref() {
+                let place = envcheck::pick_egress(&self.engine.target_statuses).and_then(
+                    |(country, colo)| {
+                        cg_core::geo::resolve(colo.as_deref(), country.as_deref()).or_else(|| {
+                            match country.as_deref() {
                                 Some("US") => cg_core::geo::by_colo("LAX"),
                                 _ => None,
-                            },
-                        )
-                    });
+                            }
+                        })
+                    },
+                );
                 let target_city = place.map(|p| p.city);
                 let target_tz = place.map(|p| p.tz);
                 let target_coords = place.map(|p| (p.lat, p.lon));
@@ -2550,86 +2623,151 @@ impl RealEngineActor {
         });
     }
 
+    #[allow(dead_code)]
     fn run_probe_onboarding(&self, now: u64) -> OnboardingProbeResult {
-        let hosts: Vec<String> = self
-            .engine
-            .config
-            .targets
-            .iter()
-            .filter(|t| t.enabled)
-            .map(|t| t.host().to_ascii_lowercase())
-            .filter(|h| !h.is_empty())
-            .collect();
-        let (access_ev, probe_route) = match self.driver.inspect_access_path(&hosts) {
-            Ok((path, _)) => (
-                path.to_protocol_evidence(now, self.engine.cfg_rev),
-                probe_http::plan_probe_route(&path),
-            ),
-            Err(_) => (
-                AccessEvidence {
-                    level: AccessLevel::Unknown,
-                    observed_at: now,
-                    revision: self.engine.cfg_rev,
-                    note: "无法读取接入路径".into(),
-                    ..AccessEvidence::default()
-                },
-                ProbeRoute::Skip("unsupported".into()),
-            ),
-        };
+        probe_onboarding_with(
+            &*self.driver,
+            &*self.probe_runner,
+            &self.engine.config,
+            self.engine.cfg_rev,
+            now,
+        )
+    }
+}
 
-        let detected_proxy_port = access_ev
-            .proxy_addr
-            .as_deref()
-            .and_then(|addr| addr.rsplit_once(':'))
-            .and_then(|(_, p)| p.parse::<u16>().ok())
-            .or(Some(self.engine.config.proxy_port));
+fn is_non_cn_geo_probe(p: &ProbeResult) -> bool {
+    let has_ip = p.ip.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let country = p
+        .country
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    p.reachable && has_ip && country.is_some_and(|c| !c.eq_ignore_ascii_case("CN"))
+}
 
-        let claude_target = self
-            .engine
-            .config
-            .target("claude")
-            .cloned()
-            .unwrap_or_else(|| {
-                cg_protocol::default_builtin_targets(&[], &[])
-                    .into_iter()
-                    .find(|t| t.id == "claude")
-                    .expect("builtin claude target")
-            });
+fn probe_onboarding_with(
+    driver: &dyn PlatformDriver,
+    probe_runner: &dyn ProbeRunner,
+    cfg: &Config,
+    cfg_rev: u64,
+    now: u64,
+) -> OnboardingProbeResult {
+    let hosts: Vec<String> = cfg
+        .targets
+        .iter()
+        .filter(|t| t.enabled)
+        .map(|t| t.host().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect();
+    let (access_ev, probe_route) = match driver.inspect_access_path(&hosts) {
+        Ok((path, _)) => (
+            path.to_protocol_evidence(now, cfg_rev),
+            probe_http::plan_probe_route(&path),
+        ),
+        Err(_) => (
+            AccessEvidence {
+                level: AccessLevel::Unknown,
+                observed_at: now,
+                revision: cfg_rev,
+                note: "无法读取接入路径".into(),
+                ..AccessEvidence::default()
+            },
+            ProbeRoute::Skip("unsupported".into()),
+        ),
+    };
 
-        let probe = if access_ev.is_known() && !matches!(probe_route, ProbeRoute::Skip(_)) {
-            let (_ev, mut list) = self.probe_runner.inspect_and_probe(
-                &*self.driver,
-                &self.engine.config,
-                self.engine.cfg_rev,
-                &[claude_target],
-                self.engine.config.enforce_access_path,
+    let detected_proxy_port = access_ev
+        .proxy_addr
+        .as_deref()
+        .and_then(|addr| addr.rsplit_once(':'))
+        .and_then(|(_, p)| p.trim_end_matches('/').parse::<u16>().ok())
+        .filter(|&p| p > 0);
+
+    let claude_target = cfg.target("claude").cloned().unwrap_or_else(|| {
+        cg_protocol::default_builtin_targets(&[], &[])
+            .into_iter()
+            .find(|t| t.id == "claude")
+            .expect("builtin claude target")
+    });
+
+    let probe = if access_ev.is_known() && !matches!(probe_route, ProbeRoute::Skip(_)) {
+        let mut chatgpt_fallback = claude_target.clone();
+        chatgpt_fallback.id = "chatgpt".into();
+        chatgpt_fallback.name = "ChatGPT".into();
+        chatgpt_fallback.enabled = true;
+        chatgpt_fallback.anchor_url = "https://chatgpt.com/cdn-cgi/trace".into();
+
+        let mut cloudflare_fallback = claude_target.clone();
+        cloudflare_fallback.id = "cloudflare".into();
+        cloudflare_fallback.name = "Cloudflare".into();
+        cloudflare_fallback.enabled = true;
+        cloudflare_fallback.anchor_url = "https://cloudflare.com/cdn-cgi/trace".into();
+
+        let mut claude_probe = claude_target;
+        claude_probe.enabled = true;
+
+        let candidates = [claude_probe, chatgpt_fallback, cloudflare_fallback];
+        let mut best_cn: Option<ProbeResult> = None;
+        let mut best_reachable: Option<ProbeResult> = None;
+        let mut first_failed: Option<ProbeResult> = None;
+        let mut selected: Option<ProbeResult> = None;
+
+        for candidate in candidates {
+            let (_ev, mut list) = probe_runner.inspect_and_probe(
+                driver,
+                cfg,
+                cfg_rev,
+                &[candidate],
+                cfg.enforce_access_path,
                 false,
                 now,
             );
-            list.pop().map(|(_, p)| p)
-        } else {
-            None
-        };
-
-        let mut installed_agents = Vec::new();
-        for a in GUI_AGENTS {
-            if !self
-                .driver
-                .discover_agent_exes(a.id)
-                .unwrap_or_default()
-                .is_empty()
-            {
-                installed_agents.push(a.id.to_string());
+            if let Some((_, res)) = list.pop() {
+                if is_non_cn_geo_probe(&res) {
+                    selected = Some(res);
+                    break;
+                }
+                if res.reachable
+                    && res
+                        .country
+                        .as_deref()
+                        .is_some_and(|c| c.trim().eq_ignore_ascii_case("CN"))
+                {
+                    if best_cn.is_none() {
+                        best_cn = Some(res);
+                    }
+                } else if res.reachable && res.ip.is_some() {
+                    if best_reachable.is_none() {
+                        best_reachable = Some(res);
+                    }
+                } else if first_failed.is_none() {
+                    first_failed = Some(res);
+                }
             }
         }
 
-        onboarding::recommend(
-            &access_ev,
-            probe.as_ref(),
-            detected_proxy_port,
-            installed_agents,
-        )
+        selected.or(best_cn).or(best_reachable).or(first_failed)
+    } else {
+        None
+    };
+
+    let mut installed_agents = Vec::new();
+    for a in GUI_AGENTS {
+        if !driver
+            .discover_agent_exes(a.id)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            installed_agents.push(a.id.to_string());
+        }
     }
+
+    onboarding::recommend(
+        &access_ev,
+        probe.as_ref(),
+        detected_proxy_port,
+        installed_agents,
+    )
 }
 
 type SnapshotStoreRef<'a> = crate::coordinator::SnapshotStore;
@@ -2910,6 +3048,20 @@ impl CoordinatorActor for RealEngineActor {
                         .as_deref()
                         .map(update_check::normalize_version)
                         .filter(|s| !s.is_empty());
+                    if self
+                        .engine
+                        .updates
+                        .antigravity_proxy
+                        .installed_version
+                        .is_none()
+                        && matches!(
+                            self.engine.updates.antigravity_proxy.phase,
+                            UpdateCheckPhase::UpToDate | UpdateCheckPhase::UpdateAvailable
+                        )
+                    {
+                        self.engine.updates.antigravity_proxy.phase =
+                            UpdateCheckPhase::NotInstalled;
+                    }
                 }
                 let _ = self.publish_snapshot(ctx.snapshot, bundle.now_secs);
             }
@@ -2979,7 +3131,9 @@ impl CoordinatorActor for RealEngineActor {
                         format!("updates-{now_secs}"),
                         OperationStatus::Unknown,
                     );
-                    let mut failed_notes = Vec::new();
+                    let mut ok_count = 0usize;
+                    let mut failed_count = 0usize;
+                    let mut failed_notes: Vec<String> = Vec::new();
                     let mut scope_parts = Vec::new();
 
                     let mut record_slot =
@@ -2989,11 +3143,23 @@ impl CoordinatorActor for RealEngineActor {
                             }
                             let st = match slot.phase {
                                 UpdateCheckPhase::Failed => {
-                                    failed_notes.push(slot.note.clone());
+                                    failed_count += 1;
+                                    let note = slot.note.trim();
+                                    let clean = if note.is_empty() {
+                                        format!("{key} 检测失败")
+                                    } else {
+                                        note.to_string()
+                                    };
+                                    if !failed_notes.contains(&clean) {
+                                        failed_notes.push(clean);
+                                    }
                                     OperationStatus::Failed
                                 }
                                 UpdateCheckPhase::NotInstalled => OperationStatus::NotApplicable,
-                                _ => OperationStatus::Verified,
+                                _ => {
+                                    ok_count += 1;
+                                    OperationStatus::Verified
+                                }
                             };
                             scope_parts.push(format!("{key}={:?}", slot.phase));
                             receipt.push_item(key, st, slot.note.clone());
@@ -3047,11 +3213,26 @@ impl CoordinatorActor for RealEngineActor {
                     );
 
                     receipt.verified_scope = scope_parts.join(", ");
-                    if failed_notes.is_empty() {
+                    if failed_count == 0 {
                         receipt.status = OperationStatus::Verified;
+                    } else if ok_count > 0 {
+                        receipt.status = OperationStatus::Partial;
+                        let brief = if failed_notes.len() <= 2 {
+                            failed_notes.join("；")
+                        } else {
+                            format!("{} 等", failed_notes[..2].join("；"))
+                        };
+                        receipt.error = Some(format!(
+                            "已完成 {ok_count} 项，{failed_count} 项检测失败：{brief}"
+                        ));
                     } else {
                         receipt.status = OperationStatus::Failed;
-                        receipt.error = Some(failed_notes.join("；"));
+                        let brief = if failed_notes.len() <= 2 {
+                            failed_notes.join("；")
+                        } else {
+                            format!("{} 等", failed_notes[..2].join("；"))
+                        };
+                        receipt.error = Some(brief);
                     }
 
                     self.engine.push_log(
@@ -3303,6 +3484,55 @@ pub fn build_defense_self_check(
     }
 }
 
+fn has_any_failed_update_slot(u: &UpdateSummary) -> bool {
+    [
+        &u.claudeguard,
+        &u.antigravity_proxy,
+        &u.claude_desktop,
+        &u.claude_code,
+        &u.codex_desktop,
+        &u.codex_cli,
+        &u.antigravity_ide,
+        &u.antigravity_cn,
+        &u.ag_usage_monitor,
+        &u.ag_capsule,
+    ]
+    .into_iter()
+    .any(|slot| slot.phase == UpdateCheckPhase::Failed)
+}
+
+fn compute_leak_report(
+    driver: &dyn PlatformDriver,
+    snap: &GuardSnapshot,
+    pid_map: &HashMap<u32, String>,
+    access_info: &access_win::AccessInfo,
+    now: u64,
+) -> LeakReport {
+    if !snap.config.leak_watch {
+        return LeakReport::not_applicable(&access_info.path, "直连泄露观察已关闭", now);
+    }
+    if snap.access.tun_iface.is_some() {
+        return LeakReport::not_applicable(
+            "tun",
+            "检测到 TUN 网卡同时在线，公网流量由虚拟网卡接管",
+            now,
+        );
+    }
+    if !driver.capabilities().leak_watch {
+        return LeakReport::not_applicable("unsupported", "当前平台不支持直连观察", now);
+    }
+    let active_proxy_port = snap
+        .access
+        .proxy_addr
+        .as_deref()
+        .and_then(|addr| addr.rsplit_once(':'))
+        .and_then(|(_, p)| p.trim_end_matches('/').parse::<u16>().ok())
+        .filter(|&p| p > 0)
+        .unwrap_or(snap.config.proxy_port);
+    let conns = driver.scan_tcp_connections().unwrap_or_default();
+    netwatch_win::fold(&conns, pid_map, active_proxy_port, access_info, now)
+}
+
 /// Manages periodic monitor ticks, cached process/leak/env telemetry, and residual sweeps.
 pub struct BackgroundMonitorHandle {
     stop_flag: Arc<AtomicBool>,
@@ -3357,7 +3587,8 @@ impl BackgroundMonitorHandle {
                     Instant::now()
                 };
                 let mut last_telemetry = Instant::now() - telemetry_interval;
-                let mut last_upd_check: Option<Instant> = None;
+                let last_upd_check: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+                let auto_upd_in_flight = Arc::new(AtomicBool::new(false));
                 let mut desktop_gone_since: Option<Instant> = None;
 
                 while !t_flag.load(Ordering::Acquire) {
@@ -3399,18 +3630,8 @@ impl BackgroundMonitorHandle {
                             claude_dir_l.as_deref(),
                         );
                         let access_info = access_win::AccessInfo::from(&snap.access);
-                        let leak = if driver.capabilities().leak_watch {
-                            let conns = driver.scan_tcp_connections().unwrap_or_default();
-                            netwatch_win::fold(
-                                &conns,
-                                &pid_map,
-                                snap.config.proxy_port,
-                                &access_info,
-                                now,
-                            )
-                        } else {
-                            LeakReport::not_applicable("unsupported", "当前平台不支持直连观察", now)
-                        };
+                        let leak =
+                            compute_leak_report(&*driver, &snap, &pid_map, &access_info, now);
 
                         let env_info = driver.read_env_info().unwrap_or_default();
                         let env = envcheck::evaluate(&snap.config, env_info, &snap.targets);
@@ -3438,7 +3659,10 @@ impl BackgroundMonitorHandle {
                             &local_clients,
                         );
 
-                        let leak_shield = if driver.capabilities().app_quarantine {
+                        let leak_shield = if driver.capabilities().app_quarantine
+                            && fw_query_ok
+                            && (!fw_rules.is_empty() || snap.leak_shield.enabled)
+                        {
                             leak_shield_win::inspect_leak_shield()
                         } else {
                             LeakShieldStatus::default()
@@ -3457,11 +3681,21 @@ impl BackgroundMonitorHandle {
                             now_secs: now,
                         });
 
+                        let effective_upd_interval = if has_any_failed_update_slot(&snap.updates) {
+                            AUTO_UPDATE_RETRY_INTERVAL.min(update_check_interval)
+                        } else {
+                            update_check_interval
+                        };
+                        let upd_due = last_upd_check.lock().ok().is_some_and(|g| {
+                            g.is_none_or(|t| t.elapsed() >= effective_upd_interval)
+                        });
+
                         if snap.config.auto_upd_check
                             && snap.lifecycle == Lifecycle::Armed
                             && snap.protection == ProtectionState::Monitoring
                             && snap.all_enabled_pass()
-                            && last_upd_check.is_none_or(|t| t.elapsed() >= update_check_interval)
+                            && upd_due
+                            && !auto_upd_in_flight.load(Ordering::Acquire)
                         {
                             let (_access, route) = resolve_access_and_route(
                                 &*driver,
@@ -3471,24 +3705,50 @@ impl BackgroundMonitorHandle {
                                 snap.config.enforce_access_path,
                                 now,
                             );
-                            if !matches!(route, ProbeRoute::Skip(_)) {
-                                let checked = driver.check_updates(
-                                    &route,
-                                    &snap.version,
-                                    &antigravity_proxy,
-                                    None,
-                                    &local_updates,
-                                    now,
-                                );
-                                let _ = coordinator.event_sender().try_send(
-                                    CoordinatorEvent::UpdatesChecked {
-                                        summary: Box::new(checked),
-                                        component: None,
-                                        now_secs: now,
-                                        reply: None,
-                                    },
-                                );
-                                last_upd_check = Some(Instant::now());
+                            if !matches!(route, ProbeRoute::Skip(_))
+                                && auto_upd_in_flight
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok()
+                            {
+                                let bg_driver = driver.clone();
+                                let bg_tx = coordinator.event_sender();
+                                let bg_ver = snap.version.clone();
+                                let bg_ag = antigravity_proxy.clone();
+                                let bg_prev = local_updates.clone();
+                                let bg_in_flight = auto_upd_in_flight.clone();
+                                let bg_last = last_upd_check.clone();
+                                let bg_stop = t_flag.clone();
+                                let _ = std::thread::Builder::new()
+                                    .name("cg-auto-update".to_string())
+                                    .spawn(move || {
+                                        struct ResetInFlight(Arc<AtomicBool>);
+                                        impl Drop for ResetInFlight {
+                                            fn drop(&mut self) {
+                                                self.0.store(false, Ordering::Release);
+                                            }
+                                        }
+                                        let _guard = ResetInFlight(bg_in_flight);
+                                        let checked = bg_driver.check_updates(
+                                            &route, &bg_ver, &bg_ag, None, &bg_prev, now,
+                                        );
+                                        if let Ok(mut g) = bg_last.lock() {
+                                            *g = Some(Instant::now());
+                                        }
+                                        if !bg_stop.load(Ordering::Acquire) {
+                                            let _ =
+                                                bg_tx.try_send(CoordinatorEvent::UpdatesChecked {
+                                                    summary: Box::new(checked),
+                                                    component: None,
+                                                    now_secs: now_unix_secs(),
+                                                    reply: None,
+                                                });
+                                        }
+                                    });
                             }
                         }
 
@@ -4022,6 +4282,21 @@ mod tests {
         }
     }
 
+    fn noop_shield_syncer() -> LeakShieldSyncFn {
+        Arc::new(|exes, quic, dns, ipv6| {
+            let active_rules =
+                exes.len() * (usize::from(quic) + usize::from(dns) * 3 + usize::from(ipv6));
+            Ok(LeakShieldStatus {
+                enabled: active_rules > 0,
+                quic_blocked: quic && active_rules > 0,
+                dns_doh_blocked: dns && active_rules > 0,
+                ipv6_blocked: ipv6 && active_rules > 0,
+                active_rules,
+                summary: format!("mock shield ({active_rules})"),
+            })
+        })
+    }
+
     fn boot_actor(
         dir: &std::path::Path,
         driver: Arc<dyn PlatformDriver>,
@@ -4029,8 +4304,11 @@ mod tests {
         recovery: Arc<dyn RecoveryExecutor>,
     ) -> CoordinatorHandle {
         let data_dir = dir.to_path_buf();
+        let syncer = noop_shield_syncer();
         let (handle, _) = start_coordinator_with(|event_tx| {
-            let boot = RealEngineActor::bootstrap(data_dir, driver, runner, recovery, event_tx);
+            let boot = RealEngineActor::bootstrap_with_syncer(
+                data_dir, driver, runner, recovery, event_tx, syncer,
+            );
             (boot.initial_snapshot, Box::new(boot.actor), ())
         });
         handle
@@ -5491,5 +5769,470 @@ mod tests {
         assert!(snap.launch_error.contains("仅监测"));
 
         coord.shutdown();
+    }
+
+    #[test]
+    fn resolve_access_and_route_honors_tun_and_custom_system_proxy_even_when_unforced() {
+        let driver = ControllableDriver::new();
+        let mut cfg = make_cfg("US");
+        cfg.enforce_access_path = false;
+        cfg.proxy_host = "127.0.0.1".into();
+        cfg.proxy_port = 7890;
+
+        // 1. TUN active while enforce_access_path == false -> ProbeRoute::Direct (never dead 7890).
+        *driver.access_path_override.lock().unwrap() = Some(AccessPath::Tun {
+            adapter: "MihomoTun".into(),
+        });
+        let (ev_tun, route_tun) =
+            resolve_access_and_route(&driver, &cfg, 1, &cfg.targets, false, 1_700_000_000);
+        assert_eq!(ev_tun.level, AccessLevel::Tun);
+        assert_eq!(route_tun, ProbeRoute::Direct);
+
+        // 2. SystemProxy on custom port 10809 while enforce_access_path == false -> ProbeRoute::Proxy(10809).
+        *driver.access_path_override.lock().unwrap() = Some(AccessPath::SystemProxy {
+            addr: "127.0.0.1:10809".into(),
+        });
+        let (ev_px, route_px) =
+            resolve_access_and_route(&driver, &cfg, 1, &cfg.targets, false, 1_700_000_000);
+        assert_eq!(ev_px.level, AccessLevel::SystemProxy);
+        assert_eq!(route_px, ProbeRoute::Proxy("http://127.0.0.1:10809".into()));
+
+        // 3. Uncovered + !enforce_access_path -> falls back to configured proxy 7890.
+        *driver.access_path_override.lock().unwrap() = Some(AccessPath::Uncovered);
+        let (_ev_unc, route_unc) =
+            resolve_access_and_route(&driver, &cfg, 1, &cfg.targets, false, 1_700_000_000);
+        assert_eq!(route_unc, ProbeRoute::Proxy("http://127.0.0.1:7890".into()));
+
+        // 4. Uncovered + enforce_access_path -> fails closed with ProbeRoute::Skip.
+        let (_ev_skip, route_skip) =
+            resolve_access_and_route(&driver, &cfg, 1, &cfg.targets, true, 1_700_000_000);
+        assert!(matches!(route_skip, ProbeRoute::Skip(_)));
+
+        // 5. UnsupportedPlatformDriver falls back to configured proxy when !enforce_access_path.
+        let unsupported = UnsupportedPlatformDriver::default();
+        let (_ev_u, route_u) =
+            resolve_access_and_route(&unsupported, &cfg, 1, &cfg.targets, false, 1_700_000_000);
+        assert_eq!(route_u, ProbeRoute::Proxy("http://127.0.0.1:7890".into()));
+    }
+
+    #[test]
+    fn leak_report_honors_disabled_flag_tun_coexistence_and_active_proxy_port() {
+        struct LeakTestDriver {
+            inner: ControllableDriver,
+            scans: AtomicUsize,
+            conns: Vec<TcpConn>,
+        }
+        impl PlatformDriver for LeakTestDriver {
+            fn capabilities(&self) -> PlatformCapabilities {
+                let mut c = self.inner.capabilities();
+                c.leak_watch = true;
+                c
+            }
+            fn firewall(&self) -> &dyn FirewallEngine {
+                self.inner.firewall()
+            }
+            fn is_elevated(&self) -> PlatformResult<bool> {
+                Ok(true)
+            }
+            fn read_access_evidence(&self) -> PlatformResult<access_win::AccessEvidenceRaw> {
+                self.inner.read_access_evidence()
+            }
+            fn detect_tun_adapter(&self) -> PlatformResult<Option<String>> {
+                self.inner.detect_tun_adapter()
+            }
+            fn inspect_access_path(
+                &self,
+                hosts: &[String],
+            ) -> PlatformResult<(AccessPath, access_win::AccessInfo)> {
+                self.inner.inspect_access_path(hosts)
+            }
+            fn scan_tcp_connections(&self) -> PlatformResult<Vec<TcpConn>> {
+                self.scans.fetch_add(1, Ordering::AcqRel);
+                Ok(self.conns.clone())
+            }
+            fn discover_agent_exes(&self, id: &str) -> PlatformResult<Vec<PathBuf>> {
+                self.inner.discover_agent_exes(id)
+            }
+            fn discover_cli_exes(&self, id: &str) -> PlatformResult<Vec<PathBuf>> {
+                self.inner.discover_cli_exes(id)
+            }
+            fn kill_gui_agent(&self, id: &str) -> PlatformResult<Vec<ProcessIdentity>> {
+                self.inner.kill_gui_agent(id)
+            }
+            fn kill_cli_agent(&self, id: &str) -> PlatformResult<Vec<ProcessIdentity>> {
+                self.inner.kill_cli_agent(id)
+            }
+            fn check_updates(
+                &self,
+                r: &ProbeRoute,
+                v: &str,
+                ag: &AntigravityProxyStatus,
+                c: Option<&str>,
+                p: &UpdateSummary,
+                n: u64,
+            ) -> UpdateSummary {
+                self.inner.check_updates(r, v, ag, c, p, n)
+            }
+            fn sweep_claude(&self, m: SweepMode) -> PlatformResult<SweepReport> {
+                self.inner.sweep_claude(m)
+            }
+            fn sweep_all_orphans(&self) -> PlatformResult<SweepReport> {
+                self.inner.sweep_all_orphans()
+            }
+            fn inspect_antigravity_proxy(
+                &self,
+                port: u16,
+                ver: Option<&str>,
+                s: &CachedProcessSnapshot,
+                n: u64,
+            ) -> AntigravityProxyStatus {
+                self.inner.inspect_antigravity_proxy(port, ver, s, n)
+            }
+            fn launch_app_normal_privilege(&self, t: &LaunchTarget) -> PlatformResult<()> {
+                self.inner.launch_app_normal_privilege(t)
+            }
+            fn send_toast(&self, t: &str, b: &str) -> PlatformResult<()> {
+                self.inner.send_toast(t, b)
+            }
+            fn protect_secret(&self, p: &[u8]) -> PlatformResult<Vec<u8>> {
+                self.inner.protect_secret(p)
+            }
+            fn unprotect_secret(&self, c: &[u8]) -> PlatformResult<Vec<u8>> {
+                self.inner.unprotect_secret(c)
+            }
+            fn read_env_info(&self) -> PlatformResult<EnvInfo> {
+                self.inner.read_env_info()
+            }
+            fn read_default_location(&self) -> PlatformResult<(Option<String>, Option<String>)> {
+                self.inner.read_default_location()
+            }
+            fn write_default_location(&self, lat: &str, lon: &str) -> PlatformResult<()> {
+                self.inner.write_default_location(lat, lon)
+            }
+            fn delete_default_location(&self) -> PlatformResult<()> {
+                self.inner.delete_default_location()
+            }
+        }
+
+        let drv = LeakTestDriver {
+            inner: ControllableDriver::new(),
+            scans: AtomicUsize::new(0),
+            conns: vec![TcpConn {
+                pid: 4242,
+                remote: "127.0.0.1".parse().unwrap(),
+                port: 10809,
+            }],
+        };
+        let pid_map = HashMap::from([(4242u32, "claude".to_string())]);
+        let mut snap = GuardSnapshot::default();
+        snap.config.proxy_port = 7890;
+        snap.access.level = AccessLevel::SystemProxy;
+        snap.access.proxy_addr = Some("127.0.0.1:10809".into());
+
+        // 1. leak_watch == false -> skips scan_tcp_connections completely!
+        snap.config.leak_watch = false;
+        let info = access_win::AccessInfo::from(&snap.access);
+        let r_off = compute_leak_report(&drv, &snap, &pid_map, &info, 1000);
+        assert!(r_off.note.contains("直连泄露观察已关闭"));
+        assert_eq!(drv.scans.load(Ordering::Acquire), 0);
+
+        // 2. SystemProxy + TUN coexistence -> not_applicable without scanning TCP!
+        snap.config.leak_watch = true;
+        snap.access.tun_iface = Some("Mihomo".into());
+        let r_tun = compute_leak_report(&drv, &snap, &pid_map, &info, 1001);
+        assert!(r_tun.note.contains("TUN 网卡同时在线"));
+        assert_eq!(drv.scans.load(Ordering::Acquire), 0);
+
+        // 3. Pure SystemProxy on custom port 10809 -> active proxy port honored as proxied!
+        snap.access.tun_iface = None;
+        let info_px = access_win::AccessInfo::from(&snap.access);
+        let r_px = compute_leak_report(&drv, &snap, &pid_map, &info_px, 1002);
+        assert_eq!(drv.scans.load(Ordering::Acquire), 1);
+        assert_eq!(r_px.proxied, 1);
+        assert_eq!(r_px.direct_total, 0);
+    }
+
+    #[test]
+    fn merge_slot_clears_uninstalled_clients_and_updates_checked_emits_partial_status() {
+        let mut slot = ComponentUpdateStatus {
+            id: "codex_cli".into(),
+            name: "Codex CLI".into(),
+            ..ComponentUpdateStatus::default()
+        };
+        slot.installed_version = Some("0.11.0".into());
+        slot.latest_version = Some("0.12.0".into());
+        slot.phase = UpdateCheckPhase::UpdateAvailable;
+        slot.checked_at = Some(100);
+
+        let mut incoming_uninstalled = slot.clone();
+        incoming_uninstalled.installed_version = None;
+        merge_slot(&mut slot, incoming_uninstalled);
+        assert!(slot.installed_version.is_none());
+        assert_eq!(slot.phase, UpdateCheckPhase::NotInstalled);
+
+        // ClaudeGuard itself preserves phase even if telemetry incoming has None installed_version.
+        let mut cg_slot = ComponentUpdateStatus {
+            id: "claudeguard".into(),
+            name: "ClaudeGuard".into(),
+            ..ComponentUpdateStatus::default()
+        };
+        cg_slot.installed_version = Some("4.0.0".into());
+        cg_slot.latest_version = Some("4.1.0".into());
+        cg_slot.phase = UpdateCheckPhase::UpdateAvailable;
+        cg_slot.checked_at = Some(100);
+        merge_slot(
+            &mut cg_slot,
+            ComponentUpdateStatus {
+                id: "claudeguard".into(),
+                name: "ClaudeGuard".into(),
+                ..ComponentUpdateStatus::default()
+            },
+        );
+        assert_eq!(cg_slot.phase, UpdateCheckPhase::UpdateAvailable);
+
+        // CoordinatorEvent::UpdatesChecked returns Partial when some slots pass and some fail.
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(ControllableDriver::new());
+        *driver.update_fn.lock().unwrap() =
+            Some(Box::new(|_route, cg_ver, _ag, _comp, prev, now_secs| {
+                let mut next = prev.clone();
+                next.claudeguard.phase = UpdateCheckPhase::UpToDate;
+                next.claudeguard.installed_version = Some(cg_ver.to_string());
+                next.claudeguard.latest_version = Some(cg_ver.to_string());
+                next.claudeguard.checked_at = Some(now_secs);
+                next.claude_code.phase = UpdateCheckPhase::Failed;
+                next.claude_code.checked_at = Some(now_secs);
+                next.claude_code.note = "GitHub API 限流".into();
+                next.codex_cli.phase = UpdateCheckPhase::Failed;
+                next.codex_cli.checked_at = Some(now_secs);
+                next.codex_cli.note = "GitHub API 限流".into();
+                next
+            }));
+        let runner = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: Arc::new(AtomicBool::new(true)),
+            ip_on_pass: "198.51.100.98".into(),
+        });
+        let recovery = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
+        let coord = boot_actor(dir.path(), driver, runner, recovery);
+        assert!(matches!(
+            coord.dispatch(PipeRequest::CompleteOnboarding {
+                config: make_cfg("US")
+            }),
+            PipeResponse::Ack { .. }
+        ));
+
+        match coord.dispatch(PipeRequest::CheckUpdates { component: None }) {
+            PipeResponse::Ack {
+                receipt: Some(rcpt),
+                ..
+            } => {
+                assert_eq!(rcpt.status, OperationStatus::Partial);
+                let err = rcpt.error.unwrap_or_default();
+                assert!(err.contains("GitHub API 限流"));
+                assert_eq!(
+                    err.matches("GitHub API 限流").count(),
+                    1,
+                    "duplicate failure notes must be deduplicated: {err}"
+                );
+            }
+            other => panic!("expected Ack(Partial), got {other:?}"),
+        }
+        coord.shutdown();
+    }
+
+    #[test]
+    fn onboarding_probe_runs_off_coordinator_with_multi_anchor_fallback_and_no_fake_port() {
+        struct MultiAnchorRunner {
+            gate: Mutex<Option<mpsc::SyncSender<()>>>,
+            release: Mutex<Option<mpsc::Receiver<()>>>,
+            all_cn: AtomicBool,
+        }
+        impl ProbeRunner for MultiAnchorRunner {
+            fn inspect_and_probe(
+                &self,
+                _driver: &dyn PlatformDriver,
+                _cfg: &Config,
+                cfg_rev: u64,
+                targets: &[Target],
+                _enforce_access_path: bool,
+                _skip_network_probes: bool,
+                now_secs: u64,
+            ) -> (AccessEvidence, Vec<(String, ProbeResult)>) {
+                if let Some(tx) = self.gate.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = self.release.lock().unwrap().take() {
+                    let _ = rx.recv_timeout(Duration::from_secs(2));
+                }
+                let force_cn = self.all_cn.load(Ordering::Acquire);
+                let ev = AccessEvidence {
+                    level: AccessLevel::Tun,
+                    observed_at: now_secs,
+                    revision: cfg_rev,
+                    note: "mock tun".into(),
+                    ..AccessEvidence::default()
+                };
+                let out = targets
+                    .iter()
+                    .map(|t| {
+                        let res = if force_cn || t.id == "claude" {
+                            ProbeResult {
+                                reachable: true,
+                                status: Some(200),
+                                ip: Some("203.0.113.10".into()),
+                                country: Some("CN".into()),
+                                raw_region: Some("CN".into()),
+                                colo: Some("SHA".into()),
+                                city: None,
+                                latency_ms: 30,
+                                parsed_as: "trace".into(),
+                                detail: "cn".into(),
+                            }
+                        } else {
+                            ProbeResult {
+                                reachable: true,
+                                status: Some(200),
+                                ip: Some("198.51.100.88".into()),
+                                country: Some("US".into()),
+                                raw_region: Some("US".into()),
+                                colo: Some("SJC".into()),
+                                city: None,
+                                latency_ms: 42,
+                                parsed_as: "trace".into(),
+                                detail: "us".into(),
+                            }
+                        };
+                        (t.id.clone(), res)
+                    })
+                    .collect();
+                (ev, out)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(ControllableDriver::new());
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let runner = Arc::new(MultiAnchorRunner {
+            gate: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+            all_cn: AtomicBool::new(false),
+        });
+        let recovery = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
+        let coord = boot_actor(dir.path(), driver, runner.clone(), recovery);
+
+        let coord_bg = coord.clone();
+        let handle = std::thread::spawn(move || coord_bg.dispatch(PipeRequest::ProbeOnboarding));
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("onboarding worker entered");
+
+        // Coordinator must NOT block GetSnapshot while ProbeOnboarding is in flight!
+        assert!(matches!(
+            coord.dispatch(PipeRequest::GetSnapshot),
+            PipeResponse::Snapshot { .. }
+        ));
+        release_tx.send(()).unwrap();
+
+        match handle.join().unwrap() {
+            PipeResponse::OnboardingProbe { probe } => {
+                assert_eq!(
+                    probe.detected_proxy_port, None,
+                    "TUN mode without proxy_addr must NOT report fake default proxy port"
+                );
+                let p = probe.probe.expect("fallback anchor result");
+                assert_eq!(p.country.as_deref(), Some("US"));
+                assert_eq!(p.ip.as_deref(), Some("198.51.100.88"));
+            }
+            other => panic!("expected OnboardingProbe, got {other:?}"),
+        }
+
+        // When all anchors return CN, falls back to CN result so onboarding warns.
+        runner.all_cn.store(true, Ordering::Release);
+        match coord.dispatch(PipeRequest::ProbeOnboarding) {
+            PipeResponse::OnboardingProbe { probe } => {
+                let p = probe.probe.expect("cn fallback result");
+                assert_eq!(p.country.as_deref(), Some("CN"));
+            }
+            other => panic!("expected OnboardingProbe(CN), got {other:?}"),
+        }
+
+        coord.shutdown();
+    }
+
+    #[test]
+    fn bootstrap_and_complete_onboarding_sync_leak_shield_when_armed_with_enabled_vectors() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = calls.clone();
+        let syncer: LeakShieldSyncFn = Arc::new(move |exes, quic, dns, ipv6| {
+            calls_ref.fetch_add(1, Ordering::AcqRel);
+            let active_rules =
+                exes.len() * (usize::from(quic) + usize::from(dns) * 3 + usize::from(ipv6));
+            Ok(LeakShieldStatus {
+                enabled: active_rules > 0,
+                quic_blocked: quic && active_rules > 0,
+                dns_doh_blocked: dns && active_rules > 0,
+                ipv6_blocked: ipv6 && active_rules > 0,
+                active_rules,
+                summary: "synced".into(),
+            })
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(ControllableDriver::new());
+        let runner = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: Arc::new(AtomicBool::new(true)),
+            ip_on_pass: "198.51.100.98".into(),
+        });
+        let recovery = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
+
+        let data_dir = dir.path().to_path_buf();
+        let drv_c = driver.clone();
+        let run_c = runner.clone();
+        let rec_c = recovery.clone();
+        let sync_c = syncer.clone();
+        let (coord, ()) = start_coordinator_with(|event_tx| {
+            let boot = RealEngineActor::bootstrap_with_syncer(
+                data_dir, drv_c, run_c, rec_c, event_tx, sync_c,
+            );
+            (boot.initial_snapshot, Box::new(boot.actor), ())
+        });
+        assert_eq!(calls.load(Ordering::Acquire), 0, "Unconfigured skips sync");
+
+        let mut cfg = make_cfg("US");
+        cfg.leak_shield_quic = true;
+        cfg.leak_shield_dns_doh = false;
+        cfg.leak_shield_ipv6 = false;
+        assert!(matches!(
+            coord.dispatch(PipeRequest::CompleteOnboarding { config: cfg }),
+            PipeResponse::Ack { .. }
+        ));
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "CompleteOnboarding must sync active leak shield rules immediately"
+        );
+        assert!(coord.snapshot().leak_shield.quic_blocked);
+        coord.shutdown();
+
+        // Reboot against persisted Armed config -> bootstrap syncs leak shield rules immediately!
+        let data_dir2 = dir.path().to_path_buf();
+        let (coord2, ()) = start_coordinator_with(|event_tx| {
+            let boot = RealEngineActor::bootstrap_with_syncer(
+                data_dir2, driver, runner, recovery, event_tx, syncer,
+            );
+            (boot.initial_snapshot, Box::new(boot.actor), ())
+        });
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            2,
+            "bootstrap must sync leak shield rules when Armed and any shield flag is true"
+        );
+        assert!(coord2.snapshot().leak_shield.quic_blocked);
+        coord2.shutdown();
     }
 }

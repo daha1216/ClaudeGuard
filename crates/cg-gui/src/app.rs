@@ -3,7 +3,9 @@
 
 use crate::assets::{EmbeddedAssets, brand_mark, ui_icon};
 use crate::demo::DemoScenario;
-use crate::ipc::{DaemonClient, TransportEndpoint, launch_agent_normal_user, open_external_url};
+use crate::ipc::{
+    DaemonClient, TransportEndpoint, TransportError, launch_agent_normal_user, open_external_url,
+};
 use crate::motion::{
     DirectionalTransition, PresenceSpring, SlidingIndicatorState, rgba_with_alpha_scale,
     spring_sheet, spring_snappy, sync_windows_reduce_motion,
@@ -79,7 +81,10 @@ pub enum ActionScope {
     UpdatesComponent(String),
     ExportDiagnostics,
     RepairAntigravity,
+    SyncLeakShield,
     SaveFeishu,
+    TestFeishu,
+    EnvAlign,
     SaveTargets,
     Flow,
 }
@@ -1086,8 +1091,12 @@ impl AppController {
                     }
                     Ok(_) => {}
                     Err(err) => {
-                        ctrl.connected = false;
-                        ctrl.connection_err = Some(err.to_string());
+                        let msg = err.to_string();
+                        if matches!(err, TransportError::DaemonOffline(_)) {
+                            ctrl.connected = false;
+                            ctrl.connection_err = Some(msg.clone());
+                        }
+                        ctrl.set_toast(msg, false, cx);
                     }
                 }
                 cx.notify();
@@ -1394,7 +1403,12 @@ impl AppController {
             }
             PipeRequest::ExportDiagnostics => Some(ActionScope::ExportDiagnostics),
             PipeRequest::RepairAntigravityProxy => Some(ActionScope::RepairAntigravity),
+            PipeRequest::SyncLeakShield => Some(ActionScope::SyncLeakShield),
             PipeRequest::SaveFeishuConfig { .. } => Some(ActionScope::SaveFeishu),
+            PipeRequest::TestFeishu { .. } => Some(ActionScope::TestFeishu),
+            PipeRequest::ApplyEnvAlignment { .. } | PipeRequest::RollbackEnvAlignment => {
+                Some(ActionScope::EnvAlign)
+            }
             PipeRequest::RecoverSafeFlowA
             | PipeRequest::DisarmAndRestoreFlowB { .. }
             | PipeRequest::Rearm
@@ -1487,13 +1501,10 @@ impl AppController {
                         }
                     }
                     Ok(PipeResponse::Ack { receipt, snapshot }) => {
-                        let failed = receipt.as_ref().is_some_and(|rc| {
-                            matches!(
-                                rc.status,
-                                OperationStatus::Failed | OperationStatus::Partial
-                            )
-                        });
-                        if !failed {
+                        let hard_failed = receipt
+                            .as_ref()
+                            .is_some_and(|rc| rc.status == OperationStatus::Failed);
+                        if !hard_failed {
                             if clear_targets_dirty_on_ok {
                                 ctrl.drafts.dirty = false;
                                 ctrl.drafts.validation_error = None;
@@ -1506,10 +1517,17 @@ impl AppController {
                             ctrl.apply_snapshot(*snap, cx);
                         }
                         if let Some(ref rc) = receipt
-                            && matches!(
-                                rc.status,
-                                OperationStatus::Failed | OperationStatus::Partial
-                            )
+                            && rc.status == OperationStatus::Failed
+                        {
+                            let detail = rc
+                                .error
+                                .as_deref()
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("操作未通过：{}", rc.verified_scope));
+                            ctrl.set_toast(detail, false, cx);
+                        } else if let Some(ref rc) = receipt
+                            && rc.status == OperationStatus::Partial
                         {
                             let detail = rc
                                 .error
@@ -1517,7 +1535,7 @@ impl AppController {
                                 .filter(|s| !s.is_empty())
                                 .map(str::to_string)
                                 .unwrap_or_else(|| {
-                                    format!("操作未完全通过：{}", rc.verified_scope)
+                                    format!("已完成可用项，部分未通过：{}", rc.verified_scope)
                                 });
                             ctrl.set_toast(detail, false, cx);
                         } else if is_export
@@ -1541,11 +1559,15 @@ impl AppController {
                     }
                     Ok(_) => {}
                     Err(err) => {
-                        ctrl.connected = false;
-                        ctrl.connection_err = Some(err.to_string());
-                        ctrl.invalidate_console_cache();
-                        ctrl.invalidate_hud_cache();
-                        ctrl.set_toast(err.to_string(), false, cx);
+                        let msg = err.to_string();
+                        if matches!(err, TransportError::DaemonOffline(_)) {
+                            ctrl.connected = false;
+                            ctrl.connection_err = Some(msg.clone());
+                            ctrl.invalidate_console_cache();
+                            ctrl.invalidate_hud_cache();
+                            ctrl.sync_tray_status();
+                        }
+                        ctrl.set_toast(msg, false, cx);
                     }
                 }
                 cx.notify();
@@ -1969,8 +1991,10 @@ impl AppController {
                     Ok(_) => {}
                     Err(err) => {
                         let msg = err.to_string();
-                        ctrl.connected = false;
-                        ctrl.connection_err = Some(msg.clone());
+                        if matches!(err, TransportError::DaemonOffline(_)) {
+                            ctrl.connected = false;
+                            ctrl.connection_err = Some(msg.clone());
+                        }
                         ctrl.onboarding_error = Some(msg.clone());
                         ctrl.set_toast(msg, false, cx);
                     }
@@ -2081,8 +2105,10 @@ impl AppController {
                     }
                     Err(err) => {
                         let msg = err.to_string();
-                        ctrl.connected = false;
-                        ctrl.connection_err = Some(msg.clone());
+                        if matches!(err, TransportError::DaemonOffline(_)) {
+                            ctrl.connected = false;
+                            ctrl.connection_err = Some(msg.clone());
+                        }
                         ctrl.show_onboarding = true;
                         ctrl.onboarding_error = Some(msg);
                     }
@@ -2769,16 +2795,27 @@ impl ConsoleWindowView {
             }
             match c.nav_section {
                 NavSection::Audit => c.refresh_audit_logs(cx),
-                NavSection::Updates => c.send_request(
-                    PipeRequest::CheckUpdates { component: None },
-                    Some("已完成组件更新检查"),
-                    cx,
-                ),
-                _ => c.send_request(
-                    PipeRequest::RecheckNow { target_id: None },
-                    Some("已完成出口核验"),
-                    cx,
-                ),
+                NavSection::Updates => {
+                    let tripped = c.snapshot.as_ref().is_some_and(|s| s.is_tripped());
+                    if tripped {
+                        c.set_toast("当前处于熔断隔离态，已暂停联网检查更新", false, cx);
+                    } else if !c.is_scope_busy(&ActionScope::UpdatesAll) {
+                        c.send_request(
+                            PipeRequest::CheckUpdates { component: None },
+                            Some("已完成组件更新检查"),
+                            cx,
+                        );
+                    }
+                }
+                _ => {
+                    if !c.is_scope_busy(&ActionScope::RecheckAll) {
+                        c.send_request(
+                            PipeRequest::RecheckNow { target_id: None },
+                            Some("已完成出口核验"),
+                            cx,
+                        );
+                    }
+                }
             }
         });
     }
@@ -4529,5 +4566,41 @@ mod tests {
 
         assert_eq!(parse_args(vec_args(&["--help"])), Err(USAGE.to_string()));
         assert!(parse_args(vec_args(&["--demo", "invalid"])).is_err());
+    }
+
+    #[test]
+    fn scope_for_request_isolates_shield_feishu_env_and_per_component_updates() {
+        assert_eq!(
+            AppController::scope_for_request(&PipeRequest::SyncLeakShield),
+            Some(ActionScope::SyncLeakShield)
+        );
+        assert_eq!(
+            AppController::scope_for_request(&PipeRequest::TestFeishu {
+                webhook: None,
+                secret: None,
+            }),
+            Some(ActionScope::TestFeishu)
+        );
+        assert_eq!(
+            AppController::scope_for_request(&PipeRequest::ApplyEnvAlignment {
+                align_tz: true,
+                align_location: false,
+            }),
+            Some(ActionScope::EnvAlign)
+        );
+        assert_eq!(
+            AppController::scope_for_request(&PipeRequest::RollbackEnvAlignment),
+            Some(ActionScope::EnvAlign)
+        );
+        assert_eq!(
+            AppController::scope_for_request(&PipeRequest::CheckUpdates {
+                component: Some("ag_capsule".into()),
+            }),
+            Some(ActionScope::UpdatesComponent("ag_capsule".into()))
+        );
+        assert_eq!(
+            AppController::scope_for_request(&PipeRequest::CheckUpdates { component: None }),
+            Some(ActionScope::UpdatesAll)
+        );
     }
 }

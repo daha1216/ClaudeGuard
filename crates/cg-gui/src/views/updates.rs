@@ -49,7 +49,7 @@ fn strip_ascii_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-fn concise_update_error(note: &str) -> String {
+pub(crate) fn concise_update_error(note: &str) -> String {
     let mut s = note.trim();
     loop {
         let prev = s;
@@ -72,7 +72,11 @@ fn concise_update_error(note: &str) -> String {
             }
         }
 
-        if s.starts_with("检查") || s.starts_with("检测") {
+        if s.starts_with("检查")
+            || s.starts_with("检测")
+            || s.starts_with("查询")
+            || s.starts_with("获取")
+        {
             for marker in [
                 "更新失败：",
                 "更新失败:",
@@ -154,10 +158,11 @@ fn render_grid_card(
     spec: GridCardSpec<'_>,
     motion: CardMotion,
     plugin_updates_count: usize,
-    can_check: bool,
+    can_check_base: bool,
     p: &'static ThemePalette,
     cx: &mut Context<ConsoleWindowView>,
 ) -> Div {
+    let can_check = can_check_base && !spec.is_checking;
     let item = spec.item;
     let has_up = item.phase == UpdateCheckPhase::UpdateAvailable;
     let is_failed = item.phase == UpdateCheckPhase::Failed;
@@ -469,10 +474,15 @@ pub fn render_updates_page(
         .map(|s| s.antigravity_proxy.clone())
         .unwrap_or_default();
     let now = now_unix_secs();
-    let can_check = connected && !busy && !tripped;
+    let can_check_base = connected && !tripped;
     let checking_all = ctrl_r.is_scope_busy(&ActionScope::UpdatesAll);
+    let checking_plugins =
+        ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("antigravity_plugins".into()));
     let checking_ag = checking_all
+        || checking_plugins
         || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("antigravity_proxy".into()));
+    let can_check_all = can_check_base && !checking_all;
+    let can_check_ag = can_check_base && !checking_ag;
     let auto_upd_on = ctrl_r.effective_toggle("upd-auto-check-sw", cfg.auto_upd_check);
     let ag_needs_repair =
         cfg.require_antigravity_proxy && ag_proxy.installed && !ag_proxy.is_ready_for_launch();
@@ -594,6 +604,7 @@ pub fn render_updates_page(
             repo_url: Some("https://github.com/Silas-02/antigravity-desktop-cn"),
             has_plugins_btn: false,
             is_checking: checking_all
+                || checking_plugins
                 || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("antigravity_cn".into())),
         },
     ];
@@ -614,27 +625,34 @@ pub fn render_updates_page(
             )
         })
         .count();
-    let (grid_summary_text, grid_summary_color, grid_summary_dot) = if avail_grid > 0 {
-        (
-            format!("6 项追踪 · {avail_grid} 项可更新"),
-            p.badge_warn.text,
-            Some(p.badge_warn.dot),
-        )
-    } else if failed_grid > 0 {
-        (
-            format!("6 项追踪 · {failed_grid} 项失败"),
-            p.badge_fail.text,
-            Some(p.badge_fail.dot),
-        )
-    } else if checked_grid == 0 {
-        ("6 项追踪 · 尚未巡检".into(), p.text_muted, None)
-    } else {
-        (
-            "6 项追踪 · 均已最新".into(),
-            p.text_primary,
-            Some(p.badge_pass.dot),
-        )
-    };
+    let (grid_summary_text, grid_summary_color, grid_summary_dot) =
+        if avail_grid > 0 && failed_grid > 0 {
+            (
+                format!("6 项追踪 · {avail_grid} 项可更新 · {failed_grid} 项失败"),
+                p.badge_warn.text,
+                Some(p.badge_warn.dot),
+            )
+        } else if avail_grid > 0 {
+            (
+                format!("6 项追踪 · {avail_grid} 项可更新"),
+                p.badge_warn.text,
+                Some(p.badge_warn.dot),
+            )
+        } else if failed_grid > 0 {
+            (
+                format!("6 项追踪 · {failed_grid} 项失败"),
+                p.badge_fail.text,
+                Some(p.badge_fail.dot),
+            )
+        } else if checked_grid == 0 {
+            ("6 项追踪 · 尚未巡检".into(), p.text_muted, None)
+        } else {
+            (
+                "6 项追踪 · 均已最新".into(),
+                p.text_primary,
+                Some(p.badge_pass.dot),
+            )
+        };
 
     let mut cards: Vec<Div> = grid_items
         .into_iter()
@@ -650,7 +668,7 @@ pub fn render_updates_page(
                     icon_scale: choreo.icon_scale(2 + row_idx, col_idx),
                 },
                 plugin_ups,
-                can_check,
+                can_check_base,
                 p,
                 cx,
             )
@@ -832,13 +850,13 @@ pub fn render_updates_page(
                                     "全部巡检 (10)"
                                 },
                                 ButtonKind::Primary,
-                                can_check,
+                                can_check_all,
                                 checking_all,
                                 p,
                             )
                             .h(px(29.))
                             .px(px(12.))
-                            .when(can_check, |b| {
+                            .when(can_check_all, |b| {
                                 b.on_mouse_up(
                                     MouseButton::Left,
                                     cx.listener(move |_, _, _, cx| {
@@ -1018,7 +1036,7 @@ pub fn render_updates_page(
                                 .text_size(px(12.))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(rgb(p.secondary_btn_text))
-                                .when(can_check, |b| {
+                                .when(can_check_ag, |b| {
                                     b.cursor_pointer()
                                         .hover(move |s| s.bg(rgb(sec_hover)))
                                         .active(|s| s.opacity(0.86))
@@ -1039,7 +1057,7 @@ pub fn render_updates_page(
                                             }),
                                         )
                                 })
-                                .when(!can_check, |b| b.opacity(0.45))
+                                .when(!can_check_ag, |b| b.opacity(0.45))
                                 .child(spinning_ui_icon(
                                     "upd-ag-check-spin",
                                     "icons/ui/refresh.svg",
@@ -1146,6 +1164,16 @@ mod tests {
         assert_eq!(
             concise_update_error("失败：检查 antigravity-proxy 更新失败：Network Error: 请求超时"),
             "请求超时"
+        );
+        assert_eq!(
+            concise_update_error(
+                "检测失败：检查 antigravity-usage-monitor 更新失败：io error: 连接被重置"
+            ),
+            "连接被重置"
+        );
+        assert_eq!(
+            concise_update_error("检查 agy-capsule 更新失败：GitHub 返回 HTTP 403"),
+            "GitHub 返回 HTTP 403"
         );
         assert_eq!(
             concise_update_error("当前接入路径受阻，已拒绝直连检查更新：本地代理未监听"),
