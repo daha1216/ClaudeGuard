@@ -4,6 +4,13 @@
 
 日期为实际发布日期（UTC / UTC+8）。更早的历史版本记录见 [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases)。
 
+## [Unreleased]
+
+### 反重力注入自愈与热修复修复
+
+- **一键热修复不再报「ZIP 归档中未找到目标文件：version.dll」（`antigravity_proxy_win` / `zip_util`）**：GitHub 发布包资产顺序会把 CLI 包排在 IDE 包前，旧逻辑只取第一个 `.zip` 并硬编码找 `version.dll`。现按 `version.dll` → `antigravity_proxy.dll` 候选名解包，兜底扫描归档内全部 `.dll` 并逐个做 PE + 特征串验签，全失败时回报归档条目便于排查；系统代理与 TUN 直连两条下载通道同时生效。
+
+
 ## [4.1.3] - 2026-11-25
 
 **全栈安全加固、防休眠误杀、底层防误判与交互体验跃升版**：全量严查并修复 46 项安全权限边界、中文路径切片崩溃、PID 复用隐患、笔记本睡眠唤醒误熔断、游戏加速器/分流网卡误判与前端状态竞态问题，同步落地离线一键拉起服务、全键盘表单流、门禁灵动岛快捷恢复等 5 大体验升级。

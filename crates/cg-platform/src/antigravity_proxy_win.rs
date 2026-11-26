@@ -658,7 +658,69 @@ fn atomic_write_verified_file(
     Ok(target_path)
 }
 
-/// Validates and atomically installs `version.dll` (raw DLL or `.zip` containing `version.dll`)
+/// Candidate DLL entry names across `yuaotian/antigravity-proxy` release layouts.
+///
+/// The IDE bundle ships `ide/version.dll`; the CLI bundle ships `cli/antigravity_proxy.dll`. Both
+/// payloads are the same binary, so either layout is accepted. Matching is suffix-based, therefore
+/// any subdirectory works.
+const PROXY_DLL_ENTRY_CANDIDATES: &[&str] = &["version.dll", "antigravity_proxy.dll"];
+
+/// Resolves the proxy DLL payload out of a release `.zip` asset.
+///
+/// Upstream publishes two zip flavours whose entry names differ (`version.dll` in the IDE bundle,
+/// `antigravity_proxy.dll` in the CLI bundle), and GitHub returns whichever asset sorts first — so a
+/// name-only lookup is fragile. Every candidate is therefore binary-validated before it is accepted,
+/// and unrelated entries such as `cli/dbghelp.dll` can never be picked.
+fn resolve_proxy_dll_from_zip(zip_bytes: &[u8]) -> Result<(String, Vec<u8>), String> {
+    for candidate in PROXY_DLL_ENTRY_CANDIDATES {
+        if let Ok((name, bytes)) = crate::zip_util::extract_file_from_zip(zip_bytes, candidate) {
+            if validate_antigravity_proxy_dll_bytes(&bytes) {
+                return Ok((name, bytes));
+            }
+        }
+    }
+
+    // Fallback for a future upstream rename: scan every `.dll` entry and keep the first one whose
+    // bytes carry the antigravity-proxy signature.
+    let Ok(entry_names) = crate::zip_util::list_entry_names(zip_bytes) else {
+        return Err(format!(
+            "ZIP 归档中未找到目标文件：{}（也无法读取归档目录）",
+            PROXY_DLL_ENTRY_CANDIDATES[0]
+        ));
+    };
+
+    for entry_name in &entry_names {
+        let lower = entry_name.to_ascii_lowercase();
+        if !lower.ends_with(".dll") {
+            continue;
+        }
+        let already_tried = PROXY_DLL_ENTRY_CANDIDATES
+            .iter()
+            .any(|c| lower == *c || lower.ends_with(&format!("/{c}")));
+        if already_tried {
+            continue;
+        }
+        if let Ok((name, bytes)) = crate::zip_util::extract_file_from_zip(zip_bytes, entry_name) {
+            if validate_antigravity_proxy_dll_bytes(&bytes) {
+                return Ok((name, bytes));
+            }
+        }
+    }
+
+    let listed = entry_names
+        .iter()
+        .take(8)
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join("、");
+    let ellipsis = if entry_names.len() > 8 { " 等" } else { "" };
+    Err(format!(
+        "ZIP 归档中未找到可用的 antigravity-proxy DLL（已检查 {}，均未通过二进制特征校验；归档内容：{listed}{ellipsis}）",
+        PROXY_DLL_ENTRY_CANDIDATES.join(" / ")
+    ))
+}
+
+/// Validates and atomically installs `version.dll` (raw DLL or `.zip` containing the proxy DLL)
 /// and synchronizes `config.json` (`proxy.port = proxy_port`, `child_injection = true`).
 pub fn install_verified_proxy_bytes_into_dir(
     dir: &Path,
@@ -670,7 +732,7 @@ pub fn install_verified_proxy_bytes_into_dir(
     ensure_no_reparse_points(dir)?;
 
     let dll_bytes = if is_zip {
-        let (_name, bytes) = crate::zip_util::extract_file_from_zip(raw_bytes, "version.dll")?;
+        let (_name, bytes) = resolve_proxy_dll_from_zip(raw_bytes)?;
         bytes
     } else {
         raw_bytes.to_vec()
@@ -886,6 +948,73 @@ mod tests {
         let marker = b"Microsoft Windows Operating System GetFileVersionInfoW";
         buf[256..256 + marker.len()].copy_from_slice(marker);
         buf
+    }
+
+    #[test]
+    fn zip_install_accepts_cli_bundle_layout_with_antigravity_proxy_dll() {
+        let dll = synthetic_proxy_dll_bytes();
+        let archive = crate::zip_util::build_zip_archive(&[
+            ("cli/agy-acp-proxy.exe", b"MZ-cli-launcher".as_slice()),
+            ("cli/config.json", b"{}".as_slice()),
+            ("cli/dbghelp.dll", b"MZ-dbghelp-not-a-proxy".as_slice()),
+            ("cli/antigravity_proxy.dll", dll.as_slice()),
+        ])
+        .expect("build cli-layout zip");
+
+        let dir = unique_temp_dir("cli-layout-install");
+        let rep = install_verified_proxy_bytes_into_dir(&dir, &archive, true, 7890, "v2.6.6")
+            .expect("cli bundle layout must install version.dll");
+        assert_eq!(rep.proxy_port, 7890);
+        assert_eq!(std::fs::read(dir.join("version.dll")).unwrap(), dll);
+
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        assert_eq!(cfg["_version"], "2.6.6");
+        assert_eq!(cfg["child_injection"], true);
+        assert_eq!(cfg["proxy"]["port"], 7890);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn zip_install_prefers_version_dll_entry_over_other_dll_entries() {
+        let version_bytes = synthetic_proxy_dll_bytes();
+        let mut decoy = version_bytes.clone();
+        decoy[1024] = b'X';
+        let archive = crate::zip_util::build_zip_archive(&[
+            ("ide/antigravity_proxy.dll", decoy.as_slice()),
+            ("ide/version.dll", version_bytes.as_slice()),
+        ])
+        .expect("build ide-layout zip");
+
+        let dir = unique_temp_dir("ide-layout-install");
+        install_verified_proxy_bytes_into_dir(&dir, &archive, true, 7890, "v2.6.6")
+            .expect("ide bundle layout must install version.dll");
+        assert_eq!(std::fs::read(dir.join("version.dll")).unwrap(), version_bytes);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn zip_install_reports_archive_contents_when_no_proxy_dll_matches() {
+        let archive = crate::zip_util::build_zip_archive(&[
+            ("launcher/start.exe", b"MZ-launcher".as_slice()),
+            ("cli/dbghelp.dll", b"MZ-dbghelp".as_slice()),
+        ])
+        .expect("build dll-less zip");
+
+        let dir = unique_temp_dir("no-proxy-dll");
+        let err = install_verified_proxy_bytes_into_dir(&dir, &archive, true, 7890, "v2.6.6")
+            .expect_err("must reject an archive without the proxy dll");
+        assert!(
+            err.contains("dbghelp.dll"),
+            "error should list archive entries: {err}"
+        );
+        assert!(
+            err.contains("version.dll"),
+            "error should name the expected file: {err}"
+        );
+        assert!(!dir.join("version.dll").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn valid_config_json(port: u16, child_injection: bool) -> String {
