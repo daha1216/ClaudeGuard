@@ -114,6 +114,7 @@ pub enum TrayEvent {
     SweepOrphans,
     SafeExit,
     QuitGuiOnly,
+    SystemShuttingDown,
 }
 
 /// Tray icon visual status tone.
@@ -531,6 +532,8 @@ mod win_impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        use windows::Win32::UI::WindowsAndMessaging::{WM_ENDSESSION, WM_QUERYENDSESSION};
+
         if msg == WM_TRAY_QUIT {
             let _ = unsafe { DestroyWindow(hwnd) };
             return LRESULT(0);
@@ -539,6 +542,16 @@ mod win_impl {
             GetWindowLongPtrW(hwnd, windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA)
         } as *const WindowContext;
         if ptr.is_null() {
+            if msg == WM_QUERYENDSESSION {
+                let _ = std::thread::spawn(crate::ipc::notify_daemon_shutdown_best_effort);
+                return LRESULT(1);
+            }
+            if msg == WM_ENDSESSION {
+                if wparam.0 != 0 {
+                    let _ = std::thread::spawn(crate::ipc::notify_daemon_shutdown_best_effort);
+                }
+                return LRESULT(0);
+            }
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
         let ctx = unsafe { &*ptr };
@@ -549,6 +562,17 @@ mod win_impl {
         }
 
         match msg {
+            WM_QUERYENDSESSION => {
+                ctx.shared.channel.send(TrayEvent::SystemShuttingDown);
+                let _ = std::thread::spawn(crate::ipc::notify_daemon_shutdown_best_effort);
+                LRESULT(1)
+            }
+            WM_ENDSESSION => {
+                if wparam.0 != 0 {
+                    let _ = std::thread::spawn(crate::ipc::notify_daemon_shutdown_best_effort);
+                }
+                LRESULT(0)
+            }
             WM_TRAY_SYNC => {
                 let _ = add_or_update_tray_icon(hwnd, ctx, false);
                 LRESULT(0)
@@ -1504,5 +1528,13 @@ mod tests {
                 assert!(transparent > 0, "corners should remain transparent");
             }
         }
+    }
+
+    #[test]
+    fn tray_channel_forwards_system_shutting_down_event() {
+        let ch = TrayChannel::new();
+        ch.send(TrayEvent::SystemShuttingDown);
+        let guard = ch.inner.lock().unwrap();
+        assert_eq!(guard.queue.front(), Some(&TrayEvent::SystemShuttingDown));
     }
 }

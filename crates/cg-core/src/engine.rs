@@ -112,6 +112,9 @@ pub struct EngineState {
     pub logs: VecDeque<LogEntry>,
     pub next_log_id: u64,
     pub pending_tx: Option<PendingTransaction>,
+    pub wal_pending: bool,
+    pub system_shutting_down: bool,
+    pub last_auto_uncovered_action_at: Option<u64>,
 }
 
 impl EngineState {
@@ -178,6 +181,9 @@ impl EngineState {
             logs: VecDeque::new(),
             next_log_id: 1,
             pending_tx: None,
+            wal_pending: false,
+            system_shutting_down: false,
+            last_auto_uncovered_action_at: None,
             config,
         }
     }
@@ -393,6 +399,9 @@ pub enum EngineEvent {
     UpdatesChecked {
         summary: Box<UpdateSummary>,
     },
+    SystemShuttingDown,
+    AbortFalseShutdownTrip,
+    WalHealed,
 }
 
 /// Imperative side-effect commands emitted by [`GuardEngine::step`] for execution by `cg-daemon` / `cg-platform`.
@@ -681,6 +690,15 @@ impl GuardEngine {
             }
             EngineEvent::UpdatesChecked { summary } => {
                 handle_updates_checked(&mut state, *summary, now_secs, &mut cmds);
+            }
+            EngineEvent::SystemShuttingDown => {
+                handle_system_shutting_down(&mut state, now_secs, &mut cmds);
+            }
+            EngineEvent::AbortFalseShutdownTrip => {
+                handle_abort_false_shutdown_trip(&mut state, now_secs, &mut cmds);
+            }
+            EngineEvent::WalHealed => {
+                handle_wal_healed(&mut state, now_secs, &mut cmds);
             }
         }
 
@@ -1038,6 +1056,7 @@ fn handle_bootstrap(
         state.last_error = err;
     }
     if wal_corrupt {
+        state.wal_pending = false;
         state.lifecycle = Lifecycle::Armed;
         state.protection = ProtectionState::Degraded;
         state.last_error = "恢复记录损坏，已保留现场并进入降级态".into();
@@ -1052,19 +1071,20 @@ fn handle_bootstrap(
         return;
     }
     if wal_pending {
+        state.wal_pending = true;
         state.lifecycle = Lifecycle::Armed;
         state.protection = ProtectionState::Degraded;
-        state.last_error = "检测到未完成的系统变更事务，等待恢复核验".into();
-        log_both(
-            state,
-            now_secs,
-            LogLevel::Warn,
-            "wal",
-            "检测到上次未提交的 WAL 事务，已保持 fail-closed 降级态",
-            cmds,
+        if state.last_error.trim().is_empty() {
+            state.last_error = "检测到未完成的系统变更事务，等待恢复核验".into();
+        }
+        let msg = format!(
+            "检测到未完成的系统变更事务，已保持 fail-closed 降级态：{}",
+            state.last_error
         );
+        log_both(state, now_secs, LogLevel::Warn, "wal", msg, cmds);
         return;
     }
+    state.wal_pending = false;
     if let Some(reason) = disarmed_reason {
         state.lifecycle = Lifecycle::Disarmed;
         state.protection = ProtectionState::Monitoring;
@@ -1077,6 +1097,73 @@ fn handle_bootstrap(
     } else {
         state.lifecycle = Lifecycle::Armed;
         state.protection = ProtectionState::Pending;
+    }
+}
+
+fn handle_system_shutting_down(
+    state: &mut EngineState,
+    now_secs: u64,
+    cmds: &mut Vec<EffectCommand>,
+) {
+    state.system_shutting_down = true;
+    state.access_streak = 0;
+    log_both(
+        state,
+        now_secs,
+        LogLevel::Info,
+        "power",
+        "检测到系统正在关机或重启，已冻结自动熔断与未覆盖锁死",
+        cmds,
+    );
+}
+
+fn handle_abort_false_shutdown_trip(
+    state: &mut EngineState,
+    now_secs: u64,
+    cmds: &mut Vec<EffectCommand>,
+) {
+    state.system_shutting_down = true;
+    state.last_auto_uncovered_action_at = None;
+    state.access_streak = 0;
+    state.tripped = None;
+    state.pending_tx = None;
+    if !state.lockdown_manual {
+        state.lockdown_applied = Some(false);
+    }
+    if matches!(state.lifecycle, Lifecycle::Armed | Lifecycle::Disarmed) {
+        state.protection = ProtectionState::Monitoring;
+    }
+    state.launch_error.clear();
+    state.runtime_epoch = state.runtime_epoch.saturating_add(1);
+    log_both(
+        state,
+        now_secs,
+        LogLevel::Audit,
+        "power",
+        "检测到关机竞态触发的未覆盖封锁，已自动回滚并免于跨重启保留",
+        cmds,
+    );
+}
+
+fn handle_wal_healed(state: &mut EngineState, now_secs: u64, cmds: &mut Vec<EffectCommand>) {
+    if state.wal_pending {
+        state.wal_pending = false;
+        state.last_error.clear();
+        if state.protection == ProtectionState::Degraded {
+            state.protection = if state.lifecycle == Lifecycle::Disarmed {
+                ProtectionState::Monitoring
+            } else {
+                ProtectionState::Pending
+            };
+        }
+        log_both(
+            state,
+            now_secs,
+            LogLevel::Audit,
+            "wal",
+            "挂起的系统变更事务已完成恢复核验，防护恢复正常",
+            cmds,
+        );
     }
 }
 
@@ -1210,7 +1297,7 @@ fn handle_round_completed(
             slot.state = TargetState::Unverified;
             slot.reason = skip_reason.clone();
             slot.checked_at = Some(now_secs);
-            if paused {
+            if paused || state.system_shutting_down {
                 slot.fail_streak = previous
                     .iter()
                     .find(|s| s.id == target.id)
@@ -1235,7 +1322,7 @@ fn handle_round_completed(
             .map(|s| s.fail_streak)
             .unwrap_or(0);
         let streak = match eval.verdict {
-            PolicyVerdict::Fail if paused => prev_streak,
+            PolicyVerdict::Fail if paused || state.system_shutting_down => prev_streak,
             PolicyVerdict::Fail => prev_streak.saturating_add(1),
             // Unverified and Pass both reset consecutive fail streak so Unverified never trips.
             PolicyVerdict::Pass | PolicyVerdict::Unverified => 0,
@@ -1276,13 +1363,18 @@ fn handle_round_completed(
     let in_resume_grace = state.is_in_resume_grace(now_secs);
 
     if state.network_isolation_supported && armed {
-        let want_auto = !state.config.monitor_only
+        let want_auto = !state.system_shutting_down
+            && !state.config.monitor_only
             && !(in_resume_grace && state.lockdown_applied != Some(true))
             && access_uncovered
             && state.config.lockdown_on_uncovered;
         let want = want_auto || state.lockdown_manual;
-        let allowed = !(paused && want && state.lockdown_applied != Some(true));
+        let allowed = !(paused && want && state.lockdown_applied != Some(true))
+            && !(state.system_shutting_down && !want && !state.lockdown_manual);
         if allowed && state.lockdown_applied != Some(want) {
+            if want_auto && !state.lockdown_manual && access_uncovered {
+                state.last_auto_uncovered_action_at = Some(now_secs);
+            }
             cmds.push(EffectCommand::SyncLockdown {
                 want,
                 manual: state.lockdown_manual,
@@ -1306,6 +1398,7 @@ fn handle_round_completed(
 
     if armed
         && !paused
+        && !state.system_shutting_down
         && !in_resume_grace
         && !state.config.monitor_only
         && ip_unchanged_hold.is_none()
@@ -1334,14 +1427,16 @@ fn handle_round_completed(
     if all_pass {
         state.ip_unchanged_hold_notified = false;
         state.monitor_only_warn_notified = false;
+        state.last_auto_uncovered_action_at = None;
     }
 
     if armed {
         if access_uncovered {
-            if !paused {
+            if !paused && !state.system_shutting_down {
                 state.access_streak = state.access_streak.saturating_add(1);
             }
             if !paused
+                && !state.system_shutting_down
                 && !in_resume_grace
                 && !state.config.monitor_only
                 && !state.protection.is_isolated()
@@ -1461,9 +1556,14 @@ fn handle_round_completed(
                 } else {
                     state.launch_error = "部分目标无法确认，暂不允许启动".into();
                 }
-            } else if !paused && !in_resume_grace && access_trip {
+            } else if !paused && !state.system_shutting_down && !in_resume_grace && access_trip {
+                if failing_ids.is_empty() {
+                    state.last_auto_uncovered_action_at = Some(now_secs);
+                } else {
+                    state.last_auto_uncovered_action_at = None;
+                }
                 begin_isolation(state, fail_reason, failing_ids, now_secs, cmds);
-            } else if !paused && !in_resume_grace && target_trip {
+            } else if !paused && !state.system_shutting_down && !in_resume_grace && target_trip {
                 if let Some(stable_ips) = ip_unchanged_hold {
                     state.protection = ProtectionState::Monitoring;
                     state.launch_error =
@@ -1481,6 +1581,7 @@ fn handle_round_completed(
                         });
                     }
                 } else {
+                    state.last_auto_uncovered_action_at = None;
                     begin_isolation(state, fail_reason, failing_ids, now_secs, cmds);
                 }
             } else {
@@ -1549,12 +1650,16 @@ fn handle_target_rechecked(
             "未接入代理链路，已跳过探测".into()
         };
         slot.checked_at = Some(now_secs);
-        slot.fail_streak = if paused { prev_streak } else { 0 };
+        slot.fail_streak = if paused || state.system_shutting_down {
+            prev_streak
+        } else {
+            0
+        };
         None
     } else {
         let ev = policy::evaluate_with_preset(&target, &probe, state.config.preset);
         let streak = match ev.verdict {
-            PolicyVerdict::Fail if paused => prev_streak,
+            PolicyVerdict::Fail if paused || state.system_shutting_down => prev_streak,
             PolicyVerdict::Fail => prev_streak.saturating_add(1),
             PolicyVerdict::Pass | PolicyVerdict::Unverified => 0,
         };
@@ -1659,7 +1764,7 @@ fn handle_target_rechecked(
             if state.config.monitor_only {
                 state.protection = ProtectionState::Monitoring;
                 state.launch_error = format!("{reason}（仅监测模式，已跳过自动熔断）");
-            } else if in_resume_grace {
+            } else if state.system_shutting_down || in_resume_grace {
                 state.protection = ProtectionState::Monitoring;
                 state.launch_error = reason;
             } else if let Some(stable_ips) = egress_ip_unchanged_summary(
@@ -1685,6 +1790,7 @@ fn handle_target_rechecked(
                     );
                 }
             } else {
+                state.last_auto_uncovered_action_at = None;
                 begin_isolation(state, reason, vec![slot.id], now_secs, cmds);
             }
         } else if all_pass {
@@ -1692,6 +1798,7 @@ fn handle_target_rechecked(
             state.launch_error.clear();
             state.ip_unchanged_hold_notified = false;
             state.monitor_only_warn_notified = false;
+            state.last_auto_uncovered_action_at = None;
         }
     }
 }
@@ -1905,6 +2012,13 @@ fn handle_lockdown_synced(
     cmds: &mut Vec<EffectCommand>,
 ) {
     if confirmed && query_ok {
+        if want
+            && !state.lockdown_manual
+            && state.lockdown_applied != Some(true)
+            && state.access.is_uncovered()
+        {
+            state.last_auto_uncovered_action_at = Some(now_secs);
+        }
         state.lockdown_applied = Some(want);
         log_both(
             state,
@@ -1969,6 +2083,9 @@ fn handle_set_manual_lockdown(
         },
         cmds,
     );
+    if on {
+        state.last_auto_uncovered_action_at = None;
+    }
     cmds.push(EffectCommand::SyncLockdown {
         want: on,
         manual: true,
@@ -1989,6 +2106,9 @@ fn handle_manual_lockdown_completed(
 ) {
     state.last_receipt = Some(receipt);
     if confirmed && query_ok {
+        if on {
+            state.last_auto_uncovered_action_at = None;
+        }
         state.lockdown_manual = on;
         state.lockdown_applied = Some(on);
         state.last_error.clear();
@@ -2175,6 +2295,7 @@ fn handle_flow_a_app_release_completed(
         state.protection = ProtectionState::Monitoring;
         state.tripped = None;
         state.access_streak = 0;
+        state.last_auto_uncovered_action_at = None;
         state.ip_unchanged_hold_notified = false;
         state.monitor_only_warn_notified = false;
         for st in &mut state.target_statuses {
@@ -2290,6 +2411,8 @@ fn handle_flow_b_completed(
         state.lockdown_manual = false;
         state.lockdown_applied = Some(false);
         state.access_streak = 0;
+        state.wal_pending = false;
+        state.last_auto_uncovered_action_at = None;
         clear_compliant_ip_baseline(state);
         for st in &mut state.target_statuses {
             st.fail_streak = 0;
@@ -2781,6 +2904,7 @@ fn handle_leak_updated(
 ) {
     state.leak = report.clone();
     if state.lifecycle == Lifecycle::Armed
+        && !state.system_shutting_down
         && !state.is_paused(now_secs)
         && !state.is_in_resume_grace(now_secs)
         && !state.config.monitor_only
@@ -2789,6 +2913,7 @@ fn handle_leak_updated(
         && report.applicable
         && report.leaked()
     {
+        state.last_auto_uncovered_action_at = None;
         begin_isolation(
             state,
             format!("检测到 {} 条直连泄露", report.direct_total),
@@ -5733,5 +5858,176 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, EffectCommand::ExecuteFlowAAppRelease { .. }))
         );
+    }
+
+    #[test]
+    fn wal_pending_preserves_detailed_error_and_heals_back_to_active_protection() {
+        let base = EngineState::new(armed_config(), true, true, 1_000);
+
+        // Detailed boot heal error is preserved instead of overwritten by a generic string.
+        let (degraded, _) = GuardEngine::step(
+            base.clone(),
+            EngineEvent::Bootstrap {
+                wal_pending: true,
+                wal_corrupt: false,
+                disarmed_reason: None,
+                last_error: Some(
+                    "failed to query firewall rules on startup: RPC_S_SERVER_UNAVAILABLE".into(),
+                ),
+            },
+            1_001,
+        );
+        assert!(degraded.wal_pending);
+        assert_eq!(degraded.lifecycle, Lifecycle::Armed);
+        assert_eq!(degraded.protection, ProtectionState::Degraded);
+        assert!(degraded.last_error.contains("RPC_S_SERVER_UNAVAILABLE"));
+        assert!(
+            degraded
+                .logs
+                .iter()
+                .any(|l| l.message.contains("RPC_S_SERVER_UNAVAILABLE"))
+        );
+
+        // Empty last_error falls back to default message.
+        let (fallback, _) = GuardEngine::step(
+            base,
+            EngineEvent::Bootstrap {
+                wal_pending: true,
+                wal_corrupt: false,
+                disarmed_reason: None,
+                last_error: Some("   ".into()),
+            },
+            1_001,
+        );
+        assert!(fallback.wal_pending);
+        assert_eq!(
+            fallback.last_error,
+            "检测到未完成的系统变更事务，等待恢复核验"
+        );
+
+        // WalHealed clears wal_pending + last_error and restores Pending (under Armed).
+        let (healed, _) = GuardEngine::step(degraded, EngineEvent::WalHealed, 1_005);
+        assert!(!healed.wal_pending);
+        assert!(healed.last_error.is_empty());
+        assert_eq!(healed.protection, ProtectionState::Pending);
+    }
+
+    #[test]
+    fn system_shutting_down_suppresses_uncovered_trips_and_aborts_false_shutdown_trip() {
+        let mut cfg = armed_config();
+        cfg.trip_threshold = 1;
+        cfg.enforce_access_path = true;
+        cfg.lockdown_on_uncovered = true;
+        cfg.leak_trip = true;
+
+        // 1) Pre-announced SystemShuttingDown freezes auto-lockdown, streaks, and isolation.
+        let state = EngineState::new(cfg.clone(), true, true, 2_000);
+        let (s1, _) = GuardEngine::step(state, EngineEvent::SystemShuttingDown, 2_001);
+        assert!(s1.system_shutting_down);
+
+        let (s2, cmds_round) = GuardEngine::step(
+            s1,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: uncovered_access(),
+                probes: Vec::new(),
+            },
+            2_002,
+        );
+        assert_eq!(s2.access_streak, 0);
+        assert_eq!(s2.protection, ProtectionState::Monitoring);
+        assert!(s2.tripped.is_none());
+        assert!(!cmds_round.iter().any(|c| matches!(
+            c,
+            EffectCommand::SyncLockdown { .. } | EffectCommand::ExecuteIsolation { .. }
+        )));
+
+        let leak = LeakReport {
+            applicable: true,
+            mode: "system_proxy".into(),
+            checked_at: 2_003,
+            agent_conns: 1,
+            direct_total: 1,
+            direct: vec![cg_protocol::LeakConn {
+                pid: 42,
+                agent: "claude".into(),
+                remote: "203.0.113.10".into(),
+                port: 443,
+                is_mcp: false,
+            }],
+            ..LeakReport::default()
+        };
+        let (s3, cmds_leak) =
+            GuardEngine::step(s2, EngineEvent::LeakUpdated { report: leak }, 2_003);
+        assert_eq!(s3.protection, ProtectionState::Monitoring);
+        assert!(
+            !cmds_leak
+                .iter()
+                .any(|c| matches!(c, EffectCommand::ExecuteIsolation { .. }))
+        );
+
+        // 2) Race case: Clash exits 2s before shutdown signal -> false uncovered trip recorded, then aborted!
+        let race_init = EngineState::new(cfg, true, true, 3_000);
+        let (r1, r1_cmds) = GuardEngine::step(
+            race_init,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: uncovered_access(),
+                probes: Vec::new(),
+            },
+            3_010,
+        );
+        assert_eq!(r1.last_auto_uncovered_action_at, Some(3_010));
+        assert_eq!(r1.protection, ProtectionState::Isolating);
+        assert!(
+            r1_cmds
+                .iter()
+                .any(|c| matches!(c, EffectCommand::SyncLockdown { want: true, .. }))
+        );
+
+        let (r2, _) = GuardEngine::step(
+            r1,
+            EngineEvent::LockdownSynced {
+                want: true,
+                confirmed: true,
+                query_ok: true,
+                rules: 1,
+            },
+            3_010,
+        );
+        let iso_epoch = r2.runtime_epoch;
+        let receipt = OperationReceipt::new("iso-race", OperationStatus::Verified);
+        let (r3, _) = GuardEngine::step(
+            r2,
+            EngineEvent::IsolationCompleted {
+                runtime_epoch: iso_epoch,
+                receipt,
+                killed: 0,
+                cli_killed: 0,
+                firewall_rules: 2,
+                quarantined_agents: vec!["claude".into()],
+                network_cut_applied: CutMode::Off,
+                network_note: String::new(),
+            },
+            3_010,
+        );
+        assert_eq!(r3.protection, ProtectionState::Quarantined);
+        assert!(r3.tripped.is_some());
+        assert_eq!(r3.lockdown_applied, Some(true));
+
+        let (aborted, _) = GuardEngine::step(r3, EngineEvent::AbortFalseShutdownTrip, 3_012);
+        assert!(aborted.system_shutting_down);
+        assert_eq!(aborted.last_auto_uncovered_action_at, None);
+        assert_eq!(aborted.access_streak, 0);
+        assert!(aborted.tripped.is_none());
+        assert!(aborted.pending_tx.is_none());
+        assert_eq!(aborted.lockdown_applied, Some(false));
+        assert_eq!(aborted.protection, ProtectionState::Monitoring);
+        assert!(aborted.launch_error.is_empty());
+        assert_eq!(aborted.runtime_epoch, iso_epoch + 1);
     }
 }

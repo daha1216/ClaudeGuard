@@ -56,11 +56,31 @@ impl Default for ShutdownPolicy {
 pub fn plan_shutdown_action(control_code: u32, policy: ShutdownPolicy) -> Option<StopBehavior> {
     const CTRL_STOP: u32 = 1;
     const CTRL_SHUTDOWN: u32 = 5;
+    const CTRL_PRESHUTDOWN: u32 = 0x0000_000F;
     match control_code {
         CTRL_STOP => Some(policy.on_stop),
-        CTRL_SHUTDOWN => Some(policy.on_shutdown),
+        CTRL_SHUTDOWN | CTRL_PRESHUTDOWN => Some(policy.on_shutdown),
         _ => None,
     }
+}
+
+/// Encodes Win32 SCM service names into a double-NUL-terminated UTF-16 `MULTI_SZ` buffer
+/// suitable for `CreateServiceW` / `ChangeServiceConfigW` `lpDependencies` (e.g. `BFE\0MpsSvc\0\0`).
+pub fn encode_service_dependencies(deps: &[&str]) -> Vec<u16> {
+    let mut buf = Vec::new();
+    for dep in deps {
+        let trimmed = dep.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        buf.extend(trimmed.encode_utf16().filter(|&ch| ch != 0));
+        buf.push(0);
+    }
+    if buf.is_empty() {
+        buf.push(0);
+    }
+    buf.push(0);
+    buf
 }
 
 /// Sanitizes a canonicalized executable string into a quoted SCM `lpBinaryPathName`.
@@ -272,7 +292,12 @@ impl DaemonRuntime {
                 })),
                 Err(err) => Err(err),
             },
-            StopBehavior::PreserveFailClosed => Ok(()),
+            StopBehavior::PreserveFailClosed => {
+                let _ = self
+                    .coordinator
+                    .dispatch(crate::protocol::PipeRequest::NotifySystemShutdown);
+                Ok(())
+            }
         };
 
         self.coordinator.shutdown();
@@ -324,9 +349,10 @@ mod win_service {
         RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
         StartServiceW, SC_ACTION, SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_ALL_ACCESS,
         SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_ACCEPT_POWEREVENT,
-        SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
-        SERVICE_CONFIG_DESCRIPTION, SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONTROL_INTERROGATE,
-        SERVICE_CONTROL_POWEREVENT, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP,
+        SERVICE_ACCEPT_PRESHUTDOWN, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
+        SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION,
+        SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_POWEREVENT,
+        SERVICE_CONTROL_PRESHUTDOWN, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP,
         SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW, SERVICE_QUERY_STATUS,
         SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE,
         SERVICE_STATUS_HANDLE, SERVICE_STATUS_PROCESS, SERVICE_STOPPED, SERVICE_STOP_PENDING,
@@ -442,8 +468,18 @@ mod win_service {
         }
         let ctx = &*(lpcontext as *const ServiceCtrlContext);
         match dwcontrol {
-            SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
+            SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN | SERVICE_CONTROL_PRESHUTDOWN => {
                 ctx.report_status(SERVICE_STOP_PENDING, 0, NO_ERROR.0, 0, 15_000);
+                if matches!(
+                    dwcontrol,
+                    SERVICE_CONTROL_SHUTDOWN | SERVICE_CONTROL_PRESHUTDOWN
+                ) {
+                    if let Ok(guard) = ctx.coordinator.lock() {
+                        if let Some(ref coord) = *guard {
+                            coord.notify_system_shutting_down();
+                        }
+                    }
+                }
                 let policy = ctx.policy.lock().map(|g| *g).unwrap_or_default();
                 if let Some(behavior) = plan_shutdown_action(dwcontrol, policy) {
                     if let Ok(mut guard) = ctx.stop_tx.lock() {
@@ -467,7 +503,10 @@ mod win_service {
             SERVICE_CONTROL_INTERROGATE => {
                 let state = SERVICE_STATUS_CURRENT_STATE(ctx.current_state.load(Ordering::SeqCst));
                 let accepted = if state == SERVICE_RUNNING {
-                    SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_POWEREVENT
+                    SERVICE_ACCEPT_STOP
+                        | SERVICE_ACCEPT_SHUTDOWN
+                        | SERVICE_ACCEPT_PRESHUTDOWN
+                        | SERVICE_ACCEPT_POWEREVENT
                 } else {
                     0
                 };
@@ -526,7 +565,10 @@ mod win_service {
 
         ctx.report_status(
             SERVICE_RUNNING,
-            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_POWEREVENT,
+            SERVICE_ACCEPT_STOP
+                | SERVICE_ACCEPT_SHUTDOWN
+                | SERVICE_ACCEPT_PRESHUTDOWN
+                | SERVICE_ACCEPT_POWEREVENT,
             NO_ERROR.0,
             0,
             0,
@@ -587,10 +629,12 @@ mod win_service {
         exe_path: &Path,
         start_now: bool,
     ) -> Result<ServiceInstallStatus, String> {
+        const SERVICE_DEPENDENCIES: &[&str] = &["BFE", "MpsSvc"];
         let binary_cmd = format_service_binary_path(exe_path)?;
         let svc_name_w = to_wide_null(SERVICE_NAME);
         let display_w = to_wide_null(SERVICE_DISPLAY_NAME);
         let binary_w = to_wide_null(&binary_cmd);
+        let deps_w = encode_service_dependencies(SERVICE_DEPENDENCIES);
 
         let scm = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ALL_ACCESS) }
             .map_err(|e| format!("OpenSCManagerW failed (admin required): {e}"))?;
@@ -608,7 +652,7 @@ mod win_service {
                 PCWSTR(binary_w.as_ptr()),
                 PCWSTR::null(),
                 None,
-                PCWSTR::null(),
+                PCWSTR(deps_w.as_ptr()),
                 PCWSTR::null(), // LocalSystem
                 PCWSTR::null(),
             )
@@ -629,7 +673,7 @@ mod win_service {
                         PCWSTR(binary_w.as_ptr()),
                         PCWSTR::null(),
                         None,
-                        PCWSTR::null(),
+                        PCWSTR(deps_w.as_ptr()),
                         PCWSTR::null(),
                         PCWSTR::null(),
                         PCWSTR(display_w.as_ptr()),
@@ -850,7 +894,17 @@ mod tests {
             plan_shutdown_action(5, policy),
             Some(StopBehavior::PreserveFailClosed)
         );
+        assert_eq!(
+            plan_shutdown_action(0x0000_000F, policy),
+            Some(StopBehavior::PreserveFailClosed)
+        );
         assert_eq!(plan_shutdown_action(4, policy), None);
+
+        // Win32 MULTI_SZ dependency encoding (`BFE\0MpsSvc\0\0`).
+        let deps = encode_service_dependencies(&["BFE", "MpsSvc"]);
+        let expected: Vec<u16> = "BFE\0MpsSvc\0\0".encode_utf16().collect();
+        assert_eq!(deps, expected);
+        assert_eq!(encode_service_dependencies(&[]), vec![0u16, 0u16]);
 
         // Power resume event classification.
         assert!(is_power_resume_event(0x0D, 0x12));
