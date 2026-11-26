@@ -13,9 +13,10 @@ use std::thread::JoinHandle;
 use cg_core::CheckPurpose;
 
 use crate::protocol::{
-    AccessEvidence, AgentRuntimeStatus, AntigravityProxyStatus, DefenseSelfCheck, EnvCheck,
-    ErrorCode, FeishuStatus, GuardSnapshot, LeakReport, LeakShieldStatus, MihomoStatus,
-    OperationReceipt, PipeRequest, PipeResponse, ProbeResult, UpdateSummary,
+    AccessEvidence, AgentRuntimeStatus, AntigravityProxyState, AntigravityProxyStatus,
+    DefenseSelfCheck, EnvCheck, ErrorCode, FeishuStatus, GuardSnapshot, LeakReport,
+    LeakShieldStatus, MihomoStatus, OperationReceipt, PipeRequest, PipeResponse, ProbeResult,
+    UpdateSummary,
 };
 
 const QUEUE_CAPACITY: usize = 256;
@@ -116,6 +117,12 @@ pub enum CoordinatorEvent {
         result: Result<String, String>,
         now_secs: u64,
         reply: SyncSender<PipeResponse>,
+    },
+    /// Background re-injection of `version.dll` after Antigravity overwrote it (no pipe reply).
+    AntigravityAutoRepairFinished {
+        result: Result<String, String>,
+        now_secs: u64,
+        trigger_state: AntigravityProxyState,
     },
     MihomoSwitchFinished {
         cfg_rev: u64,

@@ -159,6 +159,72 @@ pub fn extract_file_from_zip(
     Err(format!("ZIP 归档中未找到目标文件：{suffix_ci}"))
 }
 
+/// Lists every file entry name inside a ZIP archive (directories excluded), in central-directory order.
+///
+/// Central-directory only: nothing is decompressed and no CRC is verified. Used to report what an
+/// unexpected archive actually contains, and to fall back to scanning candidate entries by name.
+pub fn list_entry_names(zip_bytes: &[u8]) -> Result<Vec<String>, String> {
+    if zip_bytes.len() < 22 {
+        return Err("ZIP 文件过短或已损坏".into());
+    }
+
+    let search_start = zip_bytes.len().saturating_sub(65_557);
+    let mut eocd_pos = None;
+    for pos in (search_start..=zip_bytes.len() - 22).rev() {
+        if read_u32_le(zip_bytes, pos) == Some(EOCD_SIG) {
+            eocd_pos = Some(pos);
+            break;
+        }
+    }
+    let eocd = eocd_pos.ok_or_else(|| "无效 ZIP：未找到中央目录结束标记".to_string())?;
+    let total_entries = read_u16_le(zip_bytes, eocd + 10).unwrap_or(0) as usize;
+    let cd_size = read_u32_le(zip_bytes, eocd + 12).unwrap_or(0) as usize;
+    let cd_offset = read_u32_le(zip_bytes, eocd + 16).unwrap_or(0) as usize;
+    let cd_end = cd_offset
+        .checked_add(cd_size)
+        .filter(|&end| end <= zip_bytes.len())
+        .ok_or_else(|| "无效 ZIP：中央目录越界".to_string())?;
+
+    let mut names = Vec::new();
+    let mut cur = cd_offset;
+    for _ in 0..total_entries {
+        let Some(header_end) = cur.checked_add(46) else {
+            break;
+        };
+        if header_end > cd_end || read_u32_le(zip_bytes, cur) != Some(CENTRAL_DIR_SIG) {
+            break;
+        }
+        let name_len = read_u16_le(zip_bytes, cur + 28).unwrap_or(0) as usize;
+        let extra_len = read_u16_le(zip_bytes, cur + 30).unwrap_or(0) as usize;
+        let comment_len = read_u16_le(zip_bytes, cur + 32).unwrap_or(0) as usize;
+        let Some(name_end) = header_end.checked_add(name_len) else {
+            break;
+        };
+        if name_end > cd_end {
+            break;
+        }
+        let Some(name_bytes) = zip_bytes.get(header_end..name_end) else {
+            break;
+        };
+        let entry_name = String::from_utf8_lossy(name_bytes).replace('\\', "/");
+        if !entry_name.is_empty() && !entry_name.ends_with('/') {
+            names.push(entry_name);
+        }
+        let Some(next_cur) = name_end
+            .checked_add(extra_len)
+            .and_then(|v| v.checked_add(comment_len))
+        else {
+            break;
+        };
+        cur = next_cur;
+    }
+
+    if names.is_empty() {
+        return Err("无效 ZIP：中央目录中没有文件条目".into());
+    }
+    Ok(names)
+}
+
 /// Builds a standard DEFLATE `.zip` archive in memory from `(filename, content)` pairs.
 pub fn build_zip_archive(entries: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
     let entry_count_u16 =
@@ -271,5 +337,23 @@ mod tests {
         assert_eq!(rbytes, small_payload);
 
         assert!(extract_file_from_zip(&archive, "missing.dll").is_err());
+    }
+
+    #[test]
+    fn list_entry_names_reports_files_in_archive_order() {
+        let archive = build_zip_archive(&[
+            ("cli/antigravity_proxy.dll", b"dll".as_slice()),
+            ("readme.txt", b"hi".as_slice()),
+        ])
+        .expect("build zip");
+
+        assert_eq!(
+            list_entry_names(&archive).expect("list entries"),
+            vec![
+                "cli/antigravity_proxy.dll".to_string(),
+                "readme.txt".to_string()
+            ]
+        );
+        assert!(list_entry_names(b"not a zip archive").is_err());
     }
 }

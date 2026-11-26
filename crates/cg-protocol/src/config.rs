@@ -168,6 +168,9 @@ pub struct Config {
     pub auto_upd_check: bool,
     #[serde(default = "default_true")]
     pub require_antigravity_proxy: bool,
+    /// Automatically re-inject `version.dll` after an Antigravity self-update overwrote it.
+    #[serde(default = "default_true")]
+    pub auto_repair_antigravity_proxy: bool,
     #[serde(default)]
     pub last_seen_antigravity_version: Option<String>,
 
@@ -227,6 +230,7 @@ impl Default for Config {
             auto_start_with_system: false,
             auto_upd_check: true,
             require_antigravity_proxy: true,
+            auto_repair_antigravity_proxy: true,
             last_seen_antigravity_version: None,
             legacy_cut_network: None,
             legacy_disable_network_adapters: None,
