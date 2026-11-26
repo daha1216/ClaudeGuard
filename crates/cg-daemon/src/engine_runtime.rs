@@ -45,10 +45,10 @@ use crate::journal::{
 };
 use crate::protocol::{
     now_unix_secs, AccessEvidence, AccessLevel, AgentKind, AgentRuntimeStatus,
-    AntigravityProxyStatus, ComponentUpdateStatus, Config, CutMode, DefenseCheckItem,
-    DefenseSelfCheck, ErrorCode, GuardSnapshot, LeakReport, LeakShieldStatus, Lifecycle, LogLevel,
-    MihomoStatus, OnboardingProbeResult, OperationReceipt, OperationStatus, PipeRequest,
-    PipeResponse, PolicyPreset, ProbeResult, ProtectionState, SelfCheckStatus, Target,
+    AntigravityProxyState, AntigravityProxyStatus, ComponentUpdateStatus, Config, CutMode,
+    DefenseCheckItem, DefenseSelfCheck, ErrorCode, GuardSnapshot, LeakReport, LeakShieldStatus,
+    Lifecycle, LogLevel, MihomoStatus, OnboardingProbeResult, OperationReceipt, OperationStatus,
+    PipeRequest, PipeResponse, PolicyPreset, ProbeResult, ProtectionState, SelfCheckStatus, Target,
     ToastNotificationEvent, UpdateCheckPhase, UpdateSummary,
 };
 
@@ -2979,6 +2979,8 @@ impl RealEngineActor {
                     now,
                 );
                 let proxy_port = self.engine.config.proxy_port;
+                let repair_cache_dir = self.data_dir.join("antigravity-proxy");
+
                 let event_tx = self.event_tx.clone();
                 let reply_cell = Arc::new(Mutex::new(Some(reply)));
                 let worker_reply = reply_cell.clone();
@@ -2986,10 +2988,21 @@ impl RealEngineActor {
                     .name("cg-ag-repair".to_string())
                     .spawn(move || {
                         let _guard = in_flight;
+                        // The manual button always re-downloads the latest release, then seeds
+                        // the verified-DLL cache the background auto re-injection relies on.
                         let res = antigravity_proxy_win::repair_antigravity_proxy(
                             &route, proxy_port, None,
                         )
-                        .map(|r| r.summary);
+                        .map(|r| {
+                            if let Ok(dir) = antigravity_proxy_win::resolve_antigravity_dir(None) {
+                                let _ = antigravity_proxy_win::cache_proxy_dll_from_dir(
+                                    &dir,
+                                    &repair_cache_dir,
+                                    &r.release_tag,
+                                );
+                            }
+                            r.summary
+                        });
                         if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
                             let _ = event_tx.send(CoordinatorEvent::AntigravityRepairFinished {
                                 result: res,
@@ -3525,6 +3538,49 @@ impl CoordinatorActor for RealEngineActor {
                         message: msg,
                         receipt: None,
                     });
+                }
+            },
+            CoordinatorEvent::AntigravityAutoRepairFinished {
+                result,
+                now_secs,
+                trigger_state,
+            } => match result {
+                Ok(summary) => {
+                    let procs = if self.driver.capabilities().process_guard {
+                        self.process_scanner.refresh()
+                    } else {
+                        self.process_scanner.cached_snapshot()
+                    };
+                    let ag = self.driver.inspect_antigravity_proxy(
+                        self.engine.config.proxy_port,
+                        self.engine.config.last_seen_antigravity_version.as_deref(),
+                        &procs,
+                        now_secs,
+                    );
+                    self.step_and_run(
+                        EngineEvent::AntigravityProxyUpdated { status: ag },
+                        now_secs,
+                    );
+                    self.engine.push_log(
+                        now_secs,
+                        LogLevel::Audit,
+                        "antigravity",
+                        &format!("自动补注入 version.dll（{:?}）：{summary}", trigger_state),
+                    );
+                    self.emit_notification("warning", "反重力注入已自动恢复", &summary, now_secs);
+                    let _ = self.publish_snapshot(ctx.snapshot, now_secs);
+                }
+                Err(msg) => {
+                    self.engine.push_log(
+                        now_secs,
+                        LogLevel::Warn,
+                        "antigravity",
+                        &format!(
+                            "自动补注入 version.dll 未完成（{:?}）：{msg}",
+                            trigger_state
+                        ),
+                    );
+                    let _ = self.publish_snapshot(ctx.snapshot, now_secs);
                 }
             },
             CoordinatorEvent::MihomoSwitchFinished {
@@ -4150,6 +4206,132 @@ pub fn build_defense_self_check(
     }
 }
 
+/// Exponential backoff between repeated automatic re-injections (30s doubling, 10 min cap).
+fn auto_repair_backoff_secs(failures: u32) -> u64 {
+    (30u64 << failures.min(5)).min(600)
+}
+
+/// True when the on-disk injection is broken in a way that a re-injection can fix.
+fn needs_auto_antigravity_repair(status: &AntigravityProxyStatus) -> bool {
+    status.installed
+        && matches!(
+            status.state,
+            AntigravityProxyState::MissingDll
+                | AntigravityProxyState::MissingOrInvalidConfig
+                | AntigravityProxyState::PortMismatch
+        )
+}
+
+/// Scheduling state for the automatic `version.dll` re-injection.
+#[derive(Default)]
+struct AutoRepairBudget {
+    next_attempt: Option<Instant>,
+    failures: u32,
+}
+
+impl AutoRepairBudget {
+    fn due(&self, now: Instant) -> bool {
+        self.next_attempt.is_none_or(|t| now >= t)
+    }
+
+    fn record_attempt(&mut self, now: Instant) {
+        self.failures = self.failures.saturating_add(1);
+        self.next_attempt =
+            Some(now + Duration::from_secs(auto_repair_backoff_secs(self.failures)));
+    }
+
+    fn reset(&mut self) {
+        self.next_attempt = None;
+        self.failures = 0;
+    }
+}
+
+/// Keeps `version.dll` injection alive across Antigravity self-updates: when the monitor tick
+/// observes a broken injection it re-installs a previously verified DLL (cache first, release
+/// download as fallback) without a pipe request. Failures back off exponentially.
+#[allow(clippy::too_many_arguments)]
+fn schedule_auto_antigravity_repair(
+    driver: &dyn PlatformDriver,
+    snap: &GuardSnapshot,
+    status: &AntigravityProxyStatus,
+    budget: &Arc<Mutex<AutoRepairBudget>>,
+    in_flight: &Arc<AtomicBool>,
+    coordinator: &CoordinatorHandle,
+    cache_dir: &std::path::Path,
+    now: u64,
+) {
+    let mut slot = match budget.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if !snap.config.auto_repair_antigravity_proxy || !needs_auto_antigravity_repair(status) {
+        slot.reset();
+        return;
+    }
+    if snap.lifecycle != Lifecycle::Armed
+        || snap.protection != ProtectionState::Monitoring
+        || snap.tripped.is_some()
+    {
+        return;
+    }
+    if !slot.due(Instant::now()) {
+        return;
+    }
+
+    let (_access, route) = resolve_access_and_route(
+        driver,
+        &snap.config,
+        snap.cfg_rev,
+        &snap.config.targets,
+        snap.config.enforce_access_path,
+        now,
+    );
+    if matches!(route, ProbeRoute::Skip(_)) {
+        return;
+    }
+    if in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    slot.record_attempt(Instant::now());
+    let proxy_port = snap.config.proxy_port;
+    let explicit_dir = status.antigravity_dir.as_ref().map(PathBuf::from);
+    let trigger_state = status.state;
+    let cache = cache_dir.to_path_buf();
+    let tx = coordinator.event_sender();
+    let flag = in_flight.clone();
+    drop(slot);
+
+    struct ResetInFlight(Arc<AtomicBool>);
+    impl Drop for ResetInFlight {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+
+    let _ = std::thread::Builder::new()
+        .name("cg-ag-auto-repair".to_string())
+        .spawn(move || {
+            let _guard = ResetInFlight(flag);
+            let result = antigravity_proxy_win::repair_antigravity_proxy_cached(
+                &route,
+                proxy_port,
+                explicit_dir.as_deref(),
+                &cache,
+            )
+            .map(|r| r.summary);
+            let _ = tx.try_send(CoordinatorEvent::AntigravityAutoRepairFinished {
+                result,
+                now_secs: now_unix_secs(),
+                trigger_state,
+            });
+        });
+}
+
 fn has_any_failed_update_slot(u: &UpdateSummary) -> bool {
     [
         &u.claudeguard,
@@ -4241,6 +4423,7 @@ impl BackgroundMonitorHandle {
 
         let t_flag = stop_flag.clone();
         let t_sig = stop_signal.clone();
+        let ag_cache_dir = data_dir.join("antigravity-proxy");
         let journal = JournalStore::new(data_dir);
 
         let thread = std::thread::Builder::new()
@@ -4255,6 +4438,9 @@ impl BackgroundMonitorHandle {
                 let mut last_telemetry: Option<Instant> = None;
                 let last_upd_check: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
                 let auto_upd_in_flight = Arc::new(AtomicBool::new(false));
+                let ag_auto_repair: Arc<Mutex<AutoRepairBudget>> =
+                    Arc::new(Mutex::new(AutoRepairBudget::default()));
+                let ag_auto_repair_in_flight = Arc::new(AtomicBool::new(false));
                 let mut desktop_gone_since: Option<Instant> = None;
 
                 while !t_flag.load(Ordering::Acquire) {
@@ -4420,6 +4606,17 @@ impl BackgroundMonitorHandle {
                             }
                         }
 
+                        schedule_auto_antigravity_repair(
+                            &*driver,
+                            &snap,
+                            &antigravity_proxy,
+                            &ag_auto_repair,
+                            &ag_auto_repair_in_flight,
+                            &coordinator,
+                            &ag_cache_dir,
+                            now,
+                        );
+
                         // Auto residual sweep 4s after Claude desktop exits when enabled.
                         if snap.lifecycle == Lifecycle::Armed
                             && snap.config.sweep_on_exit
@@ -4512,6 +4709,59 @@ mod tests {
     };
     use cg_protocol::EnvInfo;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn auto_repair_targets_only_recoverable_states() {
+        let mut st = AntigravityProxyStatus {
+            installed: true,
+            ..Default::default()
+        };
+        for state in [
+            AntigravityProxyState::MissingDll,
+            AntigravityProxyState::MissingOrInvalidConfig,
+            AntigravityProxyState::PortMismatch,
+        ] {
+            st.state = state;
+            assert!(
+                needs_auto_antigravity_repair(&st),
+                "{state:?} must be auto-repairable"
+            );
+        }
+        for state in [
+            AntigravityProxyState::Healthy,
+            AntigravityProxyState::RuntimeUnhooked,
+            AntigravityProxyState::NotInstalled,
+        ] {
+            st.state = state;
+            assert!(
+                !needs_auto_antigravity_repair(&st),
+                "{state:?} must not trigger a repair"
+            );
+        }
+        st.state = AntigravityProxyState::MissingDll;
+        st.installed = false;
+        assert!(!needs_auto_antigravity_repair(&st));
+    }
+
+    #[test]
+    fn auto_repair_backoff_grows_then_caps() {
+        let secs: Vec<u64> = (0..8).map(auto_repair_backoff_secs).collect();
+        assert_eq!(secs, vec![30, 60, 120, 240, 480, 600, 600, 600]);
+
+        let start = Instant::now();
+        let mut budget = AutoRepairBudget::default();
+        assert!(budget.due(start));
+        budget.record_attempt(start);
+        assert!(!budget.due(start));
+        // First failure waits 30s * 2 = 60s; the guard is checked again after that.
+        assert!(!budget.due(start + Duration::from_secs(59)));
+        assert!(budget.due(start + Duration::from_secs(61)));
+        budget.record_attempt(start);
+        assert!(!budget.due(start + Duration::from_secs(119)));
+        assert!(budget.due(start + Duration::from_secs(121)));
+        budget.reset();
+        assert!(budget.due(start));
+    }
 
     #[derive(Default)]
     struct InMemoryFirewallEngine {

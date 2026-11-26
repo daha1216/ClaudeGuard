@@ -865,6 +865,21 @@ fn parse_proxy_route_addr(addr: &str, fallback_port: u16) -> (&str, u16) {
     (host, fallback_port)
 }
 
+/// Resolves the Antigravity install directory that owns the proxy DLL: an explicit override,
+/// else the first detected installation, else the first covered directory.
+pub fn resolve_antigravity_dir(explicit_dir: Option<&Path>) -> Result<PathBuf, String> {
+    match explicit_dir {
+        Some(d) => Ok(d.to_path_buf()),
+        None => {
+            let dirs = process_win::antigravity_covered_dirs();
+            pick_installed_antigravity_dir(&dirs)
+                .cloned()
+                .or_else(|| dirs.into_iter().next())
+                .ok_or_else(|| "本机未检测到 Antigravity 安装目录，无法执行热修复注入".to_string())
+        }
+    }
+}
+
 /// One-click verified hot re-injector: fetches latest `yuaotian/antigravity-proxy` release asset
 /// strictly through `NetworkPolicy` (never falls back to direct when proxy configured), verifies
 /// `version.dll` binary signature, and atomically repairs `<AntigravityDir>\version.dll` + `config.json`.
@@ -873,18 +888,7 @@ pub fn repair_antigravity_proxy(
     proxy_port: u16,
     explicit_dir: Option<&Path>,
 ) -> Result<AntigravityRepairReport, String> {
-    let dir = match explicit_dir {
-        Some(d) => d.to_path_buf(),
-        None => {
-            let dirs = process_win::antigravity_covered_dirs();
-            pick_installed_antigravity_dir(&dirs)
-                .cloned()
-                .or_else(|| dirs.into_iter().next())
-                .ok_or_else(|| {
-                    "本机未检测到 Antigravity 安装目录，无法执行热修复注入".to_string()
-                })?
-        }
-    };
+    let dir = resolve_antigravity_dir(explicit_dir)?;
 
     let policy = match route {
         crate::probe_http::ProbeRoute::Proxy(addr) => {
@@ -928,6 +932,59 @@ pub fn repair_antigravity_proxy(
     install_verified_proxy_bytes_into_dir(&dir, &downloaded, is_zip, proxy_port, &release.version)
 }
 
+/// Cache file holding the last verified antigravity-proxy DLL.
+pub fn proxy_dll_cache_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("version.dll")
+}
+
+/// Repairs the injection preferring a previously verified DLL from `cache_dir`, so an Antigravity
+/// self-update does not force another release download; refreshes the cache after a download.
+pub fn repair_antigravity_proxy_cached(
+    route: &crate::probe_http::ProbeRoute,
+    proxy_port: u16,
+    explicit_dir: Option<&Path>,
+    cache_dir: &Path,
+) -> Result<AntigravityRepairReport, String> {
+    let dir = resolve_antigravity_dir(explicit_dir)?;
+    let cache_file = proxy_dll_cache_path(cache_dir);
+    if let Ok(bytes) = std::fs::read(&cache_file) {
+        if validate_antigravity_proxy_dll_bytes(&bytes) {
+            let tag = std::fs::read_to_string(cache_dir.join("release_tag.txt"))
+                .map(|s| s.trim().to_string())
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "cache".to_string());
+            // A validated cache entry is byte-identical to what a download would yield, so a
+            // failed install means the target is locked; retrying over the network cannot help.
+            return install_verified_proxy_bytes_into_dir(&dir, &bytes, false, proxy_port, &tag);
+        }
+    }
+
+    let report = repair_antigravity_proxy(route, proxy_port, Some(&dir))?;
+    let _ = cache_proxy_dll_from_dir(&dir, cache_dir, &report.release_tag);
+    Ok(report)
+}
+
+/// Copies the installed (already verified) `version.dll` into `cache_dir` so a later injection can
+/// be repaired without network access. Returns whether the cache now holds a verified DLL.
+pub fn cache_proxy_dll_from_dir(install_dir: &Path, cache_dir: &Path, release_tag: &str) -> bool {
+    let Ok(bytes) = std::fs::read(install_dir.join("version.dll")) else {
+        return false;
+    };
+    if !validate_antigravity_proxy_dll_bytes(&bytes) || std::fs::create_dir_all(cache_dir).is_err()
+    {
+        return false;
+    }
+    if atomic_write_verified_file(cache_dir, "version.dll", &bytes).is_err() {
+        return false;
+    }
+    let tag = release_tag.trim();
+    if !tag.is_empty() {
+        let _ = std::fs::write(cache_dir.join("release_tag.txt"), tag.as_bytes());
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -968,7 +1025,8 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("version.dll")).unwrap(), dll);
 
         let cfg: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
         assert_eq!(cfg["_version"], "2.6.6");
         assert_eq!(cfg["child_injection"], true);
         assert_eq!(cfg["proxy"]["port"], 7890);
@@ -990,7 +1048,10 @@ mod tests {
         let dir = unique_temp_dir("ide-layout-install");
         install_verified_proxy_bytes_into_dir(&dir, &archive, true, 7890, "v2.6.6")
             .expect("ide bundle layout must install version.dll");
-        assert_eq!(std::fs::read(dir.join("version.dll")).unwrap(), version_bytes);
+        assert_eq!(
+            std::fs::read(dir.join("version.dll")).unwrap(),
+            version_bytes
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1315,5 +1376,38 @@ mod tests {
         );
         std::fs::remove_dir_all(&empty_cand).unwrap();
         std::fs::remove_dir_all(&real_cand).unwrap();
+    }
+
+    #[test]
+    fn cached_dll_reinstalls_without_release_download() {
+        let install_dir = unique_temp_dir("cache-install");
+        let cache_dir = unique_temp_dir("cache-store");
+        let bytes = synthetic_proxy_dll_bytes();
+        std::fs::write(cache_dir.join("version.dll"), &bytes).unwrap();
+        std::fs::write(cache_dir.join("release_tag.txt"), b"v2.6.6").unwrap();
+
+        // Skip route would refuse a download, so a successful repair proves the cache was used.
+        let report = repair_antigravity_proxy_cached(
+            &crate::probe_http::ProbeRoute::Skip("未开启系统代理且未检测到 TUN 网卡".into()),
+            7891,
+            Some(&install_dir),
+            &cache_dir,
+        )
+        .expect("cached install");
+        assert_eq!(report.proxy_port, 7891);
+        assert_eq!(report.release_tag, "v2.6.6");
+        assert_eq!(
+            std::fs::read(install_dir.join("version.dll")).unwrap(),
+            bytes
+        );
+        let cfg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(install_dir.join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg["child_injection"], serde_json::json!(true));
+        assert_eq!(cfg["proxy"]["port"], serde_json::json!(7891));
+        assert_eq!(cfg["_version"], serde_json::json!("2.6.6"));
+        std::fs::remove_dir_all(&install_dir).unwrap();
+        std::fs::remove_dir_all(&cache_dir).unwrap();
     }
 }
