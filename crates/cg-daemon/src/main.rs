@@ -184,10 +184,25 @@ fn main() {
             }
         },
         DaemonMode::Console => {
-            let driver: Arc<dyn cg_platform::PlatformDriver> =
-                Arc::new(cg_platform::default_platform_driver());
+            let test_no_os_fw = std::env::var_os("CG_TEST_NO_OS_FIREWALL")
+                .is_some_and(|v| v == "1")
+                && config.pipe_name != cg_daemon::protocol::DEFAULT_PIPE_NAME;
+            let (driver, recovery): (
+                Arc<dyn cg_platform::PlatformDriver>,
+                Arc<dyn cg_daemon::journal::RecoveryExecutor>,
+            ) = if test_no_os_fw {
+                (
+                    Arc::new(cg_platform::UnsupportedPlatformDriver::default()),
+                    Arc::new(cg_daemon::journal::NoopRecoveryExecutor),
+                )
+            } else {
+                let d: Arc<dyn cg_platform::PlatformDriver> =
+                    Arc::new(cg_platform::default_platform_driver());
+                let r: Arc<dyn cg_daemon::journal::RecoveryExecutor> =
+                    Arc::new(PlatformRecoveryExecutor::new(d.clone()));
+                (d, r)
+            };
             let probe_runner = Arc::new(PlatformProbeRunner);
-            let recovery = Arc::new(PlatformRecoveryExecutor::new(driver.clone()));
             if let Err(err) =
                 service_win::run_console_until(config, driver, probe_runner, recovery, None)
             {

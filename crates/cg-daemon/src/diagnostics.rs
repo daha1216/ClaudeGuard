@@ -1,17 +1,21 @@
 //! Redacted `.zip` support bundle exporter & rollback-safe OS environment alignment store.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tempfile::NamedTempFile;
 
 use cg_core::redact::{mask_snapshot, redact};
 use cg_platform::{env_win, process_win, zip_util};
-use cg_protocol::{AppliedEnv, GuardSnapshot};
+use cg_protocol::{AppliedEnv, GuardSnapshot, LogEntry, LogLevel};
 use serde::{Deserialize, Serialize};
 
 const ENV_BACKUP_FILE: &str = "env_backup.json";
+const DAEMON_LOG_FILE: &str = "daemon.log";
+const DAEMON_LOG_PREV_FILE: &str = "daemon.log.1";
+const MAX_DAEMON_LOG_BYTES: u64 = 512 * 1024;
+const MAX_DIAGNOSTIC_LOG_READ_BYTES: u64 = 1024 * 1024;
 const MAX_DIAGNOSTIC_ARCHIVES: usize = 10;
 
 /// Persisted pre-alignment OS snapshot so timezone & Sensor location always roll back cleanly.
@@ -384,6 +388,94 @@ fn scrub_credentials_in_text(text: &str) -> String {
     out
 }
 
+fn format_log_level_upper(level: LogLevel) -> &'static str {
+    match level {
+        LogLevel::Info => "INFO",
+        LogLevel::Warn => "WARN",
+        LogLevel::Error => "ERROR",
+        LogLevel::Audit => "AUDIT",
+    }
+}
+
+/// Appends strictly redacted operational/audit log entries to rolling `<data_dir>/daemon.log`
+/// (rotating `daemon.log` -> `daemon.log.1` once `daemon.log` reaches `512 KiB`).
+pub fn append_redacted_daemon_log_entries(data_dir: &Path, entries: &[LogEntry]) {
+    if entries.is_empty() || has_reparse_point_in_chain(data_dir) {
+        return;
+    }
+    if !data_dir.exists() && crate::journal::ensure_secure_data_dir(data_dir).is_err() {
+        return;
+    }
+    if has_reparse_point_in_chain(data_dir) {
+        return;
+    }
+
+    let log_path = data_dir.join(DAEMON_LOG_FILE);
+    let prev_path = data_dir.join(DAEMON_LOG_PREV_FILE);
+
+    if let Ok(meta) = fs::symlink_metadata(&log_path) {
+        if crate::journal::is_reparse_point_metadata(&meta) || !meta.is_file() {
+            return;
+        }
+        if meta.len() >= MAX_DAEMON_LOG_BYTES {
+            if let Ok(prev_meta) = fs::symlink_metadata(&prev_path) {
+                if crate::journal::is_reparse_point_metadata(&prev_meta) || !prev_meta.is_file() {
+                    return;
+                }
+            }
+            let _ = fs::remove_file(&prev_path);
+            let _ = fs::rename(&log_path, &prev_path);
+        }
+    }
+
+    let mut payload = String::new();
+    for entry in entries {
+        let clean =
+            scrub_user_profile_paths(&scrub_credentials_in_text(&redact(&entry.message, false)))
+                .replace(['\r', '\n'], " ");
+        payload.push_str(&format!(
+            "[{}] {} [{}] {}\n",
+            entry.timestamp,
+            format_log_level_upper(entry.level),
+            entry.category,
+            clean
+        ));
+    }
+
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) else {
+        return;
+    };
+    if let Ok(meta) = file.metadata() {
+        if crate::journal::is_reparse_point_metadata(&meta) || !meta.is_file() {
+            return;
+        }
+    }
+    let _ = file.write_all(payload.as_bytes());
+}
+
+fn read_scrubbed_daemon_log_for_zip(data_dir: &Path, filename: &str) -> Option<Vec<u8>> {
+    if has_reparse_point_in_chain(data_dir) {
+        return None;
+    }
+    let path = data_dir.join(filename);
+    let meta = fs::symlink_metadata(&path).ok()?;
+    if crate::journal::is_reparse_point_metadata(&meta) || !meta.is_file() {
+        return None;
+    }
+    let mut file = File::open(&path).ok()?;
+    let len = meta.len();
+    if len > MAX_DIAGNOSTIC_LOG_READ_BYTES {
+        let _ = file.seek(SeekFrom::Start(len - MAX_DIAGNOSTIC_LOG_READ_BYTES));
+    }
+    let mut raw = Vec::with_capacity(len.min(MAX_DIAGNOSTIC_LOG_READ_BYTES) as usize);
+    file.take(MAX_DIAGNOSTIC_LOG_READ_BYTES)
+        .read_to_end(&mut raw)
+        .ok()?;
+    let text = String::from_utf8_lossy(&raw);
+    let clean = scrub_user_profile_paths(&scrub_credentials_in_text(&redact(&text, false)));
+    Some(clean.into_bytes())
+}
+
 fn prune_diagnostics_archives(dir: &Path, keep: usize) {
     let Ok(rd) = fs::read_dir(dir) else {
         return;
@@ -554,7 +646,10 @@ pub fn export_redacted_diagnostics_zip(
     let feishu_json = serde_json::to_vec_pretty(&masked.feishu)
         .map_err(|e| format!("序列化飞书状态失败：{e}"))?;
 
-    let zip_bytes = zip_util::build_zip_archive(&[
+    let daemon_log_bytes = read_scrubbed_daemon_log_for_zip(data_dir, DAEMON_LOG_FILE);
+    let daemon_log_prev_bytes = read_scrubbed_daemon_log_for_zip(data_dir, DAEMON_LOG_PREV_FILE);
+
+    let mut archive_entries: Vec<(&str, &[u8])> = vec![
         ("snapshot_redacted.json", &snap_json),
         ("config_redacted.json", &cfg_json),
         ("self_check.json", &self_check_json),
@@ -562,7 +657,14 @@ pub fn export_redacted_diagnostics_zip(
         ("mihomo_status.json", &mihomo_json),
         ("feishu_status.json", &feishu_json),
         ("audit_logs.txt", logs_txt.as_bytes()),
-    ])?;
+    ];
+    if let Some(ref bytes) = daemon_log_bytes {
+        archive_entries.push((DAEMON_LOG_FILE, bytes));
+    }
+    if let Some(ref bytes) = daemon_log_prev_bytes {
+        archive_entries.push((DAEMON_LOG_PREV_FILE, bytes));
+    }
+    let zip_bytes = zip_util::build_zip_archive(&archive_entries)?;
 
     let fallback_dir = data_dir.join("diagnostics");
     let mut out_dir = explicit_dir
@@ -822,5 +924,94 @@ mod tests {
             resolve_diagnostics_dir_with(Some(&user_home), None, &data_dir, &temp_dir),
             user_desktop
         );
+    }
+
+    #[test]
+    fn rolling_daemon_log_redacts_rotates_at_512k_and_exports_into_diagnostics_zip() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let out_dir = dir.path().join("out");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&out_dir).unwrap();
+
+        let filler = "x".repeat(260 * 1024);
+        append_redacted_daemon_log_entries(
+            &data_dir,
+            &[
+                LogEntry {
+                    id: 1,
+                    timestamp: 1_700_000_001,
+                    level: LogLevel::Warn,
+                    category: "wal".into(),
+                    message: format!(
+                        r"first chunk 203.0.113.45 C:\Users\alice_secret\claude.exe http://u1:p1@127.0.0.1:7890 {filler}"
+                    ),
+                },
+                LogEntry {
+                    id: 2,
+                    timestamp: 1_700_000_002,
+                    level: LogLevel::Info,
+                    category: "probe".into(),
+                    message: format!("second chunk to reach 512KiB {filler}"),
+                },
+            ],
+        );
+
+        let log_path = data_dir.join("daemon.log");
+        let prev_path = data_dir.join("daemon.log.1");
+        assert!(log_path.metadata().unwrap().len() >= 512 * 1024);
+        assert!(!prev_path.exists());
+
+        // Next append must rotate `daemon.log` -> `daemon.log.1` and start a fresh `daemon.log`.
+        append_redacted_daemon_log_entries(
+            &data_dir,
+            &[LogEntry {
+                id: 3,
+                timestamp: 1_700_000_003,
+                level: LogLevel::Audit,
+                category: "power".into(),
+                message: r"post-rotate 198.51.100.98 C:\Users\bob_secret\app.exe socks5://u2:p2@127.0.0.1:7890".into(),
+            }],
+        );
+
+        assert!(prev_path.is_file());
+        assert!(log_path.is_file());
+        assert!(log_path.metadata().unwrap().len() < 1024);
+
+        let cur_text = fs::read_to_string(&log_path).unwrap();
+        let prev_text = fs::read_to_string(&prev_path).unwrap();
+        assert!(cur_text.contains("[1700000003] AUDIT [power]"));
+        for forbidden in [
+            "203.0.113.45",
+            "198.51.100.98",
+            "alice_secret",
+            "bob_secret",
+            "u1:p1@",
+            "u2:p2@",
+        ] {
+            assert!(
+                !cur_text.contains(forbidden),
+                "daemon.log leaked {forbidden}"
+            );
+            assert!(
+                !prev_text.contains(forbidden),
+                "daemon.log.1 leaked {forbidden}"
+            );
+        }
+
+        let snap = GuardSnapshot::default();
+        let zip_path =
+            export_redacted_diagnostics_zip(&data_dir, &snap, 1_700_000_100, Some(&out_dir))
+                .expect("export zip with daemon.log and daemon.log.1");
+        let raw_zip = fs::read(&zip_path).unwrap();
+        let (_, z_cur) = zip_util::extract_file_from_zip(&raw_zip, "daemon.log")
+            .expect("daemon.log must be bundled in diagnostics zip");
+        let (_, z_prev) = zip_util::extract_file_from_zip(&raw_zip, "daemon.log.1")
+            .expect("daemon.log.1 must be bundled in diagnostics zip");
+        let z_cur_str = String::from_utf8(z_cur).unwrap();
+        let z_prev_str = String::from_utf8(z_prev).unwrap();
+        assert!(z_cur_str.contains("[1700000003] AUDIT [power]"));
+        assert!(!z_cur_str.contains("bob_secret"));
+        assert!(!z_prev_str.contains("alice_secret"));
     }
 }

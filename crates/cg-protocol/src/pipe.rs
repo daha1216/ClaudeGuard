@@ -119,6 +119,8 @@ pub enum PipeRequest {
     },
     RollbackEnvAlignment,
     ExportDiagnostics,
+    /// Hint from interactive tray/session (`WM_QUERYENDSESSION` / `WM_ENDSESSION`) that OS shutdown/reboot has started.
+    NotifySystemShutdown,
 }
 
 /// Responses sent from the daemon back to GUI/CLI clients over the Named Pipe.

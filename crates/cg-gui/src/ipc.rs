@@ -557,6 +557,10 @@ impl DaemonClient {
                     snapshot: Some(Box::new(snap.clone())),
                 }
             }
+            PipeRequest::NotifySystemShutdown => PipeResponse::Ack {
+                receipt: None,
+                snapshot: Some(Box::new(snap.clone())),
+            },
         }
     }
 }
@@ -591,9 +595,41 @@ pub fn validate_pipe_name(pipe_name: &str) -> Result<(), TransportError> {
     Ok(())
 }
 
+fn resolve_pipe_name_from_env_val(raw: Option<&str>) -> String {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| DEFAULT_PIPE_NAME.to_string())
+}
+
+/// Best-effort early OS shutdown hint (`WM_QUERYENDSESSION` / `WM_ENDSESSION`) sent to the daemon.
+///
+/// Uses a strict `250ms` Named Pipe deadline and swallows all transport errors so Windows
+/// shutdown/restart is never delayed or blocked.
+pub fn notify_daemon_shutdown_best_effort() {
+    let pipe_name = resolve_pipe_name_from_env_val(std::env::var("CG_PIPE_NAME").ok().as_deref());
+    notify_daemon_shutdown_pipe_best_effort(&pipe_name);
+}
+
+fn notify_daemon_shutdown_pipe_best_effort(pipe_name: &str) {
+    #[cfg(windows)]
+    {
+        let _ = exchange_named_pipe_with_timeout(
+            pipe_name,
+            &PipeRequest::NotifySystemShutdown,
+            std::time::Duration::from_millis(250),
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pipe_name;
+    }
+}
+
 #[cfg(any(windows, test))]
 fn request_timeout_ms(req: &PipeRequest) -> u64 {
     match req {
+        PipeRequest::NotifySystemShutdown => 250,
         PipeRequest::RepairAntigravityProxy => 65_000,
         PipeRequest::CheckUpdates { .. }
         | PipeRequest::RecheckNow { .. }
@@ -1413,6 +1449,7 @@ mod tests {
 
     #[test]
     fn request_timeout_tiers_match_rpc_workload() {
+        assert_eq!(request_timeout_ms(&PipeRequest::NotifySystemShutdown), 250);
         assert_eq!(request_timeout_ms(&PipeRequest::GetSnapshot), 8_000);
         assert_eq!(
             request_timeout_ms(&PipeRequest::CheckUpdates { component: None }),
@@ -1428,6 +1465,28 @@ mod tests {
             request_timeout_ms(&PipeRequest::RepairAntigravityProxy),
             65_000
         );
+    }
+
+    #[test]
+    fn shutdown_notification_resolves_pipe_and_never_blocks_offline() {
+        assert_eq!(resolve_pipe_name_from_env_val(None), DEFAULT_PIPE_NAME);
+        assert_eq!(
+            resolve_pipe_name_from_env_val(Some("   ")),
+            DEFAULT_PIPE_NAME
+        );
+        assert_eq!(
+            resolve_pipe_name_from_env_val(Some(r" \\.\pipe\cg-custom ")),
+            r"\\.\pipe\cg-custom"
+        );
+
+        let client = DaemonClient::new(TransportEndpoint::Demo(DemoScenario::Pass));
+        let resp = client.exchange(PipeRequest::NotifySystemShutdown).unwrap();
+        assert!(matches!(resp, PipeResponse::Ack { receipt: None, .. }));
+
+        let missing = format!(r"\\.\pipe\cg-shutdown-missing-{}", std::process::id());
+        let started = std::time::Instant::now();
+        notify_daemon_shutdown_pipe_best_effort(&missing);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[cfg(windows)]

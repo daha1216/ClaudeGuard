@@ -91,6 +91,7 @@ pub enum CoordinatorEvent {
     },
     Tick,
     SystemResumed,
+    SystemShuttingDown,
     RoundFinished {
         cfg_rev: u64,
         runtime_epoch: u64,
@@ -242,6 +243,13 @@ impl CoordinatorHandle {
     pub fn notify_system_resumed(&self) {
         if !self.stopped.load(Ordering::Acquire) {
             let _ = self.tx.try_send(CoordinatorEvent::SystemResumed);
+        }
+    }
+
+    /// Notifies the coordinator that Windows shutdown/reboot has started (`SERVICE_CONTROL_PRESHUTDOWN` / `SHUTDOWN`).
+    pub fn notify_system_shutting_down(&self) {
+        if !self.stopped.load(Ordering::Acquire) {
+            let _ = self.tx.try_send(CoordinatorEvent::SystemShuttingDown);
         }
     }
 

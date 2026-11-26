@@ -5162,6 +5162,14 @@ fn handle_tray_event(ctrl: Entity<AppController>, event: TrayEvent, cx: &mut App
             });
             cx.quit();
         }
+        TrayEvent::SystemShuttingDown => {
+            let client = ctrl.read(cx).client.clone();
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = client.exchange(PipeRequest::NotifySystemShutdown);
+                })
+                .detach();
+        }
         TrayEvent::SafeExit => {
             if ctrl.read(cx).is_scope_busy(&ActionScope::Flow) {
                 return;

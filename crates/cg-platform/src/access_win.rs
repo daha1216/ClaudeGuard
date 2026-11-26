@@ -714,6 +714,22 @@ pub fn is_session_zero() -> bool {
     false
 }
 
+/// Returns true when Windows is shutting down or rebooting (`GetSystemMetrics(SM_SHUTTINGDOWN) != 0`).
+#[cfg(windows)]
+pub fn is_system_shutting_down() -> bool {
+    const SM_SHUTTINGDOWN: i32 = 0x2000;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetSystemMetrics(n_index: i32) -> i32;
+    }
+    unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
+}
+
+#[cfg(not(windows))]
+pub fn is_system_shutting_down() -> bool {
+    false
+}
+
 #[cfg(windows)]
 fn sid_for_wts_session(session_id: u32) -> Option<String> {
     use core::ffi::c_void;

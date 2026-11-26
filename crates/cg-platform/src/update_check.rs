@@ -210,6 +210,34 @@ fn is_source_or_meta_asset(name_l: &str) -> bool {
         || name_l.ends_with(".blockmap")
 }
 
+fn has_ascii_token(name_l: &str, token: &str) -> bool {
+    name_l
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| part == token)
+}
+
+/// Scores release asset filenames so IDE injection bundles (`version.dll`) beat CLI bundles
+/// (`antigravity-cli-proxy.dll`) when both match the same extension such as `.zip`:
+/// - `2`: contains bounded `"ide"` token (or `-ide` / `_ide` / `ide-`) and does NOT contain `"cli"`
+/// - `1`: does NOT contain `"cli"`
+/// - `0`: contains `"cli"`
+fn asset_target_priority(name_l: &str) -> u8 {
+    let has_cli = has_ascii_token(name_l, "cli")
+        || name_l.contains("-cli")
+        || name_l.contains("_cli")
+        || name_l.contains("cli-")
+        || name_l.contains("cli_");
+    if has_cli {
+        return 0;
+    }
+    let has_ide = has_ascii_token(name_l, "ide");
+    if has_ide {
+        2
+    } else {
+        1
+    }
+}
+
 fn pick_preferred_asset(assets: &[(String, String)], preferred_exts: &[&str]) -> Option<String> {
     let setup_requested = preferred_exts
         .iter()
@@ -233,17 +261,45 @@ fn pick_preferred_asset(assets: &[(String, String)], preferred_exts: &[&str]) ->
             continue;
         }
         let allow_setup_for_ext = ext_l.contains("setup");
-        if let Some((_, _, url)) = candidates.iter().find(|(_, name_l, _)| {
-            name_l.ends_with(&ext_l) && (allow_setup_for_ext || !name_l.ends_with("-setup.exe"))
-        }) {
-            return Some((*url).to_string());
+        let mut best: Option<(u8, &str)> = None;
+        for (_, name_l, url) in &candidates {
+            if name_l.ends_with(&ext_l) && (allow_setup_for_ext || !name_l.ends_with("-setup.exe"))
+            {
+                let prio = asset_target_priority(name_l);
+                let replace = match best {
+                    None => true,
+                    Some((best_prio, _)) => prio > best_prio,
+                };
+                if replace {
+                    best = Some((prio, *url));
+                    if prio == 2 {
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some((_, url)) = best {
+            return Some(url.to_string());
         }
     }
 
-    candidates
-        .iter()
-        .find(|(_, name_l, _)| setup_requested || !name_l.ends_with("-setup.exe"))
-        .map(|(_, _, url)| (*url).to_string())
+    let mut fallback_best: Option<(u8, &str)> = None;
+    for (_, name_l, url) in &candidates {
+        if setup_requested || !name_l.ends_with("-setup.exe") {
+            let prio = asset_target_priority(name_l);
+            let replace = match fallback_best {
+                None => true,
+                Some((best_prio, _)) => prio > best_prio,
+            };
+            if replace {
+                fallback_best = Some((prio, *url));
+                if prio == 2 {
+                    break;
+                }
+            }
+        }
+    }
+    fallback_best.map(|(_, url)| url.to_string())
 }
 
 /// Pure GitHub `/releases/latest` JSON payload parser.
@@ -2304,6 +2360,59 @@ mod tests {
         assert_eq!(
             portable.asset_url.as_deref(),
             Some("https://example.invalid/ClaudeGuard-portable.exe")
+        );
+    }
+
+    #[test]
+    fn parse_github_latest_release_prefers_ide_asset_over_cli_asset() {
+        let ag_split_json = r#"{
+            "tag_name": "v0.3.2",
+            "html_url": "https://github.com/yuaotian/antigravity-proxy/releases/tag/v0.3.2",
+            "published_at": "2026-11-25T08:00:00Z",
+            "assets": [
+                {
+                    "name": "antigravity-proxy-v0.3.2-cli-win-x64.zip",
+                    "browser_download_url": "https://example.invalid/antigravity-proxy-v0.3.2-cli-win-x64.zip"
+                },
+                {
+                    "name": "antigravity-proxy-v0.3.2-ide-win-x64.zip",
+                    "browser_download_url": "https://example.invalid/antigravity-proxy-v0.3.2-ide-win-x64.zip"
+                }
+            ]
+        }"#;
+        let parsed = parse_github_latest_release(ag_split_json, &[".zip", ".dll"]).unwrap();
+        assert_eq!(parsed.tag_name, "v0.3.2");
+        assert_eq!(parsed.version, "0.3.2");
+        assert_eq!(
+            parsed.asset_url.as_deref(),
+            Some("https://example.invalid/antigravity-proxy-v0.3.2-ide-win-x64.zip")
+        );
+
+        // Neutral non-cli asset beats cli asset, and ties preserve original order without
+        // false-matching "guide" as bounded "ide".
+        let tie_and_neutral_json = r#"{
+            "tag_name": "v0.3.3",
+            "html_url": "https://github.com/yuaotian/antigravity-proxy/releases/tag/v0.3.3",
+            "assets": [
+                {
+                    "name": "antigravity-proxy-v0.3.3-cli-win-x64.zip",
+                    "browser_download_url": "https://example.invalid/cli.zip"
+                },
+                {
+                    "name": "antigravity-proxy-v0.3.3-win-x64.zip",
+                    "browser_download_url": "https://example.invalid/first-neutral.zip"
+                },
+                {
+                    "name": "antigravity-proxy-user-guide.zip",
+                    "browser_download_url": "https://example.invalid/guide-should-not-win.zip"
+                }
+            ]
+        }"#;
+        let parsed_neutral =
+            parse_github_latest_release(tie_and_neutral_json, &[".zip", ".dll"]).unwrap();
+        assert_eq!(
+            parsed_neutral.asset_url.as_deref(),
+            Some("https://example.invalid/first-neutral.zip")
         );
     }
 

@@ -19,7 +19,7 @@ use crate::views::shared::{ag_diag_tile, page_guide_card, switch_row_gated};
 use crate::widgets::controls::{
     ButtonKind, action_button, bento_card_bloom, inset_box, mono_tabular, offset_pane,
     spinning_action_button, spinning_ui_icon, status_dot, status_pill, subtab_bar, subtab_item,
-    toggle_switch, tone_tag,
+    tone_tag,
 };
 use gpui::{Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, rgb, rgba};
 
@@ -76,6 +76,8 @@ pub fn render_environment_page(
     let env_applied = snap.as_ref().and_then(|s| s.env_applied.clone());
     let require_ag_proxy =
         ctrl_r.effective_toggle("env-ag-require-proxy", cfg.require_antigravity_proxy);
+    let auto_repair_ag_proxy =
+        ctrl_r.effective_toggle("env-ag-auto-repair", cfg.auto_repair_antigravity_proxy);
     let ag_issue = ag_proxy.installed && require_ag_proxy && !ag_proxy.is_ready_for_launch();
     let is_rechecking = ctrl_r.is_scope_busy(&ActionScope::RecheckAll);
     let is_repairing_ag = ctrl_r.is_scope_busy(&ActionScope::RepairAntigravity);
@@ -779,6 +781,7 @@ pub fn render_environment_page(
                 updates: &updates,
                 guard_proxy_port: cfg.proxy_port,
                 require_ag_proxy,
+                auto_repair_ag_proxy,
                 privacy_mask: mask,
                 connected,
                 tripped,
@@ -1112,6 +1115,7 @@ struct AgCardCtx<'a> {
     updates: &'a UpdateSummary,
     guard_proxy_port: u16,
     require_ag_proxy: bool,
+    auto_repair_ag_proxy: bool,
     privacy_mask: bool,
     connected: bool,
     tripped: bool,
@@ -1132,6 +1136,7 @@ fn render_antigravity_proxy_card(
         updates,
         guard_proxy_port,
         require_ag_proxy,
+        auto_repair_ag_proxy,
         privacy_mask,
         connected,
         tripped,
@@ -1153,7 +1158,8 @@ fn render_antigravity_proxy_card(
     } else {
         vm.dir_text.clone()
     };
-    let ctrl_toggle = ctrl.clone();
+    let ctrl_toggle_req = ctrl.clone();
+    let ctrl_toggle_repair = ctrl.clone();
     let ctrl_to_updates = ctrl.clone();
     let ctrl_repair = ctrl.clone();
     let ctrl_recheck = ctrl;
@@ -1215,8 +1221,8 @@ fn render_antigravity_proxy_card(
                 "客户端自动更新可能覆盖 version.dll 导致注入失效，系统会及时告警。",
             ),
             (
-                "3. 修复或静音告警",
-                "改用启动器或 TUN 时可关闭下方门禁；如需 DLL 注入，点「下载并热修复」补回。",
+                "3. 自动与手动修复",
+                "默认自更新后后台静默补回注入模块与配置，也可点「下载并热修复」；改用 TUN 可关闭。",
             ),
         ],
         p,
@@ -1226,7 +1232,7 @@ fn render_antigravity_proxy_card(
 
     let ag_card = bento_card_bloom(p, 17., 14., choreo.tile(0, 0))
         .flex_1()
-        .gap(px(10.))
+        .gap(px(9.))
         .child(
             div()
                 .flex()
@@ -1389,64 +1395,107 @@ fn render_antigravity_proxy_card(
         .child(
             div()
                 .flex()
+                .flex_row()
                 .items_center()
-                .justify_between()
-                .gap(px(12.))
-                .pt(px(10.))
+                .w_full()
+                .min_w(px(0.))
+                .gap(px(16.))
+                .pt(px(9.))
                 .border_t_1()
                 .border_color(rgb(p.card_border))
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(px(10.))
                         .flex_1()
+                        .flex_basis(px(0.))
                         .min_w(px(0.))
                         .child(
-                            toggle_switch("env-ag-require-proxy", require_ag_proxy, can_act, p)
-                                .when(can_act, |sw| {
-                                    sw.on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |_, _, _, cx| {
-                                            let next = !require_ag_proxy;
-                                            ctrl_toggle.update(cx, |c, cx| {
-                                                c.save_toggle_patch(
-                                                    "env-ag-require-proxy",
-                                                    next,
-                                                    move |x| x.require_antigravity_proxy = next,
-                                                    if next {
-                                                        "已开启注入失效启动拦截"
-                                                    } else {
-                                                        "已关闭注入失效拦截与告警"
-                                                    },
-                                                    cx,
-                                                );
-                                            });
-                                        }),
-                                    )
+                            switch_row_gated(
+                                "env-ag-require-proxy",
+                                "注入失效时拦截启动",
+                                "使用 antigravity-launcher、全局 TUN 或自定义代理时可关闭",
+                                require_ag_proxy,
+                                can_act,
+                                p,
+                                cx.listener(move |_, _, _, cx| {
+                                    let next = !require_ag_proxy;
+                                    ctrl_toggle_req.update(cx, |c, cx| {
+                                        c.save_toggle_patch(
+                                            "env-ag-require-proxy",
+                                            next,
+                                            move |x| x.require_antigravity_proxy = next,
+                                            if next {
+                                                "已开启注入失效启动拦截"
+                                            } else {
+                                                "已关闭注入失效拦截与告警"
+                                            },
+                                            cx,
+                                        );
+                                    });
                                 }),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .min_w(px(0.))
-                                .gap(px(1.5))
-                                .child(
-                                    div()
-                                        .text_size(px(12.))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(rgb(p.text_primary))
-                                        .child("注入失效时拦截启动"),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_size(px(10.5))
-                                        .text_color(rgb(p.text_muted))
-                                        .child("使用 antigravity-launcher、全局 TUN 或自定义代理时可关闭"),
-                                ),
+                            )
+                            .py(px(2.)),
                         ),
+                )
+                .child(div().w(px(1.)).self_stretch().bg(rgb(p.card_border)))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex_basis(px(0.))
+                        .min_w(px(0.))
+                        .child(
+                            switch_row_gated(
+                                "env-ag-auto-repair",
+                                "自更新后自动补注入",
+                                "检测到覆盖或端口漂移时静默修复 version.dll 与配置",
+                                auto_repair_ag_proxy,
+                                can_act,
+                                p,
+                                cx.listener(move |_, _, _, cx| {
+                                    let next = !auto_repair_ag_proxy;
+                                    ctrl_toggle_repair.update(cx, |c, cx| {
+                                        c.save_toggle_patch(
+                                            "env-ag-auto-repair",
+                                            next,
+                                            move |x| x.auto_repair_antigravity_proxy = next,
+                                            if next {
+                                                "已开启反重力自动补注入"
+                                            } else {
+                                                "已关闭反重力自动补注入"
+                                            },
+                                            cx,
+                                        );
+                                    });
+                                }),
+                            )
+                            .py(px(2.)),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .pt(px(9.))
+                .border_t_1()
+                .border_color(rgb(p.card_border))
+                .child(
+                    mono_tabular(format!(
+                        "门禁：{} · 自动补注入：{} · 端口 :{}",
+                        if require_ag_proxy { "已开启" } else { "已关闭" },
+                        if auto_repair_ag_proxy {
+                            "已开启"
+                        } else {
+                            "已关闭"
+                        },
+                        guard_proxy_port
+                    ))
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(11.))
+                    .text_color(rgb(p.text_muted)),
                 )
                 .child(
                     div()

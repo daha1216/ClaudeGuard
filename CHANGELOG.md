@@ -4,12 +4,31 @@
 
 日期为实际发布日期（UTC / UTC+8）。更早的历史版本记录见 [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases)。
 
-## [Unreleased]
+## [4.1.4] - 2026-11-27
 
-### 反重力注入自愈与热修复修复
+**TUN 重启零误锁自愈与反重力代理自动补注入完善版**：彻底根治 Windows 重启/关机竞态下 TUN 先退引发的误熔断、开机早于防火墙就绪导致的 `Degraded` 卡死无恢复路径（#25，感谢 @HL-slc 详尽复现分析），合入并完善社区反重力代理 ZIP 选包与客户端自更新后自动补注入机制（#26，感谢 @bkMoon1024 贡献 PR）。
 
-- **一键热修复不再报「ZIP 归档中未找到目标文件：version.dll」（`antigravity_proxy_win` / `zip_util`）**：GitHub 发布包资产顺序会把 CLI 包排在 IDE 包前，旧逻辑只取第一个 `.zip` 并硬编码找 `version.dll`。现按 `version.dll` → `antigravity_proxy.dll` 候选名解包，兜底扫描归档内全部 `.dll` 并逐个做 PE + 特征串验签，全失败时回报归档条目便于排查；系统代理与 TUN 直连两条下载通道同时生效。
-- **Antigravity 自更新覆盖 `version.dll` 后自动补注入（`engine_runtime` / `coordinator` / `config`）**：后台监控巡检发现注入状态为 `MissingDll` / `MissingOrInvalidConfig` / `PortMismatch` 时自动重新注入，成功写入审计日志并推送「反重力注入已自动恢复」告警；失败按 30s 起、上限 10 分钟的指数退避重试。验签通过的 DLL 会缓存到 `<data-dir>\antigravity-proxy`，断网也能补注入（手动热修复同样复用该缓存）。新增配置项 `auto_repair_antigravity_proxy`（默认开启，写入 `config.json` 即可关闭）。
+### 重启 / 关机防误熔断与开机 WAL 自愈闭环（#25）
+
+- **三重关机竞态防线，根除 TUN 先于系统服务退出导致的假熔断（`service_win` / `tray_win` / `access_win` / `engine` / `engine_runtime`）**：
+  - 托盘隐藏窗口监听 `WM_QUERYENDSESSION` / `WM_ENDSESSION`，在用户点击重启/关机瞬间（`T0+0ms`，早于 Clash/sing-box TUN 退出）非阻塞通知守护端进入关机冻结态；
+  - Windows 服务新增 `SERVICE_ACCEPT_PRESHUTDOWN`（`0x0F`）预关机信号与 `GetSystemMetrics(SM_SHUTTINGDOWN)` 内核状态核验，冻结一切新发未覆盖锁死与自动熔断；
+  - 若关机信号到达前 20 秒内刚因 `Uncovered` 竞态触发自动封锁/隔离，守护退出前自动执行幂等回滚清零，绝不将关机瞬态误判跨重启保留。
+- **服务依赖 `BFE` / `MpsSvc` + 开机早期 COM 就绪退避重试（`service_win` / `engine_runtime`）**：
+  - `ClaudeGuardService` 安装与更新配置显式声明 `BFE\0MpsSvc\0\0` 服务依赖，并在 `bootstrap` 阶段对防火墙瞬态未就绪执行 `250ms -> 1500ms` 退避重试，消除冷启动早于防火墙加载导致的自愈失败。
+- **打通 `Degraded (wal_pending)` 自动恢复路径并保留底层错误详情（`engine` / `engine_runtime` / `Rearm`）**：
+  - 修复 `handle_bootstrap` 覆盖 `heal_report.summary` 导致真实错误码丢失的问题，并将详情同步透出至防线自检 `wal_journal` 项；
+  - 点击「立即核验」（`RecheckNow`）与后台遥测巡检（15s 节流）均会自动重试离线 WAL 恢复，一旦核验清零即派发 `WalHealed` 自动退出降级态并恢复合规探测；同时补齐 `Rearm` 重新布防后的 4 维防泄露护盾规则即时重同步。
+- **新增持久化滚动脱敏日志 `daemon.log`（`diagnostics` / `engine_runtime`）**：
+  - 守护运行日志经 IP、代理凭据与 Windows 用户名路径三重脱敏后实时追加至 `<data-dir>\daemon.log`（满 `512 KiB` 自动轮转 `daemon.log.1`），并随一键导出诊断压缩包一并打包，彻底解决重启现场随内存清空难以回溯的问题。
+
+### 反重力代理注入自愈、免重启热修与前端开关完善（#26）
+
+- **一键热修复精准选包与全 DLL 特征验签兜底（`update_check` / `antigravity_proxy_win` / `zip_util`）**：
+  - 发布包挑选逻辑优先匹配 `ide` 归档包（排在 `cli` 包之前），解包时按 `version.dll` → `antigravity_proxy.dll` → 全归档 `.dll` 二进制 PE + 特征串逐一验签，彻底修复因首个 `.zip` 为 CLI 包导致的「ZIP 归档中未找到目标文件：version.dll」报错。
+- **Antigravity 自更新覆盖后自动补注入 + GPUI 独立开关 + 运行态免重启端口热修（`engine_runtime` / `antigravity_proxy_win` / `cg-gui::environment`）**：
+  - 后台巡检发现 `MissingDll` / `MissingOrInvalidConfig` / `PortMismatch` 时自动从本地验签缓存（`<data-dir>\antigravity-proxy`）或上游发布包静默补注入（30s–10m 指数退避），并在「防漏与环境 → 反重力代理注入」页新增 **「自更新后自动补注入」** 实时开关；
+  - 当 `Antigravity.exe` 正在运行锁定有效 `version.dll` 时，热修复支持保留已验签 `version.dll` 并免重启原子重写 `config.json` 同步代理端口；同时为 `cli_integration` 补充 `CG_TEST_NO_OS_FIREWALL` 宿主防火墙隔离，非管理员环境单测 100% 稳定通过。
 
 
 ## [4.1.3] - 2026-11-25

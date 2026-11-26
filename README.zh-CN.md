@@ -159,13 +159,13 @@ ClaudeGuard 坚持**只读观测、先拦后放**：不干涉用户的代理分�
 
 前往 [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases) 下载最新版：
 
-1. **安装版 `ClaudeGuard-v4.1.3-setup.exe`（推荐）**
+1. **安装版 `ClaudeGuard-v4.1.4-setup.exe`（推荐）**
    - 自动注册并启动 `ClaudeGuardService` 系统服务，同时登记普通用户登录托盘自启（`claudeguard-gui.exe --tray`）。
    - **支持从 v3 无缝覆盖升级**：沿用同一 Inno Setup `AppId`，自动平滑停止旧版 `ClaudeGuard.exe`、清理旧版开机启动项，并在首次启动时自动将 v2/v3 `config.json` 无损迁移至 v4（保留 `config.v3.bak.json` 备份）。
    - 卸载时自动停止与注销系统服务，并刻意保留 `%ProgramData%\ClaudeGuard` 与 `%APPDATA%\ClaudeGuard` 下的配置及日志。
-2. **旧版客户端直升级引导 `ClaudeGuard-v4.1.3-upgrade.exe`（供 `v3.x` 客户端内直接更新）**
+2. **旧版客户端直升级引导 `ClaudeGuard-v4.1.4-upgrade.exe`（供 `v3.x` 客户端内直接更新）**
    - 供 `v3.x` 在 6 小时后台巡检或手动「检查更新」自动识别并下载；自动将旧版 `%APPDATA%\ClaudeGuard\config.json` 迁移至 `%ProgramData%\ClaudeGuard\config.json`，释放并等待安装器完成覆盖升级后，自动清理旧版程序、快捷方式与暂存文件。
-3. **便携版 `ClaudeGuard-v4.1.3-portable.zip`**
+3. **便携版 `ClaudeGuard-v4.1.4-portable.zip`**
    - 包含 `claudeguard-daemon.exe`、`claudeguard-cli.exe`、`claudeguard-gui.exe`。以管理员终端运行 `claudeguard-daemon.exe --console`（或 `--install-service --start`），再以普通用户启动 `claudeguard-gui.exe`。
 
 > 可使用发布页提供的 `SHA256SUMS.txt` 校验安装包完整性。

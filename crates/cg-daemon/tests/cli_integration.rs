@@ -56,6 +56,7 @@ fn real_daemon_console_and_cli_binaries_roundtrip() {
     assert!(store.path().exists());
 
     let child = Command::new(daemon_bin)
+        .env("CG_TEST_NO_OS_FIREWALL", "1")
         .args([
             "--console",
             "--pipe",
@@ -104,6 +105,7 @@ fn real_daemon_console_and_cli_binaries_roundtrip() {
 
     // `claudeguard-cli --status` returns exit 0 and JSON daemon_online=true.
     let status_out = Command::new(cli_bin)
+        .env("CG_TEST_NO_OS_FIREWALL", "1")
         .args([
             "--status",
             "--pipe",
@@ -119,6 +121,7 @@ fn real_daemon_console_and_cli_binaries_roundtrip() {
 
     // `claudeguard-cli --check` returns exit 2 because daemon hasn't passed an egress round yet.
     let check_out = Command::new(cli_bin)
+        .env("CG_TEST_NO_OS_FIREWALL", "1")
         .args(["--check", "--pipe", &pipe])
         .output()
         .expect("run claudeguard-cli --check");
@@ -129,6 +132,7 @@ fn real_daemon_console_and_cli_binaries_roundtrip() {
 
     // `claudeguard-cli --restore` hits live pipe -> Flow B disarm -> exit 0.
     let restore_out = Command::new(cli_bin)
+        .env("CG_TEST_NO_OS_FIREWALL", "1")
         .args([
             "--restore",
             "--pipe",
@@ -168,6 +172,7 @@ fn real_cli_restore_falls_back_to_offline_wal_when_daemon_absent() {
         .unwrap();
 
     let out = Command::new(cli_bin)
+        .env("CG_TEST_NO_OS_FIREWALL", "1")
         .args([
             "--restore",
             "--pipe",

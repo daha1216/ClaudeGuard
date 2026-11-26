@@ -1,6 +1,6 @@
 [package]
 name = "cg-v3-bridge"
-version = "4.1.3"
+version = "4.1.4"
 edition = "2021"
 license = "MIT"
 description = "ClaudeGuard v3 to v4 seamless self-update bridge bootstrapper"

@@ -31,13 +31,15 @@ pub const MAX_PIPE_INSTANCES: u32 = 16;
 /// Maximum incoming request frame payload accepted by `PipeServer` (`256 KiB`).
 pub const MAX_REQUEST_FRAME_BYTES: usize = 256 * 1024;
 
-/// Returns true for read-only / non-mutating [`PipeRequest`] variants permitted across sessions.
+/// Returns true for read-only / non-mutating [`PipeRequest`] variants permitted across sessions
+/// (plus `NotifySystemShutdown` so shutdown/logoff session transitions never drop OS power hints).
 pub fn is_readonly_pipe_request(req: &PipeRequest) -> bool {
     matches!(
         req,
         PipeRequest::GetSnapshot
             | PipeRequest::CheckLaunchGate { .. }
             | PipeRequest::QueryLogs { .. }
+            | PipeRequest::NotifySystemShutdown
     )
 }
 
@@ -1309,6 +1311,7 @@ mod tests {
             limit: None,
             query: None,
         }));
+        assert!(is_readonly_pipe_request(&PipeRequest::NotifySystemShutdown));
         assert!(!is_readonly_pipe_request(&PipeRequest::Rearm));
         assert!(!is_readonly_pipe_request(
             &PipeRequest::DisarmAndRestoreFlowB { reason: None }

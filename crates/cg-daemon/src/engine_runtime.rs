@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -582,6 +582,9 @@ pub struct RealEngineActor {
     leak_shield: LeakShieldStatus,
     leak_shield_syncer: LeakShieldSyncFn,
     mihomo: MihomoStatus,
+    last_wal_heal_error: Option<String>,
+    last_wal_heal_attempt: Option<Instant>,
+    last_flushed_log_id: AtomicU64,
 }
 
 impl RealEngineActor {
@@ -614,7 +617,21 @@ impl RealEngineActor {
         let now = now_unix_secs();
         let _ = journal::ensure_secure_data_dir(&data_dir);
         let journal = JournalStore::new(&data_dir);
-        let heal_report = journal::heal_on_startup(&journal, &*recovery_executor);
+        let mut heal_report = journal::heal_on_startup(&journal, &*recovery_executor);
+        if driver.capabilities().app_quarantine
+            && (!heal_report.ok || !heal_report.verified)
+            && heal_report.status != HealStatus::CorruptJournal
+        {
+            for backoff_ms in [250u64, 500, 1000, 1500] {
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+                heal_report = journal::heal_on_startup(&journal, &*recovery_executor);
+                if (heal_report.ok && heal_report.verified)
+                    || heal_report.status == HealStatus::CorruptJournal
+                {
+                    break;
+                }
+            }
+        }
 
         let config_store = ConfigStore::new(&data_dir);
         let _ = config_store.backup_legacy_once();
@@ -755,6 +772,7 @@ impl RealEngineActor {
             } else {
                 LeakShieldStatus::default()
             };
+        let init_wal_heal_error = wal_pending.then(|| heal_report.summary.clone());
         let mut actor = Self {
             engine,
             driver,
@@ -792,6 +810,9 @@ impl RealEngineActor {
             leak_shield: init_shield,
             leak_shield_syncer,
             mihomo: MihomoStatus::default(),
+            last_wal_heal_error: init_wal_heal_error,
+            last_wal_heal_attempt: None,
+            last_flushed_log_id: AtomicU64::new(0),
         };
 
         actor.step_and_run(
@@ -807,13 +828,18 @@ impl RealEngineActor {
             &actor.engine.antigravity_proxy,
             &init_local,
         );
-        let init_self_check = build_defense_self_check(
+        let mut init_self_check = build_defense_self_check(
             &actor.engine.config,
             &*actor.driver,
             &actor.journal,
             init_fw_query_ok,
             &actor.engine.antigravity_proxy,
             now,
+        );
+        enrich_self_check_wal_error(
+            &mut init_self_check,
+            &actor.journal,
+            actor.last_wal_heal_error.as_deref(),
         );
         actor.step_and_run(
             EngineEvent::SelfCheckUpdated {
@@ -836,6 +862,7 @@ impl RealEngineActor {
                 );
             }
         }
+        actor.flush_pending_daemon_logs();
         let initial_snapshot = actor.build_snapshot(now);
 
         BootstrappedActor {
@@ -1141,10 +1168,110 @@ impl RealEngineActor {
         snap
     }
 
+    fn flush_pending_daemon_logs(&self) {
+        let watermark = self.last_flushed_log_id.load(Ordering::Acquire);
+        let batch: Vec<crate::protocol::LogEntry> = self
+            .engine
+            .logs
+            .iter()
+            .filter(|entry| entry.id > watermark)
+            .cloned()
+            .collect();
+        if let Some(max_id) = batch.last().map(|e| e.id) {
+            diagnostics::append_redacted_daemon_log_entries(&self.data_dir, &batch);
+            self.last_flushed_log_id.store(max_id, Ordering::Release);
+        }
+    }
+
     fn publish_snapshot(&self, snapshot_store: &SnapshotStoreRef<'_>, now: u64) -> GuardSnapshot {
+        self.flush_pending_daemon_logs();
         let snap = self.build_snapshot(now);
         snapshot_store.replace(snap.clone());
         snap
+    }
+
+    fn on_system_shutting_down(&mut self, now: u64) {
+        let recent_false_uncovered_trip = !self.engine.lockdown_manual
+            && self
+                .engine
+                .last_auto_uncovered_action_at
+                .is_some_and(|ts| now.saturating_sub(ts) <= 20)
+            && (self.engine.lockdown_applied == Some(true)
+                || self.engine.is_tripped()
+                || self.journal.path().exists());
+        if recent_false_uncovered_trip {
+            let heal = journal::heal_offline(&self.journal, &*self.recovery_executor);
+            if heal.ok && heal.verified {
+                self.active_journal = None;
+                self.step_and_run(EngineEvent::AbortFalseShutdownTrip, now);
+                return;
+            }
+        }
+        if !self.engine.system_shutting_down {
+            self.step_and_run(EngineEvent::SystemShuttingDown, now);
+        }
+    }
+
+    fn try_recover_wal_pending(&mut self, now: u64, force: bool) -> bool {
+        if !self.engine.wal_pending {
+            return false;
+        }
+        let due = force
+            || self
+                .last_wal_heal_attempt
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(15));
+        if !due {
+            return false;
+        }
+        self.last_wal_heal_attempt = Some(Instant::now());
+        let heal = journal::heal_offline(&self.journal, &*self.recovery_executor);
+        if heal.ok && heal.verified {
+            self.last_wal_heal_error = None;
+            self.step_and_run(EngineEvent::WalHealed, now);
+            if self.engine.lifecycle == Lifecycle::Armed
+                && self.driver.capabilities().app_quarantine
+                && (self.engine.config.leak_shield_quic
+                    || self.engine.config.leak_shield_dns_doh
+                    || self.engine.config.leak_shield_ipv6)
+            {
+                if let Err(err) = self.sync_leak_shield_rules(now) {
+                    self.engine.push_log(
+                        now,
+                        LogLevel::Warn,
+                        "shield",
+                        &format!("恢复核验后同步防泄露护盾规则失败：{err}"),
+                    );
+                }
+            }
+            let self_check = build_defense_self_check(
+                &self.engine.config,
+                &*self.driver,
+                &self.journal,
+                self.driver.capabilities().app_quarantine,
+                &self.engine.antigravity_proxy,
+                now,
+            );
+            self.step_and_run(EngineEvent::SelfCheckUpdated { self_check }, now);
+            true
+        } else {
+            self.last_wal_heal_error = Some(heal.summary.clone());
+            self.engine.last_error = heal.summary;
+            let mut self_check = build_defense_self_check(
+                &self.engine.config,
+                &*self.driver,
+                &self.journal,
+                false,
+                &self.engine.antigravity_proxy,
+                now,
+            );
+            enrich_self_check_wal_error(
+                &mut self_check,
+                &self.journal,
+                self.last_wal_heal_error.as_deref(),
+            );
+            self.step_and_run(EngineEvent::SelfCheckUpdated { self_check }, now);
+            false
+        }
     }
 
     fn step_and_run(&mut self, event: EngineEvent, now: u64) {
@@ -2100,6 +2227,7 @@ impl RealEngineActor {
                 });
             }
             PipeRequest::RecheckNow { target_id } => {
+                let _ = self.try_recover_wal_pending(now, true);
                 if let Some(raw_tid) = target_id
                     .as_deref()
                     .map(str::trim)
@@ -2334,6 +2462,28 @@ impl RealEngineActor {
             }
             PipeRequest::Rearm => {
                 self.step_and_run(EngineEvent::Rearm, now);
+                if self.last_rejected.is_none()
+                    && self.mutation_error.is_none()
+                    && self.engine.lifecycle == Lifecycle::Armed
+                    && self.driver.capabilities().app_quarantine
+                {
+                    match self.sync_leak_shield_rules(now) {
+                        Ok(receipt) => {
+                            self.engine.last_receipt = Some(receipt);
+                        }
+                        Err(err) => {
+                            let detail = format!("重新布防后自动同步防泄露护盾规则失败：{err}");
+                            self.engine.push_log(now, LogLevel::Warn, "shield", &detail);
+                            let mut receipt = OperationReceipt::new(
+                                format!("shield-sync-{now}"),
+                                OperationStatus::Partial,
+                            );
+                            receipt.verified_scope = "leak_shield".into();
+                            receipt.push_item("leak_shield", OperationStatus::Failed, detail);
+                            self.engine.last_receipt = Some(receipt);
+                        }
+                    }
+                }
                 let snap = self.publish_snapshot(snapshot_store, now);
                 self.flush_superseded_waiters(&snap);
                 self.send_mutation_reply(reply, snap);
@@ -3143,6 +3293,7 @@ impl RealEngineActor {
                 }
             }
             PipeRequest::ExportDiagnostics => {
+                self.flush_pending_daemon_logs();
                 let snap = self.build_snapshot(now);
                 match diagnostics::export_redacted_diagnostics_zip(&self.data_dir, &snap, now, None)
                 {
@@ -3179,6 +3330,14 @@ impl RealEngineActor {
                         });
                     }
                 }
+            }
+            PipeRequest::NotifySystemShutdown => {
+                self.on_system_shutting_down(now);
+                let snap = self.publish_snapshot(snapshot_store, now);
+                let _ = reply.send(PipeResponse::Ack {
+                    receipt: None,
+                    snapshot: Some(Box::new(snap)),
+                });
             }
         }
     }
@@ -3397,6 +3556,11 @@ impl CoordinatorActor for RealEngineActor {
                             let _ = tx.try_send(CoordinatorEvent::Tick);
                         });
                 }
+            }
+            CoordinatorEvent::SystemShuttingDown => {
+                let now = now_unix_secs();
+                self.on_system_shutting_down(now);
+                let _ = self.publish_snapshot(ctx.snapshot, now);
             }
             CoordinatorEvent::SingleTargetProbed {
                 cfg_rev,
@@ -3654,6 +3818,9 @@ impl CoordinatorActor for RealEngineActor {
                 mut probes,
                 now_secs,
             } => {
+                if cg_platform::access_win::is_system_shutting_down() {
+                    self.on_system_shutting_down(now_secs);
+                }
                 let _ = self.poll_wake_grace_expiry(now_secs);
                 let accepted_round =
                     cfg_rev == self.engine.cfg_rev && runtime_epoch == self.engine.runtime_epoch;
@@ -3702,6 +3869,9 @@ impl CoordinatorActor for RealEngineActor {
                 }
             }
             CoordinatorEvent::Telemetry(bundle) => {
+                if cg_platform::access_win::is_system_shutting_down() {
+                    self.on_system_shutting_down(bundle.now_secs);
+                }
                 let _ = self.poll_wake_grace_expiry(bundle.now_secs);
                 self.resync_guarded_agents_on_path_change(&bundle.agents, bundle.now_secs);
 
@@ -3710,6 +3880,9 @@ impl CoordinatorActor for RealEngineActor {
                 if bundle.cfg_rev != self.engine.cfg_rev
                     || bundle.runtime_epoch != self.engine.runtime_epoch
                 {
+                    if self.engine.system_shutting_down {
+                        let _ = self.publish_snapshot(ctx.snapshot, bundle.now_secs);
+                    }
                     return ActorControl::Continue;
                 }
 
@@ -3745,10 +3918,16 @@ impl CoordinatorActor for RealEngineActor {
                     },
                     bundle.now_secs,
                 );
+                let mut self_check = bundle.self_check;
+                if self.engine.wal_pending {
+                    enrich_self_check_wal_error(
+                        &mut self_check,
+                        &self.journal,
+                        self.last_wal_heal_error.as_deref(),
+                    );
+                }
                 self.step_and_run(
-                    EngineEvent::SelfCheckUpdated {
-                        self_check: bundle.self_check,
-                    },
+                    EngineEvent::SelfCheckUpdated { self_check },
                     bundle.now_secs,
                 );
                 if let Some(upd) = bundle.updates {
@@ -3775,6 +3954,16 @@ impl CoordinatorActor for RealEngineActor {
                         self.engine.updates.antigravity_proxy.phase =
                             UpdateCheckPhase::NotInstalled;
                     }
+                }
+                if self.try_recover_wal_pending(bundle.now_secs, false)
+                    && self.engine.lifecycle == Lifecycle::Armed
+                {
+                    self.step_and_run(
+                        EngineEvent::StartRound {
+                            purpose: CheckPurpose::Monitor,
+                        },
+                        bundle.now_secs,
+                    );
                 }
                 let _ = self.publish_snapshot(ctx.snapshot, bundle.now_secs);
             }
@@ -4077,6 +4266,35 @@ pub fn build_agent_statuses(
     }
 
     out
+}
+
+fn enrich_self_check_wal_error(
+    self_check: &mut DefenseSelfCheck,
+    journal: &JournalStore,
+    wal_heal_error: Option<&str>,
+) {
+    let Some(err) = wal_heal_error.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    match journal.load() {
+        LoadedJournal::NotFound => {
+            self_check.wal_clean = false;
+            if let Some(item) = self_check.items.iter_mut().find(|i| i.id == "wal_journal") {
+                item.status = SelfCheckStatus::Degraded;
+                item.detail = format!("启动恢复核验未完成：{err}");
+            }
+        }
+        LoadedJournal::Uncommitted(_) | LoadedJournal::Committed(_) => {
+            self_check.wal_clean = false;
+            if let Some(item) = self_check.items.iter_mut().find(|i| i.id == "wal_journal") {
+                item.status = SelfCheckStatus::Degraded;
+                if !item.detail.contains(err) {
+                    item.detail = format!("{}（{err}）", item.detail);
+                }
+            }
+        }
+        LoadedJournal::Corrupt(_) | LoadedJournal::Unreadable(_) => {}
+    }
 }
 
 /// Computes `DefenseSelfCheck` (core rows + optional Antigravity proxy row) off the snapshot read path.
@@ -7489,5 +7707,334 @@ mod tests {
             "post-wake grace window must suppress false leak-trips while TUN/Wi-Fi reconnects"
         );
         coord2.shutdown();
+    }
+
+    struct FlakyRecoveryExecutor {
+        remaining_failures: Mutex<usize>,
+        inner: MockRecoveryExecutor,
+    }
+
+    impl FlakyRecoveryExecutor {
+        fn new(failures: usize, state: MockRecoveryState) -> Self {
+            Self {
+                remaining_failures: Mutex::new(failures),
+                inner: MockRecoveryExecutor::new(state),
+            }
+        }
+    }
+
+    impl RecoveryExecutor for FlakyRecoveryExecutor {
+        fn remove_firewall_rule(&self, rule_name: &str) -> Result<(), String> {
+            self.inner.remove_firewall_rule(rule_name)
+        }
+
+        fn list_managed_firewall_rules(&self) -> Result<Vec<String>, String> {
+            let mut rem = self.remaining_failures.lock().unwrap();
+            if *rem > 0 {
+                *rem -= 1;
+                return Err("RPC_S_SERVER_UNAVAILABLE (BFE starting)".into());
+            }
+            drop(rem);
+            self.inner.list_managed_firewall_rules()
+        }
+
+        fn clear_all_managed_firewall_rules(&self) -> Result<usize, String> {
+            self.inner.clear_all_managed_firewall_rules()
+        }
+
+        fn enable_nic_by_guid(&self, guid: &str, name_hint: &str) -> Result<(), String> {
+            self.inner.enable_nic_by_guid(guid, name_hint)
+        }
+
+        fn restore_timezone(&self, tz_key: &str) -> Result<(), String> {
+            self.inner.restore_timezone(tz_key)
+        }
+
+        fn restore_location(&self, lat: Option<&str>, lon: Option<&str>) -> Result<(), String> {
+            self.inner.restore_location(lat, lon)
+        }
+    }
+
+    struct AccessAwareProbeRunner {
+        pass: Arc<AtomicBool>,
+    }
+
+    impl ProbeRunner for AccessAwareProbeRunner {
+        fn inspect_and_probe(
+            &self,
+            driver: &dyn PlatformDriver,
+            _cfg: &Config,
+            cfg_rev: u64,
+            targets: &[Target],
+            enforce_access_path: bool,
+            skip_network_probes: bool,
+            now_secs: u64,
+        ) -> (AccessEvidence, Vec<(String, ProbeResult)>) {
+            let path = driver
+                .inspect_access_path(&[])
+                .map(|(p, _)| p)
+                .unwrap_or(AccessPath::Uncovered);
+            let access = match path {
+                AccessPath::Tun { adapter } => AccessEvidence {
+                    level: AccessLevel::Tun,
+                    tun_iface: Some(adapter),
+                    route_hint: true,
+                    observed_at: now_secs,
+                    revision: cfg_rev,
+                    note: "mock tun".into(),
+                    ..AccessEvidence::default()
+                },
+                AccessPath::Uncovered => AccessEvidence {
+                    level: AccessLevel::Uncovered,
+                    observed_at: now_secs,
+                    revision: cfg_rev,
+                    note: "未接入代理或 TUN".into(),
+                    ..AccessEvidence::default()
+                },
+                _ => AccessEvidence {
+                    level: AccessLevel::Unknown,
+                    observed_at: now_secs,
+                    revision: cfg_rev,
+                    note: "unknown".into(),
+                    ..AccessEvidence::default()
+                },
+            };
+            if skip_network_probes || (enforce_access_path && !access.is_known()) {
+                return (access, Vec::new());
+            }
+            let ok = self.pass.load(Ordering::Acquire);
+            let results = targets
+                .iter()
+                .filter(|t| t.enabled)
+                .map(|t| {
+                    let probe = if ok {
+                        ProbeResult {
+                            reachable: true,
+                            status: Some(200),
+                            ip: Some("198.51.100.98".into()),
+                            country: Some("US".into()),
+                            raw_region: Some("US".into()),
+                            colo: Some("SJC".into()),
+                            latency_ms: 15,
+                            parsed_as: "trace".into(),
+                            detail: "ok".into(),
+                            ..ProbeResult::default()
+                        }
+                    } else {
+                        ProbeResult::failed("fail")
+                    };
+                    (t.id.clone(), probe)
+                })
+                .collect();
+            (access, results)
+        }
+    }
+
+    #[test]
+    fn early_boot_retry_and_wal_pending_auto_heals_on_recheck_and_telemetry() {
+        // 1) Early-boot retry (`[250, 500, ...]`) recovers transient BFE COM startup failure on attempt 2.
+        let dir_retry = tempfile::tempdir().unwrap();
+        ConfigStore::new(dir_retry.path())
+            .save_verified(&make_cfg("US"))
+            .unwrap();
+        let driver_retry = Arc::new(ControllableDriver::new());
+        let runner_retry = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: Arc::new(AtomicBool::new(true)),
+            ip_on_pass: "198.51.100.98".into(),
+        });
+        let flaky_once = Arc::new(FlakyRecoveryExecutor::new(1, MockRecoveryState::default()));
+        let coord_retry = boot_actor(dir_retry.path(), driver_retry, runner_retry, flaky_once);
+        assert_eq!(coord_retry.snapshot().lifecycle, Lifecycle::Armed);
+        assert_eq!(coord_retry.snapshot().protection, ProtectionState::Pending);
+        assert!(coord_retry.snapshot().self_check.wal_clean);
+        coord_retry.shutdown();
+
+        // 2) `Degraded(wal_pending)` preserves detailed boot error + self_check item, then heals on `RecheckNow`.
+        let dir_recheck = tempfile::tempdir().unwrap();
+        ConfigStore::new(dir_recheck.path())
+            .save_verified(&make_cfg("US"))
+            .unwrap();
+        let driver_recheck: Arc<dyn PlatformDriver> =
+            Arc::new(UnsupportedPlatformDriver::default());
+        let runner_recheck = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: Arc::new(AtomicBool::new(true)),
+            ip_on_pass: "198.51.100.98".into(),
+        });
+        let flaky_boot = Arc::new(FlakyRecoveryExecutor::new(1, MockRecoveryState::default()));
+        let coord_recheck = boot_actor(
+            dir_recheck.path(),
+            driver_recheck,
+            runner_recheck,
+            flaky_boot,
+        );
+
+        let snap0 = coord_recheck.snapshot();
+        assert_eq!(snap0.protection, ProtectionState::Degraded);
+        assert!(snap0.last_error.contains("RPC_S_SERVER_UNAVAILABLE"));
+        assert!(!snap0.self_check.wal_clean);
+        let wal_item = snap0
+            .self_check
+            .items
+            .iter()
+            .find(|i| i.id == "wal_journal")
+            .unwrap();
+        assert_eq!(wal_item.status, SelfCheckStatus::Degraded);
+        assert!(wal_item.detail.contains("启动恢复核验未完成"));
+
+        match coord_recheck.dispatch(PipeRequest::RecheckNow { target_id: None }) {
+            PipeResponse::Ack {
+                snapshot: Some(healed_snap),
+                ..
+            } => {
+                assert_eq!(healed_snap.protection, ProtectionState::Monitoring);
+                assert!(healed_snap.last_error.is_empty());
+                assert!(healed_snap.self_check.wal_clean);
+            }
+            other => panic!("expected Ack after RecheckNow heal, got {other:?}"),
+        }
+        coord_recheck.shutdown();
+
+        // 3) `Degraded(wal_pending)` also self-heals automatically via background `Telemetry`!
+        let dir_tel = tempfile::tempdir().unwrap();
+        ConfigStore::new(dir_tel.path())
+            .save_verified(&make_cfg("US"))
+            .unwrap();
+        let driver_tel: Arc<dyn PlatformDriver> = Arc::new(UnsupportedPlatformDriver::default());
+        let runner_tel = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: Arc::new(AtomicBool::new(true)),
+            ip_on_pass: "198.51.100.98".into(),
+        });
+        let flaky_tel = Arc::new(FlakyRecoveryExecutor::new(1, MockRecoveryState::default()));
+        let coord_tel = boot_actor(dir_tel.path(), driver_tel, runner_tel, flaky_tel);
+        assert_eq!(coord_tel.snapshot().protection, ProtectionState::Degraded);
+
+        let cur = coord_tel.snapshot();
+        coord_tel.try_send_telemetry(TelemetryBundle {
+            cfg_rev: cur.cfg_rev,
+            runtime_epoch: cur.runtime_epoch,
+            agents: Vec::new(),
+            leak: LeakReport::default(),
+            leak_shield: LeakShieldStatus::default(),
+            mihomo: MihomoStatus::default(),
+            env: EnvCheck::default(),
+            antigravity_proxy: AntigravityProxyStatus::default(),
+            self_check: cur.self_check,
+            updates: None,
+            now_secs: now_unix_secs(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while coord_tel.snapshot().protection != ProtectionState::Monitoring
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let healed_tel = coord_tel.snapshot();
+        assert_eq!(healed_tel.protection, ProtectionState::Monitoring);
+        assert!(healed_tel.last_error.is_empty());
+        assert!(healed_tel.self_check.wal_clean);
+        coord_tel.shutdown();
+    }
+
+    #[test]
+    fn false_shutdown_uncovered_trip_rolls_back_and_rearm_syncs_leak_shield() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(ControllableDriver::new());
+        let pass = Arc::new(AtomicBool::new(true));
+        let runner = Arc::new(AccessAwareProbeRunner { pass: pass.clone() });
+        let recovery = Arc::new(PlatformRecoveryExecutor::new(driver.clone()));
+        let coord = boot_actor(dir.path(), driver.clone(), runner, recovery);
+
+        let mut cfg = make_cfg("US");
+        cfg.enforce_access_path = true;
+        cfg.lockdown_on_uncovered = true;
+        cfg.trip_threshold = 1;
+        cfg.leak_shield_quic = true;
+        cfg.leak_shield_dns_doh = true;
+        cfg.leak_shield_ipv6 = true;
+        assert!(matches!(
+            coord.dispatch(PipeRequest::CompleteOnboarding { config: cfg }),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(matches!(
+            coord.dispatch(PipeRequest::RecheckNow { target_id: None }),
+            PipeResponse::Ack { .. }
+        ));
+        assert_eq!(coord.snapshot().protection, ProtectionState::Monitoring);
+        assert!(coord.snapshot().leak_shield.enabled);
+        assert!(coord.snapshot().leak_shield.active_rules > 0);
+
+        // Flow B disarm clears shield -> Rearm MUST re-synchronize Leak Shield rules immediately!
+        assert!(matches!(
+            coord.dispatch(PipeRequest::DisarmAndRestoreFlowB {
+                reason: Some("test disarm".into()),
+            }),
+            PipeResponse::Ack { .. }
+        ));
+        assert_eq!(coord.snapshot().lifecycle, Lifecycle::Disarmed);
+
+        match coord.dispatch(PipeRequest::Rearm) {
+            PipeResponse::Ack {
+                snapshot: Some(rearmed),
+                ..
+            } => {
+                assert_eq!(rearmed.lifecycle, Lifecycle::Armed);
+                assert!(
+                    rearmed.leak_shield.enabled && rearmed.leak_shield.active_rules > 0,
+                    "Rearm must re-sync Leak Shield rules"
+                );
+            }
+            other => panic!("expected Ack from Rearm, got {other:?}"),
+        }
+        assert!(matches!(
+            coord.dispatch(PipeRequest::RecheckNow { target_id: None }),
+            PipeResponse::Ack { .. }
+        ));
+        assert_eq!(coord.snapshot().protection, ProtectionState::Monitoring);
+
+        // Simulate user-mode TUN (`Clash`) exiting 2s before OS shutdown -> false uncovered lockdown & quarantine!
+        *driver.access_path_override.lock().unwrap() = Some(AccessPath::Uncovered);
+        assert!(matches!(
+            coord.dispatch(PipeRequest::RecheckNow { target_id: None }),
+            PipeResponse::Ack { .. }
+        ));
+        let tripped_snap = coord.snapshot();
+        assert_eq!(tripped_snap.protection, ProtectionState::Quarantined);
+        assert!(tripped_snap.tripped.is_some());
+        assert!(tripped_snap.lockdown);
+        assert!(JournalStore::new(dir.path()).path().exists());
+        assert!(!driver.fw.enumerate_rules("ClaudeGuard").unwrap().is_empty());
+
+        // OS shutdown notification arrives within 20s -> false uncovered trip & WAL rolled back!
+        match coord.dispatch(PipeRequest::NotifySystemShutdown) {
+            PipeResponse::Ack {
+                snapshot: Some(rolled_back),
+                ..
+            } => {
+                assert_eq!(rolled_back.protection, ProtectionState::Monitoring);
+                assert!(rolled_back.tripped.is_none());
+                assert!(!rolled_back.lockdown);
+            }
+            other => panic!("expected Ack from NotifySystemShutdown, got {other:?}"),
+        }
+        assert!(
+            !JournalStore::new(dir.path()).path().exists(),
+            "false shutdown trip WAL must not persist across reboot"
+        );
+        assert!(
+            driver.fw.enumerate_rules("ClaudeGuard").unwrap().is_empty(),
+            "false shutdown trip firewall rules must be cleaned before reboot"
+        );
+        assert!(
+            dir.path().join("daemon.log").is_file(),
+            "rolling redacted daemon.log must be flushed to data_dir"
+        );
+
+        coord.shutdown();
     }
 }

@@ -744,20 +744,45 @@ pub fn install_verified_proxy_bytes_into_dir(
         );
     }
 
-    // Compute SHA-256 of verified DLL bytes for audit trail
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(&dll_bytes);
-    let mut sha256_hex = String::with_capacity(64);
-    for b in digest {
-        sha256_hex.push_str(&format!("{b:02x}"));
-    }
+    let compute_sha256_hex = |bytes: &[u8]| -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(bytes);
+        let mut hex = String::with_capacity(64);
+        for b in digest {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        hex
+    };
 
-    // Symlink-safe atomic write `version.dll` via randomized `create_new(true)` sibling temp file
-    if let Err(err) = atomic_write_verified_file(dir, "version.dll", &dll_bytes) {
-        return Err(format!(
-            "{err}（若 Antigravity 正在运行，请先关闭客户端后重试）"
-        ));
-    }
+    // Symlink-safe atomic write `version.dll` via randomized `create_new(true)` sibling temp file.
+    // When Antigravity is running, Windows locks the mapped `version.dll` image section against
+    // rename/overwrite; if the on-disk `version.dll` is ALREADY a valid `antigravity-proxy` module,
+    // keep it in place and hot-repair `config.json` without forcing a client restart.
+    let existing_dll_path = dir.join("version.dll");
+    let (dll_was_replaced, same_as_candidate, sha256_hex) =
+        match atomic_write_verified_file(dir, "version.dll", &dll_bytes) {
+            Ok(_) => (true, true, compute_sha256_hex(&dll_bytes)),
+            Err(write_err) => {
+                let existing_valid_bytes = ensure_no_reparse_points(&existing_dll_path)
+                    .ok()
+                    .and_then(|()| std::fs::metadata(&existing_dll_path).ok())
+                    .filter(|m| m.is_file() && m.len() <= MAX_PROXY_DLL_BYTES)
+                    .and_then(|_| std::fs::read(&existing_dll_path).ok())
+                    .filter(|b| validate_antigravity_proxy_dll_bytes(b));
+                match existing_valid_bytes {
+                    Some(existing_bytes) => {
+                        let same = existing_bytes == dll_bytes;
+                        let hex = compute_sha256_hex(&existing_bytes);
+                        (false, same, hex)
+                    }
+                    None => {
+                        return Err(format!(
+                            "{write_err}（若 Antigravity 正在运行，请先关闭客户端后重试）"
+                        ));
+                    }
+                }
+            }
+        };
 
     // Preserve existing `config.json` fields while aligning `child_injection: true` & `proxy.port`.
     let cfg_path = dir.join("config.json");
@@ -768,7 +793,7 @@ pub fn install_verified_proxy_bytes_into_dir(
         .filter(|v: &serde_json::Value| v.is_object())
         .unwrap_or_else(|| serde_json::json!({}));
     if let Some(obj) = cfg_val.as_object_mut() {
-        if !release_tag.trim().is_empty() {
+        if dll_was_replaced && !release_tag.trim().is_empty() {
             obj.insert(
                 "_version".into(),
                 serde_json::Value::String(release_tag.trim_start_matches(['v', 'V']).to_string()),
@@ -798,15 +823,35 @@ pub fn install_verified_proxy_bytes_into_dir(
 
     process_win::invalidate_discovery_cache();
 
+    let effective_release_tag = if dll_was_replaced || same_as_candidate {
+        release_tag.to_string()
+    } else {
+        cfg_val
+            .get("_version")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| process_win::read_pe_file_version(&existing_dll_path))
+            .unwrap_or_default()
+    };
+
     let sha_head = sha256_hex.get(..12).unwrap_or(&sha256_hex);
+    let summary = if dll_was_replaced {
+        format!(
+            "已安装并验签 antigravity-proxy {release_tag}（SHA256 {sha_head}…），同步代理端口 :{proxy_port}"
+        )
+    } else {
+        format!(
+            "检测到有效 version.dll 正在运行占用，已免重启热修复 config.json 代理端口 :{proxy_port}（SHA256 {sha_head}…）"
+        )
+    };
     Ok(AntigravityRepairReport {
         install_dir: dir.to_path_buf(),
-        release_tag: release_tag.to_string(),
-        sha256_hex: sha256_hex.clone(),
+        release_tag: effective_release_tag,
+        sha256_hex,
         proxy_port,
-        summary: format!(
-            "已安装并验签 antigravity-proxy {release_tag}（SHA256 {sha_head}…），同步代理端口 :{proxy_port}"
-        ),
+        summary,
     })
 }
 
@@ -1409,5 +1454,107 @@ mod tests {
         assert_eq!(cfg["_version"], serde_json::json!("2.6.6"));
         std::fs::remove_dir_all(&install_dir).unwrap();
         std::fs::remove_dir_all(&cache_dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_valid_version_dll_hot_repairs_config_json_while_locked_invalid_dll_errors() {
+        use sha2::{Digest, Sha256};
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+
+        // 1. Valid `version.dll` locked without `FILE_SHARE_DELETE` + wrong port `1080` in `config.json`:
+        //    `install_verified_proxy_bytes_into_dir` must hot-repair `config.json` to `7890`.
+        let valid_dir = unique_temp_dir("locked-valid-dll");
+        let existing_dll = synthetic_proxy_dll_bytes();
+        let mut candidate_dll = existing_dll.clone();
+        candidate_dll[2048] = b'N';
+
+        let valid_dll_path = valid_dir.join("version.dll");
+        std::fs::write(&valid_dll_path, &existing_dll).unwrap();
+        std::fs::write(
+            valid_dir.join("config.json"),
+            valid_config_json(1080, false),
+        )
+        .unwrap();
+
+        let lock_valid = std::fs::File::options()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&valid_dll_path)
+            .expect("open locked valid version.dll");
+
+        let report = install_verified_proxy_bytes_into_dir(
+            &valid_dir,
+            &candidate_dll,
+            false,
+            7890,
+            "v2.7.0",
+        )
+        .expect("locked valid version.dll should allow lock-free config.json hot repair");
+
+        assert_eq!(report.proxy_port, 7890);
+        assert!(
+            report
+                .summary
+                .contains("免重启热修复 config.json 代理端口 :7890"),
+            "unexpected summary: {}",
+            report.summary
+        );
+
+        let expected_sha = {
+            let digest = Sha256::digest(&existing_dll);
+            let mut hex = String::with_capacity(64);
+            for b in digest {
+                hex.push_str(&format!("{b:02x}"));
+            }
+            hex
+        };
+        assert_eq!(report.sha256_hex, expected_sha);
+        assert_eq!(std::fs::read(&valid_dll_path).unwrap(), existing_dll);
+
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(valid_dir.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(cfg["proxy"]["port"], serde_json::json!(7890));
+        assert_eq!(cfg["child_injection"], serde_json::json!(true));
+        assert_eq!(cfg["_version"], serde_json::json!("2.6.3"));
+
+        drop(lock_valid);
+        std::fs::remove_dir_all(&valid_dir).unwrap();
+
+        // 2. Invalid/system `version.dll` locked without `FILE_SHARE_DELETE`:
+        //    must fail with the close-client hint and must NOT silently succeed.
+        let invalid_dir = unique_temp_dir("locked-invalid-dll");
+        let invalid_dll_path = invalid_dir.join("version.dll");
+        std::fs::write(&invalid_dll_path, synthetic_system_version_dll_bytes()).unwrap();
+        std::fs::write(
+            invalid_dir.join("config.json"),
+            valid_config_json(1080, true),
+        )
+        .unwrap();
+
+        let lock_invalid = std::fs::File::options()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&invalid_dll_path)
+            .expect("open locked invalid version.dll");
+
+        let err = install_verified_proxy_bytes_into_dir(
+            &invalid_dir,
+            &candidate_dll,
+            false,
+            7890,
+            "v2.7.0",
+        )
+        .expect_err("locked invalid version.dll must fail");
+        assert!(
+            err.contains("请先关闭客户端后重试"),
+            "error must contain close-client hint: {err}"
+        );
+
+        drop(lock_invalid);
+        std::fs::remove_dir_all(&invalid_dir).unwrap();
     }
 }
