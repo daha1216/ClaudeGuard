@@ -5,11 +5,13 @@
 
 use crate::demo::now_unix_secs;
 use crate::protocol::{
-    AccessLevel, AgentKind, AnchorKind, AntigravityProxyState, AntigravityProxyStatus, Config,
-    DefenseCheckItem, GuardSnapshot, Lifecycle, LogEntry, LogLevel, OnboardingProbeResult,
-    OnboardingStrategy, OperationReceipt, PolicyPreset, ProtectionState, SelfCheckStatus, Target,
-    TargetState, TargetStatus, TimelineBucket, TimelineStatus, UiLabelExt, UpdateSummary,
-    clean_guarded_agents, ensure_builtin_targets, mask_ip_str, mask_ips_in_text, region_name,
+    AccessLevel, AccountVault, AgentKind, AnchorKind, AntigravityProxyState,
+    AntigravityProxyStatus, Config, DefenseCheckItem, GuardSnapshot, Lifecycle, LogEntry, LogLevel,
+    MsixIsolationMode, OnboardingProbeResult, OnboardingStrategy, OperationReceipt, PolicyPreset,
+    ProtectionState, SafetyGrade, SelfCheckStatus, Target, TargetState, TargetStatus,
+    TimelineBucket, TimelineStatus, UiLabelExt, UpdateSummary, VaultRuntimeState, WfpBlockedEvent,
+    clean_guarded_agents, ensure_builtin_targets, is_valid_vault_id, mask_ip_str, mask_ips_in_text,
+    normalize_ip_or_cidr, region_name,
 };
 use crate::theme::{BadgeTone, HeroTone};
 
@@ -18,6 +20,8 @@ use crate::theme::{BadgeTone, HeroTone};
 pub enum NavSection {
     #[default]
     Overview,
+    Vaults,
+    CleanRoom,
     Targets,
     Breaker,
     Environment,
@@ -27,8 +31,10 @@ pub enum NavSection {
 }
 
 impl NavSection {
-    pub const ALL: [NavSection; 7] = [
+    pub const ALL: [NavSection; 9] = [
         NavSection::Overview,
+        NavSection::Vaults,
+        NavSection::CleanRoom,
         NavSection::Targets,
         NavSection::Breaker,
         NavSection::Environment,
@@ -40,6 +46,8 @@ impl NavSection {
     pub fn label(self) -> &'static str {
         match self {
             Self::Overview => "守护总览磁贴",
+            Self::Vaults => "多账号仓",
+            Self::CleanRoom => "防连坐净室",
             Self::Targets => "目标与白名单",
             Self::Breaker => "熔断与防火墙",
             Self::Environment => "环境与防泄露",
@@ -52,6 +60,8 @@ impl NavSection {
     pub fn short_tag(self) -> &'static str {
         match self {
             Self::Overview => "总览",
+            Self::Vaults => "多账号仓",
+            Self::CleanRoom => "防连坐",
             Self::Targets => "白名单",
             Self::Breaker => "熔断",
             Self::Environment => "环境",
@@ -59,6 +69,242 @@ impl NavSection {
             Self::Updates => "更新",
             Self::Notify => "通知",
         }
+    }
+}
+
+/// Maps 10D [`SafetyGrade`] to a Frost Ceramic semantic [`BadgeTone`].
+pub fn safety_grade_tone(grade: SafetyGrade) -> BadgeTone {
+    match grade {
+        SafetyGrade::S | SafetyGrade::A => BadgeTone::Pass,
+        SafetyGrade::B | SafetyGrade::C => BadgeTone::Warn,
+        SafetyGrade::F => BadgeTone::Fail,
+    }
+}
+
+/// Formats a WFP blocked packet's remote IP respecting `privacy_mask_ip`.
+pub fn mask_wfp_event_ip(ev: &WfpBlockedEvent, privacy_mask: bool) -> String {
+    if ev.remote_ip.trim().is_empty() {
+        return "--".into();
+    }
+    if privacy_mask {
+        mask_ip_str(&ev.remote_ip)
+    } else {
+        ev.remote_ip.clone()
+    }
+}
+
+/// Editable Sovereign Account Vault form draft (100% isolated from 1s background snapshot polling).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultDraft {
+    pub editing_existing: bool,
+    pub id: String,
+    pub name: String,
+    pub accent_hex: String,
+    pub enabled: bool,
+    pub pinned_regions_text: String,
+    pub pinned_ips_text: String,
+    pub pinned_asn_text: String,
+    pub dedicated_proxy_port_text: String,
+    pub preferred_mihomo_group: String,
+    pub preferred_mihomo_node: String,
+    pub auto_align_mihomo_on_vault_launch: bool,
+    pub min_safety_score_text: String,
+    pub cooldown_secs_text: String,
+    pub share_ide_extensions: bool,
+    pub msix_isolation_mode: MsixIsolationMode,
+}
+
+impl Default for VaultDraft {
+    fn default() -> Self {
+        Self {
+            editing_existing: false,
+            id: String::new(),
+            name: String::new(),
+            accent_hex: "#5B69D0".into(),
+            enabled: true,
+            pinned_regions_text: "US".into(),
+            pinned_ips_text: String::new(),
+            pinned_asn_text: String::new(),
+            dedicated_proxy_port_text: String::new(),
+            preferred_mihomo_group: String::new(),
+            preferred_mihomo_node: String::new(),
+            auto_align_mihomo_on_vault_launch: false,
+            min_safety_score_text: "80".into(),
+            cooldown_secs_text: "900".into(),
+            share_ide_extensions: true,
+            msix_isolation_mode: MsixIsolationMode::AutoVerifyLock,
+        }
+    }
+}
+
+impl VaultDraft {
+    pub fn from_vault(v: &AccountVault) -> Self {
+        Self {
+            editing_existing: true,
+            id: v.id.clone(),
+            name: v.name.clone(),
+            accent_hex: if v.accent_hex.is_empty() {
+                "#5B69D0".into()
+            } else {
+                v.accent_hex.clone()
+            },
+            enabled: v.enabled,
+            pinned_regions_text: v.pinned_regions.join(", "),
+            pinned_ips_text: v.pinned_ips.join(", "),
+            pinned_asn_text: v.pinned_asn.map(|n| n.to_string()).unwrap_or_default(),
+            dedicated_proxy_port_text: v
+                .dedicated_proxy_port
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+            preferred_mihomo_group: v.preferred_mihomo_group.clone().unwrap_or_default(),
+            preferred_mihomo_node: v.preferred_mihomo_node.clone().unwrap_or_default(),
+            auto_align_mihomo_on_vault_launch: v.auto_align_mihomo_on_vault_launch,
+            min_safety_score_text: v.min_safety_score.to_string(),
+            cooldown_secs_text: v.cooldown_after_ip_change_secs.to_string(),
+            share_ide_extensions: v.share_ide_extensions,
+            msix_isolation_mode: v.msix_isolation_mode,
+        }
+    }
+
+    /// One-click helper adopting the live probed egress country, IP, ASN, and active Mihomo node.
+    pub fn adopt_current_egress(&mut self, snap: &GuardSnapshot) {
+        let primary_target = snap
+            .targets
+            .iter()
+            .find(|t| t.id == "claude" && t.ip.is_some())
+            .or_else(|| snap.targets.iter().find(|t| t.ip.is_some()));
+
+        if let Some(cc) = snap
+            .risk_assessment
+            .ip_purity
+            .country
+            .as_deref()
+            .or_else(|| primary_target.and_then(|t| t.country.as_deref()))
+            .filter(|c| !c.trim().is_empty())
+        {
+            self.pinned_regions_text = cc.trim().to_ascii_uppercase();
+        }
+        if let Some(ip) = snap
+            .risk_assessment
+            .ip_purity
+            .ip
+            .as_deref()
+            .or_else(|| primary_target.and_then(|t| t.ip.as_deref()))
+            .filter(|ip| !ip.trim().is_empty())
+        {
+            self.pinned_ips_text = ip.trim().to_string();
+        }
+        if let Some(asn) = snap.risk_assessment.ip_purity.asn {
+            self.pinned_asn_text = asn.to_string();
+        }
+        if snap.config.proxy_port > 0 {
+            self.dedicated_proxy_port_text = snap.config.proxy_port.to_string();
+        }
+        if !snap.mihomo.active_group.trim().is_empty() {
+            self.preferred_mihomo_group = snap.mihomo.active_group.trim().to_string();
+        }
+        if !snap.mihomo.active_node.trim().is_empty() {
+            self.preferred_mihomo_node = snap.mihomo.active_node.trim().to_string();
+        }
+    }
+
+    /// Validates draft fields and converts into a normalized [`AccountVault`].
+    pub fn to_account_vault(&self) -> Result<AccountVault, String> {
+        let id = self.id.trim().to_ascii_lowercase();
+        if !is_valid_vault_id(&id) {
+            return Err(
+                "隔离仓 ID 须为 2–32 位小写字母、数字、- 或 _（且不能是系统保留字）".into(),
+            );
+        }
+        let name = self.name.trim();
+        let display_name = if name.is_empty() {
+            id.clone()
+        } else {
+            name.to_string()
+        };
+
+        let pinned_regions = if self.pinned_regions_text.trim().is_empty() {
+            Vec::new()
+        } else {
+            parse_and_validate_regions(&self.pinned_regions_text)?
+        };
+
+        let mut pinned_ips = Vec::new();
+        for tok in split_tokens(&self.pinned_ips_text) {
+            let Some(norm) = normalize_ip_or_cidr(&tok) else {
+                return Err(format!("锁定 IP/CIDR 格式无效：{tok}"));
+            };
+            if !pinned_ips.contains(&norm) {
+                pinned_ips.push(norm);
+            }
+        }
+
+        let pinned_asn = if self.pinned_asn_text.trim().is_empty() {
+            None
+        } else {
+            let raw = self
+                .pinned_asn_text
+                .trim()
+                .trim_start_matches(['A', 'a'])
+                .trim_start_matches(['S', 's']);
+            let parsed = raw
+                .parse::<u32>()
+                .ok()
+                .filter(|&v| v > 0)
+                .ok_or_else(|| format!("锁定 ASN 无效：{}", self.pinned_asn_text.trim()))?;
+            Some(parsed)
+        };
+
+        let dedicated_proxy_port = if self.dedicated_proxy_port_text.trim().is_empty() {
+            None
+        } else {
+            let port = self
+                .dedicated_proxy_port_text
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|&p| p >= 1)
+                .ok_or_else(|| "独立代理端口须为 1–65535 整数".to_string())?;
+            Some(port)
+        };
+
+        let min_safety_score: u8 = self
+            .min_safety_score_text
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .filter(|&v| v <= 100)
+            .ok_or_else(|| "最低防封安全分须为 0–100 整数".to_string())?;
+
+        let cooldown_secs: u64 = self
+            .cooldown_secs_text
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|&v| v <= 86_400)
+            .ok_or_else(|| "换 IP 冷却时长须为 0–86400 秒".to_string())?;
+
+        let mut vault = AccountVault {
+            id,
+            name: display_name,
+            accent_hex: self.accent_hex.clone(),
+            enabled: self.enabled,
+            pinned_regions,
+            pinned_ips,
+            pinned_asn,
+            dedicated_proxy_port,
+            preferred_mihomo_group: (!self.preferred_mihomo_group.trim().is_empty())
+                .then(|| self.preferred_mihomo_group.trim().to_string()),
+            preferred_mihomo_node: (!self.preferred_mihomo_node.trim().is_empty())
+                .then(|| self.preferred_mihomo_node.trim().to_string()),
+            auto_align_mihomo_on_vault_launch: self.auto_align_mihomo_on_vault_launch,
+            min_safety_score,
+            cooldown_after_ip_change_secs: cooldown_secs,
+            share_ide_extensions: self.share_ide_extensions,
+            msix_isolation_mode: self.msix_isolation_mode,
+        };
+        vault.normalize();
+        Ok(vault)
     }
 }
 
@@ -134,6 +380,10 @@ pub struct DraftStore {
     pub onboarding_custom_cidr: String,
     pub onboarding_custom_regions: String,
     pub validation_error: Option<String>,
+    /// Sovereign Account Vault drawer draft (strictly isolated from 1s snapshot polling).
+    pub vault_draft: VaultDraft,
+    pub vault_dirty: bool,
+    pub vault_validation_error: Option<String>,
 }
 
 impl Default for DraftStore {
@@ -158,6 +408,9 @@ impl Default for DraftStore {
             onboarding_custom_cidr: String::new(),
             onboarding_custom_regions: String::new(),
             validation_error: None,
+            vault_draft: VaultDraft::default(),
+            vault_dirty: false,
+            vault_validation_error: None,
         }
     }
 }
@@ -426,6 +679,11 @@ pub struct HudProjection {
     pub launch_apps: Vec<SafeLaunchAppViewModel>,
     pub quick_cleanup_apps: Vec<HudCleanupChipViewModel>,
     pub pause_button_label: String,
+    pub safety_score: u8,
+    pub safety_grade: SafetyGrade,
+    pub safety_evaluated: bool,
+    pub wfp_blocked_total: u64,
+    pub active_vault_name: Option<String>,
 }
 
 /// Projected runtime status row for one AI client on the Breaker page.
@@ -1041,6 +1299,20 @@ pub fn project_hud(
         }
     });
 
+    let (safety_score, safety_grade, safety_evaluated) = snap
+        .map(|s| {
+            let r = &s.risk_assessment;
+            (r.score, r.grade, r.evaluated_at > 0)
+        })
+        .unwrap_or((0, SafetyGrade::C, false));
+    let wfp_blocked_total = snap.map(|s| s.wfp.total_blocked_packets).unwrap_or(0);
+    let active_vault_name = snap.and_then(|s| {
+        s.vaults
+            .iter()
+            .find(|v| v.state == VaultRuntimeState::ActiveRunning)
+            .map(|v| v.name.clone())
+    });
+
     HudProjection {
         connected,
         connection_err: connection_err.map(ToString::to_string),
@@ -1054,6 +1326,11 @@ pub fn project_hud(
         launch_apps: project_launch_apps(snap),
         quick_cleanup_apps,
         pause_button_label,
+        safety_score,
+        safety_grade,
+        safety_evaluated,
+        wfp_blocked_total,
+        active_vault_name,
     }
 }
 
@@ -2109,7 +2386,19 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["claude", "chatgpt", "antigravity", "claude-code", "codex"]
+            vec![
+                "claude",
+                "chatgpt",
+                "antigravity",
+                "cursor",
+                "windsurf",
+                "zed",
+                "trae",
+                "claude-code",
+                "codex",
+                "gemini",
+                "aider"
+            ]
         );
         let claude_row = pass_view
             .agent_statuses
@@ -2286,5 +2575,61 @@ mod tests {
         assert_eq!(&dt[4..5], "-");
         assert_eq!(&dt[7..8], "-");
         assert_eq!(&dt[10..11], " ");
+    }
+
+    #[test]
+    fn vault_draft_is_isolated_from_background_snapshot_polling_and_validates() {
+        let snap1 = build_demo_snapshot(DemoScenario::Pass);
+        let mut drafts = DraftStore::default();
+        drafts.sync_from_snapshot(&snap1.config, snap1.cfg_rev);
+
+        // User begins typing a new Sovereign Vault in the form drawer.
+        drafts.vault_draft.id = "team-us-01".into();
+        drafts.vault_draft.name = "Team US 独享仓".into();
+        drafts.vault_draft.adopt_current_egress(&snap1);
+        drafts.vault_dirty = true;
+
+        assert_eq!(drafts.vault_draft.pinned_regions_text, "US");
+        assert_eq!(drafts.vault_draft.pinned_ips_text, "198.51.100.98");
+        assert_eq!(drafts.vault_draft.pinned_asn_text, "7922");
+
+        // 1s background snapshot poll arrives with higher cfg_rev — must NEVER overwrite vault_draft!
+        let mut snap2 = snap1.clone();
+        snap2.cfg_rev += 1;
+        snap2.config.proxy_port = 8899;
+        assert!(drafts.sync_from_snapshot(&snap2.config, snap2.cfg_rev));
+        assert_eq!(drafts.vault_draft.id, "team-us-01");
+        assert_eq!(drafts.vault_draft.pinned_ips_text, "198.51.100.98");
+        assert!(drafts.vault_dirty);
+
+        // Valid vault draft converts cleanly; invalid ID is rejected.
+        let vault = drafts.vault_draft.to_account_vault().expect("valid vault");
+        assert_eq!(vault.id, "team-us-01");
+        assert_eq!(vault.pinned_asn, Some(7922));
+        assert!(!vault.auto_align_mihomo_on_vault_launch);
+
+        drafts.vault_draft.id = "../escape".into();
+        assert!(drafts.vault_draft.to_account_vault().is_err());
+    }
+
+    #[test]
+    fn v5_wfp_privacy_mask_and_safety_grade_tone_projection() {
+        let pass = build_demo_snapshot(DemoScenario::Pass);
+        let hud = project_hud(Some(&pass), true, None, true);
+        assert!(hud.safety_evaluated);
+        assert_eq!(hud.safety_score, 94);
+        assert_eq!(hud.safety_grade, SafetyGrade::S);
+        assert_eq!(hud.wfp_blocked_total, 12);
+        assert!(hud.active_vault_name.is_some());
+
+        assert_eq!(safety_grade_tone(SafetyGrade::S), BadgeTone::Pass);
+        assert_eq!(safety_grade_tone(SafetyGrade::A), BadgeTone::Pass);
+        assert_eq!(safety_grade_tone(SafetyGrade::B), BadgeTone::Warn);
+        assert_eq!(safety_grade_tone(SafetyGrade::C), BadgeTone::Warn);
+        assert_eq!(safety_grade_tone(SafetyGrade::F), BadgeTone::Fail);
+
+        let ev = &pass.wfp.recent_blocked[0];
+        assert_eq!(mask_wfp_event_ip(ev, false), "198.51.100.42");
+        assert_eq!(mask_wfp_event_ip(ev, true), "198.51.*.*");
     }
 }

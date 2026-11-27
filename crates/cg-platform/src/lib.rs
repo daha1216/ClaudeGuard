@@ -41,6 +41,8 @@ pub use update_check::{
 
 #[cfg(windows)]
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 
 pub use traits::{
     Coverage, FirewallEngine, FirewallProfileStatus, FirewallRuleRecord, FirewallRuleSpec,
@@ -58,12 +60,48 @@ use netwatch_win::TcpConn;
 #[cfg(windows)]
 use process_win::{LaunchTarget, ProcessIdentity, SweepMode, SweepReport};
 
-/// Native Windows `PlatformDriver` backed by COM Firewall, IpHelper, Toolhelp32, WinRT Toast,
-/// Win32 DPAPI, and Registry readers.
 #[cfg(windows)]
-#[derive(Debug, Default)]
+static ACTIVE_HYBRID_FIREWALL: OnceLock<RwLock<Option<Weak<wfp_win::HybridFirewallEngine>>>> =
+    OnceLock::new();
+
+#[cfg(windows)]
+fn register_active_hybrid_firewall(engine: &Arc<wfp_win::HybridFirewallEngine>) {
+    let lock = ACTIVE_HYBRID_FIREWALL.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = Some(Arc::downgrade(engine));
+    }
+}
+
+/// Returns the active [`wfp_win::HybridFirewallEngine`] owned by the live [`WindowsPlatformDriver`],
+/// allowing `cg-daemon` to synchronize WFP backend preferences, boot-time filters, and split-permit
+/// posture without opening duplicate BFE handles.
+#[cfg(windows)]
+pub fn active_hybrid_firewall() -> Option<Arc<wfp_win::HybridFirewallEngine>> {
+    ACTIVE_HYBRID_FIREWALL
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .and_then(|guard| guard.as_ref().and_then(Weak::upgrade))
+}
+
+/// Non-Windows stub returning `None` cleanly.
+#[cfg(not(windows))]
+pub fn active_hybrid_firewall() -> Option<std::sync::Arc<wfp_win::HybridFirewallEngine>> {
+    None
+}
+
+/// Native Windows `PlatformDriver` backed by Dual-Session WFP / COM Hybrid Firewall, IpHelper,
+/// Toolhelp32, WinRT Toast, Win32 DPAPI/CNG, and Registry readers.
+#[cfg(windows)]
+#[derive(Debug)]
 pub struct WindowsPlatformDriver {
-    firewall: firewall_com::ComFirewallEngine,
+    firewall: Arc<wfp_win::HybridFirewallEngine>,
+}
+
+#[cfg(windows)]
+impl Default for WindowsPlatformDriver {
+    fn default() -> Self {
+        Self::with_firewall_backend(cg_protocol::FirewallBackendPref::AutoWfpFirst)
+    }
 }
 
 #[cfg(windows)]
@@ -71,16 +109,80 @@ impl WindowsPlatformDriver {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Construct a `WindowsPlatformDriver` with an explicit initial [`cg_protocol::FirewallBackendPref`].
+    pub fn with_firewall_backend(pref: cg_protocol::FirewallBackendPref) -> Self {
+        let firewall = Arc::new(wfp_win::HybridFirewallEngine::new(pref));
+        register_active_hybrid_firewall(&firewall);
+        Self { firewall }
+    }
+
+    /// Borrow the underlying [`wfp_win::HybridFirewallEngine`] handle.
+    pub fn hybrid_firewall(&self) -> &Arc<wfp_win::HybridFirewallEngine> {
+        &self.firewall
+    }
+
+    /// Query live WFP sublayer and blocked-packet attribution telemetry.
+    pub fn wfp_status(&self) -> cg_protocol::WfpStatus {
+        self.firewall.wfp_status()
+    }
+
+    /// Clear the in-memory WFP blocked-packet event ring buffer.
+    pub fn clear_wfp_events(&self) {
+        self.firewall.clear_wfp_events();
+    }
+
+    /// Switch the firewall backend preference at runtime (`AutoWfpFirst` / `WfpOnly` / `ComLegacy`).
+    pub fn set_firewall_backend(
+        &self,
+        pref: cg_protocol::FirewallBackendPref,
+    ) -> cg_protocol::WfpStatus {
+        self.firewall.set_preference(pref)
+    }
+
+    /// Synchronize the opt-in persistent `FWPM_FILTER_FLAG_BOOTTIME` early boot guard (`wfp_boot_guard`).
+    pub fn sync_wfp_boot_guard(&self, enable: bool, app_exes: &[PathBuf]) -> PlatformResult<usize> {
+        self.firewall.sync_boot_guard(enable, app_exes)
+    }
+
+    /// Synchronize the Per-App Split-Permit Sandwich and dynamic WFP posture.
+    pub fn sync_wfp_tunnel_only(
+        &self,
+        spec: &wfp_win::WfpRuntimePostureSpec,
+    ) -> PlatformResult<cg_protocol::WfpStatus> {
+        self.firewall.sync_tunnel_only_split_permit(spec)
+    }
+
+    /// Synchronize the 4-Vector Leak Shield via WFP when active, or COM fallback.
+    pub fn sync_leak_shield_wfp(
+        &self,
+        app_paths: &[PathBuf],
+        block_quic: bool,
+        block_dns_doh: bool,
+        block_ipv6: bool,
+    ) -> PlatformResult<cg_protocol::LeakShieldStatus> {
+        self.firewall
+            .sync_leak_shield_wfp(app_paths, block_quic, block_dns_doh, block_ipv6)
+    }
+
+    /// Idempotently purge any persistent / boot-time ClaudeGuard WFP filters.
+    pub fn clear_persistent_boot_guard(&self) -> PlatformResult<RemoveReport> {
+        self.firewall.clear_persistent_boot_guard()
+    }
 }
 
 #[cfg(windows)]
 impl PlatformDriver for WindowsPlatformDriver {
     fn capabilities(&self) -> PlatformCapabilities {
-        PlatformCapabilities::windows_com_default()
+        if self.firewall.engine_name() == wfp_win::BACKEND_WFP_DYNAMIC {
+            PlatformCapabilities::windows_wfp_default()
+        } else {
+            PlatformCapabilities::windows_com_default()
+        }
     }
 
     fn firewall(&self) -> &dyn FirewallEngine {
-        &self.firewall
+        self.firewall.as_ref()
     }
 
     fn is_elevated(&self) -> PlatformResult<bool> {
@@ -151,13 +253,21 @@ impl PlatformDriver for WindowsPlatformDriver {
             ag_usage_monitor: process_win::installed_ag_usage_monitor_version(),
             ag_capsule: process_win::installed_ag_capsule_version(),
         };
+        let v5_local = update_check::V5LocalIdeVersions {
+            cursor_ide: process_win::installed_cursor_ide_version(),
+            windsurf_ide: process_win::installed_windsurf_ide_version(),
+            zed_ide: process_win::installed_zed_ide_version(),
+            trae_ide: process_win::installed_trae_ide_version(),
+        };
+        let mut seeded_prev = prev.clone();
+        update_check::hydrate_v5_ide_updates(&mut seeded_prev, &v5_local, now_secs);
         update_check::check_all_updates_full(
             route,
             cg_version,
             ag_proxy,
             &local,
             component,
-            prev,
+            &seeded_prev,
             now_secs,
         )
     }
@@ -207,6 +317,18 @@ impl PlatformDriver for WindowsPlatformDriver {
 
     fn delete_default_location(&self) -> PlatformResult<()> {
         env_win::delete_default_location()
+    }
+
+    fn wfp_status(&self) -> cg_protocol::WfpStatus {
+        self.firewall.wfp_status()
+    }
+
+    fn clear_wfp_events(&self) {
+        self.firewall.clear_wfp_events();
+    }
+
+    fn detect_tun_adapter_with_luid(&self) -> PlatformResult<Option<(String, u64)>> {
+        Ok(wfp_win::detect_active_tun_luid())
     }
 }
 

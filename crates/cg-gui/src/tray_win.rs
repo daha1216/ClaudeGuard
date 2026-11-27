@@ -104,6 +104,87 @@ pub struct LogicalRect {
     pub height: f32,
 }
 
+/// Win32 global hotkey identifiers registered on the hidden tray message window.
+pub const HOTKEY_PANIC_LOCKDOWN: i32 = 1;
+pub const HOTKEY_QUICK_HUD: i32 = 2;
+
+/// Win32 `RegisterHotKey` modifier bitmask constants (used cross-platform in chord parser + tests).
+pub const MOD_ALT_RAW: u32 = 0x0001;
+pub const MOD_CONTROL_RAW: u32 = 0x0002;
+pub const MOD_SHIFT_RAW: u32 = 0x0004;
+pub const MOD_WIN_RAW: u32 = 0x0008;
+pub const MOD_NOREPEAT_RAW: u32 = 0x4000;
+
+/// Registration outcome reported back by the tray thread when binding global emergency hotkeys.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HotkeyRegistrationReport {
+    pub panic_ok: bool,
+    pub hud_ok: bool,
+    pub conflict_note: String,
+}
+
+/// Parses a human-readable hotkey chord (e.g. `"Ctrl+Alt+Shift+L"`, `"Ctrl+Alt+Shift+H"`,
+/// `"Win+Shift+F9"`) into `(win32_modifiers_with_norepeat, virtual_key_code)`.
+///
+/// Requires at least one modifier key (`Ctrl`/`Alt`/`Shift`/`Win`) and exactly one primary key.
+pub fn parse_hotkey_chord(chord: &str) -> Option<(u32, u32)> {
+    let mut mods = 0u32;
+    let mut vk: Option<u32> = None;
+
+    for raw in chord.split('+') {
+        let tok = raw.trim();
+        if tok.is_empty() {
+            return None;
+        }
+        match tok.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => mods |= MOD_CONTROL_RAW,
+            "alt" => mods |= MOD_ALT_RAW,
+            "shift" => mods |= MOD_SHIFT_RAW,
+            "win" | "meta" | "super" => mods |= MOD_WIN_RAW,
+            key => {
+                if vk.is_some() {
+                    return None;
+                }
+                vk = parse_virtual_key(key);
+                vk?;
+            }
+        }
+    }
+
+    if mods == 0 {
+        return None;
+    }
+    Some((mods | MOD_NOREPEAT_RAW, vk?))
+}
+
+fn parse_virtual_key(key_lower: &str) -> Option<u32> {
+    if key_lower.len() == 1 {
+        let b = key_lower.as_bytes()[0];
+        if b.is_ascii_lowercase() {
+            return Some(u32::from(b.to_ascii_uppercase()));
+        }
+        if b.is_ascii_digit() {
+            return Some(u32::from(b));
+        }
+    }
+    if let Some(num_str) = key_lower.strip_prefix('f')
+        && let Ok(n) = num_str.parse::<u32>()
+        && (1..=12).contains(&n)
+    {
+        return Some(0x70 + (n - 1)); // VK_F1..VK_F12
+    }
+    match key_lower {
+        "space" => Some(0x20),
+        "esc" | "escape" => Some(0x1B),
+        "pause" => Some(0x13),
+        "home" => Some(0x24),
+        "end" => Some(0x23),
+        "ins" | "insert" => Some(0x2D),
+        "del" | "delete" => Some(0x2E),
+        _ => None,
+    }
+}
+
 /// Tray events emitted from the Win32 tray thread to the GPUI app controller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayEvent {
@@ -112,6 +193,7 @@ pub enum TrayEvent {
     RecheckNow,
     TogglePause,
     SweepOrphans,
+    PanicLockdown,
     SafeExit,
     QuitGuiOnly,
     SystemShuttingDown,
@@ -253,7 +335,16 @@ mod win_impl {
     const WM_TRAY_SYNC: u32 = WM_USER + 102;
     const WM_TRAY_BALLOON: u32 = WM_USER + 103;
     const WM_TRAY_QUIT: u32 = WM_USER + 104;
+    const WM_TRAY_SYNC_HOTKEYS: u32 = WM_USER + 105;
+    const WM_HOTKEY_RAW: u32 = 0x0312;
+    const ERROR_HOTKEY_ALREADY_REGISTERED_RAW: u32 = 1409;
     const TRAY_ICON_ID: u32 = 1;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn RegisterHotKey(h_wnd: *mut c_void, id: i32, fs_modifiers: u32, vk: u32) -> i32;
+        fn UnregisterHotKey(h_wnd: *mut c_void, id: i32) -> i32;
+    }
 
     /// RAII Win32 named-mutex guard ensuring single-instance lifetime across normal GUI launches.
     pub struct SingleInstanceGuard {
@@ -306,6 +397,14 @@ mod win_impl {
     const CMD_SWEEP_ORPHANS: u32 = 1005;
     const CMD_SAFE_EXIT: u32 = 1006;
     const CMD_QUIT_GUI: u32 = 1007;
+    const CMD_PANIC_LOCKDOWN: u32 = 1008;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct HotkeyDesiredConfig {
+        enabled: bool,
+        panic_chord: String,
+        hud_chord: String,
+    }
 
     struct TraySharedState {
         channel: TrayChannel,
@@ -313,6 +412,8 @@ mod win_impl {
         paused: AtomicBool,
         tooltip: Mutex<String>,
         pending_balloons: Mutex<VecDeque<(String, String, bool)>>,
+        hotkeys: Mutex<HotkeyDesiredConfig>,
+        hotkey_report: Mutex<HotkeyRegistrationReport>,
         taskbar_created_msg: u32,
         hwnd: Mutex<Option<isize>>,
     }
@@ -328,8 +429,14 @@ mod win_impl {
                 channel,
                 tone: AtomicU8::new(0),
                 paused: AtomicBool::new(false),
-                tooltip: Mutex::new("ClaudeGuard v4 · 守护中".to_string()),
+                tooltip: Mutex::new("ClaudeGuard v5 · 守护中".to_string()),
                 pending_balloons: Mutex::new(VecDeque::with_capacity(MAX_PENDING_BALLOONS)),
+                hotkeys: Mutex::new(HotkeyDesiredConfig {
+                    enabled: true,
+                    panic_chord: "Ctrl+Alt+Shift+L".to_string(),
+                    hud_chord: "Ctrl+Alt+Shift+H".to_string(),
+                }),
+                hotkey_report: Mutex::new(HotkeyRegistrationReport::default()),
                 taskbar_created_msg: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
                 hwnd: Mutex::new(None),
             });
@@ -381,6 +488,41 @@ mod win_impl {
                 let hwnd = HWND(raw as *mut _);
                 let _ = unsafe { PostMessageW(hwnd, WM_TRAY_BALLOON, WPARAM(0), LPARAM(0)) };
             }
+        }
+
+        /// Updates Win32 global emergency hotkeys (`RegisterHotKey`) without keyboard hooks.
+        pub fn sync_hotkeys(&self, enabled: bool, panic_chord: &str, hud_chord: &str) {
+            let desired = HotkeyDesiredConfig {
+                enabled,
+                panic_chord: panic_chord.trim().to_string(),
+                hud_chord: hud_chord.trim().to_string(),
+            };
+            let changed = if let Ok(mut guard) = self.shared.hotkeys.lock() {
+                if *guard == desired {
+                    false
+                } else {
+                    *guard = desired;
+                    true
+                }
+            } else {
+                false
+            };
+            if changed
+                && let Ok(guard) = self.shared.hwnd.lock()
+                && let Some(raw) = *guard
+            {
+                let hwnd = HWND(raw as *mut _);
+                let _ = unsafe { PostMessageW(hwnd, WM_TRAY_SYNC_HOTKEYS, WPARAM(0), LPARAM(0)) };
+            }
+        }
+
+        /// Returns the latest Win32 `RegisterHotKey` status & any conflict note.
+        pub fn hotkey_report(&self) -> HotkeyRegistrationReport {
+            self.shared
+                .hotkey_report
+                .lock()
+                .map(|r| r.clone())
+                .unwrap_or_default()
         }
 
         pub fn shutdown(&mut self) {
@@ -503,6 +645,7 @@ mod win_impl {
 
         let ctx_ref = unsafe { &*ctx_ptr };
         let _ = add_or_update_tray_icon(hwnd, ctx_ref, true);
+        apply_registered_hotkeys(hwnd, &ctx_ref.shared);
         let _ = ready_tx.send(Ok(()));
 
         let mut msg = MSG::default();
@@ -510,6 +653,7 @@ mod win_impl {
             let _ = unsafe { DispatchMessageW(&msg) };
         }
 
+        unregister_all_hotkeys(hwnd);
         let _ = remove_tray_icon(hwnd);
         if let Ok(mut guard) = shared.hwnd.lock() {
             *guard = None;
@@ -577,6 +721,18 @@ mod win_impl {
                 let _ = add_or_update_tray_icon(hwnd, ctx, false);
                 LRESULT(0)
             }
+            WM_TRAY_SYNC_HOTKEYS => {
+                apply_registered_hotkeys(hwnd, &ctx.shared);
+                LRESULT(0)
+            }
+            WM_HOTKEY_RAW => {
+                match wparam.0 as i32 {
+                    HOTKEY_PANIC_LOCKDOWN => ctx.shared.channel.send(TrayEvent::PanicLockdown),
+                    HOTKEY_QUICK_HUD => ctx.shared.channel.send(TrayEvent::ToggleHud),
+                    _ => {}
+                }
+                LRESULT(0)
+            }
             WM_TRAY_BALLOON => {
                 let batch: Vec<(String, String, bool)> =
                     if let Ok(mut guard) = ctx.shared.pending_balloons.lock() {
@@ -617,11 +773,71 @@ mod win_impl {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                unregister_all_hotkeys(hwnd);
                 let _ = remove_tray_icon(hwnd);
                 unsafe { PostQuitMessage(0) };
                 LRESULT(0)
             }
             _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        }
+    }
+
+    fn unregister_all_hotkeys(hwnd: HWND) {
+        // SAFETY: `hwnd` is the tray thread's hidden window; UnregisterHotKey is idempotent.
+        unsafe {
+            let _ = UnregisterHotKey(hwnd.0, HOTKEY_PANIC_LOCKDOWN);
+            let _ = UnregisterHotKey(hwnd.0, HOTKEY_QUICK_HUD);
+        }
+    }
+
+    fn apply_registered_hotkeys(hwnd: HWND, shared: &TraySharedState) {
+        unregister_all_hotkeys(hwnd);
+        let cfg = match shared.hotkeys.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => return,
+        };
+        let mut report = HotkeyRegistrationReport::default();
+        if !cfg.enabled {
+            if let Ok(mut dst) = shared.hotkey_report.lock() {
+                *dst = report;
+            }
+            return;
+        }
+        let mut notes = Vec::new();
+        for (id, label, chord, out_ok) in [
+            (
+                HOTKEY_PANIC_LOCKDOWN,
+                "紧急锁死热键",
+                cfg.panic_chord.as_str(),
+                &mut report.panic_ok,
+            ),
+            (
+                HOTKEY_QUICK_HUD,
+                "快捷 HUD 热键",
+                cfg.hud_chord.as_str(),
+                &mut report.hud_ok,
+            ),
+        ] {
+            if let Some((mods, vk)) = super::parse_hotkey_chord(chord) {
+                // SAFETY: `hwnd` belongs to this tray thread message loop.
+                let ok = unsafe { RegisterHotKey(hwnd.0, id, mods, vk) } != 0;
+                *out_ok = ok;
+                if !ok {
+                    let err = unsafe { GetLastError() }.0;
+                    if err == ERROR_HOTKEY_ALREADY_REGISTERED_RAW {
+                        notes.push(format!("{label} ({chord}) 与其他应用热键冲突"));
+                    } else {
+                        notes.push(format!("{label} ({chord}) 注册失败 (code {err})"));
+                    }
+                }
+            } else {
+                *out_ok = false;
+                notes.push(format!("{label} 组合格式无效：{chord}"));
+            }
+        }
+        report.conflict_note = notes.join("；");
+        if let Ok(mut dst) = shared.hotkey_report.lock() {
+            *dst = report;
         }
     }
 
@@ -632,6 +848,7 @@ mod win_impl {
             CMD_RECHECK => channel.send(TrayEvent::RecheckNow),
             CMD_TOGGLE_PAUSE => channel.send(TrayEvent::TogglePause),
             CMD_SWEEP_ORPHANS => channel.send(TrayEvent::SweepOrphans),
+            CMD_PANIC_LOCKDOWN => channel.send(TrayEvent::PanicLockdown),
             CMD_SAFE_EXIT => channel.send(TrayEvent::SafeExit),
             CMD_QUIT_GUI => channel.send(TrayEvent::QuitGuiOnly),
             _ => {}
@@ -670,6 +887,12 @@ mod win_impl {
                 MF_STRING,
                 CMD_SWEEP_ORPHANS as usize,
                 w!("一键清孤儿进程"),
+            );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                CMD_PANIC_LOCKDOWN as usize,
+                w!("紧急防封锁死 (Ctrl+Alt+Shift+L)"),
             );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT_GUI as usize, w!("仅退出托盘界面"));
@@ -1216,6 +1439,12 @@ mod win_impl {
 
         pub fn show_balloon(&self, _title: &str, _body: &str, _is_error: bool) {}
 
+        pub fn sync_hotkeys(&self, _enabled: bool, _panic_chord: &str, _hud_chord: &str) {}
+
+        pub fn hotkey_report(&self) -> HotkeyRegistrationReport {
+            HotkeyRegistrationReport::default()
+        }
+
         pub fn shutdown(&mut self) {}
     }
 
@@ -1531,10 +1760,40 @@ mod tests {
     }
 
     #[test]
-    fn tray_channel_forwards_system_shutting_down_event() {
+    fn tray_channel_forwards_system_shutting_down_and_panic_events() {
         let ch = TrayChannel::new();
         ch.send(TrayEvent::SystemShuttingDown);
+        ch.send(TrayEvent::PanicLockdown);
         let guard = ch.inner.lock().unwrap();
-        assert_eq!(guard.queue.front(), Some(&TrayEvent::SystemShuttingDown));
+        assert_eq!(guard.queue[0], TrayEvent::SystemShuttingDown);
+        assert_eq!(guard.queue[1], TrayEvent::PanicLockdown);
+    }
+
+    #[test]
+    fn parse_hotkey_chord_supports_standard_and_rejects_invalid_chords() {
+        assert_eq!(
+            parse_hotkey_chord("Ctrl+Alt+Shift+L"),
+            Some((
+                MOD_CONTROL_RAW | MOD_ALT_RAW | MOD_SHIFT_RAW | MOD_NOREPEAT_RAW,
+                u32::from(b'L')
+            ))
+        );
+        assert_eq!(
+            parse_hotkey_chord("  ctrl + alt + shift + h "),
+            Some((
+                MOD_CONTROL_RAW | MOD_ALT_RAW | MOD_SHIFT_RAW | MOD_NOREPEAT_RAW,
+                u32::from(b'H')
+            ))
+        );
+        assert_eq!(
+            parse_hotkey_chord("Win+Shift+F9"),
+            Some((MOD_WIN_RAW | MOD_SHIFT_RAW | MOD_NOREPEAT_RAW, 0x78))
+        );
+        // Must require at least one modifier and valid single primary key.
+        assert_eq!(parse_hotkey_chord("L"), None);
+        assert_eq!(parse_hotkey_chord("Ctrl+Alt"), None);
+        assert_eq!(parse_hotkey_chord("Ctrl+A+B"), None);
+        assert_eq!(parse_hotkey_chord("Ctrl+F13"), None);
+        assert_eq!(parse_hotkey_chord(""), None);
     }
 }

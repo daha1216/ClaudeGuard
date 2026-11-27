@@ -193,3 +193,51 @@ fn real_cli_restore_falls_back_to_offline_wal_when_daemon_absent() {
     assert!(!store.path().exists());
     assert!(disarm::read_disarmed(dir.path()).unwrap().is_some());
 }
+
+#[test]
+fn real_cli_hook_gate_blocks_when_daemon_offline_or_unverified() {
+    let cli_bin = env!("CARGO_BIN_EXE_claudeguard-cli");
+    let dir = tempfile::tempdir().unwrap();
+    let missing_pipe = unique_pipe();
+
+    // 1) Offline FailClosed returns exit 0 with official Claude Code block JSON.
+    let out_json = Command::new(cli_bin)
+        .env("CG_TEST_NO_OS_FIREWALL", "1")
+        .args([
+            "--hook-gate",
+            "--agent",
+            "claude-code",
+            "--pipe",
+            &missing_pipe,
+            "--data-dir",
+            &dir.path().to_string_lossy(),
+            "--timeout-ms",
+            "80",
+        ])
+        .output()
+        .expect("run claudeguard-cli --hook-gate");
+    assert_eq!(out_json.status.code(), Some(0));
+    let parsed: serde_json::Value = serde_json::from_slice(&out_json.stdout).unwrap();
+    assert_eq!(parsed["decision"], "block");
+    assert!(parsed["reason"].as_str().is_some_and(|s| !s.is_empty()));
+
+    // 2) With --exit-code-block (PowerShell wrapper mode), returns exit 2 + stderr.
+    let out_pwsh = Command::new(cli_bin)
+        .env("CG_TEST_NO_OS_FIREWALL", "1")
+        .args([
+            "--hook-gate",
+            "--agent",
+            "claude-code",
+            "--exit-code-block",
+            "--pipe",
+            &missing_pipe,
+            "--data-dir",
+            &dir.path().to_string_lossy(),
+            "--timeout-ms",
+            "80",
+        ])
+        .output()
+        .expect("run claudeguard-cli --hook-gate --exit-code-block");
+    assert_eq!(out_pwsh.status.code(), Some(2));
+    assert!(!String::from_utf8_lossy(&out_pwsh.stderr).trim().is_empty());
+}

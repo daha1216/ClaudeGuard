@@ -38,6 +38,10 @@ pub fn is_readonly_pipe_request(req: &PipeRequest) -> bool {
         req,
         PipeRequest::GetSnapshot
             | PipeRequest::CheckLaunchGate { .. }
+            | PipeRequest::FastHookGate { .. }
+            | PipeRequest::ScanCleanRoom { .. }
+            | PipeRequest::ListCleanRoomBackups
+            | PipeRequest::BuildHealthCard { export_png: false }
             | PipeRequest::QueryLogs { .. }
             | PipeRequest::NotifySystemShutdown
     )
@@ -1312,6 +1316,32 @@ mod tests {
             query: None,
         }));
         assert!(is_readonly_pipe_request(&PipeRequest::NotifySystemShutdown));
+        assert!(is_readonly_pipe_request(&PipeRequest::FastHookGate {
+            agent_id: "claude-code".into(),
+            vault_id: None,
+            hook_event: None,
+        }));
+        assert!(is_readonly_pipe_request(&PipeRequest::ScanCleanRoom {
+            scope: Default::default(),
+        }));
+        assert!(is_readonly_pipe_request(&PipeRequest::ListCleanRoomBackups));
+        assert!(is_readonly_pipe_request(&PipeRequest::BuildHealthCard {
+            export_png: false,
+        }));
+        assert!(!is_readonly_pipe_request(&PipeRequest::BuildHealthCard {
+            export_png: true,
+        }));
+        assert!(!is_readonly_pipe_request(
+            &PipeRequest::TriggerPanicLockdown
+        ));
+        assert!(!is_readonly_pipe_request(
+            &PipeRequest::ClearWfpBlockedEvents
+        ));
+        assert!(!is_readonly_pipe_request(&PipeRequest::RunDeepRiskAudit));
+        assert!(!is_readonly_pipe_request(
+            &PipeRequest::ClearGeoVelocityCooldown
+        ));
+        assert!(!is_readonly_pipe_request(&PipeRequest::SyncWslBridge));
         assert!(!is_readonly_pipe_request(&PipeRequest::Rearm));
         assert!(!is_readonly_pipe_request(
             &PipeRequest::DisarmAndRestoreFlowB { reason: None }

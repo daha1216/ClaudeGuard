@@ -300,6 +300,14 @@ pub enum WalAction {
     KillProcesses {
         agent_ids: Vec<String>,
     },
+    /// M1: Opt-in persistent early boot-time WFP sublayer synchronization.
+    WfpPersistentSync {
+        sublayer_guid: String,
+    },
+    /// M3: Patched Electron desktop shortcut hygiene backup pointer for rollback.
+    PatchShortcutHygiene {
+        backup_path: String,
+    },
 }
 
 /// Planned step written before OS mutation begins.
@@ -509,6 +517,25 @@ pub fn validate_journal_safety(journal: &RecoveryJournal) -> Result<(), String> 
                 }
             }
             WalAction::AlignLocation { .. } | WalAction::KillProcesses { .. } => {}
+            WalAction::WfpPersistentSync { sublayer_guid } => {
+                if !is_valid_guid(sublayer_guid) {
+                    return Err(format!(
+                        "step {} contains invalid WFP sublayer GUID '{}'",
+                        step.step_id, sublayer_guid
+                    ));
+                }
+            }
+            WalAction::PatchShortcutHygiene { backup_path } => {
+                if backup_path.trim().is_empty()
+                    || backup_path.contains(['\r', '\n', '\0'])
+                    || backup_path.contains("..")
+                {
+                    return Err(format!(
+                        "step {} contains invalid shortcut backup path '{}'",
+                        step.step_id, backup_path
+                    ));
+                }
+            }
         }
     }
     for nic in &journal.baseline.enabled_nics {
@@ -753,6 +780,16 @@ pub trait RecoveryExecutor: Send + Sync {
 
     /// Restores or clears the Windows Sensor default location override.
     fn restore_location(&self, lat: Option<&str>, lon: Option<&str>) -> Result<(), String>;
+
+    /// M1: Idempotently clears persistent boot-time WFP filters (returns removed count).
+    fn clear_wfp_persistent_filters(&self) -> Result<usize, String> {
+        Ok(0)
+    }
+
+    /// M3: Idempotently restores patched Electron desktop shortcuts from a WAL backup JSON path.
+    fn restore_shortcut_hygiene_backup(&self, _backup_path: &str) -> Result<usize, String> {
+        Ok(0)
+    }
 }
 
 /// No-op recovery executor for Wave-1 foreground/dev mode when platform drivers are not yet wired.
@@ -877,6 +914,29 @@ impl RecoveryExecutor for PlatformRecoveryExecutor {
         };
         match res {
             Ok(()) | Err(PlatformError::Unsupported { .. }) => Ok(()),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    fn clear_wfp_persistent_filters(&self) -> Result<usize, String> {
+        if !self.driver.capabilities().app_quarantine {
+            return Ok(0);
+        }
+        match cg_platform::wfp_win::clear_persistent_filters() {
+            Ok(report) => Ok(report.removed),
+            Err(PlatformError::Unsupported { .. }) => Ok(0),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    fn restore_shortcut_hygiene_backup(&self, backup_path: &str) -> Result<usize, String> {
+        let path = Path::new(backup_path);
+        if !path.is_file() {
+            return Ok(0);
+        }
+        match cg_platform::hygiene_win::restore_shortcut_from_backup(path, None) {
+            Ok(count) => Ok(count),
+            Err(PlatformError::Unsupported { .. }) => Ok(0),
             Err(err) => Err(err.to_string()),
         }
     }
@@ -1045,6 +1105,8 @@ fn heal_from_journal(
     let mut seen_guids: BTreeSet<String> = BTreeSet::new();
     let mut restore_tz: Option<String> = None;
     let mut restore_loc: Option<(Option<String>, Option<String>)> = None;
+    let mut clear_wfp_persistent = false;
+    let mut shortcut_backups: Vec<String> = Vec::new();
 
     // Reverse planned steps deterministically (last applied -> first undone).
     for step in journal.planned_steps.iter().rev() {
@@ -1068,6 +1130,14 @@ fn heal_from_journal(
                 restore_loc.get_or_insert_with(|| (from_lat.clone(), from_lon.clone()));
             }
             WalAction::KillProcesses { .. } => {}
+            WalAction::WfpPersistentSync { .. } => {
+                clear_wfp_persistent = true;
+            }
+            WalAction::PatchShortcutHygiene { backup_path } => {
+                if !shortcut_backups.contains(backup_path) {
+                    shortcut_backups.push(backup_path.clone());
+                }
+            }
         }
     }
 
@@ -1127,6 +1197,32 @@ fn heal_from_journal(
         match executor.restore_location(lat.as_deref(), lon.as_deref()) {
             Ok(()) => report.push("restore_location", true, "restored sensor location"),
             Err(err) => report.push("restore_location", false, err),
+        }
+    }
+
+    // Step 3b: Clear persistent boot-time WFP filters and restore shortcut hygiene backups if recorded.
+    if clear_wfp_persistent {
+        match executor.clear_wfp_persistent_filters() {
+            Ok(removed) => report.push(
+                "clear_wfp_persistent_filters",
+                true,
+                format!("cleared {removed} persistent WFP filter(s)"),
+            ),
+            Err(err) => report.push("clear_wfp_persistent_filters", false, err),
+        }
+    }
+    for backup_path in &shortcut_backups {
+        match executor.restore_shortcut_hygiene_backup(backup_path) {
+            Ok(count) => report.push(
+                format!("restore_shortcut_hygiene:{backup_path}"),
+                true,
+                format!("restored {count} shortcut(s)"),
+            ),
+            Err(err) => report.push(
+                format!("restore_shortcut_hygiene:{backup_path}"),
+                false,
+                err,
+            ),
         }
     }
 
@@ -1340,6 +1436,19 @@ pub(crate) mod tests {
                 _ => None,
             };
             Ok(())
+        }
+
+        fn clear_wfp_persistent_filters(&self) -> Result<usize, String> {
+            let mut st = self.state.lock().unwrap();
+            st.calls.push("clear_wfp_persistent_filters".to_string());
+            Ok(2)
+        }
+
+        fn restore_shortcut_hygiene_backup(&self, backup_path: &str) -> Result<usize, String> {
+            let mut st = self.state.lock().unwrap();
+            st.calls
+                .push(format!("restore_shortcut_hygiene_backup:{backup_path}"));
+            Ok(1)
         }
     }
 
@@ -1596,6 +1705,78 @@ pub(crate) mod tests {
         assert_eq!(report.status, HealStatus::Failed);
         assert!(!report.ok);
         assert!(exec.state.lock().unwrap().calls.is_empty());
+    }
+
+    #[test]
+    fn v5_wal_wfp_persistent_and_shortcut_hygiene_validate_and_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JournalStore::new(dir.path());
+
+        // Invalid sublayer GUID rejected.
+        let bad_wfp = PlannedStep {
+            step_id: 1,
+            description: "bad wfp guid".into(),
+            action: WalAction::WfpPersistentSync {
+                sublayer_guid: "not-a-guid".into(),
+            },
+        };
+        assert!(store
+            .begin_tx(
+                1,
+                TxKind::Composite,
+                vec![bad_wfp],
+                BaselineState::default()
+            )
+            .is_err());
+
+        // Path traversal in backup_path rejected.
+        let bad_shortcut = PlannedStep {
+            step_id: 2,
+            description: "bad traversal".into(),
+            action: WalAction::PatchShortcutHygiene {
+                backup_path: r"C:\Temp\..\evil.json".into(),
+            },
+        };
+        assert!(store
+            .begin_tx(
+                1,
+                TxKind::Composite,
+                vec![bad_shortcut],
+                BaselineState::default()
+            )
+            .is_err());
+
+        // Valid v5 WAL actions heal cleanly on startup and clear journal.
+        let valid_steps = vec![
+            PlannedStep {
+                step_id: 1,
+                description: "arm persistent wfp boot guard".into(),
+                action: WalAction::WfpPersistentSync {
+                    sublayer_guid: "{9c4e7a23-5b38-4f19-a8d2-61e0c3f94b03}".into(),
+                },
+            },
+            PlannedStep {
+                step_id: 2,
+                description: "patch desktop shortcut".into(),
+                action: WalAction::PatchShortcutHygiene {
+                    backup_path: r"C:\ProgramData\ClaudeGuard\shortcut_bak.json".into(),
+                },
+            },
+        ];
+        store
+            .begin_tx(2, TxKind::Composite, valid_steps, BaselineState::default())
+            .expect("valid v5 WAL");
+
+        let exec = MockRecoveryExecutor::new(MockRecoveryState::default());
+        let report = heal_on_startup(&store, &exec);
+        assert_eq!(report.status, HealStatus::RecoveredFromCrash);
+        assert!(report.ok && report.verified);
+        assert!(!store.path().exists());
+        let calls = &exec.state.lock().unwrap().calls;
+        assert!(calls.iter().any(|c| c == "clear_wfp_persistent_filters"));
+        assert!(calls.iter().any(|c| {
+            c == r"restore_shortcut_hygiene_backup:C:\ProgramData\ClaudeGuard\shortcut_bak.json"
+        }));
     }
 
     #[test]

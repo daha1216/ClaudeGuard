@@ -132,6 +132,10 @@ fn component_toast(id: &str) -> &'static str {
         "codex_cli" => "已检测 Codex CLI 版本",
         "antigravity_ide" => "已检测 Antigravity IDE 版本",
         "antigravity_cn" => "已检测 Antigravity 汉化仓库",
+        "cursor_ide" => "已检测 Cursor IDE 版本",
+        "windsurf_ide" => "已检测 Windsurf IDE 版本",
+        "zed_ide" => "已检测 Zed IDE 版本",
+        "trae_ide" => "已检测 Trae IDE 版本",
         _ => "已完成版本检测",
     }
 }
@@ -607,7 +611,56 @@ pub fn render_updates_page(
                 || checking_plugins
                 || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("antigravity_cn".into())),
         },
+        GridCardSpec {
+            item: &updates.cursor_ide,
+            icon_key: "cursor",
+            title: "Cursor IDE",
+            subtitle: "Anysphere 桌面端",
+            source: "官方源",
+            is_repo_track: false,
+            repo_url: Some("https://www.cursor.com/downloads"),
+            has_plugins_btn: false,
+            is_checking: checking_all
+                || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("cursor_ide".into())),
+        },
+        GridCardSpec {
+            item: &updates.windsurf_ide,
+            icon_key: "windsurf",
+            title: "Windsurf IDE",
+            subtitle: "Codeium 桌面端",
+            source: "官方源",
+            is_repo_track: false,
+            repo_url: Some("https://windsurf.com/download"),
+            has_plugins_btn: false,
+            is_checking: checking_all
+                || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("windsurf_ide".into())),
+        },
+        GridCardSpec {
+            item: &updates.zed_ide,
+            icon_key: "zed",
+            title: "Zed IDE",
+            subtitle: "zed-industries/zed",
+            source: "GitHub",
+            is_repo_track: false,
+            repo_url: Some("https://github.com/zed-industries/zed/releases"),
+            has_plugins_btn: false,
+            is_checking: checking_all
+                || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("zed_ide".into())),
+        },
+        GridCardSpec {
+            item: &updates.trae_ide,
+            icon_key: "trae",
+            title: "Trae IDE",
+            subtitle: "Trae 官方桌面端",
+            source: "官方源",
+            is_repo_track: false,
+            repo_url: Some("https://www.trae.ai/"),
+            has_plugins_btn: false,
+            is_checking: checking_all
+                || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("trae_ide".into())),
+        },
     ];
+    let grid_total = grid_items.len();
     let avail_grid = grid_items
         .iter()
         .filter(|g| g.item.phase == UpdateCheckPhase::UpdateAvailable)
@@ -628,27 +681,31 @@ pub fn render_updates_page(
     let (grid_summary_text, grid_summary_color, grid_summary_dot) =
         if avail_grid > 0 && failed_grid > 0 {
             (
-                format!("6 项追踪 · {avail_grid} 项可更新 · {failed_grid} 项失败"),
+                format!("{grid_total} 项追踪 · {avail_grid} 项可更新 · {failed_grid} 项失败"),
                 p.badge_warn.text,
                 Some(p.badge_warn.dot),
             )
         } else if avail_grid > 0 {
             (
-                format!("6 项追踪 · {avail_grid} 项可更新"),
+                format!("{grid_total} 项追踪 · {avail_grid} 项可更新"),
                 p.badge_warn.text,
                 Some(p.badge_warn.dot),
             )
         } else if failed_grid > 0 {
             (
-                format!("6 项追踪 · {failed_grid} 项失败"),
+                format!("{grid_total} 项追踪 · {failed_grid} 项失败"),
                 p.badge_fail.text,
                 Some(p.badge_fail.dot),
             )
         } else if checked_grid == 0 {
-            ("6 项追踪 · 尚未巡检".into(), p.text_muted, None)
+            (
+                format!("{grid_total} 项追踪 · 尚未巡检"),
+                p.text_muted,
+                None,
+            )
         } else {
             (
-                "6 项追踪 · 均已最新".into(),
+                format!("{grid_total} 项追踪 · 均已最新"),
                 p.text_primary,
                 Some(p.badge_pass.dot),
             )
@@ -664,8 +721,8 @@ pub fn render_updates_page(
                 ctrl.clone(),
                 spec,
                 CardMotion {
-                    pose: choreo.tile(1 + row_idx, col_idx),
-                    icon_scale: choreo.icon_scale(2 + row_idx, col_idx),
+                    pose: choreo.tile(1 + row_idx.min(3), col_idx),
+                    icon_scale: choreo.icon_scale(2 + row_idx.min(2), col_idx),
                 },
                 plugin_ups,
                 can_check_base,
@@ -674,24 +731,12 @@ pub fn render_updates_page(
             )
         })
         .collect();
-    let row1 = div()
-        .flex()
-        .flex_row()
-        .w_full()
-        .gap(px(10.))
-        .children(cards.drain(0..2));
-    let row2 = div()
-        .flex()
-        .flex_row()
-        .w_full()
-        .gap(px(10.))
-        .children(cards.drain(0..2));
-    let row3 = div()
-        .flex()
-        .flex_row()
-        .w_full()
-        .gap(px(10.))
-        .children(cards);
+    let mut grid_rows: Vec<Div> = Vec::new();
+    while !cards.is_empty() {
+        let take_n = cards.len().min(2);
+        let pair: Vec<Div> = cards.drain(0..take_n).collect();
+        grid_rows.push(div().flex().flex_row().w_full().gap(px(10.)).children(pair));
+    }
     let sec_hover = p.sidebar_hover_bg;
 
     div()
@@ -847,7 +892,7 @@ pub fn render_updates_page(
                                 } else if checking_all {
                                     "巡检中…"
                                 } else {
-                                    "全部巡检 (10)"
+                                    "全部巡检 (14)"
                                 },
                                 ButtonKind::Primary,
                                 can_check_all,
@@ -863,7 +908,7 @@ pub fn render_updates_page(
                                         ctrl_check_all.update(cx, |c, cx| {
                                             c.send_request(
                                                 PipeRequest::CheckUpdates { component: None },
-                                                Some("已完成全部 10 项版本巡检"),
+                                                Some("已完成全部 14 项版本巡检"),
                                                 cx,
                                             );
                                         });
@@ -1143,9 +1188,7 @@ pub fn render_updates_page(
                                 ),
                         ),
                 ))
-                .child(row1)
-                .child(row2)
-                .child(row3),
+                .children(grid_rows),
         )
 }
 

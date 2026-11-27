@@ -18,12 +18,29 @@ pub const GUI_AGENTS: &[GuiAgentDef] = &[
         id: "antigravity",
         name: "反重力",
     },
+    GuiAgentDef {
+        id: "cursor",
+        name: "Cursor",
+    },
+    GuiAgentDef {
+        id: "windsurf",
+        name: "Windsurf",
+    },
+    GuiAgentDef {
+        id: "zed",
+        name: "Zed",
+    },
+    GuiAgentDef {
+        id: "trae",
+        name: "Trae",
+    },
 ];
 
 pub const CLI_AGENTS: &[(&str, &str)] = &[
     ("claude-code", "Claude Code"),
     ("codex", "Codex CLI"),
     ("gemini", "Gemini CLI"),
+    ("aider", "Aider CLI"),
 ];
 
 pub fn agent_ids() -> Vec<&'static str> {
@@ -163,12 +180,55 @@ pub fn gui_agent_matches_with_all_dirs(
                     .iter()
                     .any(|dir| path_under_dir_l(exe_path_l, dir))
         }
+        "cursor" => {
+            exe_name_l == "cursor.exe"
+                || exe_path_l.contains(r"\programs\cursor\")
+                || exe_path_l.contains(r"\cursor\resources\app\")
+        }
+        "windsurf" => {
+            exe_name_l == "windsurf.exe"
+                || exe_path_l.contains(r"\programs\windsurf\")
+                || exe_path_l.contains(r"\windsurf\resources\app\")
+        }
+        "zed" => {
+            exe_name_l == "zed.exe"
+                || exe_name_l == "zed-cli.exe"
+                || exe_path_l.contains(r"\programs\zed\")
+                || exe_path_l.contains(r"\apps\zed\")
+        }
+        "trae" => {
+            exe_name_l == "trae.exe"
+                || exe_path_l.contains(r"\programs\trae\")
+                || exe_path_l.contains(r"\trae\resources\app\")
+        }
         _ => false,
     }
 }
 
+/// Pure GUI process fingerprint match with explicit custom install directories for any agent id.
+pub fn gui_agent_matches_with_custom_dirs(
+    id: &str,
+    exe_name_l: &str,
+    exe_path_l: &str,
+    custom_dirs_l: &[String],
+) -> bool {
+    if is_uninstaller_exe(exe_name_l) {
+        return false;
+    }
+    if id == "claude" && is_claude_cli_path_l(exe_path_l) {
+        return false;
+    }
+    gui_agent_matches(id, exe_name_l, exe_path_l, None)
+        || custom_dirs_l
+            .iter()
+            .any(|dir| path_under_dir_l(exe_path_l, dir))
+}
+
 /// Pure CLI process fingerprint match (CLI is warned/orphan-swept, or killed on trip when `kill_cli_on_fail` is enabled).
 pub fn cli_agent_matches(id: &str, exe_name_l: &str, exe_path_l: &str, cmd_l: &str) -> bool {
+    if is_uninstaller_exe(exe_name_l) {
+        return false;
+    }
     match id {
         "claude-code" => {
             cmd_l.contains(r"@anthropic-ai\claude-code")
@@ -194,6 +254,21 @@ pub fn cli_agent_matches(id: &str, exe_name_l: &str, exe_path_l: &str, cmd_l: &s
                 || exe_path_l.contains("codex-win32-")
         }
         "gemini" => cmd_l.contains("gemini-cli"),
+        "aider" => {
+            exe_name_l == "aider.exe"
+                || exe_name_l == "aider"
+                || exe_path_l.contains(r"\aider\")
+                || exe_path_l.contains(r"\aider-chat\")
+                || exe_path_l.contains(r"\tools\aider-chat\")
+                || cmd_l == "aider"
+                || cmd_l.starts_with("aider ")
+                || cmd_l.starts_with("aider.exe ")
+                || cmd_l.contains("aider-chat")
+                || cmd_l.contains("aider.main")
+                || cmd_l.contains(" -m aider")
+                || cmd_l.contains(r"\scripts\aider")
+                || cmd_l.contains("/bin/aider")
+        }
         _ => false,
     }
 }
@@ -492,6 +567,135 @@ mod tests {
             "codex.exe",
             r"c:\users\dev\appdata\roaming\npm\node_modules\@openai\codex-win32-x64\codex.exe",
             ""
+        ));
+    }
+
+    #[test]
+    fn v5_seven_gui_and_four_cli_agents_match_accurately_and_exclude_uninstallers() {
+        assert_eq!(agent_ids().as_slice(), &cg_protocol::KNOWN_GUI_AGENT_IDS);
+        let cli_ids: Vec<&str> = CLI_AGENTS.iter().map(|(id, _)| *id).collect();
+        assert_eq!(cli_ids.as_slice(), &cg_protocol::KNOWN_CLI_AGENT_IDS);
+
+        // Cursor
+        assert!(gui_agent_matches(
+            "cursor",
+            "cursor.exe",
+            r"c:\users\dev\appdata\local\programs\cursor\cursor.exe",
+            None
+        ));
+        assert!(gui_agent_matches(
+            "cursor",
+            "rg.exe",
+            r"c:\users\dev\appdata\local\programs\cursor\resources\app\bin\rg.exe",
+            None
+        ));
+        assert!(!gui_agent_matches(
+            "cursor",
+            "unins000.exe",
+            r"c:\users\dev\appdata\local\programs\cursor\unins000.exe",
+            None
+        ));
+
+        // Windsurf
+        assert!(gui_agent_matches(
+            "windsurf",
+            "windsurf.exe",
+            r"c:\users\dev\appdata\local\programs\windsurf\windsurf.exe",
+            None
+        ));
+        assert!(gui_agent_matches(
+            "windsurf",
+            "language_server_windows_x64.exe",
+            r"c:\users\dev\appdata\local\programs\windsurf\resources\app\extensions\windsurf\bin\language_server_windows_x64.exe",
+            None
+        ));
+        assert!(!gui_agent_matches(
+            "windsurf",
+            "unins000.exe",
+            r"c:\users\dev\appdata\local\programs\windsurf\unins000.exe",
+            None
+        ));
+
+        // Zed
+        assert!(gui_agent_matches(
+            "zed",
+            "zed.exe",
+            r"c:\users\dev\appdata\local\programs\zed\zed.exe",
+            None
+        ));
+        assert!(gui_agent_matches(
+            "zed",
+            "zed-cli.exe",
+            r"c:\users\dev\scoop\apps\zed\current\zed-cli.exe",
+            None
+        ));
+        assert!(!gui_agent_matches(
+            "zed",
+            "uninstall.exe",
+            r"c:\users\dev\appdata\local\programs\zed\uninstall.exe",
+            None
+        ));
+
+        // Trae
+        assert!(gui_agent_matches(
+            "trae",
+            "trae.exe",
+            r"c:\users\dev\appdata\local\programs\trae\trae.exe",
+            None
+        ));
+        assert!(gui_agent_matches(
+            "trae",
+            "marscode-helper.exe",
+            r"c:\users\dev\appdata\local\programs\trae\resources\app\marscode-helper.exe",
+            None
+        ));
+        assert!(!gui_agent_matches(
+            "trae",
+            "unins000.exe",
+            r"c:\users\dev\appdata\local\programs\trae\unins000.exe",
+            None
+        ));
+
+        // Custom dirs helper
+        let custom_trae = vec![r"d:\ides\trae".to_string()];
+        assert!(gui_agent_matches_with_custom_dirs(
+            "trae",
+            "ai-agent.exe",
+            r"d:\ides\trae\bin\ai-agent.exe",
+            &custom_trae
+        ));
+        assert!(!gui_agent_matches_with_custom_dirs(
+            "trae",
+            "unins000.exe",
+            r"d:\ides\trae\unins000.exe",
+            &custom_trae
+        ));
+
+        // Aider CLI
+        assert!(cli_agent_matches(
+            "aider",
+            "aider.exe",
+            r"c:\users\dev\.local\bin\aider.exe",
+            ""
+        ));
+        assert!(cli_agent_matches(
+            "aider",
+            "python.exe",
+            r"c:\users\dev\appdata\roaming\uv\tools\aider-chat\scripts\python.exe",
+            r"python -m aider --model claude-3-7-sonnet"
+        ));
+        assert!(cli_agent_matches(
+            "aider",
+            "python.exe",
+            r"c:\python312\python.exe",
+            r"python c:\users\dev\.local\pipx\venvs\aider-chat\scripts\aider"
+        ));
+        // Negative: never false-match unrelated binaries containing "raider"
+        assert!(!cli_agent_matches(
+            "aider",
+            "tomb_raider.exe",
+            r"d:\games\tomb_raider.exe",
+            "tomb_raider.exe"
         ));
     }
 }

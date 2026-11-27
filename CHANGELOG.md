@@ -4,6 +4,60 @@
 
 日期为实际发布日期（UTC / UTC+8）。更早的历史版本记录见 [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases)。
 
+## [5.0.0] - 2026-11-27
+
+**反封号堡垒大版本（Anti-Ban Fortress，M1–M7 全模块落地）**：全面引入 Win32 WFP 内核态动态过滤与实时拦截瀑布流、10 维封号风险雷达与 290+ 离线 ASN 库、DPAPI-HMAC 7 天地理速度账本、原生 RFC 5389 STUN 与 Electron 参数卫生治理、独立多账号金库（Sovereign Vaults）、4 维无尘室清理器与 `CGBAK005` 加密时光机、`<2ms` O(1) CLI Hook 门禁与 WSL2 HMAC 桥接，并将受管矩阵扩展至 7 款 AI 桌面客户端 + 4 款 CLI。
+
+### M1 · Win32 WFP 内核态防漏引擎与实时阻断瀑布流
+
+- **动态 WFP 子层 + 混合回退引擎（`cg-platform::wfp_win` / `HybridFirewallEngine`）**：
+  - 默认启用 `AutoWfpFirst`（支持 `WfpOnly` / `ComLegacy` 切换），通过 `FWPM_SESSION_DYNAMIC` 挂载动态子层（高优先级 `0xFF00`），守护异常退出时由内核 BFE 自动清理防断网；同时提供默认关闭的开机早期保护选项（`wfp_boot_guard: false`，持久化子层 `0xFF10` 与 `FWPM_FILTER_FLAG_BOOTTIME`，动态/持久 Provider GUID 严格隔离避免 `FWP_E_LIFETIME_MISMATCH`）。
+  - 接入 `FwpmNetEventSubscribe4` 实时订阅 WFP 丢包事件并在 GPUI 熔断实况页展示脱敏拦截瀑布流，WAL 账本与 `claudeguard-cli --restore` 同步支持离线持久化 WFP 规则幂等清零。
+
+### M2 · 10 维封号风险雷达、290+ 离线 ASN 库与 7 天地理速度账本
+
+- **10 维确定性封号风险评估（`cg-core::risk_scorer` / `cg-core::asn_db` / `cg-platform::ip_intel`）**：
+  - 综合出口类型（住宅 / 机房 / 云厂商 / 公共代理）、地区合规性、地理瞬移速度、QUIC/DNS/IPv6/WebRTC 防漏覆盖、时区语言一致性、客户端参数卫生与异常请求节拍输出 0–100 安全分与 `S / A / B / C / D` 风险等级。
+  - 内置 290+ 离线 ASN 分类库，零外部依赖即可在本地识别主流数据中心、住宅宽带与共享代理网段。
+- **DPAPI-HMAC 7 天滚动地理速度账本（`cg-daemon::egress_ledger`）**：
+  - 使用本机 DPAPI 封装密钥（`ledger_key.dpapi`）对出口 IP 执行 HMAC-SHA256 摘要入账（`egress_history.json`，磁盘绝不落盘明文 IP），实时识别跨国/跨洲短时瞬移并触发账户冷却保护与按金库独立冷却清零。
+
+### M3 · 原生 RFC 5389 STUN 探测与 Electron 参数卫生治理
+
+- **纯 Rust RFC 5389 STUN 探测（`cg-platform::stun_probe`）**：
+  - 原生构造与解析 STUN Binding 报文，精准探测 UDP / WebRTC 潜在真实出口泄露，并与代理出口交叉核验。
+- **`NtQueryInformationProcess(60)` 命令行审计与卫生清理（`cg-platform::hygiene_win` / `cg-core::hygiene_plan`）**：
+  - 通过原生 `NtQueryInformationProcess(ProcessCommandLineInformation)` 检视运行中的 Electron / Chromium AI 客户端代理与网络参数，审计快捷方式启动参数污染并在 WAL 保护下安全修复或回滚。
+
+### M4 · 独立多账号沙箱金库（Sovereign Multi-Account Vaults）
+
+- **账号级配置隔离与出口绑定（`cg-platform::vault_win` / `cg-daemon` / `cg-gui::views::vaults`）**：
+  - 为每个账号分配独立隔离数据目录（`--user-data-dir` / `CLAUDE_CONFIG_DIR`）、绑定专属合规出口 IP/地区基线，并支持一键采纳当前已核验出口作为基线与创建桌面 `.lnk` 专属安全启动入口（`claudeguard-cli vault launch --vault <id>`）。
+  - 坚持只读零越权底线：`auto_align_mihomo_on_vault_launch` 默认关闭，出口不匹配时硬拦截启动而不擅自改写用户代理策略。
+
+### M5 · 4 维无尘室清理器与 `CGBAK005` 加密时光机
+
+- **4 维残留扫描与 100% 代码资产保护（`cg-platform::cleanroom_win` / `cg-platform::crypto_win` / `cg-gui::views::cleanroom`）**：
+  - 支持 `claudeguard-cli --cleanroom-scan` 与 GPUI 3 步式无尘室清理，覆盖遥测标识、账号缓存/Cookie、设备指纹与代理痕迹 4 大向量，内置绿色保护盾严格豁免项目代码与自定义配置。
+  - 任何清理前自动生成 `CGBAK005` 格式加密归档（Windows CNG AES-256-GCM + DPAPI 密钥封装，`.cgbak`），支持随时一键时光机无损恢复。
+
+### M6 · `<2ms` O(1) CLI Hook 门禁、WSL2 HMAC 桥接与 `BurstGuard`
+
+- **亚 2 毫秒预检门禁与自动 Hook 安装（`cg-daemon::coordinator` / `cg-daemon::hook_installer` / `claudeguard-cli`）**：
+  - 新增 `claudeguard-cli --hook-gate`（支持 Claude Code 官方 Hook JSON 阻断格式及 `--exit-code-block` PowerShell 退出码模式），依托内存态 O(1) `FastHookGate` 在 2ms 内完成合规与节拍判定。
+  - 一键幂等合并 Claude Code `settings.json`（保留既有钩子、非法 JSON 安全中止）与 PowerShell `$PROFILE`（UTF-8 BOM + CRLF）拦截包装块。
+- **WSL2 回环 HMAC 桥接与 `BurstGuard` 节拍保护（`cg-daemon::wsl_bridge` / `cg-core::burst_guard`）**：
+  - 仅监听 `127.0.0.1:0` 的 WSL2 桥接服务，基于每次启动轮换的 256-bit `.claudeguard-wsl-token`（受限用户 DACL）、HMAC-SHA256、60 秒时间窗与 512 容量 LRU Nonce 防重放缓存，并检测宿主机与 WSL2 代理失步。
+  - `BurstGuard` 追踪高频请求与机械等间隔自动化节拍，及时预警或节流降低风控触发概率。
+
+### M7 · 7 桌面端 + 4 CLI 全栈矩阵、全局快捷键与零泄露健康卡
+
+- **7 GUI + 4 CLI 扩展守护矩阵（`cg-core::agents` / `cg-platform::process_win` / `cg-platform::update_check`）**：
+  - 桌面端新增 `Cursor`、`Windsurf`、`Zed`、`Trae`（连同 `Claude Desktop`、`ChatGPT / Codex`、`Antigravity IDE` 共 7 款）守护与本地版本检测；CLI 扩展至 `Claude Code`、`Codex CLI`、`Gemini CLI`、`Aider CLI`（共 4 款）。
+- **原生 Win32 全局热键与零 IP 泄露健康诊断卡（`cg-gui::tray_win` / `cg-gui::health_card`）**：
+  - 通过托盘隐藏窗口原生 `RegisterHotKey` 注册全局「紧急一键锁死」与「快捷 HUD」热键（零 `SetWindowsHookEx` 钩子、退出自动注销、冲突优雅提示）。
+  - 新增零外部依赖纯 Rust 脱敏健康卡（Markdown 文本 + `1200×680` Frost Ceramic / Obsidian 无元数据 PNG 导出），单元测试强约束零 IP、零 Windows 用户名泄露。
+
 ## [4.1.4] - 2026-11-27
 
 **TUN 重启零误锁自愈与反重力代理自动补注入完善版**：彻底根治 Windows 重启/关机竞态下 TUN 先退引发的误熔断、开机早于防火墙就绪导致的 `Degraded` 卡死无恢复路径（#25，感谢 @HL-slc 详尽复现分析），合入并完善社区反重力代理 ZIP 选包与客户端自更新后自动补注入机制（#26，感谢 @bkMoon1024 贡献 PR）。

@@ -23,7 +23,7 @@ pub const SERVICE_DISPLAY_NAME: &str = "ClaudeGuard Daemon Service";
 
 /// Service description registered in SCM.
 pub const SERVICE_DESCRIPTION: &str =
-    "ClaudeGuard v4 network egress guard, WAL crash recovery, and Named Pipe IPC coordinator";
+    "ClaudeGuard v5 kernel WFP network egress guard, WAL crash recovery, Sovereign Vaults, and Named Pipe IPC coordinator";
 
 /// Behavior on Windows Service stop or OS shutdown control signals.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,13 +175,15 @@ pub struct DaemonConfig {
     pub enable_background_loop: bool,
 }
 
-/// Live daemon runtime assembling WAL startup heal, `RealEngineActor`, background monitor, and Named Pipe server.
+/// Live daemon runtime assembling WAL startup heal, `RealEngineActor`, background monitor,
+/// WSL2 loopback HMAC bridge, and Named Pipe server.
 pub struct DaemonRuntime {
     config: DaemonConfig,
     heal_report: HealReport,
     coordinator: CoordinatorHandle,
     pipe_server: PipeServer,
     monitor: Option<BackgroundMonitorHandle>,
+    wsl_bridge: Option<crate::wsl_bridge::WslBridgeServer>,
 }
 
 impl DaemonRuntime {
@@ -199,20 +201,21 @@ impl DaemonRuntime {
         crate::journal::ensure_secure_data_dir(&config.data_dir)?;
         let data_dir = config.data_dir.clone();
         let bg_driver = driver.clone();
-        let (coordinator, (heal_report, process_scanner)) = start_coordinator_with(|event_tx| {
-            let boot = RealEngineActor::bootstrap(
-                data_dir,
-                driver,
-                probe_runner,
-                recovery_executor,
-                event_tx,
-            );
-            (
-                boot.initial_snapshot,
-                Box::new(boot.actor),
-                (boot.heal_report, boot.process_scanner),
-            )
-        });
+        let (coordinator, (heal_report, process_scanner, egress_ledger)) =
+            start_coordinator_with(|event_tx| {
+                let boot = RealEngineActor::bootstrap(
+                    data_dir,
+                    driver,
+                    probe_runner,
+                    recovery_executor,
+                    event_tx,
+                );
+                (
+                    boot.initial_snapshot,
+                    Box::new(boot.actor),
+                    (boot.heal_report, boot.process_scanner, boot.egress_ledger),
+                )
+            });
 
         let pipe_server = match PipeServer::start(&config.pipe_name, coordinator.clone()) {
             Ok(srv) => srv,
@@ -225,11 +228,54 @@ impl DaemonRuntime {
             }
         };
 
+        let wsl_bridge = if config.enable_background_loop {
+            let init_snap = coordinator.snapshot();
+            if init_snap.config.wsl_bridge_enabled {
+                let token_dir = crate::hook_installer::resolve_interactive_user_home();
+                match crate::wsl_bridge::WslBridgeServer::start(
+                    coordinator.clone(),
+                    token_dir.as_deref(),
+                    init_snap.config.proxy_port,
+                ) {
+                    Ok(srv) => {
+                        coordinator.update_wsl_bridge_status(srv.status(Vec::new(), false));
+                        Some(srv)
+                    }
+                    Err(err) => {
+                        coordinator.update_wsl_bridge_status(crate::protocol::WslBridgeStatus {
+                            enabled: true,
+                            listening: false,
+                            bound_port: None,
+                            token_ready: false,
+                            synced_distros: Vec::new(),
+                            proxy_desync_detected: false,
+                            summary: format!("WSL2 回环桥接启动失败：{err}"),
+                        });
+                        None
+                    }
+                }
+            } else {
+                coordinator.update_wsl_bridge_status(crate::protocol::WslBridgeStatus {
+                    enabled: false,
+                    listening: false,
+                    bound_port: None,
+                    token_ready: false,
+                    synced_distros: Vec::new(),
+                    proxy_desync_detected: false,
+                    summary: "WSL2 跨子系统桥接已在设置中关闭".into(),
+                });
+                None
+            }
+        } else {
+            None
+        };
+
         let monitor = if config.enable_background_loop {
             Some(BackgroundMonitorHandle::start(
                 coordinator.clone(),
                 bg_driver,
                 process_scanner,
+                egress_ledger,
                 config.data_dir.clone(),
                 true,
             ))
@@ -243,6 +289,7 @@ impl DaemonRuntime {
             coordinator,
             pipe_server,
             monitor,
+            wsl_bridge,
         })
     }
 
@@ -274,6 +321,9 @@ impl DaemonRuntime {
     /// - [`StopBehavior::PreserveFailClosed`]: Stops background loop, pipe server, and coordinator
     ///   while preserving active protection and WAL journal on disk for next-boot `heal_on_startup()`.
     pub fn shutdown_graceful(self, behavior: StopBehavior) -> Result<(), String> {
+        if let Some(wsl) = self.wsl_bridge {
+            wsl.shutdown();
+        }
         if let Some(monitor) = self.monitor {
             monitor.shutdown();
         }

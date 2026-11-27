@@ -2,10 +2,10 @@
   <img src="assets/icon.png" alt="ClaudeGuard Logo" width="128" height="128" />
 </p>
 
-<h1 align="center">ClaudeGuard v4</h1>
+<h1 align="center">ClaudeGuard v5</h1>
 
 <p align="center">
-  <strong>Zero-bypass Windows Service egress gate &amp; native GPUI desktop guardian for AI desktop apps and CLIs</strong>
+  <strong>Anti-Ban Fortress: Win32 WFP kernel egress gate, 10D ban-risk radar, Sovereign Multi-Account Vaults, &lt;2ms CLI hooks &amp; native GPUI guardian for Windows AI apps and CLIs</strong>
 </p>
 
 <p align="center">
@@ -14,13 +14,14 @@
 
 <p align="center">
   <a href="https://github.com/daha1216/ClaudeGuard/releases"><img src="https://img.shields.io/github/v/release/daha1216/ClaudeGuard" alt="GitHub Release" /></a>
+  <img src="https://img.shields.io/badge/Version-v5.0.0%20Anti--Ban%20Fortress-0f766e" alt="v5.0.0 Anti-Ban Fortress" />
   <img src="https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011%20(x64)-blue" alt="Windows 10/11" />
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Rust" />
   <img src="https://img.shields.io/badge/GUI-Native%20GPUI-111317" alt="Native GPUI" />
   <img src="https://img.shields.io/badge/License-MIT%20%2F%20Apache--2.0-green" alt="License" />
 </p>
 
-> **Architecture note**: Starting from **v4.0.0**, ClaudeGuard has been rebuilt from a Tauri 2 single binary into a **Windows Service daemon + native GPUI client** (`claudeguard-daemon.exe` + `claudeguard-gui.exe` + `claudeguard-cli.exe`) — **zero WebView2 dependency, zero daily UAC prompts**, and crash-safe WAL rollback. The legacy v3 codebase (including the community macOS preview) remains preserved on the [`v3`](https://github.com/daha1216/ClaudeGuard/tree/v3) branch and tag [`v3.12.5`](https://github.com/daha1216/ClaudeGuard/releases/tag/v3.12.5).
+> **Architecture note**: Built on the privilege-separated **Windows Service daemon + native GPUI client** (`claudeguard-daemon.exe` + `claudeguard-gui.exe` + `claudeguard-cli.exe`, zero WebView2 dependency, zero daily UAC prompts, crash-safe WAL rollback), **v5.0.0** expands ClaudeGuard into a full **Anti-Ban Fortress (M1–M7)** with dynamic Win32 WFP kernel filtering, a 10D ban-risk radar, Sovereign Multi-Account Vaults, encrypted 4-vector Clean-Room sanitization, `<2ms` O(1) CLI/WSL2 hook gating, and a 7-GUI + 4-CLI guarded matrix. The legacy v3 codebase remains preserved on the [`v3`](https://github.com/daha1216/ClaudeGuard/tree/v3) branch and tag [`v3.12.5`](https://github.com/daha1216/ClaudeGuard/releases/tag/v3.12.5).
 
 ---
 
@@ -138,21 +139,23 @@ All screenshots below are real HiDPI renders captured directly from `claudeguard
 
 ---
 
-## v4 Architecture Highlights
+## v5 Architecture & Anti-Ban Fortress Highlights (M1–M7)
 
-1. **Privilege-Separated 3-Binary Design**:
-   - **`claudeguard-daemon.exe`** (`ClaudeGuardService`, Windows `LocalSystem`): owns firewall COM rules, process termination/orphan cleanup, OS timezone/location writes, `antigravity-proxy` injection checks, proxy-only probing, and WAL recovery. Starts automatically at boot.
-   - **`claudeguard-gui.exe`** (`asInvoker`, normal user token): native GPUI interface with zero WebView2 overhead, spawning guarded AI apps with the user's normal desktop token, relaying desktop toasts in Session-1, and idling at ~0 VRAM in `--tray` mode.
-   - **`claudeguard-cli.exe`**: scriptable `--check` pre-flight check, `--status` diagnostics, and `--restore` emergency recovery (with offline WAL fallback if the service is stopped).
-2. **Hardened Named Pipe IPC (`\\.\pipe\ClaudeGuardV4`)**:
-   - Secured via SDDL ACL (`D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)`) + `PIPE_REJECT_REMOTE_CLIENTS` (blocks remote SMB access, lets normal interactive users talk to Session-0 without daily UAC prompts).
-3. **Write-Ahead Recovery Journal (`journal.json`)**:
-   - Every OS mutation (per-app firewall block, manual lockdown, global outbound cut, NIC disable, OS timezone/location alignment) persists and flushes a WAL transaction *before* changing Windows state. Startup self-healing and `--restore` execute deterministic, verified idempotent cleanup (`list_managed_firewall_rules == 0`).
-4. **Proxy-Only Egress Probing (Zero Direct Fallback)**:
-   - Every target binds its own domain: `Claude` → `claude.ai/cdn-cgi/trace`, `Codex` → `chatgpt.com/cdn-cgi/trace`, `Antigravity` → reachability of `daily-cloudcode-pa.googleapis.com` (`cloudcode-pa.googleapis.com`), `Local Egress` (off by default) → `cloudflare.com/cdn-cgi/trace`, plus custom HTTP trace / JSON IP / page region / reachability targets.
-   - All probes and update checks strictly obey `ProbeRoute` (configured proxy or verified TUN); if no proxy access exists, ClaudeGuard **never probes direct** with your home IP.
-5. **10-Component Read-Only Update Radar**:
-   - Tracks `ClaudeGuard` (`daha1216/ClaudeGuard`), `antigravity-proxy` (`yuaotian/antigravity-proxy`), `Claude Desktop` (MSIX), `Claude Code CLI` (npm), `ChatGPT / Codex Desktop` (MSIX), `Codex CLI` (npm), `Antigravity IDE` (`latest-x64-win.yml`), `Antigravity 中文汉化引擎` (`Silas-02/antigravity-desktop-cn`), `antigravity-usage-monitor` (`yuhuan-dev/antigravity-usage-monitor`), and `agy-capsule` (`Lumidarin/agy-capsule`). Read-only checks only — never auto-overwrites installed clients or plugins.
+1. **Privilege-Separated 3-Binary Design & Hardened Named Pipe IPC (`\\.\pipe\ClaudeGuardV4`)**:
+   - **`claudeguard-daemon.exe`** (`ClaudeGuardService`, Windows `LocalSystem`): owns WFP/COM firewall rules, process governance, OS timezone/location alignment, `antigravity-proxy` injection checks, proxy-only probing, Sovereign Vaults, Clean-Room encryption, and WAL recovery.
+   - **`claudeguard-gui.exe`** (`asInvoker`, normal user token): native GPUI interface with zero WebView2 overhead, native Win32 `RegisterHotKey` panic-lockdown & quick-HUD chords (zero `SetWindowsHookEx`), zero-IP-leak Markdown/PNG Health Card export, and ~0 VRAM in `--tray` mode.
+   - **`claudeguard-cli.exe`**: `<2ms` O(1) `--hook-gate`, `--launch-vault` / `vault launch`, `--cleanroom-scan`, `--check`, `--status`, and `--restore` (including offline WAL + persistent WFP recovery).
+2. **M1 · Dynamic Win32 WFP Kernel Filtering + Live Blocked-Packet Waterfall**:
+   - `AutoWfpFirst` hybrid engine (`FWPM_SESSION_DYNAMIC` sublayer `0xFF00` that auto-clears if the daemon stops, opt-in `wfp_boot_guard: false` persistent `FWPM_FILTER_FLAG_BOOTTIME` sublayer `0xFF10` with separated provider GUIDs, plus COM fallback) and live `FwpmNetEventSubscribe4` blocked-event waterfall with IP privacy masking.
+3. **M2 & M3 · 10D Ban-Risk Radar, 290+ Offline ASN DB, 7-Day Geo-Velocity Ledger, STUN & Electron Hygiene**:
+   - Deterministic 0–100 (`S`–`D`) ban-risk scoring backed by a 290+ entry offline ASN classification table and a DPAPI-HMAC-SHA256 7-day rolling geo-velocity ledger (`egress_history.json`, zero plaintext IPs on disk).
+   - Native RFC 5389 STUN UDP/WebRTC leak detection plus `NtQueryInformationProcess(60)` Electron/Chromium proxy-flag hygiene auditing and WAL-protected shortcut cleanup.
+4. **M4 & M5 · Sovereign Multi-Account Vaults & 4-Vector Clean-Room Sanitizer (`CGBAK005`)**:
+   - Per-account isolated profile directories (`--user-data-dir` / `CLAUDE_CONFIG_DIR`), per-vault egress baselines, desktop `.lnk` launchers, and read-only fail-closed launch enforcement (`auto_align_mihomo_on_vault_launch: false` by default).
+   - 4-vector local residue scanner that preserves 100% of user code/configs and mandates `CGBAK005` Windows CNG AES-256-GCM + DPAPI encrypted `.cgbak` Time-Machine backups before any purge.
+5. **M6 & M7 · `<2ms` O(1) CLI Hooks, WSL2 Loopback HMAC Bridge, `BurstGuard` & 7-GUI + 4-CLI Matrix**:
+   - Idempotent Claude Code `settings.json` hook merge and PowerShell `$PROFILE` wrapper installer, loopback-only (`127.0.0.1:0`) WSL2 HMAC-SHA256 anti-replay bridge (`.claudeguard-wsl-token`), and `BurstGuard` rate/cadence anomaly defense.
+   - Expanded coverage across **7 GUI apps** (`Claude Desktop`, `ChatGPT / Codex`, `Antigravity IDE`, `Cursor`, `Windsurf`, `Zed`, `Trae`) and **4 CLIs** (`Claude Code`, `Codex CLI`, `Gemini CLI`, `Aider CLI`), alongside the 10-component read-only update radar.
 
 ---
 
@@ -160,13 +163,13 @@ All screenshots below are real HiDPI renders captured directly from `claudeguard
 
 Grab the latest release from [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases):
 
-1. **Installer — `ClaudeGuard-v4.1.4-setup.exe` (Recommended)**
+1. **Installer — `ClaudeGuard-v5.0.0-setup.exe` (Recommended)**
    - Registers & starts `ClaudeGuardService` (`LocalSystem`, auto-start at boot) and adds normal-privilege tray autostart (`claudeguard-gui.exe --tray`) so daily usage requires **0 UAC prompts**.
-   - Upgrading from v3 (`v3.x`): shares the same Inno Setup `AppId`, gracefully stops `ClaudeGuard.exe`, cleans up the legacy v3 `HKCU\...\Run\ClaudeGuard` entry, and automatically migrates legacy `config.json` (writing a one-time `config.v3.bak.json` backup).
-   - Uninstall cleanly removes the Windows Service & binaries while deliberately preserving configuration and journals in `%ProgramData%\ClaudeGuard` and `%APPDATA%\ClaudeGuard`.
-2. **In-App Upgrade Bridge — `ClaudeGuard-v4.1.4-upgrade.exe` (For `v3.x` Auto-Update)**
-   - Matched automatically by legacy `v3.x` clients during 6-hour background checks and manual "Check for updates": copies `%APPDATA%\ClaudeGuard\config.json` into `%ProgramData%\ClaudeGuard\config.json`, stages and launches the v4 installer cleanly, waits for completion, and removes legacy `ClaudeGuard.exe`, shortcuts, and staging residue after installation succeeds.
-3. **Portable — `ClaudeGuard-v4.1.4-portable.zip`**
+   - Upgrading from v3 or v4 (`v3.x` / `v4.x`): shares the same Inno Setup `AppId`, gracefully stops running service/tray processes, cleans up legacy v3 `HKCU\...\Run\ClaudeGuard`, and automatically migrates existing `config.json` (preserving backups).
+   - Uninstall runs `claudeguard-cli.exe --restore` to clear firewall/WFP rules before removing the Windows Service & binaries, while deliberately preserving configuration and journals in `%ProgramData%\ClaudeGuard` and `%APPDATA%\ClaudeGuard`.
+2. **In-App Upgrade Bridge — `ClaudeGuard-v5.0.0-upgrade.exe` (For `v3.x` Auto-Update)**
+   - Matched automatically by legacy `v3.x` clients during 6-hour background checks and manual "Check for updates": copies `%APPDATA%\ClaudeGuard\config.json` into `%ProgramData%\ClaudeGuard\config.json`, stages and launches the v5 installer cleanly, waits for completion, and removes legacy `ClaudeGuard.exe`, shortcuts, and staging residue after installation succeeds.
+3. **Portable — `ClaudeGuard-v5.0.0-portable.zip`**
    - Contains `claudeguard-daemon.exe`, `claudeguard-cli.exe`, and `claudeguard-gui.exe`. Run `claudeguard-daemon.exe --console` (elevated) or register the service via `--install-service --start`, then launch `claudeguard-gui.exe` as your normal user.
 
 > Verify integrity anytime against the release `SHA256SUMS.txt`.
@@ -175,13 +178,16 @@ Grab the latest release from [GitHub Releases](https://github.com/daha1216/Claud
 
 ## CLI & GUI Flags
 
-### `claudeguard-cli.exe` (Scriptable & Emergency)
+### `claudeguard-cli.exe` (Sub-2ms Hook Gate, Vaults, Clean-Room & Emergency)
 
 ```powershell
-claudeguard-cli.exe --check              # Query daemon compliance JSON; exit 0=pass, 2=not passed
-claudeguard-cli.exe --check --recheck    # Trigger fresh probe round first, then print compliance JSON
-claudeguard-cli.exe --restore            # Emergency disarm & full firewall/network/env restore (online or offline WAL fallback)
-claudeguard-cli.exe --status             # Print daemon service, WAL journal & live snapshot status JSON
+claudeguard-cli.exe --hook-gate --agent claude-code        # <2ms O(1) pre-prompt gate (Claude Code hook JSON or --exit-code-block)
+claudeguard-cli.exe vault launch --vault <ID> --app <APP>  # Safe-launch an app inside a Sovereign Account Vault
+claudeguard-cli.exe --cleanroom-scan                       # 100% read-only 4-vector local Clean-Room residue scan
+claudeguard-cli.exe --check                                # Query daemon compliance JSON; exit 0=pass, 2=not passed
+claudeguard-cli.exe --check --recheck                      # Trigger fresh probe round first, then print compliance JSON
+claudeguard-cli.exe --restore                              # Emergency disarm & full firewall/WFP/network/env restore (online or offline WAL)
+claudeguard-cli.exe --status                               # Print daemon service, WAL journal & live snapshot status JSON
 ```
 
 ### `claudeguard-daemon.exe`
@@ -223,15 +229,19 @@ claudeguard-gui.exe --demo pass                    # Standalone UI demo (pass | 
 Requires Rust (`1.98+`, verified on `rustc 1.99.0`), Windows 10/11 SDK, and [Inno Setup 6](https://jrsoftware.org/isinfo.php) (for `.exe` installer packaging):
 
 ```powershell
-# 1. Core workspace (protocol, core, platform, daemon, cli) — 188 tests
+# 1. Core workspace (protocol, core, platform, daemon, cli) — 330 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 
-# 2. Native GPUI desktop client (cg-gui) — 25 tests (incl. live daemon pipe E2E)
+# 2. v3->v5 upgrade bridge (cg-v3-bridge) — 4 tests
+cargo clippy --locked --manifest-path crates/cg-v3-bridge/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path crates/cg-v3-bridge/Cargo.toml
+
+# 3. Native GPUI desktop client (cg-gui) — 71 tests (incl. live daemon pipe E2E)
 cargo clippy --locked --manifest-path crates/cg-gui/Cargo.toml --all-targets -- -D warnings
 cargo test --locked --manifest-path crates/cg-gui/Cargo.toml
 
-# 3. Stage Release binaries, Inno Setup installer, portable zip & SHA256SUMS.txt
+# 4. Stage Release binaries, Inno Setup installer, portable zip & SHA256SUMS.txt
 pwsh -NoProfile -ExecutionPolicy Bypass -File make-release.ps1
 ```
 

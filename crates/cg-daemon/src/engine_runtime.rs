@@ -15,42 +15,57 @@ use cg_core::engine::{
     CheckPurpose, EffectCommand, EngineEvent, EngineState, GuardEngine, PendingTxKind,
 };
 use cg_core::envcheck;
+use cg_core::hygiene_plan;
 use cg_core::onboarding;
 use cg_core::policy;
+use cg_core::risk_scorer;
 use cg_core::timeline::BUCKETS_48;
-use cg_core::TimelineAggregator;
+use cg_core::{BurstGuardConfig, BurstGuardTracker, TimelineAggregator};
 use cg_platform::access_win::{self, AccessPath};
 use cg_platform::antigravity_proxy_win;
+use cg_platform::cleanroom_win;
+use cg_platform::env_win;
 use cg_platform::firewall_com;
+use cg_platform::hygiene_win;
+use cg_platform::ip_intel;
 use cg_platform::leak_shield_win;
 use cg_platform::mihomo_win;
 use cg_platform::netwatch_win;
 use cg_platform::probe_http::{self, NetworkPolicy, ProbeRoute};
 use cg_platform::process_win::{
-    self, CachedProcessSnapshot, ClaudePresence, ProcessScanner, SweepMode,
+    self, CachedProcessSnapshot, ClaudePresence, LaunchTarget, ProcessScanner, SweepMode,
 };
-use cg_platform::{update_check, PlatformDriver, PlatformError};
+use cg_platform::stun_probe;
+use cg_platform::vault_win;
+use cg_platform::{update_check, wfp_win, PlatformDriver, PlatformError};
 
 use crate::config_store::{ConfigStore, LoadedConfig};
 use crate::coordinator::{
-    ActorControl, CoordinatorActor, CoordinatorContext, CoordinatorEvent, CoordinatorHandle,
-    TelemetryBundle,
+    check_vault_egress_contract, current_primary_egress, evaluate_fast_hook_gate_at, ActorControl,
+    CoordinatorActor, CoordinatorContext, CoordinatorEvent, CoordinatorHandle, FastGateOutcome,
+    HookGateMetrics, TelemetryBundle,
 };
 use crate::diagnostics;
 use crate::disarm;
+use crate::egress_ledger::EgressLedger;
 use crate::feishu::FeishuNotifier;
+use crate::hook_installer;
 use crate::journal::{
     self, BaselineState, FirewallDirection, HealReport, HealStatus, JournalStore, LoadedJournal,
     PlannedStep, RecoveryExecutor, RecoveryJournal, TxKind, WalAction,
 };
 use crate::protocol::{
-    now_unix_secs, AccessEvidence, AccessLevel, AgentKind, AgentRuntimeStatus,
-    AntigravityProxyState, AntigravityProxyStatus, ComponentUpdateStatus, Config, CutMode,
-    DefenseCheckItem, DefenseSelfCheck, ErrorCode, GuardSnapshot, LeakReport, LeakShieldStatus,
-    Lifecycle, LogLevel, MihomoStatus, OnboardingProbeResult, OperationReceipt, OperationStatus,
-    PipeRequest, PipeResponse, PolicyPreset, ProbeResult, ProtectionState, SelfCheckStatus, Target,
-    ToastNotificationEvent, UpdateCheckPhase, UpdateSummary,
+    is_valid_vault_id, now_unix_millis, now_unix_secs, AccessEvidence, AccessLevel, AgentKind,
+    AgentRuntimeStatus, AntigravityProxyState, AntigravityProxyStatus, BurstGuardStatus,
+    CleanRoomReport, ComponentUpdateStatus, Config, CutMode, DefenseCheckItem, DefenseSelfCheck,
+    ErrorCode, GuardSnapshot, HookDecision, HookIntegrationStatus, HotkeyStatus, LeakReport,
+    LeakShieldStatus, Lifecycle, LogLevel, MihomoStatus, OnboardingProbeResult, OperationReceipt,
+    OperationStatus, PipeRequest, PipeResponse, PolicyPreset, ProbeResult, ProtectionState,
+    RiskAssessment, SelfCheckStatus, Target, ToastNotificationEvent, UpdateCheckPhase,
+    UpdateSummary, VaultAppTarget, VaultRuntimeState, VaultRuntimeStatus, WslBridgeStatus,
+    KNOWN_CLI_AGENT_IDS,
 };
+use crate::wsl_bridge;
 
 pub const TIMELINE_FILE: &str = "timeline.json";
 const DEFAULT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(10);
@@ -177,6 +192,8 @@ fn hydrate_local_updates(
     local: &update_check::LocalClientVersions,
 ) {
     update_check::hydrate_summary_locals(updates, cg_version, ag_proxy, local);
+    let v5_local = update_check::V5LocalIdeVersions::detect();
+    update_check::hydrate_v5_ide_updates(updates, &v5_local, now_unix_secs());
 }
 
 fn merge_slot(dst: &mut ComponentUpdateStatus, incoming: ComponentUpdateStatus) {
@@ -212,6 +229,10 @@ fn merge_telemetry_updates(dst: &mut UpdateSummary, incoming: UpdateSummary) {
     merge_slot(&mut dst.antigravity_cn, incoming.antigravity_cn);
     merge_slot(&mut dst.ag_usage_monitor, incoming.ag_usage_monitor);
     merge_slot(&mut dst.ag_capsule, incoming.ag_capsule);
+    merge_slot(&mut dst.cursor_ide, incoming.cursor_ide);
+    merge_slot(&mut dst.windsurf_ide, incoming.windsurf_ide);
+    merge_slot(&mut dst.zed_ide, incoming.zed_ide);
+    merge_slot(&mut dst.trae_ide, incoming.trae_ide);
 }
 
 fn parse_update_component_filter(
@@ -244,6 +265,14 @@ fn parse_update_component_filter(
                 Ok((false, false, Some("ag_usage_monitor".to_string())))
             }
             "ag_capsule" | "agy-capsule" => Ok((false, false, Some("ag_capsule".to_string()))),
+            "cursor_ide" | "cursor-ide" | "cursor" => {
+                Ok((false, false, Some("cursor_ide".to_string())))
+            }
+            "windsurf_ide" | "windsurf-ide" | "windsurf" => {
+                Ok((false, false, Some("windsurf_ide".to_string())))
+            }
+            "zed_ide" | "zed-ide" | "zed" => Ok((false, false, Some("zed_ide".to_string()))),
+            "trae_ide" | "trae-ide" | "trae" => Ok((false, false, Some("trae_ide".to_string()))),
             "plugins" | "antigravity_plugins" => {
                 Ok((false, true, Some("antigravity_plugins".to_string())))
             }
@@ -299,6 +328,10 @@ fn build_skipped_update_summary(
         ("antigravity_cn", &mut out.antigravity_cn),
         ("ag_usage_monitor", &mut out.ag_usage_monitor),
         ("ag_capsule", &mut out.ag_capsule),
+        ("cursor_ide", &mut out.cursor_ide),
+        ("windsurf_ide", &mut out.windsurf_ide),
+        ("zed_ide", &mut out.zed_ide),
+        ("trae_ide", &mut out.trae_ide),
     ] {
         if component_matches_filter(norm.as_deref(), id) {
             slot.phase = UpdateCheckPhase::Failed;
@@ -535,6 +568,7 @@ pub struct BootstrappedActor {
     pub initial_snapshot: GuardSnapshot,
     pub heal_report: HealReport,
     pub process_scanner: Arc<ProcessScanner>,
+    pub egress_ledger: Arc<EgressLedger>,
 }
 
 /// Injection point for synchronizing OS 4-vector leak shield rules (`leak_shield_win::sync_leak_shield` in production).
@@ -543,6 +577,13 @@ type LeakShieldSyncFn = Arc<
         + Send
         + Sync,
 >;
+
+type FastHookWaiter = (
+    String,
+    Option<String>,
+    Option<String>,
+    SyncSender<PipeResponse>,
+);
 
 /// Single-writer actor executing `GuardEngine::step` and real OS/WAL/Config side effects.
 pub struct RealEngineActor {
@@ -563,6 +604,7 @@ pub struct RealEngineActor {
     _probe_worker: Option<JoinHandle<()>>,
     recheck_waiters: Vec<SyncSender<PipeResponse>>,
     launch_waiters: Vec<(Option<String>, SyncSender<PipeResponse>)>,
+    fast_hook_waiters: Vec<FastHookWaiter>,
     last_rejected: Option<(ErrorCode, String)>,
     mutation_error: Option<String>,
     pause_deadline: Option<Instant>,
@@ -577,6 +619,8 @@ pub struct RealEngineActor {
     feishu_test_in_flight: Arc<AtomicBool>,
     mihomo_switch_in_flight: Arc<AtomicBool>,
     ag_repair_in_flight: Arc<AtomicBool>,
+    deep_audit_in_flight: Arc<AtomicBool>,
+    wsl_sync_in_flight: Arc<AtomicBool>,
     recent_toasts: VecDeque<ToastNotificationEvent>,
     toast_seq: u64,
     leak_shield: LeakShieldStatus,
@@ -585,6 +629,17 @@ pub struct RealEngineActor {
     last_wal_heal_error: Option<String>,
     last_wal_heal_attempt: Option<Instant>,
     last_flushed_log_id: AtomicU64,
+    // ---- v5 Runtime State (M1–M7) ----
+    egress_ledger: Arc<EgressLedger>,
+    last_cleanroom_report: Option<CleanRoomReport>,
+    cleanroom_backup_count: usize,
+    hooks: HookIntegrationStatus,
+    wsl_bridge: WslBridgeStatus,
+    vault_sessions: HashMap<String, Vec<(u32, String)>>,
+    burst_guard_ref: Option<Arc<Mutex<BurstGuardTracker>>>,
+    hook_metrics_ref: Option<Arc<HookGateMetrics>>,
+    test_user_home_override: Option<PathBuf>,
+    test_vaults_root_override: Option<PathBuf>,
 }
 
 impl RealEngineActor {
@@ -596,13 +651,20 @@ impl RealEngineActor {
         recovery_executor: Arc<dyn RecoveryExecutor>,
         probe_event_tx: SyncSender<CoordinatorEvent>,
     ) -> BootstrappedActor {
+        let default_syncer: LeakShieldSyncFn = Arc::new(|exes, quic, dns_doh, ipv6| {
+            if let Some(hybrid) = cg_platform::active_hybrid_firewall() {
+                hybrid.sync_leak_shield_wfp(exes, quic, dns_doh, ipv6)
+            } else {
+                leak_shield_win::sync_leak_shield(exes, quic, dns_doh, ipv6)
+            }
+        });
         Self::bootstrap_with_syncer(
             data_dir,
             driver,
             probe_runner,
             recovery_executor,
             probe_event_tx,
-            Arc::new(leak_shield_win::sync_leak_shield),
+            default_syncer,
         )
     }
 
@@ -773,6 +835,22 @@ impl RealEngineActor {
                 LeakShieldStatus::default()
             };
         let init_wal_heal_error = wal_pending.then(|| heal_report.summary.clone());
+        let egress_ledger = Arc::new(EgressLedger::open(&data_dir));
+        let cleanroom_backup_count = cleanroom_win::list_cleanroom_backups(&data_dir).len();
+        let init_hooks = hook_installer::inspect_hook_status(&engine.config.vaults, 0, 0, 0);
+        let init_wsl_bridge = WslBridgeStatus {
+            enabled: engine.config.wsl_bridge_enabled,
+            listening: false,
+            bound_port: None,
+            token_ready: false,
+            synced_distros: Vec::new(),
+            proxy_desync_detected: false,
+            summary: if engine.config.wsl_bridge_enabled {
+                "WSL2 回环桥接等待初始化".into()
+            } else {
+                "WSL2 跨子系统桥接已关闭".into()
+            },
+        };
         let mut actor = Self {
             engine,
             driver,
@@ -791,6 +869,7 @@ impl RealEngineActor {
             _probe_worker: probe_worker,
             recheck_waiters: Vec::new(),
             launch_waiters: Vec::new(),
+            fast_hook_waiters: Vec::new(),
             last_rejected: None,
             mutation_error: None,
             pause_deadline: None,
@@ -805,6 +884,8 @@ impl RealEngineActor {
             feishu_test_in_flight: Arc::new(AtomicBool::new(false)),
             mihomo_switch_in_flight: Arc::new(AtomicBool::new(false)),
             ag_repair_in_flight: Arc::new(AtomicBool::new(false)),
+            deep_audit_in_flight: Arc::new(AtomicBool::new(false)),
+            wsl_sync_in_flight: Arc::new(AtomicBool::new(false)),
             recent_toasts: VecDeque::new(),
             toast_seq: 0,
             leak_shield: init_shield,
@@ -813,7 +894,19 @@ impl RealEngineActor {
             last_wal_heal_error: init_wal_heal_error,
             last_wal_heal_attempt: None,
             last_flushed_log_id: AtomicU64::new(0),
+            egress_ledger: egress_ledger.clone(),
+            last_cleanroom_report: None,
+            cleanroom_backup_count,
+            hooks: init_hooks,
+            wsl_bridge: init_wsl_bridge,
+            vault_sessions: HashMap::new(),
+            burst_guard_ref: None,
+            hook_metrics_ref: None,
+            test_user_home_override: None,
+            test_vaults_root_override: None,
         };
+
+        actor.sync_wfp_config(now);
 
         actor.step_and_run(
             EngineEvent::AntigravityProxyUpdated {
@@ -870,6 +963,7 @@ impl RealEngineActor {
             initial_snapshot,
             heal_report,
             process_scanner,
+            egress_ledger,
         }
     }
 
@@ -877,6 +971,73 @@ impl RealEngineActor {
     fn with_leak_shield_syncer(mut self, syncer: LeakShieldSyncFn) -> Self {
         self.leak_shield_syncer = syncer;
         self
+    }
+
+    #[cfg(test)]
+    fn with_test_sandbox_dirs(mut self, user_home: PathBuf, vaults_root: PathBuf) -> Self {
+        self.test_user_home_override = Some(user_home);
+        self.test_vaults_root_override = Some(vaults_root);
+        self
+    }
+
+    fn effective_user_home(&self) -> Option<PathBuf> {
+        self.test_user_home_override
+            .clone()
+            .or_else(hook_installer::resolve_interactive_user_home)
+    }
+
+    fn effective_vaults_root(&self) -> Result<PathBuf, String> {
+        if let Some(ref root) = self.test_vaults_root_override {
+            return Ok(root.clone());
+        }
+        vault_win::default_vaults_root()
+    }
+
+    fn sync_wfp_config(&mut self, now: u64) {
+        if self.driver.capabilities().app_quarantine {
+            if let Some(hybrid) = cg_platform::active_hybrid_firewall() {
+                let _ = hybrid.set_preference(self.engine.config.firewall_backend);
+                // Safest default: `wfp_boot_guard` is default `false`. Only arm persistent boot
+                // filters when explicitly opted-in while Armed, recording WAL first.
+                if self.engine.config.wfp_boot_guard && self.engine.lifecycle == Lifecycle::Armed {
+                    let mut exes = Vec::new();
+                    for agent in &self.engine.config.guarded_agents {
+                        for p in self.driver.discover_agent_exes(agent).unwrap_or_default() {
+                            if !exes.contains(&p) {
+                                exes.push(p);
+                            }
+                        }
+                    }
+                    let sublayer_guid = format_wfp_persistent_sublayer_guid();
+                    let step = PlannedStep {
+                        step_id: 1,
+                        description: "arm opt-in persistent WFP boot-time guard".into(),
+                        action: WalAction::WfpPersistentSync { sublayer_guid },
+                    };
+                    if let Ok(mut tx) = self.journal.begin_coexisting_tx(
+                        self.engine.runtime_epoch,
+                        TxKind::Composite,
+                        vec![step],
+                        BaselineState::default(),
+                        self.engine.lockdown_applied == Some(true),
+                        self.engine.protection.is_isolated(),
+                    ) {
+                        if hybrid.sync_boot_guard(true, &exes).is_ok() {
+                            let _ = self.journal.commit_tx(&mut tx);
+                        }
+                    }
+                } else {
+                    let _ = hybrid.sync_boot_guard(false, &[]);
+                }
+            }
+        }
+        let wfp = self.driver.wfp_status();
+        self.step_and_run(
+            EngineEvent::WfpUpdated {
+                status: Box::new(wfp),
+            },
+            now,
+        );
     }
 
     fn sync_leak_shield_rules(&mut self, now: u64) -> Result<OperationReceipt, PlatformError> {
@@ -1153,6 +1314,95 @@ impl RealEngineActor {
         }
     }
 
+    fn build_vault_statuses(&self, snap: &GuardSnapshot, now: u64) -> Vec<VaultRuntimeStatus> {
+        let vaults_root = self.effective_vaults_root().ok();
+        let (obs_ip, obs_country, obs_asn) = current_primary_egress(snap);
+        self.engine
+            .config
+            .vaults
+            .iter()
+            .map(|vault| {
+                let sessions: Vec<(u32, String)> = self
+                    .vault_sessions
+                    .get(&vault.id)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter(|(pid, _)| *pid > 0 && is_pid_alive(*pid))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let running_pids: Vec<u32> = sessions.iter().map(|(pid, _)| *pid).collect();
+                let mut running_apps: Vec<String> = Vec::new();
+                for (_, app) in &sessions {
+                    if !running_apps.contains(app) {
+                        running_apps.push(app.clone());
+                    }
+                }
+                let cooldown_remaining =
+                    self.egress_ledger.vault_cooldown_remaining(&vault.id, now);
+                let egress_match_res = check_vault_egress_contract(
+                    vault,
+                    obs_ip.as_deref(),
+                    obs_country.as_deref(),
+                    obs_asn,
+                );
+                let egress_matches_contract = egress_match_res.is_ok();
+                let (last_active_at, last_country) = self
+                    .egress_ledger
+                    .vault_last_activity(&vault.id)
+                    .map(|(ts, c)| (Some(ts), (!c.is_empty()).then_some(c)))
+                    .unwrap_or((None, None));
+                let state = if !vault.enabled {
+                    VaultRuntimeState::Disabled
+                } else if !running_pids.is_empty() {
+                    VaultRuntimeState::ActiveRunning
+                } else if cooldown_remaining > 0 {
+                    VaultRuntimeState::CoolingDown
+                } else if !egress_matches_contract {
+                    VaultRuntimeState::EgressMismatch
+                } else {
+                    VaultRuntimeState::Ready
+                };
+                let vault_dir = vaults_root
+                    .as_ref()
+                    .map(|r| r.join(&vault.id).to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let summary = match state {
+                    VaultRuntimeState::Disabled => "保险箱已停用".into(),
+                    VaultRuntimeState::ActiveRunning => format!(
+                        "运行中（{} 个进程：{}）",
+                        running_pids.len(),
+                        running_apps.join(", ")
+                    ),
+                    VaultRuntimeState::CoolingDown => {
+                        format!("换 IP 冷却保护中（剩余 {cooldown_remaining}s）")
+                    }
+                    VaultRuntimeState::EgressMismatch => egress_match_res
+                        .err()
+                        .unwrap_or_else(|| "当前出口与保险箱绑定契约不匹配".into()),
+                    VaultRuntimeState::Ready => "出口契约匹配，可安全一键启动".into(),
+                };
+                VaultRuntimeStatus {
+                    id: vault.id.clone(),
+                    name: vault.name.clone(),
+                    accent_hex: vault.accent_hex.clone(),
+                    state,
+                    running_pids,
+                    running_apps,
+                    egress_matches_contract,
+                    cooldown_remaining_secs: cooldown_remaining,
+                    last_active_at,
+                    last_ip_masked: None,
+                    last_country,
+                    vault_dir,
+                    summary,
+                }
+            })
+            .collect()
+    }
+
     fn build_snapshot(&self, now: u64) -> GuardSnapshot {
         let mut snap = self.engine.to_snapshot(now, self.cached_agents.clone());
         if let Some(deadline) = self.pause_deadline {
@@ -1165,6 +1415,54 @@ impl RealEngineActor {
         snap.feishu = self.feishu.status();
         snap.leak_shield = self.leak_shield.clone();
         snap.mihomo = self.mihomo.clone();
+
+        // v5 control-plane telemetry fields
+        if snap.wfp.active_backend.is_empty() {
+            snap.wfp = self.driver.wfp_status();
+        }
+        snap.last_cleanroom_report = self.last_cleanroom_report.clone();
+        snap.cleanroom_backup_count = self.cleanroom_backup_count;
+
+        let mut hooks = self.hooks.clone();
+        if let Some(ref metrics) = self.hook_metrics_ref {
+            let (checks, blocks, latency_us) = metrics.snapshot_counts();
+            hooks.total_gate_checks = checks;
+            hooks.total_gate_blocks = blocks;
+            hooks.last_gate_latency_us = latency_us;
+        }
+        snap.hooks = hooks;
+
+        let mut wsl = self.wsl_bridge.clone();
+        wsl.enabled = self.engine.config.wsl_bridge_enabled;
+        if let Some(ref metrics) = self.hook_metrics_ref {
+            wsl.proxy_desync_detected = metrics.wsl_proxy_desync.load(Ordering::Relaxed);
+        }
+        snap.wsl_bridge = wsl;
+
+        snap.burst_guard = if let Some(ref bg) = self.burst_guard_ref {
+            let tracker = bg.lock().unwrap_or_else(|e| e.into_inner());
+            tracker.overall_status(
+                now_unix_millis(),
+                &BurstGuardConfig::from_config(&self.engine.config),
+            )
+        } else {
+            BurstGuardStatus {
+                mode: self.engine.config.burst_guard_mode,
+                summary: "节律正常（1m:0 / 15m:0）".into(),
+                ..Default::default()
+            }
+        };
+
+        snap.hotkeys = HotkeyStatus {
+            enabled: self.engine.config.global_hotkeys_enabled,
+            panic_lockdown_chord: self.engine.config.hotkey_panic_lockdown.clone(),
+            quick_hud_chord: self.engine.config.hotkey_quick_hud.clone(),
+            panic_registered_ok: self.engine.config.global_hotkeys_enabled,
+            hud_registered_ok: self.engine.config.global_hotkeys_enabled,
+            conflict_note: String::new(),
+        };
+
+        snap.vaults = self.build_vault_statuses(&snap, now);
         snap
     }
 
@@ -2078,6 +2376,9 @@ impl RealEngineActor {
 
         let heal = journal::heal_offline(&self.journal, &*self.recovery_executor);
         if self.driver.capabilities().app_quarantine {
+            if let Some(hybrid) = cg_platform::active_hybrid_firewall() {
+                let _ = hybrid.clear_persistent_boot_guard();
+            }
             if let Ok(removed) = leak_shield_win::clear_leak_shield() {
                 if removed > 0 {
                     self.leak_shield = LeakShieldStatus::default();
@@ -2167,6 +2468,15 @@ impl RealEngineActor {
                 snapshot: Some(Box::new(snapshot.clone())),
             });
         }
+        for (_, _, _, tx) in self.fast_hook_waiters.drain(..) {
+            let _ = tx.send(PipeResponse::FastGateVerdict {
+                allowed: false,
+                decision: HookDecision::Block,
+                safety_score: snapshot.risk_assessment.score,
+                reason: "配置或守卫生命周期已变更，门禁复核已中止".into(),
+                latency_path: "sync_probe_fallback".into(),
+            });
+        }
     }
 
     fn fulfill_round_waiters(&mut self, snapshot: &GuardSnapshot, now: u64) {
@@ -2197,6 +2507,50 @@ impl RealEngineActor {
             }
             if let Some(reason) = blocked_reason {
                 self.emit_notification("launch_blocked", "ClaudeGuard 已阻止启动", &reason, now);
+            }
+        }
+
+        if !self.fast_hook_waiters.is_empty() {
+            let waiters = std::mem::take(&mut self.fast_hook_waiters);
+            let fallback_tracker = Mutex::new(BurstGuardTracker::new());
+            let now_ms = now_unix_millis();
+            for (agent_id, vault_id, hook_event, tx) in waiters {
+                let tracker_ref: &Mutex<BurstGuardTracker> =
+                    self.burst_guard_ref.as_deref().unwrap_or(&fallback_tracker);
+                let resp = match evaluate_fast_hook_gate_at(
+                    snapshot,
+                    tracker_ref,
+                    &agent_id,
+                    vault_id.as_deref(),
+                    hook_event.as_deref(),
+                    now,
+                    now_ms,
+                ) {
+                    FastGateOutcome::Immediate(PipeResponse::FastGateVerdict {
+                        allowed,
+                        decision,
+                        safety_score,
+                        reason,
+                        ..
+                    }) => PipeResponse::FastGateVerdict {
+                        allowed,
+                        decision,
+                        safety_score,
+                        reason,
+                        latency_path: "sync_probe_fallback".into(),
+                    },
+                    FastGateOutcome::Immediate(other) => other,
+                    FastGateOutcome::NeedsSyncProbe => PipeResponse::FastGateVerdict {
+                        allowed: false,
+                        decision: HookDecision::Block,
+                        safety_score: snapshot.risk_assessment.score,
+                        reason:
+                            "🛡️ [ClaudeGuard 复核未通过] 出口探测仍未确认合规，已阻止提示词发送"
+                                .into(),
+                        latency_path: "sync_probe_fallback".into(),
+                    },
+                };
+                let _ = tx.send(resp);
             }
         }
     }
@@ -2375,6 +2729,10 @@ impl RealEngineActor {
                 self.send_mutation_reply(reply, snap);
             }
             PipeRequest::SaveConfig { config } => {
+                let prev_wfp = (
+                    self.engine.config.firewall_backend,
+                    self.engine.config.wfp_boot_guard,
+                );
                 let prev_shield = (
                     self.engine.config.leak_shield_quic,
                     self.engine.config.leak_shield_dns_doh,
@@ -2382,6 +2740,13 @@ impl RealEngineActor {
                     self.engine.config.guarded_agents.clone(),
                 );
                 self.step_and_run(EngineEvent::SaveConfig { next: config }, now);
+                let next_wfp = (
+                    self.engine.config.firewall_backend,
+                    self.engine.config.wfp_boot_guard,
+                );
+                if self.last_rejected.is_none() && prev_wfp != next_wfp {
+                    self.sync_wfp_config(now);
+                }
                 let next_shield = (
                     self.engine.config.leak_shield_quic,
                     self.engine.config.leak_shield_dns_doh,
@@ -2467,6 +2832,7 @@ impl RealEngineActor {
                     && self.engine.lifecycle == Lifecycle::Armed
                     && self.driver.capabilities().app_quarantine
                 {
+                    self.sync_wfp_config(now);
                     match self.sync_leak_shield_rules(now) {
                         Ok(receipt) => {
                             self.engine.last_receipt = Some(receipt);
@@ -2663,6 +3029,7 @@ impl RealEngineActor {
                 let rejected = self.last_rejected.is_some();
                 let persisted_ok = self.mutation_error.is_none();
                 if !rejected && persisted_ok && self.engine.lifecycle == Lifecycle::Armed {
+                    self.sync_wfp_config(now);
                     if self.driver.capabilities().app_quarantine
                         && (self.engine.config.leak_shield_quic
                             || self.engine.config.leak_shield_dns_doh
@@ -2866,9 +3233,14 @@ impl RealEngineActor {
                                 },
                             ),
                             "antigravity" => (vec!["antigravity".to_string()], Vec::new()),
+                            "cursor" => (vec!["cursor".to_string()], Vec::new()),
+                            "windsurf" => (vec!["windsurf".to_string()], Vec::new()),
+                            "zed" => (vec!["zed".to_string()], Vec::new()),
+                            "trae" => (vec!["trae".to_string()], Vec::new()),
                             "claude-code" => (Vec::new(), vec!["claude-code"]),
                             "codex" => (Vec::new(), vec!["codex"]),
                             "gemini" => (Vec::new(), vec!["gemini"]),
+                            "aider" => (Vec::new(), vec!["aider"]),
                             _ => {
                                 let _ = reply.send(PipeResponse::Error {
                                     code: ErrorCode::InvalidRequest,
@@ -3339,7 +3711,1155 @@ impl RealEngineActor {
                     snapshot: Some(Box::new(snap)),
                 });
             }
+            // ---- v5 Control-Plane Requests (M1–M7) ----
+            PipeRequest::FastHookGate {
+                agent_id,
+                vault_id,
+                hook_event,
+            } => {
+                self.sync_monotonic_pause(now);
+                let cur_snap = self.build_snapshot(now);
+                let fallback_tracker = Mutex::new(BurstGuardTracker::new());
+                let tracker_ref: &Mutex<BurstGuardTracker> =
+                    self.burst_guard_ref.as_deref().unwrap_or(&fallback_tracker);
+                if let FastGateOutcome::Immediate(resp) = evaluate_fast_hook_gate_at(
+                    &cur_snap,
+                    tracker_ref,
+                    &agent_id,
+                    vault_id.as_deref(),
+                    hook_event.as_deref(),
+                    now,
+                    now_unix_millis(),
+                ) {
+                    let _ = reply.send(resp);
+                    return;
+                }
+
+                // Stale or unverified: run/join a real Launch-purpose probe round.
+                self.step_and_run(
+                    EngineEvent::StartRound {
+                        purpose: CheckPurpose::Launch,
+                    },
+                    now,
+                );
+                if let Some((_code, reason)) = self.last_rejected.take() {
+                    let _ = reply.send(PipeResponse::FastGateVerdict {
+                        allowed: false,
+                        decision: HookDecision::Block,
+                        safety_score: cur_snap.risk_assessment.score,
+                        reason,
+                        latency_path: "sync_probe_fallback".into(),
+                    });
+                    return;
+                }
+                let snap = self.publish_snapshot(snapshot_store, now);
+                if self.engine.checking {
+                    self.fast_hook_waiters
+                        .push((agent_id, vault_id, hook_event, reply));
+                } else {
+                    let decision = GuardEngine::evaluate_launch_gate_for_agent(
+                        &self.engine,
+                        Some(agent_id.as_str()),
+                        now,
+                    );
+                    let _ = reply.send(PipeResponse::FastGateVerdict {
+                        allowed: decision.allowed,
+                        decision: if decision.allowed {
+                            HookDecision::Allow
+                        } else {
+                            HookDecision::Block
+                        },
+                        safety_score: snap.risk_assessment.score,
+                        reason: decision.reason,
+                        latency_path: "sync_probe_fallback".into(),
+                    });
+                }
+            }
+            PipeRequest::UpsertVault { mut vault } => {
+                vault.normalize();
+                if !is_valid_vault_id(&vault.id) {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::ValidationFailed,
+                        message: format!(
+                            "非法账号保险箱 ID `{}`：仅允许 2-32 位小写字母、数字、`-` 或 `_` 且不能为 Windows 保留名",
+                            vault.id
+                        ),
+                        receipt: None,
+                    });
+                    return;
+                }
+                let vaults_root = match self.effective_vaults_root() {
+                    Ok(p) => p,
+                    Err(err) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: err,
+                            receipt: None,
+                        });
+                        return;
+                    }
+                };
+                let paths = match vault_win::ensure_vault_layout_in(&vaults_root, &vault) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: err,
+                            receipt: None,
+                        });
+                        return;
+                    }
+                };
+
+                let mut next_cfg = self.engine.config.clone();
+                if let Some(existing) = next_cfg
+                    .vaults
+                    .iter_mut()
+                    .find(|v| v.id.eq_ignore_ascii_case(&vault.id))
+                {
+                    *existing = vault.clone();
+                } else {
+                    next_cfg.vaults.push(vault.clone());
+                }
+                match self.config_store.save_verified(&next_cfg) {
+                    Ok(saved) => {
+                        self.engine.config = saved;
+                        if self.hooks.claude_code_hook_installed {
+                            let cli_exe = hook_installer::resolve_cli_exe_path();
+                            let _ = hook_installer::sync_claude_code_settings(
+                                &paths.claude_code_home.join("settings.json"),
+                                &cli_exe,
+                                Some(&vault.id),
+                                true,
+                            );
+                        }
+                        let mut receipt = OperationReceipt::new(
+                            format!("vault-upsert-{}-{now}", vault.id),
+                            OperationStatus::Verified,
+                        );
+                        receipt.verified_scope = paths.vault_root.to_string_lossy().to_string();
+                        receipt.push_item(
+                            format!("vault:{}", vault.id),
+                            OperationStatus::Verified,
+                            format!("已初始化主权隔离保险箱「{}」", vault.name),
+                        );
+                        self.engine.push_log(
+                            now,
+                            LogLevel::Audit,
+                            "vault",
+                            &format!("创建/更新主权账号保险箱「{}」（{}）", vault.name, vault.id),
+                        );
+                        self.engine.last_receipt = Some(receipt);
+                    }
+                    Err(err) => {
+                        self.mutation_error = Some(err);
+                    }
+                }
+                let snap = self.publish_snapshot(snapshot_store, now);
+                self.send_mutation_reply(reply, snap);
+            }
+            PipeRequest::DeleteVault {
+                vault_id,
+                purge_disk_data,
+            } => {
+                let norm_id = vault_id.trim().to_ascii_lowercase();
+                if !is_valid_vault_id(&norm_id) {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::ValidationFailed,
+                        message: format!("非法的保险箱 ID：`{vault_id}`"),
+                        receipt: None,
+                    });
+                    return;
+                }
+                if !self
+                    .engine
+                    .config
+                    .vaults
+                    .iter()
+                    .any(|v| v.id.eq_ignore_ascii_case(&norm_id))
+                {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::NotFound,
+                        message: format!("未找到账号保险箱 `{norm_id}`"),
+                        receipt: None,
+                    });
+                    return;
+                }
+                let vaults_root = match self.effective_vaults_root() {
+                    Ok(p) => p,
+                    Err(err) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: err,
+                            receipt: None,
+                        });
+                        return;
+                    }
+                };
+                let _ = self.stop_vault_processes(&norm_id, &vaults_root);
+                let archived = match vault_win::remove_vault_files_in(
+                    &vaults_root,
+                    &norm_id,
+                    purge_disk_data,
+                    now,
+                ) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: err,
+                            receipt: None,
+                        });
+                        return;
+                    }
+                };
+
+                let mut next_cfg = self.engine.config.clone();
+                next_cfg
+                    .vaults
+                    .retain(|v| !v.id.eq_ignore_ascii_case(&norm_id));
+                match self.config_store.save_verified(&next_cfg) {
+                    Ok(saved) => {
+                        self.engine.config = saved;
+                        let detail = match archived {
+                            Some(p) => {
+                                format!("已移除保险箱 `{norm_id}` 并安全归档至 {}", p.display())
+                            }
+                            None if purge_disk_data => {
+                                format!("已移除保险箱 `{norm_id}` 并清理磁盘隔离数据")
+                            }
+                            None => format!("已移除保险箱 `{norm_id}` 配置"),
+                        };
+                        let mut receipt = OperationReceipt::new(
+                            format!("vault-delete-{norm_id}-{now}"),
+                            OperationStatus::Verified,
+                        );
+                        receipt.verified_scope = norm_id.clone();
+                        receipt.push_item(
+                            "vault_delete",
+                            OperationStatus::Verified,
+                            detail.clone(),
+                        );
+                        self.engine.push_log(now, LogLevel::Audit, "vault", &detail);
+                        self.engine.last_receipt = Some(receipt);
+                    }
+                    Err(err) => {
+                        self.mutation_error = Some(err);
+                    }
+                }
+                let snap = self.publish_snapshot(snapshot_store, now);
+                self.send_mutation_reply(reply, snap);
+            }
+            PipeRequest::LaunchVault {
+                vault_id,
+                app,
+                extra_args,
+            } => {
+                let norm_id = vault_id.trim().to_ascii_lowercase();
+                let Some(vault) = self
+                    .engine
+                    .config
+                    .vaults
+                    .iter()
+                    .find(|v| v.id.eq_ignore_ascii_case(&norm_id))
+                    .cloned()
+                else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::NotFound,
+                        message: format!("未找到主权账号保险箱 `{norm_id}`"),
+                        receipt: None,
+                    });
+                    return;
+                };
+                if !vault.enabled {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: format!("保险箱「{}」当前已停用", vault.name),
+                        receipt: None,
+                    });
+                    return;
+                }
+                if self.engine.is_tripped() || self.engine.lockdown_applied == Some(true) {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: "当前处于熔断隔离或锁死状态，已拒绝启动分身保险箱".into(),
+                        receipt: None,
+                    });
+                    return;
+                }
+                let snap = self.build_snapshot(now);
+                if self.engine.lifecycle == Lifecycle::Armed
+                    && self.engine.config.enforce_access_path
+                    && snap.access.is_uncovered()
+                {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: "未检测到活跃代理通道（TUN/系统代理离线），拒绝启动分身保险箱"
+                            .into(),
+                        receipt: None,
+                    });
+                    return;
+                }
+
+                // Cooldown enforcement.
+                let cooldown = self.egress_ledger.vault_cooldown_remaining(&vault.id, now);
+                if cooldown > 0 {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: format!(
+                            "保险箱「{}」处于换 IP 冷静期（剩余 {cooldown}s），暂不允许启动",
+                            vault.name
+                        ),
+                        receipt: None,
+                    });
+                    return;
+                }
+
+                // Contract verification (safest default: read-only HARD BLOCK on mismatch unless
+                // `vault.auto_align_mihomo_on_vault_launch == true`).
+                let (obs_ip, obs_country, obs_asn) = current_primary_egress(&snap);
+                if let Err(mismatch_reason) = check_vault_egress_contract(
+                    &vault,
+                    obs_ip.as_deref(),
+                    obs_country.as_deref(),
+                    obs_asn,
+                ) {
+                    if vault.auto_align_mihomo_on_vault_launch {
+                        if let (Some(group), Some(node)) = (
+                            vault.preferred_mihomo_group.as_deref(),
+                            vault.preferred_mihomo_node.as_deref(),
+                        ) {
+                            match mihomo_win::switch_mihomo_node(group, node, true) {
+                                Ok(msg) => {
+                                    self.engine.push_log(
+                                        now,
+                                        LogLevel::Audit,
+                                        "vault",
+                                        &format!(
+                                            "保险箱「{}」自动对齐 Mihomo 节点（{msg}），触发复检等待核验",
+                                            vault.name
+                                        ),
+                                    );
+                                    self.step_and_run(
+                                        EngineEvent::StartRound {
+                                            purpose: CheckPurpose::Manual,
+                                        },
+                                        now,
+                                    );
+                                    let _ = reply.send(PipeResponse::Error {
+                                        code: ErrorCode::IllegalState,
+                                        message: format!(
+                                            "出口不匹配，已自动请求 Mihomo 切换至 `{node}` 并发起出口复检，请等待 2 秒核验通过后再次启动"
+                                        ),
+                                        receipt: None,
+                                    });
+                                    return;
+                                }
+                                Err(err) => {
+                                    let _ = reply.send(PipeResponse::Error {
+                                        code: ErrorCode::IllegalState,
+                                        message: format!(
+                                            "{mismatch_reason}；自动对齐 Mihomo 节点失败：{err}"
+                                        ),
+                                        receipt: None,
+                                    });
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: format!(
+                            "出口契约阻断（只读硬拦截，未改动您的代理配置）：{mismatch_reason}"
+                        ),
+                        receipt: None,
+                    });
+                    return;
+                }
+
+                if snap.risk_assessment.evaluated_at > 0
+                    && snap.risk_assessment.score < vault.min_safety_score
+                {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: format!(
+                            "当前 10D 出口安全分 {} 低于保险箱「{}」最低要求 {}，已拒绝启动",
+                            snap.risk_assessment.score, vault.name, vault.min_safety_score
+                        ),
+                        receipt: None,
+                    });
+                    return;
+                }
+
+                let vaults_root = match self.effective_vaults_root() {
+                    Ok(p) => p,
+                    Err(err) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: err,
+                            receipt: None,
+                        });
+                        return;
+                    }
+                };
+                if let Err(err) = vault_win::ensure_vault_layout_in(&vaults_root, &vault) {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IoFailed,
+                        message: err,
+                        receipt: None,
+                    });
+                    return;
+                }
+
+                let user_home = self.effective_user_home();
+                let mut spec = match vault_win::plan_vault_launch_env_and_args_in(
+                    &vaults_root,
+                    user_home.as_deref(),
+                    &vault,
+                    app,
+                    &self.engine.config.proxy_host,
+                    self.engine.config.proxy_port,
+                    &extra_args,
+                ) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::ValidationFailed,
+                            message: err,
+                            receipt: None,
+                        });
+                        return;
+                    }
+                };
+
+                if let vault_win::MsixLaunchStrategy::ExclusiveSwapLock { .. } = &spec.msix_strategy
+                {
+                    if let Err(err) = vault_win::acquire_msix_exclusive_lock(
+                        &vaults_root,
+                        app.agent_id(),
+                        &vault.id,
+                        now,
+                    ) {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IllegalState,
+                            message: err,
+                            receipt: None,
+                        });
+                        return;
+                    }
+                }
+
+                // Append mode-aware Electron anti-leak hygiene args when enabled.
+                if self.engine.config.enforce_electron_hygiene_flags
+                    && hygiene_plan::is_electron_agent(app.agent_id())
+                {
+                    let proxy_addr = format!(
+                        "{}:{}",
+                        self.engine.config.proxy_host, spec.effective_proxy_port
+                    );
+                    let ag_dll_active = app == VaultAppTarget::AntigravityIde
+                        && self.engine.antigravity_proxy.state.is_healthy();
+                    let plan =
+                        hygiene_plan::plan_electron_hygiene(&hygiene_plan::HygienePlanInput {
+                            agent_id: app.agent_id().to_string(),
+                            access_level: snap.access.level,
+                            proxy_addr: Some(proxy_addr),
+                            antigravity_version_dll_active: ag_dll_active,
+                            enabled: true,
+                        });
+                    for flag in plan.args {
+                        if !spec.args.contains(&flag) {
+                            spec.args.push(flag);
+                        }
+                    }
+                }
+
+                let exe_candidates = if app.is_cli() {
+                    self.driver
+                        .discover_cli_exes(app.agent_id())
+                        .unwrap_or_default()
+                } else {
+                    self.driver
+                        .discover_agent_exes(app.agent_id())
+                        .unwrap_or_default()
+                };
+                let Some(exe_path) = exe_candidates.into_iter().next() else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::NotFound,
+                        message: format!(
+                            "未在本机找到目标客户端 `{}` 的可执行文件",
+                            app.agent_id()
+                        ),
+                        receipt: None,
+                    });
+                    return;
+                };
+
+                let target = LaunchTarget::executable_with_env(
+                    exe_path,
+                    spec.args,
+                    spec.env,
+                    spec.working_dir,
+                );
+                let has_process_guard = self.driver.capabilities().process_guard;
+                let before_pids: std::collections::HashSet<u32> = if has_process_guard {
+                    self.process_scanner
+                        .refresh()
+                        .procs
+                        .iter()
+                        .map(|p| p.pid)
+                        .collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
+                match self.driver.launch_app_normal_privilege(&target) {
+                    Ok(()) => {
+                        if has_process_guard {
+                            let mut discovered = discover_launched_vault_pids(
+                                &self.process_scanner.refresh(),
+                                &vaults_root,
+                                &vault.id,
+                                app,
+                                &before_pids,
+                            );
+                            if discovered.is_empty() {
+                                std::thread::sleep(Duration::from_millis(80));
+                                discovered = discover_launched_vault_pids(
+                                    &self.process_scanner.refresh(),
+                                    &vaults_root,
+                                    &vault.id,
+                                    app,
+                                    &before_pids,
+                                );
+                            }
+                            if !discovered.is_empty() {
+                                merge_vault_session_pids(
+                                    self.vault_sessions.entry(vault.id.clone()).or_default(),
+                                    discovered,
+                                );
+                            }
+                        }
+                        let _ = self.egress_ledger.record_vault_activity(
+                            &vault.id,
+                            obs_ip.as_deref(),
+                            obs_country.as_deref(),
+                            snap.risk_assessment.ip_purity.city.as_deref(),
+                            snap.risk_assessment.ip_purity.lat_tenths,
+                            snap.risk_assessment.ip_purity.lon_tenths,
+                            vault.cooldown_after_ip_change_secs,
+                            now,
+                        );
+                        let mut receipt = OperationReceipt::new(
+                            format!("vault-launch-{}-{now}", vault.id),
+                            OperationStatus::Verified,
+                        );
+                        receipt.verified_scope = format!("{}:{}", vault.id, app.agent_id());
+                        receipt.push_item(
+                            "vault_launch",
+                            OperationStatus::Verified,
+                            format!("已在主权保险箱「{}」启动 {}", vault.name, app.agent_id()),
+                        );
+                        self.engine.push_log(
+                            now,
+                            LogLevel::Audit,
+                            "vault",
+                            &format!("启动主权保险箱「{}」应用 {}", vault.name, app.agent_id()),
+                        );
+                        self.engine.last_receipt = Some(receipt.clone());
+                        let next_snap = self.publish_snapshot(snapshot_store, now);
+                        let _ = reply.send(PipeResponse::Ack {
+                            receipt: Some(receipt),
+                            snapshot: Some(Box::new(next_snap)),
+                        });
+                    }
+                    Err(err) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: format!("启动分身保险箱进程失败：{err}"),
+                            receipt: None,
+                        });
+                    }
+                }
+            }
+            PipeRequest::StopVault { vault_id } => {
+                let norm_id = vault_id.trim().to_ascii_lowercase();
+                if !is_valid_vault_id(&norm_id) {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::ValidationFailed,
+                        message: format!("非法的保险箱 ID：`{vault_id}`"),
+                        receipt: None,
+                    });
+                    return;
+                }
+                let vaults_root = match self.effective_vaults_root() {
+                    Ok(p) => p,
+                    Err(err) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: err,
+                            receipt: None,
+                        });
+                        return;
+                    }
+                };
+                let stopped = self.stop_vault_processes(&norm_id, &vaults_root);
+                let mut receipt = OperationReceipt::new(
+                    format!("vault-stop-{norm_id}-{now}"),
+                    OperationStatus::Verified,
+                );
+                receipt.verified_scope = format!("stopped_pids={stopped}");
+                receipt.push_item(
+                    "vault_stop",
+                    OperationStatus::Verified,
+                    format!("已停止保险箱 `{norm_id}` 下 {stopped} 个跟踪进程"),
+                );
+                self.engine.push_log(
+                    now,
+                    LogLevel::Audit,
+                    "vault",
+                    &format!("停止主权保险箱 `{norm_id}`（终止 {stopped} 个进程）"),
+                );
+                self.engine.last_receipt = Some(receipt.clone());
+                let snap = self.publish_snapshot(snapshot_store, now);
+                let _ = reply.send(PipeResponse::Ack {
+                    receipt: Some(receipt),
+                    snapshot: Some(Box::new(snap)),
+                });
+            }
+            PipeRequest::GenerateVaultShortcuts { vault_id } => {
+                let norm_id = vault_id.trim().to_ascii_lowercase();
+                let Some(vault) = self
+                    .engine
+                    .config
+                    .vaults
+                    .iter()
+                    .find(|v| v.id.eq_ignore_ascii_case(&norm_id))
+                    .cloned()
+                else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::NotFound,
+                        message: format!("未找到主权账号保险箱 `{norm_id}`"),
+                        receipt: None,
+                    });
+                    return;
+                };
+                let vaults_root = match self.effective_vaults_root() {
+                    Ok(p) => p,
+                    Err(err) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: err,
+                            receipt: None,
+                        });
+                        return;
+                    }
+                };
+                let cli_exe = hook_installer::resolve_cli_exe_path();
+                let desktop_dir = self
+                    .effective_user_home()
+                    .map(|h| h.join("Desktop"))
+                    .unwrap_or_else(|| vaults_root.join(&vault.id).join("shortcuts"));
+                match vault_win::generate_vault_shortcuts_in(
+                    &vaults_root,
+                    &vault,
+                    &cli_exe,
+                    &desktop_dir,
+                ) {
+                    Ok(created) => {
+                        let mut receipt = OperationReceipt::new(
+                            format!("vault-shortcuts-{norm_id}-{now}"),
+                            OperationStatus::Verified,
+                        );
+                        receipt.verified_scope = format!("created={}", created.len());
+                        receipt.push_item(
+                            "vault_shortcuts",
+                            OperationStatus::Verified,
+                            format!("已生成 {} 个直启快捷方式与终端环境脚本", created.len()),
+                        );
+                        self.engine.push_log(
+                            now,
+                            LogLevel::Audit,
+                            "vault",
+                            &format!(
+                                "已为保险箱「{}」生成 {} 个快捷方式",
+                                vault.name,
+                                created.len()
+                            ),
+                        );
+                        self.engine.last_receipt = Some(receipt.clone());
+                        let snap = self.publish_snapshot(snapshot_store, now);
+                        let _ = reply.send(PipeResponse::Ack {
+                            receipt: Some(receipt),
+                            snapshot: Some(Box::new(snap)),
+                        });
+                    }
+                    Err(err) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: err,
+                            receipt: None,
+                        });
+                    }
+                }
+            }
+            PipeRequest::ScanCleanRoom { scope } => {
+                let user_home = self.effective_user_home();
+                let report = cleanroom_win::scan_cleanroom(&scope, user_home.as_deref(), now);
+                self.last_cleanroom_report = Some(report.clone());
+                self.cleanroom_backup_count =
+                    cleanroom_win::list_cleanroom_backups(&self.data_dir).len();
+                let _ = self.publish_snapshot(snapshot_store, now);
+                let _ = reply.send(PipeResponse::CleanRoomScan {
+                    report: Box::new(report),
+                });
+            }
+            PipeRequest::ExecuteCleanRoom {
+                scope,
+                selected_finding_ids,
+            } => {
+                let user_home = self.effective_user_home();
+                match cleanroom_win::execute_cleanroom_with_backup(
+                    &self.data_dir,
+                    &scope,
+                    &selected_finding_ids,
+                    user_home.as_deref(),
+                    now,
+                ) {
+                    Ok((meta, post_report)) => {
+                        self.last_cleanroom_report = Some(post_report.clone());
+                        self.cleanroom_backup_count =
+                            cleanroom_win::list_cleanroom_backups(&self.data_dir).len();
+                        let mut receipt = OperationReceipt::new(
+                            format!("cleanroom-exec-{now}"),
+                            OperationStatus::Verified,
+                        );
+                        receipt.verified_scope = meta.backup_id.clone();
+                        receipt.push_item(
+                            "cleanroom_backup",
+                            OperationStatus::Verified,
+                            format!(
+                                "已生成加密备份 {}（{} 项，残余污染分 {}/100）",
+                                meta.backup_id, meta.item_count, post_report.pollution_score
+                            ),
+                        );
+                        self.engine.push_log(
+                            now,
+                            LogLevel::Audit,
+                            "cleanroom",
+                            &format!(
+                                "净室洗白完成：已加密备份 {}（{} 项），复扫污染分 {}/100",
+                                meta.backup_id, meta.item_count, post_report.pollution_score
+                            ),
+                        );
+                        self.engine.last_receipt = Some(receipt.clone());
+                        let snap = self.publish_snapshot(snapshot_store, now);
+                        let _ = reply.send(PipeResponse::Ack {
+                            receipt: Some(receipt),
+                            snapshot: Some(Box::new(snap)),
+                        });
+                    }
+                    Err(msg) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: msg,
+                            receipt: None,
+                        });
+                    }
+                }
+            }
+            PipeRequest::ListCleanRoomBackups => {
+                let backups = cleanroom_win::list_cleanroom_backups(&self.data_dir);
+                self.cleanroom_backup_count = backups.len();
+                let _ = self.publish_snapshot(snapshot_store, now);
+                let _ = reply.send(PipeResponse::CleanRoomBackups { backups });
+            }
+            PipeRequest::RestoreCleanRoomBackup { backup_id } => {
+                match cleanroom_win::restore_cleanroom_backup(&self.data_dir, &backup_id) {
+                    Ok(restored) => {
+                        let mut receipt = OperationReceipt::new(
+                            format!("cleanroom-restore-{now}"),
+                            OperationStatus::Verified,
+                        );
+                        receipt.verified_scope = format!("backup={backup_id}, restored={restored}");
+                        receipt.push_item(
+                            "cleanroom_restore",
+                            OperationStatus::Verified,
+                            format!("已从加密备份 `{backup_id}` 还原 {restored} 项文件/凭据"),
+                        );
+                        self.engine.push_log(
+                            now,
+                            LogLevel::Audit,
+                            "cleanroom",
+                            &format!("净室回滚完成：已从 `{backup_id}` 还原 {restored} 项"),
+                        );
+                        self.engine.last_receipt = Some(receipt.clone());
+                        let snap = self.publish_snapshot(snapshot_store, now);
+                        let _ = reply.send(PipeResponse::Ack {
+                            receipt: Some(receipt),
+                            snapshot: Some(Box::new(snap)),
+                        });
+                    }
+                    Err(msg) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: msg,
+                            receipt: None,
+                        });
+                    }
+                }
+            }
+            PipeRequest::ConfigureCliHooks {
+                install_claude_code,
+                install_pwsh_profile,
+                sync_all_vaults,
+            } => {
+                let Some(user_home) = self.effective_user_home() else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IoFailed,
+                        message: "未能解析交互用户主目录，无法写入 CLI Hook 配置".into(),
+                        receipt: None,
+                    });
+                    return;
+                };
+                let vaults_root = match self.effective_vaults_root() {
+                    Ok(p) => p,
+                    Err(err) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: err,
+                            receipt: None,
+                        });
+                        return;
+                    }
+                };
+                let cli_exe = hook_installer::resolve_cli_exe_path();
+                match hook_installer::configure_cli_hooks_in(
+                    &user_home,
+                    Some(&vaults_root),
+                    &cli_exe,
+                    &self.engine.config.vaults,
+                    install_claude_code,
+                    install_pwsh_profile,
+                    sync_all_vaults,
+                ) {
+                    Ok(status) => {
+                        let summary = status.summary.clone();
+                        self.hooks = status;
+                        let mut receipt = OperationReceipt::new(
+                            format!("cli-hooks-{now}"),
+                            OperationStatus::Verified,
+                        );
+                        receipt.verified_scope = "cli_hooks".into();
+                        receipt.push_item("cli_hooks", OperationStatus::Verified, summary.clone());
+                        self.engine
+                            .push_log(now, LogLevel::Audit, "hooks", &summary);
+                        self.engine.last_receipt = Some(receipt.clone());
+                        let snap = self.publish_snapshot(snapshot_store, now);
+                        let _ = reply.send(PipeResponse::Ack {
+                            receipt: Some(receipt),
+                            snapshot: Some(Box::new(snap)),
+                        });
+                    }
+                    Err(msg) => {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IoFailed,
+                            message: msg,
+                            receipt: None,
+                        });
+                    }
+                }
+            }
+            PipeRequest::SyncWslBridge => {
+                let Some(in_flight) = InFlightGuard::try_acquire(&self.wsl_sync_in_flight) else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "WSL2 发行版探针同步正在进行中，请稍候".into(),
+                        receipt: None,
+                    });
+                    return;
+                };
+                let enabled = self.engine.config.wsl_bridge_enabled;
+                let bound_port = self.wsl_bridge.bound_port;
+                let token_ready = self.wsl_bridge.token_ready;
+                let desync = self
+                    .hook_metrics_ref
+                    .as_ref()
+                    .is_some_and(|m| m.wsl_proxy_desync.load(Ordering::Relaxed));
+                let event_tx = self.event_tx.clone();
+                let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                let worker_reply = reply_cell.clone();
+                if std::thread::Builder::new()
+                    .name("cg-wsl-sync".to_string())
+                    .spawn(move || {
+                        let _guard = in_flight;
+                        let status =
+                            wsl_bridge::sync_wsl_distros(enabled, bound_port, token_ready, desync);
+                        if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = event_tx.send(CoordinatorEvent::WslBridgeSynced {
+                                status: Box::new(status),
+                                now_secs: now_unix_secs(),
+                                reply: Some(tx),
+                            });
+                        }
+                    })
+                    .is_err()
+                {
+                    if let Some(tx) = reply_cell.lock().ok().and_then(|mut g| g.take()) {
+                        let _ = tx.send(PipeResponse::Error {
+                            code: ErrorCode::Busy,
+                            message: "创建 WSL2 同步工作线程失败，请稍后重试".into(),
+                            receipt: None,
+                        });
+                    }
+                }
+            }
+            PipeRequest::TriggerPanicLockdown => {
+                if matches!(
+                    self.engine.lifecycle,
+                    Lifecycle::Unconfigured | Lifecycle::Stopping
+                ) {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: format!(
+                            "当前生命周期（{}）不允许触发紧急全锁死",
+                            self.engine.lifecycle.label()
+                        ),
+                        receipt: None,
+                    });
+                    return;
+                }
+                self.step_and_run(EngineEvent::SetManualLockdown { on: true }, now);
+                let mut receipt = OperationReceipt::new(
+                    format!("panic-lockdown-{now}"),
+                    OperationStatus::Verified,
+                );
+                let guis = self.engine.config.guarded_agents.clone();
+                let (gui_killed, _, _) = kill_gui_list_with_receipt(
+                    &*self.driver,
+                    &guis,
+                    "panic_kill_gui",
+                    &mut receipt,
+                );
+                let (cli_killed, _, _) =
+                    kill_cli_list_with_receipt(&*self.driver, &KNOWN_CLI_AGENT_IDS, &mut receipt);
+                let mut vault_killed = 0usize;
+                if let Ok(vaults_root) = self.effective_vaults_root() {
+                    let mut vids: Vec<String> = self.vault_sessions.keys().cloned().collect();
+                    for v in &self.engine.config.vaults {
+                        if !vids.iter().any(|existing| existing == &v.id) {
+                            vids.push(v.id.clone());
+                        }
+                    }
+                    for vid in vids {
+                        vault_killed += self.stop_vault_processes(&vid, &vaults_root);
+                    }
+                }
+                receipt.verified_scope = format!(
+                    "lockdown=true, gui_killed={gui_killed}, cli_killed={cli_killed}, vault_killed={vault_killed}"
+                );
+                let msg = format!(
+                    "触发紧急一键锁死（Panic Lockdown）：已锁定出站并终止 GUI {gui_killed} / CLI {cli_killed} / 保险箱 {vault_killed} 个进程"
+                );
+                self.engine.push_log(now, LogLevel::Audit, "panic", &msg);
+                self.emit_notification("trip", "ClaudeGuard 紧急锁死已触发", &msg, now);
+                self.engine.last_receipt = Some(receipt.clone());
+                let snap = self.publish_snapshot(snapshot_store, now);
+                let _ = reply.send(PipeResponse::Ack {
+                    receipt: Some(receipt),
+                    snapshot: Some(Box::new(snap)),
+                });
+            }
+            PipeRequest::ClearWfpBlockedEvents => {
+                self.driver.clear_wfp_events();
+                let wfp = self.driver.wfp_status();
+                self.step_and_run(
+                    EngineEvent::WfpUpdated {
+                        status: Box::new(wfp),
+                    },
+                    now,
+                );
+                let mut receipt = OperationReceipt::new(
+                    format!("wfp-clear-events-{now}"),
+                    OperationStatus::Verified,
+                );
+                receipt.verified_scope = "wfp.recent_blocked".into();
+                receipt.push_item(
+                    "clear_wfp_events",
+                    OperationStatus::Verified,
+                    "已清空 WFP 实时内核拦截事件缓冲队列",
+                );
+                self.engine
+                    .push_log(now, LogLevel::Audit, "wfp", "已清空 WFP 内核拦截事件列表");
+                self.engine.last_receipt = Some(receipt.clone());
+                let snap = self.publish_snapshot(snapshot_store, now);
+                let _ = reply.send(PipeResponse::Ack {
+                    receipt: Some(receipt),
+                    snapshot: Some(Box::new(snap)),
+                });
+            }
+            PipeRequest::RunDeepRiskAudit => {
+                let Some(in_flight) = InFlightGuard::try_acquire(&self.deep_audit_in_flight) else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "10D 深度封号风险体检正在进行中，请稍候".into(),
+                        receipt: None,
+                    });
+                    return;
+                };
+                let snap = self.build_snapshot(now);
+                let driver = self.driver.clone();
+                let ledger = self.egress_ledger.clone();
+                let scanner = self.process_scanner.clone();
+                let has_process_guard = self.driver.capabilities().process_guard;
+                let event_tx = self.event_tx.clone();
+                let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                let worker_reply = reply_cell.clone();
+                if std::thread::Builder::new()
+                    .name("cg-deep-risk-audit".to_string())
+                    .spawn(move || {
+                        let _guard = in_flight;
+                        ip_intel::clear_ip_intel_cache();
+                        let procs = if has_process_guard {
+                            scanner.refresh()
+                        } else {
+                            scanner.cached_snapshot()
+                        };
+                        let electron_pids = collect_electron_agent_pids(&procs);
+                        let ts = now_unix_secs();
+                        let assessment = compute_deep_risk_assessment(
+                            &*driver,
+                            &snap,
+                            &ledger,
+                            &electron_pids,
+                            true,
+                            ts,
+                        );
+                        if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = event_tx.send(CoordinatorEvent::DeepRiskAuditFinished {
+                                assessment: Box::new(assessment),
+                                now_secs: now_unix_secs(),
+                                reply: Some(tx),
+                            });
+                        }
+                    })
+                    .is_err()
+                {
+                    if let Some(tx) = reply_cell.lock().ok().and_then(|mut g| g.take()) {
+                        let _ = tx.send(PipeResponse::Error {
+                            code: ErrorCode::Busy,
+                            message: "创建深度体检工作线程失败，请稍后重试".into(),
+                            receipt: None,
+                        });
+                    }
+                }
+            }
+            PipeRequest::ClearGeoVelocityCooldown => {
+                let _ = self.egress_ledger.clear_cooldown(now);
+                let mut next_risk = self.engine.risk_assessment.clone();
+                next_risk.geo_velocity_alert = None;
+                self.step_and_run(
+                    EngineEvent::RiskUpdated {
+                        assessment: Box::new(next_risk),
+                    },
+                    now,
+                );
+                let mut receipt = OperationReceipt::new(
+                    format!("clear-geo-cooldown-{now}"),
+                    OperationStatus::Verified,
+                );
+                receipt.verified_scope = "egress_ledger.cooldown".into();
+                receipt.push_item(
+                    "clear_geo_velocity_cooldown",
+                    OperationStatus::Verified,
+                    "已确认行程并清除时空瞬移冷却锁定",
+                );
+                self.engine.push_log(
+                    now,
+                    LogLevel::Audit,
+                    "risk",
+                    "用户手动确认并清除了跨国瞬移冷却锁",
+                );
+                self.engine.last_receipt = Some(receipt.clone());
+                let snap = self.publish_snapshot(snapshot_store, now);
+                let _ = reply.send(PipeResponse::Ack {
+                    receipt: Some(receipt),
+                    snapshot: Some(Box::new(snap)),
+                });
+            }
+            PipeRequest::BuildHealthCard { export_png } => {
+                let snap = self.build_snapshot(now);
+                let card = diagnostics::build_sanitized_health_card(
+                    &snap,
+                    &self.data_dir,
+                    now,
+                    export_png,
+                );
+                if export_png {
+                    self.engine.push_log(
+                        now,
+                        LogLevel::Audit,
+                        "diagnostics",
+                        "已导出脱敏防封健康体检卡 PNG",
+                    );
+                    let _ = self.publish_snapshot(snapshot_store, now);
+                }
+                let _ = reply.send(PipeResponse::HealthCard {
+                    card: Box::new(card),
+                });
+            }
         }
+    }
+
+    fn refresh_live_vault_sessions(&mut self, procs: &CachedProcessSnapshot) {
+        self.vault_sessions.retain(|_, entries| {
+            entries.retain(|(pid, _)| *pid > 0 && is_pid_alive(*pid));
+            !entries.is_empty()
+        });
+        let Ok(vaults_root) = self.effective_vaults_root() else {
+            return;
+        };
+        let vault_ids: Vec<String> = self
+            .engine
+            .config
+            .vaults
+            .iter()
+            .map(|v| v.id.clone())
+            .collect();
+        for vid in vault_ids {
+            let discovered = discover_live_vault_pids(procs, &vaults_root, &vid);
+            if !discovered.is_empty() {
+                merge_vault_session_pids(self.vault_sessions.entry(vid).or_default(), discovered);
+            }
+        }
+    }
+
+    fn stop_vault_processes(&mut self, vault_id: &str, vaults_root: &std::path::Path) -> usize {
+        let mut target_pids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        if let Some(entries) = self.vault_sessions.remove(vault_id) {
+            for (pid, _app) in entries {
+                if pid > 0 {
+                    target_pids.insert(pid);
+                }
+            }
+        }
+        if self.driver.capabilities().process_guard {
+            let procs = self.process_scanner.refresh();
+            for (pid, _app) in discover_live_vault_pids(&procs, vaults_root, vault_id) {
+                if pid > 0 {
+                    target_pids.insert(pid);
+                }
+            }
+        }
+        let mut count = 0usize;
+        for pid in target_pids {
+            if terminate_pid_best_effort(pid) {
+                count += 1;
+            }
+        }
+        let _ = vault_win::release_msix_exclusive_lock(vaults_root, "claude", vault_id);
+        let _ = vault_win::release_msix_exclusive_lock(vaults_root, "chatgpt", vault_id);
+        count
     }
 
     fn send_mutation_reply(&mut self, reply: SyncSender<PipeResponse>, snap: GuardSnapshot) {
@@ -3381,6 +4901,439 @@ impl RealEngineActor {
             now,
         )
     }
+}
+
+fn format_wfp_persistent_sublayer_guid() -> String {
+    let g = wfp_win::CLAUDEGUARD_WFP_SUBLAYER_PERSISTENT_GUID_U128;
+    format!(
+        "{{{:08x}-{:04x}-{:04x}-{:04x}-{:012x}}}",
+        (g >> 96) as u32,
+        ((g >> 80) & 0xFFFF) as u16,
+        ((g >> 64) & 0xFFFF) as u16,
+        ((g >> 48) & 0xFFFF) as u16,
+        g & 0xFFFF_FFFF_FFFF,
+    )
+}
+
+#[cfg(windows)]
+fn terminate_pid_best_effort(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, pid) else {
+            return false;
+        };
+        let ok = TerminateProcess(handle, 1).is_ok();
+        let _ = CloseHandle(handle);
+        ok
+    }
+}
+
+#[cfg(not(windows))]
+fn terminate_pid_best_effort(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(windows)]
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE_EXIT_CODE: u32 = 259;
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut exit_code: u32 = 0;
+        let alive = GetExitCodeProcess(handle, &mut exit_code).is_ok()
+            && exit_code == STILL_ACTIVE_EXIT_CODE;
+        let _ = CloseHandle(handle);
+        alive
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_pid_alive(_pid: u32) -> bool {
+    false
+}
+
+/// Extracts main Electron GUI client `(agent_id, pid)` pairs from a cached process snapshot
+/// for live command-line anti-leak hygiene auditing (`NtQueryInformationProcess(60)`).
+///
+/// Filters out Chromium child helper processes (`--type=renderer`, `--type=gpu-process`, etc.),
+/// SCM service/updater helpers, and non-Electron clients such as `zed`.
+pub fn collect_electron_agent_pids(procs: &CachedProcessSnapshot) -> Vec<(String, u32)> {
+    let pid_to_name: HashMap<u32, &str> = procs
+        .procs
+        .iter()
+        .map(|p| (p.pid, p.name_l.as_str()))
+        .collect();
+    let mut out: Vec<(String, u32)> = Vec::new();
+    let mut seen_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+    for p in &procs.procs {
+        if p.pid == 0 || !seen_pids.insert(p.pid) {
+            continue;
+        }
+        if cg_core::agents::is_agent_scm_service_exe(&p.name_l)
+            || p.name_l.contains("crashpad")
+            || p.name_l.contains("updater")
+            || p.name_l == "update.exe"
+            || p.cmd_l.contains("--type=")
+        {
+            continue;
+        }
+        if p.cmd_l.is_empty()
+            && p.ppid != 0
+            && pid_to_name
+                .get(&p.ppid)
+                .is_some_and(|parent_name| *parent_name == p.name_l.as_str())
+        {
+            continue;
+        }
+        for agent in GUI_AGENTS {
+            if !hygiene_plan::is_electron_agent(agent.id) {
+                continue;
+            }
+            if cg_core::agents::gui_agent_matches_with_all_dirs(
+                agent.id,
+                &p.name_l,
+                &p.path_l,
+                &procs.claude_dirs_l,
+                &procs.chatgpt_dirs_l,
+                &procs.antigravity_dirs_l,
+            ) {
+                out.push((agent.id.to_string(), p.pid));
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn normalize_path_needle(path: &std::path::Path) -> (String, String) {
+    let raw = path.to_string_lossy();
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let bs = stripped
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    let fs = bs.replace('\\', "/");
+    (bs, fs)
+}
+
+fn cmd_contains_path_prefix(cmd_l: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut search_from = 0usize;
+    while let Some(rel) = cmd_l[search_from..].find(needle) {
+        let end = search_from + rel + needle.len();
+        let boundary_ok = match cmd_l[end..].chars().next() {
+            None => true,
+            Some('\\' | '/' | '"' | '\'' | ' ' | '\t' | ';' | ',') => true,
+            Some(_) => false,
+        };
+        if boundary_ok {
+            return true;
+        }
+        search_from = search_from + rel + 1;
+        if search_from >= cmd_l.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn infer_vault_proc_app_label(
+    p: &process_win::ProcInfo,
+    cmd_l: &str,
+    procs: &CachedProcessSnapshot,
+) -> String {
+    for agent in GUI_AGENTS {
+        if cg_core::agents::gui_agent_matches_with_all_dirs(
+            agent.id,
+            &p.name_l,
+            &p.path_l,
+            &procs.claude_dirs_l,
+            &procs.chatgpt_dirs_l,
+            &procs.antigravity_dirs_l,
+        ) {
+            return agent.id.to_string();
+        }
+    }
+    for (id, _) in CLI_AGENTS {
+        if cg_core::agents::cli_agent_matches(id, &p.name_l, &p.path_l, cmd_l) {
+            return (*id).to_string();
+        }
+    }
+    let stem = p.name_l.trim_end_matches(".exe").trim();
+    if stem.is_empty() {
+        "vault-app".to_string()
+    } else {
+        stem.to_string()
+    }
+}
+
+/// Pure snapshot scanner discovering all non-zero processes whose command line references
+/// `<vaults_root>\<vault_id>` (e.g. `--user-data-dir=<vault_dir>\...`), enforcing strict path boundaries
+/// so `jp` never false-matches `jp-work`.
+pub fn discover_vault_pids_in_snapshot(
+    procs: &CachedProcessSnapshot,
+    vaults_root: &std::path::Path,
+    vault_id: &str,
+) -> Vec<(u32, String)> {
+    let vault_dir = vaults_root.join(vault_id);
+    let (needle_bs, needle_fs) = normalize_path_needle(&vault_dir);
+    let self_pid = std::process::id();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for p in &procs.procs {
+        if p.pid == 0 || p.pid == self_pid || !seen.insert(p.pid) {
+            continue;
+        }
+        if cmd_contains_path_prefix(&p.cmd_l, &needle_bs)
+            || cmd_contains_path_prefix(&p.cmd_l, &needle_fs)
+        {
+            out.push((p.pid, infer_vault_proc_app_label(p, &p.cmd_l, procs)));
+        }
+    }
+    out
+}
+
+fn discover_live_vault_pids(
+    procs: &CachedProcessSnapshot,
+    vaults_root: &std::path::Path,
+    vault_id: &str,
+) -> Vec<(u32, String)> {
+    let mut found = discover_vault_pids_in_snapshot(procs, vaults_root, vault_id);
+    let mut seen: std::collections::HashSet<u32> = found.iter().map(|(pid, _)| *pid).collect();
+    let vault_dir = vaults_root.join(vault_id);
+    let (needle_bs, needle_fs) = normalize_path_needle(&vault_dir);
+    let self_pid = std::process::id();
+
+    for p in &procs.procs {
+        if p.pid == 0 || p.pid == self_pid || !p.cmd_l.is_empty() || seen.contains(&p.pid) {
+            continue;
+        }
+        let matches_known_gui = GUI_AGENTS.iter().any(|agent| {
+            cg_core::agents::gui_agent_matches_with_all_dirs(
+                agent.id,
+                &p.name_l,
+                &p.path_l,
+                &procs.claude_dirs_l,
+                &procs.chatgpt_dirs_l,
+                &procs.antigravity_dirs_l,
+            )
+        });
+        if !matches_known_gui {
+            continue;
+        }
+        if let Ok(raw_cmd) = hygiene_win::query_process_command_line_fast(p.pid) {
+            let cmd_l = raw_cmd.to_ascii_lowercase();
+            if cmd_contains_path_prefix(&cmd_l, &needle_bs)
+                || cmd_contains_path_prefix(&cmd_l, &needle_fs)
+            {
+                seen.insert(p.pid);
+                found.push((p.pid, infer_vault_proc_app_label(p, &cmd_l, procs)));
+            }
+        }
+    }
+    found
+}
+
+fn discover_launched_vault_pids(
+    after_procs: &CachedProcessSnapshot,
+    vaults_root: &std::path::Path,
+    vault_id: &str,
+    app: VaultAppTarget,
+    before_pids: &std::collections::HashSet<u32>,
+) -> Vec<(u32, String)> {
+    let mut found = discover_live_vault_pids(after_procs, vaults_root, vault_id);
+    let mut seen: std::collections::HashSet<u32> = found.iter().map(|(pid, _)| *pid).collect();
+    let self_pid = std::process::id();
+    let agent_id = app.agent_id();
+
+    for p in &after_procs.procs {
+        if p.pid == 0 || p.pid == self_pid || before_pids.contains(&p.pid) || seen.contains(&p.pid)
+        {
+            continue;
+        }
+        let matched = if app.is_cli() {
+            cg_core::agents::cli_agent_matches(agent_id, &p.name_l, &p.path_l, &p.cmd_l)
+        } else {
+            cg_core::agents::gui_agent_matches_with_all_dirs(
+                agent_id,
+                &p.name_l,
+                &p.path_l,
+                &after_procs.claude_dirs_l,
+                &after_procs.chatgpt_dirs_l,
+                &after_procs.antigravity_dirs_l,
+            )
+        };
+        if matched {
+            seen.insert(p.pid);
+            found.push((p.pid, agent_id.to_string()));
+        }
+    }
+    found
+}
+
+fn merge_vault_session_pids(existing: &mut Vec<(u32, String)>, incoming: Vec<(u32, String)>) {
+    for (pid, app) in incoming {
+        if pid == 0 {
+            continue;
+        }
+        if !existing
+            .iter()
+            .any(|(existing_pid, _)| *existing_pid == pid)
+        {
+            existing.push((pid, app));
+        }
+    }
+}
+
+/// Computes a full 10-Dimension Ban-Risk & Egress Safety [`RiskAssessment`] strictly off-thread.
+///
+/// Honors fail-closed routing: when `ProbeRoute::Skip(_)` or `access_path_inspection` is unsupported,
+/// opens ZERO external sockets and computes an offline purity/hygiene/ledger assessment cleanly.
+pub fn compute_deep_risk_assessment(
+    driver: &dyn PlatformDriver,
+    snap: &GuardSnapshot,
+    ledger: &EgressLedger,
+    electron_pids: &[(String, u32)],
+    allow_network: bool,
+    now_secs: u64,
+) -> RiskAssessment {
+    let (obs_ip, obs_country, _obs_asn) = current_primary_egress(snap);
+    let route = if allow_network && driver.capabilities().access_path_inspection {
+        resolve_access_and_route(
+            driver,
+            &snap.config,
+            snap.cfg_rev,
+            &snap.config.targets,
+            snap.config.enforce_access_path,
+            now_secs,
+        )
+        .1
+    } else {
+        ProbeRoute::Skip("offline".into())
+    };
+
+    let mut ip_purity = ip_intel::fetch_ip_purity_via_route(
+        &route,
+        obs_ip.as_deref(),
+        obs_country.as_deref(),
+        now_secs,
+    );
+
+    if allow_network && !matches!(route, ProbeRoute::Skip(_)) {
+        let ipv6_cc = ip_intel::probe_ipv6_egress_via_route(&route, Duration::from_secs(3))
+            .and_then(|(_, cc)| cc);
+        ip_intel::attach_dual_stack_ipv6_check(&mut ip_purity, ipv6_cc);
+    }
+
+    let stun_leak = if allow_network
+        && snap.config.enable_stun_dns_audit
+        && driver.capabilities().access_path_inspection
+    {
+        stun_probe::probe_webrtc_stun_leak(
+            ip_purity.ip.as_deref().or(obs_ip.as_deref()),
+            1200,
+            now_secs,
+        )
+    } else {
+        crate::protocol::StunLeakReport::default()
+    };
+
+    let dns_coherence = if allow_network
+        && snap.config.enable_stun_dns_audit
+        && !matches!(route, ProbeRoute::Skip(_))
+    {
+        ip_intel::probe_dns_coherence(
+            &route,
+            ip_purity.country.as_deref().or(obs_country.as_deref()),
+            now_secs,
+        )
+    } else {
+        crate::protocol::DnsCoherenceReport::default()
+    };
+
+    let electron_hygiene = hygiene_win::audit_running_electron_hygiene(electron_pids, now_secs);
+
+    let history_7d = ledger.observations_for_scoring(None, now_secs);
+    let current_observation = match (
+        ip_purity.ip.as_deref().or(obs_ip.as_deref()),
+        ip_purity.country.as_deref().or(obs_country.as_deref()),
+    ) {
+        (Some(ip), Some(cc)) => {
+            let city = ip_purity.city.as_deref().unwrap_or("");
+            let _ = ledger.record_and_evaluate(
+                ip,
+                cc,
+                city,
+                ip_purity.lat_tenths,
+                ip_purity.lon_tenths,
+                None,
+                if snap.config.enforce_geo_velocity {
+                    risk_scorer::DEFAULT_TELEPORT_COOLDOWN_MINS
+                } else {
+                    0
+                },
+                now_secs,
+            );
+            Some(ledger.make_observation(
+                ip,
+                cc,
+                city,
+                ip_purity.lat_tenths,
+                ip_purity.lon_tenths,
+                None,
+                now_secs,
+            ))
+        }
+        _ => None,
+    };
+
+    let mut lat_min = u64::MAX;
+    let mut lat_max = 0u64;
+    for t in &snap.targets {
+        if t.latency_ms > 0 {
+            lat_min = lat_min.min(t.latency_ms);
+            lat_max = lat_max.max(t.latency_ms);
+        }
+    }
+    let rtt_jitter_ms = lat_max.saturating_sub(lat_min);
+
+    let input = risk_scorer::RiskScoringInput {
+        ip_purity,
+        stun_leak,
+        dns_coherence,
+        electron_hygiene,
+        env_check: Some(snap.env.clone()),
+        windows_geo_name: env_win::read_user_geo_name(),
+        accept_language: Some(env_win::read_accept_language_hint()),
+        edge_challenged: false,
+        tls_or_http_downgraded: false,
+        active_mtu: None,
+        rtt_jitter_ms,
+        history_7d,
+        current_observation,
+        teleport_cooldown_mins: if snap.config.enforce_geo_velocity {
+            risk_scorer::DEFAULT_TELEPORT_COOLDOWN_MINS
+        } else {
+            0
+        },
+        now_secs,
+    };
+    risk_scorer::score_egress_risk(&input)
 }
 
 fn is_non_cn_geo_probe(p: &ProbeResult) -> bool {
@@ -3527,6 +5480,12 @@ type SnapshotStoreRef<'a> = crate::coordinator::SnapshotStore;
 
 impl CoordinatorActor for RealEngineActor {
     fn on_event(&mut self, event: CoordinatorEvent, ctx: &CoordinatorContext<'_>) -> ActorControl {
+        if self.burst_guard_ref.is_none() {
+            self.burst_guard_ref = Some(ctx.burst_guard.clone());
+        }
+        if self.hook_metrics_ref.is_none() {
+            self.hook_metrics_ref = Some(ctx.hook_metrics.clone());
+        }
         match event {
             CoordinatorEvent::Pipe { req, reply } => {
                 self.handle_pipe_request(req, reply, ctx.snapshot);
@@ -3889,6 +5848,25 @@ impl CoordinatorActor for RealEngineActor {
                 self.cached_agents = bundle.agents;
                 self.leak_shield = bundle.leak_shield;
                 self.mihomo = bundle.mihomo;
+                self.hooks = bundle.hooks;
+                {
+                    let mut bg = ctx.burst_guard.lock().unwrap_or_else(|e| e.into_inner());
+                    bg.set_suspicious_oauth_processes(bundle.suspicious_oauth_processes);
+                }
+                self.step_and_run(
+                    EngineEvent::WfpUpdated {
+                        status: Box::new(bundle.wfp),
+                    },
+                    bundle.now_secs,
+                );
+                if let Some(risk) = bundle.risk_assessment {
+                    self.step_and_run(
+                        EngineEvent::RiskUpdated {
+                            assessment: Box::new(risk),
+                        },
+                        bundle.now_secs,
+                    );
+                }
                 let effective_leak = if self.in_wake_grace(bundle.now_secs) && bundle.leak.leaked()
                 {
                     LeakReport::not_applicable(
@@ -3964,6 +5942,10 @@ impl CoordinatorActor for RealEngineActor {
                         },
                         bundle.now_secs,
                     );
+                }
+                if self.driver.capabilities().process_guard {
+                    let procs = self.process_scanner.cached_snapshot();
+                    self.refresh_live_vault_sessions(&procs);
                 }
                 let _ = self.publish_snapshot(ctx.snapshot, bundle.now_secs);
             }
@@ -4065,6 +6047,26 @@ impl CoordinatorActor for RealEngineActor {
                     &mut next_summary.ag_capsule,
                     &incoming.ag_capsule,
                 );
+                let did_cursor = merge_checked_slot(
+                    check_client("cursor_ide"),
+                    &mut next_summary.cursor_ide,
+                    &incoming.cursor_ide,
+                );
+                let did_windsurf = merge_checked_slot(
+                    check_client("windsurf_ide"),
+                    &mut next_summary.windsurf_ide,
+                    &incoming.windsurf_ide,
+                );
+                let did_zed = merge_checked_slot(
+                    check_client("zed_ide"),
+                    &mut next_summary.zed_ide,
+                    &incoming.zed_ide,
+                );
+                let did_trae = merge_checked_slot(
+                    check_client("trae_ide"),
+                    &mut next_summary.trae_ide,
+                    &incoming.trae_ide,
+                );
 
                 self.step_and_run(
                     EngineEvent::UpdatesChecked {
@@ -4122,6 +6124,10 @@ impl CoordinatorActor for RealEngineActor {
                     record_slot("antigravity_cn", did_cn, &next_summary.antigravity_cn);
                     record_slot("ag_usage_monitor", did_um, &next_summary.ag_usage_monitor);
                     record_slot("ag_capsule", did_cap, &next_summary.ag_capsule);
+                    record_slot("cursor_ide", did_cursor, &next_summary.cursor_ide);
+                    record_slot("windsurf_ide", did_windsurf, &next_summary.windsurf_ide);
+                    record_slot("zed_ide", did_zed, &next_summary.zed_ide);
+                    record_slot("trae_ide", did_trae, &next_summary.trae_ide);
 
                     receipt.verified_scope = scope_parts.join(", ");
                     if failed_count == 0 {
@@ -4169,6 +6175,67 @@ impl CoordinatorActor for RealEngineActor {
                         snapshot: Some(Box::new(snap)),
                     });
                 }
+            }
+            CoordinatorEvent::DeepRiskAuditFinished {
+                assessment,
+                now_secs,
+                reply,
+            } => {
+                let headline = assessment.headline.clone();
+                let score = assessment.score;
+                let grade = assessment.grade;
+                self.step_and_run(EngineEvent::RiskUpdated { assessment }, now_secs);
+                let mut receipt = OperationReceipt::new(
+                    format!("deep-risk-audit-{now_secs}"),
+                    OperationStatus::Verified,
+                );
+                receipt.verified_scope = format!("score={score}, grade={}", grade.code());
+                receipt.push_item("risk_audit", OperationStatus::Verified, headline.clone());
+                self.engine.push_log(
+                    now_secs,
+                    LogLevel::Audit,
+                    "risk",
+                    &format!(
+                        "完成 10D 深度封号风险体检：{score}/100（{} 级）· {headline}",
+                        grade.code()
+                    ),
+                );
+                self.engine.last_receipt = Some(receipt.clone());
+                let snap = self.publish_snapshot(ctx.snapshot, now_secs);
+                if let Some(tx) = reply {
+                    let _ = tx.send(PipeResponse::Ack {
+                        receipt: Some(receipt),
+                        snapshot: Some(Box::new(snap)),
+                    });
+                }
+            }
+            CoordinatorEvent::WslBridgeSynced {
+                status,
+                now_secs,
+                reply,
+            } => {
+                let summary = status.summary.clone();
+                self.wsl_bridge = *status;
+                let mut receipt = OperationReceipt::new(
+                    format!("wsl-sync-{now_secs}"),
+                    OperationStatus::Verified,
+                );
+                receipt.verified_scope = "wsl_bridge".into();
+                receipt.push_item("wsl_bridge", OperationStatus::Verified, summary.clone());
+                self.engine
+                    .push_log(now_secs, LogLevel::Audit, "wsl", &summary);
+                self.engine.last_receipt = Some(receipt.clone());
+                let snap = self.publish_snapshot(ctx.snapshot, now_secs);
+                if let Some(tx) = reply {
+                    let _ = tx.send(PipeResponse::Ack {
+                        receipt: Some(receipt),
+                        snapshot: Some(Box::new(snap)),
+                    });
+                }
+            }
+            CoordinatorEvent::UpdateWslBridgeStatus { status } => {
+                self.wsl_bridge = *status;
+                let _ = self.publish_snapshot(ctx.snapshot, now_unix_secs());
             }
             CoordinatorEvent::BeginStopping { reply } => {
                 let now = now_unix_secs();
@@ -4562,6 +6629,10 @@ fn has_any_failed_update_slot(u: &UpdateSummary) -> bool {
         &u.antigravity_cn,
         &u.ag_usage_monitor,
         &u.ag_capsule,
+        &u.cursor_ide,
+        &u.windsurf_ide,
+        &u.zed_ide,
+        &u.trae_ide,
     ]
     .into_iter()
     .any(|slot| slot.phase == UpdateCheckPhase::Failed)
@@ -4612,6 +6683,7 @@ impl BackgroundMonitorHandle {
         coordinator: CoordinatorHandle,
         driver: Arc<dyn PlatformDriver>,
         process_scanner: Arc<ProcessScanner>,
+        egress_ledger: Arc<EgressLedger>,
         data_dir: PathBuf,
         enable_initial_tick: bool,
     ) -> Self {
@@ -4619,6 +6691,7 @@ impl BackgroundMonitorHandle {
             coordinator,
             driver,
             process_scanner,
+            egress_ledger,
             data_dir,
             enable_initial_tick,
             DEFAULT_TELEMETRY_INTERVAL,
@@ -4627,10 +6700,12 @@ impl BackgroundMonitorHandle {
     }
 
     /// Spawns the background scheduler + telemetry loop with configurable intervals (also used in tests).
+    #[allow(clippy::too_many_arguments)]
     pub fn start_with_intervals(
         coordinator: CoordinatorHandle,
         driver: Arc<dyn PlatformDriver>,
         process_scanner: Arc<ProcessScanner>,
+        egress_ledger: Arc<EgressLedger>,
         data_dir: PathBuf,
         enable_initial_tick: bool,
         telemetry_interval: Duration,
@@ -4656,6 +6731,9 @@ impl BackgroundMonitorHandle {
                 let mut last_telemetry: Option<Instant> = None;
                 let last_upd_check: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
                 let auto_upd_in_flight = Arc::new(AtomicBool::new(false));
+                let bg_risk_in_flight = Arc::new(AtomicBool::new(false));
+                let mut last_risk_audit: Option<Instant> = None;
+                let mut last_risk_ip: Option<String> = None;
                 let ag_auto_repair: Arc<Mutex<AutoRepairBudget>> =
                     Arc::new(Mutex::new(AutoRepairBudget::default()));
                 let ag_auto_repair_in_flight = Arc::new(AtomicBool::new(false));
@@ -4738,6 +6816,15 @@ impl BackgroundMonitorHandle {
                             LeakShieldStatus::default()
                         };
                         let mihomo = mihomo_win::inspect_mihomo();
+                        let wfp = driver.wfp_status();
+                        let (checks, blocks, latency_us) = coordinator.hook_gate_metrics();
+                        let hooks = hook_installer::inspect_hook_status(
+                            &snap.config.vaults,
+                            checks,
+                            blocks,
+                            latency_us,
+                        );
+                        let suspicious_oauth_processes = Vec::new();
 
                         coordinator.try_send_telemetry(TelemetryBundle {
                             cfg_rev: snap.cfg_rev,
@@ -4750,8 +6837,66 @@ impl BackgroundMonitorHandle {
                             antigravity_proxy: antigravity_proxy.clone(),
                             self_check,
                             updates: Some(local_updates.clone()),
+                            wfp,
+                            risk_assessment: None,
+                            hooks,
+                            suspicious_oauth_processes,
                             now_secs: now,
                         });
+
+                        // Periodic off-thread 10D risk assessment refresh (every 5m or when primary egress IP changes).
+                        let (cur_ip, _, _) = current_primary_egress(&snap);
+                        let ip_changed = cur_ip.is_some() && cur_ip != last_risk_ip;
+                        let risk_due = ip_changed
+                            || last_risk_audit
+                                .is_none_or(|t| t.elapsed() >= Duration::from_secs(300));
+                        if snap.lifecycle == Lifecycle::Armed
+                            && snap.protection == ProtectionState::Monitoring
+                            && snap.all_enabled_pass()
+                            && driver.capabilities().access_path_inspection
+                            && risk_due
+                            && bg_risk_in_flight
+                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                                .is_ok()
+                        {
+                            last_risk_audit = Some(Instant::now());
+                            last_risk_ip = cur_ip;
+                            let r_driver = driver.clone();
+                            let r_snap = snap.clone();
+                            let r_ledger = egress_ledger.clone();
+                            let r_electron_pids = collect_electron_agent_pids(&procs);
+                            let r_tx = coordinator.event_sender();
+                            let r_flag = bg_risk_in_flight.clone();
+                            let r_stop = t_flag.clone();
+                            let _ = std::thread::Builder::new()
+                                .name("cg-bg-risk-audit".to_string())
+                                .spawn(move || {
+                                    struct ResetRisk(Arc<AtomicBool>);
+                                    impl Drop for ResetRisk {
+                                        fn drop(&mut self) {
+                                            self.0.store(false, Ordering::Release);
+                                        }
+                                    }
+                                    let _guard = ResetRisk(r_flag);
+                                    let assessment = compute_deep_risk_assessment(
+                                        &*r_driver,
+                                        &r_snap,
+                                        &r_ledger,
+                                        &r_electron_pids,
+                                        true,
+                                        now_unix_secs(),
+                                    );
+                                    if !r_stop.load(Ordering::Acquire) {
+                                        let _ = r_tx.try_send(
+                                            CoordinatorEvent::DeepRiskAuditFinished {
+                                                assessment: Box::new(assessment),
+                                                now_secs: now_unix_secs(),
+                                                reply: None,
+                                            },
+                                        );
+                                    }
+                                });
+                        }
 
                         let effective_upd_interval = if has_any_failed_update_slot(&snap.updates) {
                             AUTO_UPDATE_RETRY_INTERVAL.min(update_check_interval)
@@ -4918,7 +7063,7 @@ mod tests {
     use crate::coordinator::{start_coordinator_with, CoordinatorHandle};
     use crate::journal::tests::{MockRecoveryExecutor, MockRecoveryState};
     use crate::journal::PlatformRecoveryExecutor;
-    use crate::protocol::{AntigravityProxyState, EnvCheck};
+    use crate::protocol::{AntigravityProxyState, EnvCheck, WfpStatus};
     use cg_platform::netwatch_win::TcpConn;
     use cg_platform::process_win::{LaunchTarget, ProcessIdentity, SweepReport};
     use cg_platform::{
@@ -5114,6 +7259,7 @@ mod tests {
         check_updates_calls: AtomicUsize,
         last_update_route: Mutex<Option<ProbeRoute>>,
         update_fn: Mutex<Option<UpdateCheckFn>>,
+        allow_launch: AtomicBool,
     }
 
     impl ControllableDriver {
@@ -5135,6 +7281,7 @@ mod tests {
                 check_updates_calls: AtomicUsize::new(0),
                 last_update_route: Mutex::new(None),
                 update_fn: Mutex::new(None),
+                allow_launch: AtomicBool::new(false),
             }
         }
     }
@@ -5313,7 +7460,11 @@ mod tests {
         }
 
         fn launch_app_normal_privilege(&self, target: &LaunchTarget) -> PlatformResult<()> {
-            self.fallback.launch_app_normal_privilege(target)
+            if self.allow_launch.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                self.fallback.launch_app_normal_privilege(target)
+            }
         }
 
         fn send_toast(&self, title: &str, body: &str) -> PlatformResult<()> {
@@ -5792,6 +7943,10 @@ mod tests {
                 1_700_000_200,
             ),
             updates: None,
+            wfp: WfpStatus::default(),
+            risk_assessment: None,
+            hooks: HookIntegrationStatus::default(),
+            suspicious_oauth_processes: Vec::new(),
             now_secs: 1_700_000_200,
         });
         assert!(matches!(
@@ -5851,6 +8006,10 @@ mod tests {
                 1_700_000_205,
             ),
             updates: None,
+            wfp: WfpStatus::default(),
+            risk_assessment: None,
+            hooks: HookIntegrationStatus::default(),
+            suspicious_oauth_processes: Vec::new(),
             now_secs: 1_700_000_205,
         });
         let _ = coord.dispatch(PipeRequest::QueryLogs {
@@ -6080,6 +8239,10 @@ mod tests {
             antigravity_proxy: healthy_ag.clone(),
             self_check,
             updates: None,
+            wfp: WfpStatus::default(),
+            risk_assessment: None,
+            hooks: HookIntegrationStatus::default(),
+            suspicious_oauth_processes: Vec::new(),
             now_secs: 1_700_000_500,
         });
 
@@ -6255,6 +8418,10 @@ mod tests {
             antigravity_proxy: AntigravityProxyStatus::default(),
             self_check: sc,
             updates: Some(msix_only),
+            wfp: WfpStatus::default(),
+            risk_assessment: None,
+            hooks: HookIntegrationStatus::default(),
+            suspicious_oauth_processes: Vec::new(),
             now_secs: tel_now,
         });
         let _ = coord.dispatch(PipeRequest::QueryLogs {
@@ -6664,9 +8831,13 @@ mod tests {
 
         let data_dir = dir.path().to_path_buf();
         let drv_clone = driver.clone();
-        let (coord, ()) = start_coordinator_with(|event_tx| {
+        let (coord, egress_ledger) = start_coordinator_with(|event_tx| {
             let boot = RealEngineActor::bootstrap(data_dir, drv_clone, runner, recovery, event_tx);
-            (boot.initial_snapshot, Box::new(boot.actor), ())
+            (
+                boot.initial_snapshot,
+                Box::new(boot.actor),
+                boot.egress_ledger,
+            )
         });
 
         let mut cfg = make_cfg("US");
@@ -6686,6 +8857,7 @@ mod tests {
             coord.clone(),
             driver.clone(),
             process_scanner,
+            egress_ledger,
             dir.path().to_path_buf(),
             false,
             Duration::from_millis(25),
@@ -7419,6 +9591,7 @@ mod tests {
         let recovery = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
         let coord = boot_actor(dir.path(), driver.clone(), runner, recovery);
         let scanner = Arc::new(ProcessScanner::new(Duration::from_secs(5)));
+        let ledger = Arc::new(EgressLedger::open(dir.path()));
 
         // Huge 100-year interval is strictly larger than any OS uptime (`Instant::now() - interval` would panic!).
         let huge_interval = Duration::from_secs(86_400 * 365 * 100);
@@ -7426,6 +9599,7 @@ mod tests {
             coord.clone(),
             driver,
             scanner,
+            ledger,
             dir.path().to_path_buf(),
             false,
             huge_interval,
@@ -7524,6 +9698,10 @@ mod tests {
             antigravity_proxy: AntigravityProxyStatus::default(),
             self_check: DefenseSelfCheck::default(),
             updates: None,
+            wfp: WfpStatus::default(),
+            risk_assessment: None,
+            hooks: HookIntegrationStatus::default(),
+            suspicious_oauth_processes: Vec::new(),
             now_secs: 1_700_001_000,
         });
         let _ = coord.dispatch(PipeRequest::QueryLogs {
@@ -7670,6 +9848,10 @@ mod tests {
             antigravity_proxy: AntigravityProxyStatus::default(),
             self_check: DefenseSelfCheck::default(),
             updates: None,
+            wfp: WfpStatus::default(),
+            risk_assessment: None,
+            hooks: HookIntegrationStatus::default(),
+            suspicious_oauth_processes: Vec::new(),
             now_secs: 1_700_002_000,
         });
         let _ = coord2.dispatch(PipeRequest::QueryLogs {
@@ -7694,6 +9876,10 @@ mod tests {
             antigravity_proxy: AntigravityProxyStatus::default(),
             self_check: DefenseSelfCheck::default(),
             updates: None,
+            wfp: WfpStatus::default(),
+            risk_assessment: None,
+            hooks: HookIntegrationStatus::default(),
+            suspicious_oauth_processes: Vec::new(),
             now_secs: now_unix_secs(),
         });
         let _ = coord2.dispatch(PipeRequest::QueryLogs {
@@ -7926,6 +10112,10 @@ mod tests {
             antigravity_proxy: AntigravityProxyStatus::default(),
             self_check: cur.self_check,
             updates: None,
+            wfp: WfpStatus::default(),
+            risk_assessment: None,
+            hooks: HookIntegrationStatus::default(),
+            suspicious_oauth_processes: Vec::new(),
             now_secs: now_unix_secs(),
         });
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -8034,6 +10224,592 @@ mod tests {
             dir.path().join("daemon.log").is_file(),
             "rolling redacted daemon.log must be flushed to data_dir"
         );
+
+        coord.shutdown();
+    }
+
+    #[test]
+    fn v5_vaults_cleanroom_panic_lockdown_wfp_and_health_card_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let fake_home = dir.path().join("home");
+        let vaults_root = dir.path().join("vaults");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::fs::create_dir_all(&vaults_root).unwrap();
+
+        let driver = Arc::new(ControllableDriver::new());
+        let pass = Arc::new(AtomicBool::new(true));
+        let runner = Arc::new(AccessAwareProbeRunner { pass: pass.clone() });
+        let recovery = Arc::new(PlatformRecoveryExecutor::new(driver.clone()));
+
+        let (coord, ()) = start_coordinator_with(|event_tx| {
+            let mut boot = RealEngineActor::bootstrap(
+                data_dir.clone(),
+                driver.clone(),
+                runner,
+                recovery,
+                event_tx,
+            );
+            boot.actor = boot
+                .actor
+                .with_test_sandbox_dirs(fake_home.clone(), vaults_root.clone());
+            (boot.initial_snapshot, Box::new(boot.actor), ())
+        });
+
+        let mut cfg = make_cfg("US");
+        cfg.enforce_access_path = false;
+        assert!(matches!(
+            coord.dispatch(PipeRequest::CompleteOnboarding { config: cfg }),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(matches!(
+            coord.dispatch(PipeRequest::RecheckNow { target_id: None }),
+            PipeResponse::Ack { .. }
+        ));
+
+        // 1) UpsertVault creates isolated dirs, seeds machine-id, and persists config.
+        let jp_vault = crate::protocol::AccountVault {
+            id: "jp-work".into(),
+            name: "日本工作仓".into(),
+            accent_hex: "#10B981".into(),
+            enabled: true,
+            pinned_regions: vec!["JP".into()],
+            pinned_ips: Vec::new(),
+            pinned_asn: None,
+            dedicated_proxy_port: None,
+            preferred_mihomo_group: None,
+            preferred_mihomo_node: None,
+            auto_align_mihomo_on_vault_launch: false,
+            min_safety_score: 75,
+            cooldown_after_ip_change_secs: 900,
+            share_ide_extensions: true,
+            msix_isolation_mode: Default::default(),
+        };
+        match coord.dispatch(PipeRequest::UpsertVault {
+            vault: jp_vault.clone(),
+        }) {
+            PipeResponse::Ack {
+                snapshot: Some(snap),
+                ..
+            } => {
+                assert_eq!(snap.config.vaults.len(), 1);
+                assert_eq!(snap.vaults.len(), 1);
+                assert_eq!(snap.vaults[0].state, VaultRuntimeState::EgressMismatch);
+                assert!(vaults_root.join("jp-work").join("meta.json").is_file());
+            }
+            other => panic!("expected Ack from UpsertVault, got {other:?}"),
+        }
+
+        // 2) LaunchVault enforces read-only hard block when current egress (US) mismatches vault (JP).
+        match coord.dispatch(PipeRequest::LaunchVault {
+            vault_id: "jp-work".into(),
+            app: VaultAppTarget::ClaudeDesktop,
+            extra_args: Vec::new(),
+        }) {
+            PipeResponse::Error { code, message, .. } => {
+                assert_eq!(code, ErrorCode::IllegalState);
+                assert!(message.contains("只读硬拦截"));
+            }
+            other => panic!("LaunchVault must hard-block on mismatch, got {other:?}"),
+        }
+
+        // 3) DeleteVault with purge_disk_data=false archives directory safely instead of destroying it.
+        assert!(matches!(
+            coord.dispatch(PipeRequest::DeleteVault {
+                vault_id: "jp-work".into(),
+                purge_disk_data: false,
+            }),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(coord.snapshot().config.vaults.is_empty());
+        assert!(!vaults_root.join("jp-work").exists());
+        assert!(vaults_root.join(vault_win::ARCHIVED_VAULTS_DIR).is_dir());
+
+        // 4) ScanCleanRoom + ExecuteCleanRoom + ListCleanRoomBackups + RestoreCleanRoomBackup.
+        let claude_json = fake_home.join(".claude.json");
+        std::fs::write(
+            &claude_json,
+            r#"{"userID":"usr_secret_123456789","anonymousId":"anon-1111","mcpServers":{"keep":{"command":"npx"}}}"#,
+        )
+        .unwrap();
+        let scope = crate::protocol::CleanRoomScope::default();
+        let finding_ids: Vec<String> = match coord.dispatch(PipeRequest::ScanCleanRoom {
+            scope: scope.clone(),
+        }) {
+            PipeResponse::CleanRoomScan { report } => {
+                assert!(report.pollution_score > 0);
+                assert!(!report.findings.is_empty());
+                report.findings.into_iter().map(|f| f.id).collect()
+            }
+            other => panic!("expected CleanRoomScan, got {other:?}"),
+        };
+        assert!(matches!(
+            coord.dispatch(PipeRequest::ExecuteCleanRoom {
+                scope,
+                selected_finding_ids: finding_ids,
+            }),
+            PipeResponse::Ack { .. }
+        ));
+        let cleaned_text = std::fs::read_to_string(&claude_json).unwrap();
+        assert!(!cleaned_text.contains("usr_secret_123456789"));
+        assert!(cleaned_text.contains("mcpServers"));
+
+        let backup_id = match coord.dispatch(PipeRequest::ListCleanRoomBackups) {
+            PipeResponse::CleanRoomBackups { backups } => {
+                assert_eq!(backups.len(), 1);
+                backups[0].backup_id.clone()
+            }
+            other => panic!("expected CleanRoomBackups, got {other:?}"),
+        };
+        assert!(matches!(
+            coord.dispatch(PipeRequest::RestoreCleanRoomBackup { backup_id }),
+            PipeResponse::Ack { .. }
+        ));
+        let restored_text = std::fs::read_to_string(&claude_json).unwrap();
+        assert!(restored_text.contains("usr_secret_123456789"));
+
+        // 5) ConfigureCliHooks installs Claude Code hook idempotently in fake_home.
+        assert!(matches!(
+            coord.dispatch(PipeRequest::ConfigureCliHooks {
+                install_claude_code: true,
+                install_pwsh_profile: false,
+                sync_all_vaults: false,
+            }),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(coord.snapshot().hooks.claude_code_hook_installed);
+
+        // 6) RunDeepRiskAudit + ClearGeoVelocityCooldown + ClearWfpBlockedEvents.
+        assert!(matches!(
+            coord.dispatch(PipeRequest::RunDeepRiskAudit),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(coord.snapshot().risk_assessment.evaluated_at > 0);
+        assert!(matches!(
+            coord.dispatch(PipeRequest::ClearGeoVelocityCooldown),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(matches!(
+            coord.dispatch(PipeRequest::ClearWfpBlockedEvents),
+            PipeResponse::Ack { .. }
+        ));
+
+        // 7) BuildHealthCard produces zero IP leaks.
+        match coord.dispatch(PipeRequest::BuildHealthCard { export_png: false }) {
+            PipeResponse::HealthCard { card } => {
+                let raw = serde_json::to_string(&card).unwrap();
+                assert!(
+                    !raw.contains("198.51.100."),
+                    "HealthCard must never leak raw egress IP: {raw}"
+                );
+                assert!(card.region_badge.contains("US"));
+            }
+            other => panic!("expected HealthCard, got {other:?}"),
+        }
+
+        // 8) TriggerPanicLockdown enables manual lockdown immediately.
+        assert!(matches!(
+            coord.dispatch(PipeRequest::TriggerPanicLockdown),
+            PipeResponse::Ack { .. }
+        ));
+        let after_panic = coord.snapshot();
+        assert!(after_panic.lockdown);
+        assert!(after_panic.lockdown_manual);
+
+        coord.shutdown();
+    }
+
+    #[test]
+    fn fast_hook_gate_stale_fallback_counts_burst_guard_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = make_cfg("US");
+        cfg.burst_guard_mode = crate::protocol::BurstGuardMode::ThrottleGate;
+        cfg.burst_warn_rpm = 5;
+        cfg.burst_throttle_rpm = 7;
+        ConfigStore::new(dir.path()).save_verified(&cfg).unwrap();
+
+        let driver: Arc<dyn PlatformDriver> = Arc::new(ControllableDriver::new());
+        let runner = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: Arc::new(AtomicBool::new(true)),
+            ip_on_pass: "198.51.100.71".into(),
+        });
+        let recovery = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
+        let coord = boot_actor(dir.path(), driver, runner, recovery);
+
+        // Freshly bootstrapped Armed state has `checked_at == None` (stale), so FastHookGate
+        // must go through `NeedsSyncProbe` -> coordinator -> real probe -> `fulfill_round_waiters`,
+        // recording EXACTLY 1 BurstGuard event (never 3).
+        assert!(coord.snapshot().checked_at.is_none());
+        match coord.dispatch(PipeRequest::FastHookGate {
+            agent_id: "claude-code".into(),
+            vault_id: None,
+            hook_event: Some("UserPromptSubmit".into()),
+        }) {
+            PipeResponse::FastGateVerdict {
+                allowed,
+                decision,
+                latency_path,
+                ..
+            } => {
+                assert!(
+                    allowed,
+                    "first stale FastHookGate prompt must not self-block via BurstGuard triple-count"
+                );
+                assert_eq!(decision, HookDecision::Allow);
+                assert_eq!(latency_path, "sync_probe_fallback");
+            }
+            other => panic!("expected FastGateVerdict, got {other:?}"),
+        }
+
+        // Republish snapshot via RecheckNow and verify BurstGuard recorded exactly 1 prompt.
+        assert!(matches!(
+            coord.dispatch(PipeRequest::RecheckNow { target_id: None }),
+            PipeResponse::Ack { .. }
+        ));
+        assert_eq!(
+            coord.snapshot().burst_guard.prompts_last_1m,
+            1,
+            "stale fallback must increment BurstGuard counter by exactly 1"
+        );
+
+        // Prompts #2..#7 hit fast_o1 and are still allowed (<= normalized throttle_rpm=7).
+        for n in 2..=7u32 {
+            match coord.dispatch(PipeRequest::FastHookGate {
+                agent_id: "claude-code".into(),
+                vault_id: None,
+                hook_event: Some("UserPromptSubmit".into()),
+            }) {
+                PipeResponse::FastGateVerdict {
+                    allowed,
+                    latency_path,
+                    ..
+                } => {
+                    assert!(allowed, "prompt #{n} must still be allowed (<= 7)");
+                    assert_eq!(latency_path, "fast_o1");
+                }
+                other => panic!("expected fast_o1 Allow on prompt #{n}, got {other:?}"),
+            }
+        }
+
+        // Prompt #8 exceeds throttle_rpm=7 and blocks via BurstGuard on fast_o1.
+        match coord.dispatch(PipeRequest::FastHookGate {
+            agent_id: "claude-code".into(),
+            vault_id: None,
+            hook_event: Some("UserPromptSubmit".into()),
+        }) {
+            PipeResponse::FastGateVerdict {
+                allowed,
+                decision,
+                reason,
+                latency_path,
+                ..
+            } => {
+                assert!(!allowed);
+                assert_eq!(decision, HookDecision::Block);
+                assert_eq!(latency_path, "fast_o1");
+                assert!(reason.contains("BurstGuard"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected BurstGuard Block on 8th prompt, got {other:?}"),
+        }
+
+        coord.shutdown();
+    }
+
+    #[test]
+    fn clear_geo_velocity_cooldown_updates_shared_egress_ledger_without_split_brain() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver: Arc<dyn PlatformDriver> = Arc::new(ControllableDriver::new());
+        let runner = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: Arc::new(AtomicBool::new(true)),
+            ip_on_pass: "198.51.100.88".into(),
+        });
+        let recovery = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
+        let data_dir = dir.path().to_path_buf();
+        let drv_clone = driver.clone();
+        let (coord, shared_ledger) = start_coordinator_with(|event_tx| {
+            let boot = RealEngineActor::bootstrap(data_dir, drv_clone, runner, recovery, event_tx);
+            (
+                boot.initial_snapshot,
+                Box::new(boot.actor),
+                boot.egress_ledger,
+            )
+        });
+
+        assert!(matches!(
+            coord.dispatch(PipeRequest::CompleteOnboarding {
+                config: make_cfg("US"),
+            }),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(matches!(
+            coord.dispatch(PipeRequest::RecheckNow { target_id: None }),
+            PipeResponse::Ack { .. }
+        ));
+
+        let now = now_unix_secs();
+        let _ = shared_ledger.record_and_evaluate(
+            "198.51.100.10",
+            "US",
+            "San Jose",
+            Some(373),
+            Some(-1219),
+            None,
+            60,
+            now.saturating_sub(600),
+        );
+        let jump_eval = shared_ledger.record_and_evaluate(
+            "203.0.113.55",
+            "JP",
+            "Tokyo",
+            Some(357),
+            Some(1397),
+            None,
+            60,
+            now.saturating_sub(60),
+        );
+        assert!(
+            jump_eval.alert.is_some(),
+            "US -> JP in 9 minutes must trigger impossible-travel alert"
+        );
+        assert_eq!(shared_ledger.observations_for_scoring(None, now).len(), 2);
+
+        // User clears cooldown via daemon IPC; shared ledger handle (also held by BackgroundMonitorHandle)
+        // must immediately observe the cleared state with zero split-brain resurrection.
+        assert!(matches!(
+            coord.dispatch(PipeRequest::ClearGeoVelocityCooldown),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(
+            shared_ledger
+                .observations_for_scoring(None, now_unix_secs())
+                .is_empty(),
+            "shared EgressLedger must immediately drop pre-clear observations"
+        );
+        let bg_assessment = compute_deep_risk_assessment(
+            &*driver,
+            &coord.snapshot(),
+            &shared_ledger,
+            &[],
+            false,
+            now_unix_secs(),
+        );
+        assert!(
+            bg_assessment.geo_velocity_alert.is_none(),
+            "background audit on shared ledger must not resurrect cleared geo-velocity alert"
+        );
+
+        coord.shutdown();
+    }
+
+    #[test]
+    fn collect_electron_agent_pids_filters_helpers_and_non_electron_agents() {
+        let snap = CachedProcessSnapshot {
+            procs: vec![
+                process_win::ProcInfo {
+                    pid: 101,
+                    ppid: 10,
+                    name_l: "claude.exe".into(),
+                    path_l: r"c:\users\alice\appdata\local\anthropicclaude\claude.exe".into(),
+                    cmd_l: r"claude.exe --disable-quic".into(),
+                    start_time: 1,
+                },
+                process_win::ProcInfo {
+                    pid: 102,
+                    ppid: 101,
+                    name_l: "claude.exe".into(),
+                    path_l: r"c:\users\alice\appdata\local\anthropicclaude\claude.exe".into(),
+                    cmd_l: r"claude.exe --type=renderer --lang=en-us".into(),
+                    start_time: 2,
+                },
+                process_win::ProcInfo {
+                    pid: 103,
+                    ppid: 101,
+                    name_l: "claude.exe".into(),
+                    path_l: r"c:\users\alice\appdata\local\anthropicclaude\claude.exe".into(),
+                    cmd_l: String::new(),
+                    start_time: 3,
+                },
+                process_win::ProcInfo {
+                    pid: 104,
+                    ppid: 101,
+                    name_l: "cowork-svc.exe".into(),
+                    path_l: r"c:\users\alice\appdata\local\anthropicclaude\cowork-svc.exe".into(),
+                    cmd_l: "cowork-svc.exe".into(),
+                    start_time: 4,
+                },
+                process_win::ProcInfo {
+                    pid: 201,
+                    ppid: 10,
+                    name_l: "cursor.exe".into(),
+                    path_l: r"c:\users\alice\appdata\local\programs\cursor\cursor.exe".into(),
+                    cmd_l: "cursor.exe".into(),
+                    start_time: 5,
+                },
+                process_win::ProcInfo {
+                    pid: 301,
+                    ppid: 10,
+                    name_l: "zed.exe".into(),
+                    path_l: r"c:\users\alice\appdata\local\programs\zed\zed.exe".into(),
+                    cmd_l: "zed.exe".into(),
+                    start_time: 6,
+                },
+                process_win::ProcInfo {
+                    pid: 401,
+                    ppid: 10,
+                    name_l: "notepad.exe".into(),
+                    path_l: r"c:\windows\system32\notepad.exe".into(),
+                    cmd_l: "notepad.exe".into(),
+                    start_time: 7,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let found = collect_electron_agent_pids(&snap);
+        assert_eq!(
+            found,
+            vec![("claude".to_string(), 101), ("cursor".to_string(), 201)]
+        );
+    }
+
+    #[test]
+    fn discover_vault_pids_and_liveness_pruning_never_use_dummy_pid_zero() {
+        let vaults_root = std::path::Path::new(r"C:\Users\alice\AppData\Local\ClaudeGuard\Vaults");
+        let procs = CachedProcessSnapshot {
+            procs: vec![
+                process_win::ProcInfo {
+                    pid: 0,
+                    ppid: 0,
+                    name_l: "claude.exe".into(),
+                    path_l: r"c:\programs\claude\claude.exe".into(),
+                    cmd_l: r#"claude.exe --user-data-dir="c:\users\alice\appdata\local\claudeguard\vaults\jp\claude-desktop""#.into(),
+                    start_time: 1,
+                },
+                process_win::ProcInfo {
+                    pid: 5001,
+                    ppid: 10,
+                    name_l: "claude.exe".into(),
+                    path_l: r"c:\programs\claude\claude.exe".into(),
+                    cmd_l: r#"claude.exe --user-data-dir="c:\users\alice\appdata\local\claudeguard\vaults\jp\claude-desktop""#.into(),
+                    start_time: 2,
+                },
+                process_win::ProcInfo {
+                    pid: 5002,
+                    ppid: 10,
+                    name_l: "claude.exe".into(),
+                    path_l: r"c:\programs\claude\claude.exe".into(),
+                    cmd_l: r#"claude.exe --user-data-dir="c:\users\alice\appdata\local\claudeguard\vaults\jp-work\claude-desktop""#.into(),
+                    start_time: 3,
+                },
+                process_win::ProcInfo {
+                    pid: 5003,
+                    ppid: 10,
+                    name_l: "cursor.exe".into(),
+                    path_l: r"c:\users\alice\appdata\local\programs\cursor\cursor.exe".into(),
+                    cmd_l: "cursor.exe --user-data-dir=c:/users/alice/appdata/local/claudeguard/vaults/jp/cursor-ide".into(),
+                    start_time: 4,
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Prefix-boundary isolation: `jp` must NOT match `jp-work` and must exclude dummy PID 0.
+        let jp_pids = discover_vault_pids_in_snapshot(&procs, vaults_root, "jp");
+        assert_eq!(
+            jp_pids,
+            vec![(5001, "claude".to_string()), (5003, "cursor".to_string())]
+        );
+        let jp_work_pids = discover_vault_pids_in_snapshot(&procs, vaults_root, "jp-work");
+        assert_eq!(jp_work_pids, vec![(5002, "claude".to_string())]);
+
+        assert!(!is_pid_alive(0));
+        assert!(!is_pid_alive(u32::MAX - 1));
+        #[cfg(windows)]
+        assert!(is_pid_alive(std::process::id()));
+
+        // Verify LaunchVault on a matching vault NEVER inserts dummy PID 0 into running_pids.
+        let dir = tempfile::tempdir().unwrap();
+        let fake_vaults = dir.path().join("vaults");
+        let driver = Arc::new(ControllableDriver::new());
+        driver.allow_launch.store(true, Ordering::Release);
+        driver.gui_exes.lock().unwrap().insert(
+            "claude".into(),
+            vec![PathBuf::from(r"C:\Programs\Claude\Claude.exe")],
+        );
+        let runner = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: Arc::new(AtomicBool::new(true)),
+            ip_on_pass: "198.51.100.77".into(),
+        });
+        let recovery = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
+        let drv: Arc<dyn PlatformDriver> = driver;
+        let data_dir = dir.path().to_path_buf();
+        let fv = fake_vaults.clone();
+        let (coord, ()) = start_coordinator_with(|event_tx| {
+            let mut boot = RealEngineActor::bootstrap(data_dir, drv, runner, recovery, event_tx);
+            boot.actor.test_vaults_root_override = Some(fv);
+            (boot.initial_snapshot, Box::new(boot.actor), ())
+        });
+        assert!(matches!(
+            coord.dispatch(PipeRequest::CompleteOnboarding {
+                config: make_cfg("US"),
+            }),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(matches!(
+            coord.dispatch(PipeRequest::RecheckNow { target_id: None }),
+            PipeResponse::Ack { .. }
+        ));
+
+        let us_vault = crate::protocol::AccountVault {
+            id: "us-live".into(),
+            name: "美国实测仓".into(),
+            accent_hex: "#3B82F6".into(),
+            enabled: true,
+            pinned_regions: vec!["US".into()],
+            pinned_ips: Vec::new(),
+            pinned_asn: None,
+            dedicated_proxy_port: None,
+            preferred_mihomo_group: None,
+            preferred_mihomo_node: None,
+            auto_align_mihomo_on_vault_launch: false,
+            min_safety_score: 50,
+            cooldown_after_ip_change_secs: 0,
+            share_ide_extensions: true,
+            msix_isolation_mode: Default::default(),
+        };
+        assert!(matches!(
+            coord.dispatch(PipeRequest::UpsertVault { vault: us_vault }),
+            PipeResponse::Ack { .. }
+        ));
+        match coord.dispatch(PipeRequest::LaunchVault {
+            vault_id: "us-live".into(),
+            app: VaultAppTarget::ClaudeDesktop,
+            extra_args: Vec::new(),
+        }) {
+            PipeResponse::Ack {
+                snapshot: Some(snap),
+                ..
+            } => {
+                assert_eq!(snap.vaults.len(), 1);
+                assert!(
+                    !snap.vaults[0].running_pids.contains(&0),
+                    "LaunchVault must NEVER store dummy PID 0"
+                );
+                assert_ne!(
+                    snap.vaults[0].state,
+                    VaultRuntimeState::ActiveRunning,
+                    "vault without real live PIDs must not falsely report ActiveRunning"
+                );
+            }
+            other => panic!("expected Ack from matching US LaunchVault, got {other:?}"),
+        }
 
         coord.shutdown();
     }

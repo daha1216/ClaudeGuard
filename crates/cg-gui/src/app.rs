@@ -12,22 +12,23 @@ use crate::motion::{
     spring_sheet, spring_snappy, sync_windows_reduce_motion,
 };
 use crate::protocol::{
-    ANCHOR_KINDS, AnchorKind, Config, DEFAULT_PIPE_NAME, GuardSnapshot, Lifecycle, LogEntry,
-    LogLevel, OnboardingProbeResult, OperationStatus, POLICY_PRESETS, PipeRequest, PipeResponse,
-    PolicyPreset, Target, UpdateCheckPhase, normalize_ip_or_cidr,
+    ANCHOR_KINDS, AnchorKind, CleanRoomBackupMeta, CleanRoomReport, CleanRoomScope, Config,
+    DEFAULT_PIPE_NAME, GuardSnapshot, Lifecycle, LogEntry, LogLevel, OnboardingProbeResult,
+    OperationStatus, POLICY_PRESETS, PipeRequest, PipeResponse, PolicyPreset, SanitizedHealthCard,
+    Target, UpdateCheckPhase, normalize_ip_or_cidr,
 };
 use crate::state::{
     ConsoleProjection, ConsoleProjectionInput, DraftStore, HudProjection, NavSection, TargetDraft,
-    extract_region_tokens_lossy, parse_and_validate_regions, project_console_from_input,
-    project_hud, split_tokens,
+    VaultDraft, extract_region_tokens_lossy, parse_and_validate_regions,
+    project_console_from_input, project_hud, split_tokens,
 };
 use crate::theme::{
     THEME_MODES, THEME_STYLES, ThemeMode, ThemePalette, ThemeStyle, layout, load_saved_theme_style,
     resolve_styled_palette, save_theme_style, system_prefers_light_theme, theme_mode_label,
 };
 use crate::tray_win::{
-    LogicalRect, SingleInstanceOutcome, TrayChannel, TrayEvent, TrayHandle, TrayTone,
-    acquire_single_instance, apply_win11_round_corners, compute_hud_bounds,
+    HotkeyRegistrationReport, LogicalRect, SingleInstanceOutcome, TrayChannel, TrayEvent,
+    TrayHandle, TrayTone, acquire_single_instance, apply_win11_round_corners, compute_hud_bounds,
     ensure_window_on_screen, minimize_window_smooth, primary_work_area_logical,
     restore_window_if_minimized, signal_existing_tray_instance, toggle_maximize_window_smooth,
 };
@@ -104,6 +105,14 @@ pub enum ActionScope {
     LaunchGate(String),
     StartService,
     Flow,
+    VaultOp(String),
+    CleanRoomScan,
+    CleanRoomExecute,
+    CleanRoomRestore,
+    DeepRiskAudit,
+    ConfigureHooks,
+    SyncWslBridge,
+    BuildHealthCard,
 }
 
 actions!([
@@ -120,7 +129,9 @@ actions!([
     NavTab4,
     NavTab5,
     NavTab6,
-    NavTab7
+    NavTab7,
+    NavTab8,
+    NavTab9
 ]);
 
 /// Sub-tabs for Mode B `熔断` page.
@@ -145,6 +156,8 @@ impl BreakerSubTab {
 pub enum EnvSubTab {
     #[default]
     Shield,
+    RiskRadar,
+    HooksWsl,
     Antigravity,
     Timezone,
 }
@@ -153,8 +166,10 @@ impl EnvSubTab {
     const fn index(self) -> usize {
         match self {
             Self::Shield => 0,
-            Self::Antigravity => 1,
-            Self::Timezone => 2,
+            Self::RiskRadar => 1,
+            Self::HooksWsl => 2,
+            Self::Antigravity => 3,
+            Self::Timezone => 4,
         }
     }
 }
@@ -213,12 +228,12 @@ impl Default for LaunchArgs {
 }
 
 pub const USAGE: &str = concat!(
-    "用法：claudeguard-gui [--tray | --hud] [--nav overview|targets|breaker|env|audit|updates|notify] [--subtab <name>] [--plugins] [--theme light|dark|auto] [--demo pass|trip|disarmed|wizard] [--pipe <端点>]\n",
+    "用法：claudeguard-gui [--tray | --hud] [--nav overview|vaults|cleanroom|targets|breaker|env|audit|updates|notify] [--subtab <name>] [--plugins] [--theme light|dark|auto] [--demo pass|trip|disarmed|wizard] [--pipe <端点>]\n",
     "\n",
     "  --tray                    启动后驻留系统托盘（0 窗口、0 VRAM），点击托盘呼出 HUD\n",
     "  --hud                     启动即打开 Mode A 快捷托盘 HUD (398x432)\n",
     "  --nav <section>           指定主控制台默认打开的页面（默认 overview）\n",
-    "  --subtab <name>           指定子标签（rules|live|shield|antigravity|tz|events|feishu）\n",
+    "  --subtab <name>           指定子标签（rules|live|shield|risk|hooks|antigravity|tz|events|feishu）\n",
     "  --plugins                 启动后自动打开 Antigravity 精选插件与更新弹窗\n",
     "  --theme <mode>            初始主题覆盖：light | dark | auto\n",
     "  --demo <scenario>         独立演示模式：pass | trip | disarmed | wizard（不连接真实守护）\n",
@@ -263,6 +278,8 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<LaunchArgs, 
                     .ok_or_else(|| format!("{arg} 缺少页面名\n{USAGE}"))?;
                 out.initial_nav = match val.to_ascii_lowercase().as_str() {
                     "overview" => NavSection::Overview,
+                    "vaults" | "vault" => NavSection::Vaults,
+                    "cleanroom" | "clean-room" => NavSection::CleanRoom,
                     "targets" => NavSection::Targets,
                     "breaker" => NavSection::Breaker,
                     "env" | "environment" => NavSection::Environment,
@@ -308,6 +325,16 @@ pub struct InputHandles {
     pub feishu_secret: Entity<DraftTextInput>,
     pub onboarding_cidr: Entity<DraftTextInput>,
     pub onboarding_regions: Entity<DraftTextInput>,
+    pub vault_id: Entity<DraftTextInput>,
+    pub vault_name: Entity<DraftTextInput>,
+    pub vault_regions: Entity<DraftTextInput>,
+    pub vault_ips: Entity<DraftTextInput>,
+    pub vault_asn: Entity<DraftTextInput>,
+    pub vault_proxy_port: Entity<DraftTextInput>,
+    pub vault_mihomo_group: Entity<DraftTextInput>,
+    pub vault_mihomo_node: Entity<DraftTextInput>,
+    pub vault_min_score: Entity<DraftTextInput>,
+    pub vault_cooldown: Entity<DraftTextInput>,
 }
 
 /// Central controller entity managing daemon IPC, drafts, theme, tray, and dual windows.
@@ -330,6 +357,13 @@ pub struct AppController {
     pub notify_tab: NotifySubTab,
     pub open_region_picker_for: Option<String>,
     pub show_add_target_drawer: bool,
+    pub show_vault_drawer: bool,
+    pub cleanroom_scope: CleanRoomScope,
+    pub cleanroom_selected_ids: HashSet<String>,
+    pub cleanroom_report: Option<CleanRoomReport>,
+    pub cleanroom_backups: Vec<CleanRoomBackupMeta>,
+    pub wfp_agent_filter: Option<String>,
+    pub last_health_card: Option<SanitizedHealthCard>,
     pub audit_level_filter: Option<LogLevel>,
     pub selected_log_id: Option<u64>,
     pub show_plugins_modal: bool,
@@ -588,6 +622,137 @@ impl AppController {
                 Some(AppController::complete_onboarding),
                 cx,
             ),
+            vault_id: make_input(
+                "如 work-claude-max",
+                true,
+                false,
+                true,
+                |ctrl, text| {
+                    ctrl.drafts.vault_draft.id = text.to_string();
+                    ctrl.drafts.vault_dirty = true;
+                    ctrl.drafts.vault_validation_error = None;
+                    false
+                },
+                Some(AppController::save_vault_draft),
+                cx,
+            ),
+            vault_name: make_input(
+                "如 主力 Max (US 住宅)",
+                true,
+                false,
+                false,
+                |ctrl, text| {
+                    ctrl.drafts.vault_draft.name = text.to_string();
+                    ctrl.drafts.vault_dirty = true;
+                    false
+                },
+                Some(AppController::save_vault_draft),
+                cx,
+            ),
+            vault_regions: make_input(
+                "如 US, JP",
+                true,
+                false,
+                true,
+                |ctrl, text| {
+                    ctrl.drafts.vault_draft.pinned_regions_text = text.to_string();
+                    ctrl.drafts.vault_dirty = true;
+                    false
+                },
+                Some(AppController::save_vault_draft),
+                cx,
+            ),
+            vault_ips: make_input(
+                "如 198.51.100.0/24",
+                true,
+                false,
+                true,
+                |ctrl, text| {
+                    ctrl.drafts.vault_draft.pinned_ips_text = text.to_string();
+                    ctrl.drafts.vault_dirty = true;
+                    false
+                },
+                Some(AppController::save_vault_draft),
+                cx,
+            ),
+            vault_asn: make_input(
+                "如 7922",
+                true,
+                false,
+                true,
+                |ctrl, text| {
+                    ctrl.drafts.vault_draft.pinned_asn_text = text.to_string();
+                    ctrl.drafts.vault_dirty = true;
+                    false
+                },
+                Some(AppController::save_vault_draft),
+                cx,
+            ),
+            vault_proxy_port: make_input(
+                "如 7892",
+                true,
+                false,
+                true,
+                |ctrl, text| {
+                    ctrl.drafts.vault_draft.dedicated_proxy_port_text = text.to_string();
+                    ctrl.drafts.vault_dirty = true;
+                    false
+                },
+                Some(AppController::save_vault_draft),
+                cx,
+            ),
+            vault_mihomo_group: make_input(
+                "如 Proxy",
+                true,
+                false,
+                false,
+                |ctrl, text| {
+                    ctrl.drafts.vault_draft.preferred_mihomo_group = text.to_string();
+                    ctrl.drafts.vault_dirty = true;
+                    false
+                },
+                Some(AppController::save_vault_draft),
+                cx,
+            ),
+            vault_mihomo_node: make_input(
+                "如 US-LAX-ISP-01",
+                true,
+                false,
+                false,
+                |ctrl, text| {
+                    ctrl.drafts.vault_draft.preferred_mihomo_node = text.to_string();
+                    ctrl.drafts.vault_dirty = true;
+                    false
+                },
+                Some(AppController::save_vault_draft),
+                cx,
+            ),
+            vault_min_score: make_input(
+                "80",
+                true,
+                false,
+                true,
+                |ctrl, text| {
+                    ctrl.drafts.vault_draft.min_safety_score_text = text.to_string();
+                    ctrl.drafts.vault_dirty = true;
+                    false
+                },
+                Some(AppController::save_vault_draft),
+                cx,
+            ),
+            vault_cooldown: make_input(
+                "900",
+                true,
+                false,
+                true,
+                |ctrl, text| {
+                    ctrl.drafts.vault_draft.cooldown_secs_text = text.to_string();
+                    ctrl.drafts.vault_dirty = true;
+                    false
+                },
+                Some(AppController::save_vault_draft),
+                cx,
+            ),
         };
 
         let system_prefers_light = system_prefers_light_theme();
@@ -605,6 +770,8 @@ impl AppController {
             _ => BreakerSubTab::Rules,
         };
         let env_tab = match args.initial_subtab.as_deref() {
+            Some("risk" | "radar") => EnvSubTab::RiskRadar,
+            Some("hooks" | "wsl" | "burst") => EnvSubTab::HooksWsl,
             Some("antigravity" | "ag") => EnvSubTab::Antigravity,
             Some("tz" | "timezone") => EnvSubTab::Timezone,
             _ => EnvSubTab::Shield,
@@ -633,6 +800,13 @@ impl AppController {
             notify_tab,
             open_region_picker_for: None,
             show_add_target_drawer: false,
+            show_vault_drawer: false,
+            cleanroom_scope: CleanRoomScope::default(),
+            cleanroom_selected_ids: HashSet::new(),
+            cleanroom_report: None,
+            cleanroom_backups: Vec::new(),
+            wfp_agent_filter: None,
+            last_health_card: None,
             audit_level_filter: None,
             selected_log_id: None,
             show_plugins_modal: args.initial_plugins_modal,
@@ -877,6 +1051,9 @@ impl AppController {
             self.console_scroll.set_offset(point(px(0.), px(0.)));
             self.selected_log_id = None;
             self.invalidate_console_cache();
+        }
+        if section == NavSection::CleanRoom && self.connected && self.cleanroom_backups.is_empty() {
+            self.refresh_cleanroom_backups(cx);
         }
         if section == NavSection::Audit && self.connected {
             cx.spawn(async move |this, cx| {
@@ -1305,6 +1482,16 @@ impl AppController {
             self.feishu_initialized = true;
             self.feishu_dirty = false;
         }
+        if let Some(tray) = self.tray.as_ref() {
+            tray.sync_hotkeys(
+                snapshot.config.global_hotkeys_enabled,
+                &snapshot.config.hotkey_panic_lockdown,
+                &snapshot.config.hotkey_quick_hud,
+            );
+        }
+        if let Some(report) = snapshot.last_cleanroom_report.clone() {
+            self.cleanroom_report = Some(report);
+        }
         self.snapshot = Some(Arc::new(snapshot));
         self.snapshot_seq = self.snapshot_seq.wrapping_add(1);
         self.invalidate_console_cache();
@@ -1415,7 +1602,22 @@ impl AppController {
         let proj = self.hud_projection();
         let paused = self.snapshot.as_ref().is_some_and(|s| s.is_paused_at(now));
         let tone = TrayTone::from(proj.hero.tone);
-        let tip = format!("ClaudeGuard v4 · {}", proj.hero.title);
+        let tip = if proj.safety_evaluated {
+            let vault_seg = proj
+                .active_vault_name
+                .as_deref()
+                .map(|v| format!("活跃仓: {v} | "))
+                .unwrap_or_default();
+            format!(
+                "ClaudeGuard v5 · {}分 {}级\n{vault_seg}WFP拦截: {} | {}",
+                proj.safety_score,
+                proj.safety_grade.code(),
+                proj.wfp_blocked_total,
+                proj.hero.title
+            )
+        } else {
+            format!("ClaudeGuard v5 · {}", proj.hero.title)
+        };
         let next_state = (tone, paused, tip.clone());
         if self.last_tray_state.as_ref() == Some(&next_state) {
             return;
@@ -1494,7 +1696,22 @@ impl AppController {
             PipeRequest::RecoverSafeFlowA
             | PipeRequest::DisarmAndRestoreFlowB { .. }
             | PipeRequest::Rearm
-            | PipeRequest::SetManualLockdown { .. } => Some(ActionScope::Flow),
+            | PipeRequest::SetManualLockdown { .. }
+            | PipeRequest::TriggerPanicLockdown => Some(ActionScope::Flow),
+            PipeRequest::UpsertVault { vault } => Some(ActionScope::VaultOp(vault.id.clone())),
+            PipeRequest::DeleteVault { vault_id, .. }
+            | PipeRequest::LaunchVault { vault_id, .. }
+            | PipeRequest::StopVault { vault_id }
+            | PipeRequest::GenerateVaultShortcuts { vault_id } => {
+                Some(ActionScope::VaultOp(vault_id.clone()))
+            }
+            PipeRequest::ScanCleanRoom { .. } => Some(ActionScope::CleanRoomScan),
+            PipeRequest::ExecuteCleanRoom { .. } => Some(ActionScope::CleanRoomExecute),
+            PipeRequest::RestoreCleanRoomBackup { .. } => Some(ActionScope::CleanRoomRestore),
+            PipeRequest::RunDeepRiskAudit => Some(ActionScope::DeepRiskAudit),
+            PipeRequest::ConfigureCliHooks { .. } => Some(ActionScope::ConfigureHooks),
+            PipeRequest::SyncWslBridge => Some(ActionScope::SyncWslBridge),
+            PipeRequest::BuildHealthCard { .. } => Some(ActionScope::BuildHealthCard),
             _ => None,
         }
     }
@@ -1650,6 +1867,50 @@ impl AppController {
                         } else if let Some(msg) = ok_msg {
                             ctrl.set_toast(msg, true, cx);
                         }
+                    }
+                    Ok(PipeResponse::CleanRoomScan { report }) => {
+                        ctrl.cleanroom_report = Some(*report);
+                        ctrl.cleanroom_selected_ids.clear();
+                        if let Some(msg) = ok_msg {
+                            ctrl.set_toast(msg, true, cx);
+                        }
+                    }
+                    Ok(PipeResponse::CleanRoomBackups { backups }) => {
+                        ctrl.cleanroom_backups = backups;
+                        if let Some(msg) = ok_msg {
+                            ctrl.set_toast(msg, true, cx);
+                        }
+                    }
+                    Ok(PipeResponse::HealthCard { mut card }) => {
+                        let md = card.markdown_snippet.clone();
+                        cx.write_to_clipboard(ClipboardItem::new_string(md));
+                        let saved = card.saved_png_path.clone().or_else(|| {
+                            let is_dark = ctrl.palette().is_dark;
+                            crate::health_card::export_health_card_png(
+                                &mut card,
+                                ctrl.snapshot.as_deref(),
+                                is_dark,
+                                None,
+                            )
+                            .ok()
+                            .map(|p| p.to_string_lossy().into_owned())
+                        });
+                        ctrl.last_health_card = Some(*card);
+                        if let Some(path) = saved {
+                            ctrl.set_toast_with_path(
+                                "已生成零隐私泄露体检卡 PNG 并复制 Markdown 到剪贴板",
+                                true,
+                                Some(path),
+                                cx,
+                            );
+                        } else {
+                            ctrl.set_toast("已复制脱敏防封体检卡 Markdown 到剪贴板", true, cx);
+                        }
+                    }
+                    Ok(PipeResponse::FastGateVerdict {
+                        allowed, reason, ..
+                    }) => {
+                        ctrl.set_toast(reason, allowed, cx);
                     }
                     Ok(PipeResponse::Error { message, .. }) => {
                         ctrl.set_toast(message, false, cx);
@@ -2619,6 +2880,145 @@ impl AppController {
             cx,
         );
     }
+
+    pub fn hotkey_registration_report(&self) -> HotkeyRegistrationReport {
+        self.tray
+            .as_ref()
+            .map(TrayHandle::hotkey_report)
+            .unwrap_or_default()
+    }
+
+    pub fn open_new_vault_drawer(&mut self, cx: &mut Context<Self>) {
+        self.drafts.vault_draft = VaultDraft::default();
+        self.drafts.vault_dirty = false;
+        self.drafts.vault_validation_error = None;
+        self.show_vault_drawer = true;
+        self.sync_vault_input_entities(cx);
+        cx.notify();
+    }
+
+    pub fn open_edit_vault_drawer(&mut self, vault_id: &str, cx: &mut Context<Self>) {
+        let found = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.config.vaults.iter().find(|v| v.id == vault_id))
+            .cloned();
+        if let Some(vault) = found {
+            self.drafts.vault_draft = VaultDraft::from_vault(&vault);
+            self.drafts.vault_dirty = false;
+            self.drafts.vault_validation_error = None;
+            self.show_vault_drawer = true;
+            self.sync_vault_input_entities(cx);
+            cx.notify();
+        }
+    }
+
+    pub fn close_vault_drawer(&mut self, cx: &mut Context<Self>) {
+        self.show_vault_drawer = false;
+        self.drafts.vault_dirty = false;
+        self.drafts.vault_validation_error = None;
+        cx.notify();
+    }
+
+    pub fn adopt_egress_into_vault_draft(&mut self, cx: &mut Context<Self>) {
+        if let Some(snap) = self.snapshot.clone() {
+            self.drafts.vault_draft.adopt_current_egress(&snap);
+            self.drafts.vault_dirty = true;
+            self.sync_vault_input_entities(cx);
+            self.set_toast("已采纳当前实时出口基线至隔离仓表单", true, cx);
+        }
+    }
+
+    pub fn sync_vault_input_entities(&mut self, cx: &mut Context<Self>) {
+        let d = self.drafts.vault_draft.clone();
+        self.inputs
+            .vault_id
+            .update(cx, |i, cx| i.set_text_silent(&d.id, cx));
+        self.inputs
+            .vault_name
+            .update(cx, |i, cx| i.set_text_silent(&d.name, cx));
+        self.inputs
+            .vault_regions
+            .update(cx, |i, cx| i.set_text_silent(&d.pinned_regions_text, cx));
+        self.inputs
+            .vault_ips
+            .update(cx, |i, cx| i.set_text_silent(&d.pinned_ips_text, cx));
+        self.inputs
+            .vault_asn
+            .update(cx, |i, cx| i.set_text_silent(&d.pinned_asn_text, cx));
+        self.inputs.vault_proxy_port.update(cx, |i, cx| {
+            i.set_text_silent(&d.dedicated_proxy_port_text, cx)
+        });
+        self.inputs
+            .vault_mihomo_group
+            .update(cx, |i, cx| i.set_text_silent(&d.preferred_mihomo_group, cx));
+        self.inputs
+            .vault_mihomo_node
+            .update(cx, |i, cx| i.set_text_silent(&d.preferred_mihomo_node, cx));
+        self.inputs
+            .vault_min_score
+            .update(cx, |i, cx| i.set_text_silent(&d.min_safety_score_text, cx));
+        self.inputs
+            .vault_cooldown
+            .update(cx, |i, cx| i.set_text_silent(&d.cooldown_secs_text, cx));
+    }
+
+    pub fn save_vault_draft(&mut self, cx: &mut Context<Self>) {
+        match self.drafts.vault_draft.to_account_vault() {
+            Ok(vault) => {
+                self.drafts.vault_validation_error = None;
+                self.drafts.vault_dirty = false;
+                self.show_vault_drawer = false;
+                let msg = format!("已保存主权隔离仓「{}」", vault.name);
+                self.send_request_msg(PipeRequest::UpsertVault { vault }, Some(msg), cx);
+            }
+            Err(err) => {
+                self.drafts.vault_validation_error = Some(err.clone());
+                self.set_toast(err, false, cx);
+            }
+        }
+    }
+
+    pub fn run_cleanroom_scan(&mut self, cx: &mut Context<Self>) {
+        let scope = self.cleanroom_scope.clone();
+        self.send_request(
+            PipeRequest::ScanCleanRoom { scope },
+            Some("净室纯只读深度扫描已完成"),
+            cx,
+        );
+    }
+
+    pub fn execute_cleanroom_purge(&mut self, cx: &mut Context<Self>) {
+        let scope = self.cleanroom_scope.clone();
+        let selected_finding_ids: Vec<String> =
+            self.cleanroom_selected_ids.iter().cloned().collect();
+        self.send_request(
+            PipeRequest::ExecuteCleanRoom {
+                scope,
+                selected_finding_ids,
+            },
+            Some("已完成加密备份并执行防连坐洗白（后置复核通过）"),
+            cx,
+        );
+        self.refresh_cleanroom_backups(cx);
+    }
+
+    pub fn refresh_cleanroom_backups(&mut self, cx: &mut Context<Self>) {
+        self.send_request(PipeRequest::ListCleanRoomBackups, None, cx);
+    }
+
+    pub fn restore_cleanroom_backup(&mut self, backup_id: String, cx: &mut Context<Self>) {
+        let msg = format!("已从加密时光机备份 {backup_id} 还原");
+        self.send_request_msg(
+            PipeRequest::RestoreCleanRoomBackup { backup_id },
+            Some(msg),
+            cx,
+        );
+    }
+
+    pub fn build_and_export_health_card(&mut self, export_png: bool, cx: &mut Context<Self>) {
+        self.send_request(PipeRequest::BuildHealthCard { export_png }, None, cx);
+    }
 }
 
 /// Opens or focuses Mode A Tray Quick HUD (`398x432` logical px), anchored bottom-right above taskbar.
@@ -3388,21 +3788,27 @@ impl ConsoleWindowView {
         self.jump_nav(NavSection::Overview, cx);
     }
     fn on_nav_2(&mut self, _: &NavTab2, _: &mut Window, cx: &mut Context<Self>) {
-        self.jump_nav(NavSection::Targets, cx);
+        self.jump_nav(NavSection::Vaults, cx);
     }
     fn on_nav_3(&mut self, _: &NavTab3, _: &mut Window, cx: &mut Context<Self>) {
-        self.jump_nav(NavSection::Breaker, cx);
+        self.jump_nav(NavSection::CleanRoom, cx);
     }
     fn on_nav_4(&mut self, _: &NavTab4, _: &mut Window, cx: &mut Context<Self>) {
-        self.jump_nav(NavSection::Environment, cx);
+        self.jump_nav(NavSection::Targets, cx);
     }
     fn on_nav_5(&mut self, _: &NavTab5, _: &mut Window, cx: &mut Context<Self>) {
-        self.jump_nav(NavSection::Audit, cx);
+        self.jump_nav(NavSection::Breaker, cx);
     }
     fn on_nav_6(&mut self, _: &NavTab6, _: &mut Window, cx: &mut Context<Self>) {
-        self.jump_nav(NavSection::Updates, cx);
+        self.jump_nav(NavSection::Environment, cx);
     }
     fn on_nav_7(&mut self, _: &NavTab7, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_nav(NavSection::Audit, cx);
+    }
+    fn on_nav_8(&mut self, _: &NavTab8, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_nav(NavSection::Updates, cx);
+    }
+    fn on_nav_9(&mut self, _: &NavTab9, _: &mut Window, cx: &mut Context<Self>) {
         self.jump_nav(NavSection::Notify, cx);
     }
 }
@@ -3547,9 +3953,23 @@ impl Render for ConsoleWindowView {
                 &s.updates.antigravity_cn,
                 &s.updates.ag_usage_monitor,
                 &s.updates.ag_capsule,
+                &s.updates.cursor_ide,
+                &s.updates.windsurf_ide,
+                &s.updates.zed_ide,
+                &s.updates.trae_ide,
             ]
             .iter()
             .any(|slot| slot.phase == UpdateCheckPhase::UpdateAvailable)
+        });
+        let cleanroom_alert = snapshot_opt.as_ref().is_some_and(|s| {
+            s.last_cleanroom_report
+                .as_ref()
+                .is_some_and(|r| r.pollution_score >= 60)
+        });
+        let vault_active = snapshot_opt.as_ref().is_some_and(|s| {
+            s.vaults
+                .iter()
+                .any(|v| v.state == crate::protocol::VaultRuntimeState::ActiveRunning)
         });
 
         let mut header_cache_style = StyleRefinement::default();
@@ -3568,6 +3988,8 @@ impl Render for ConsoleWindowView {
                 pill_geom: dock_geom,
                 active_icon_dy,
                 active_icon_scale,
+                vault_active,
+                cleanroom_alert,
                 targets_alert: tripped,
                 targets_dirty,
                 env_alert: tripped || ag_issue,
@@ -3591,6 +4013,12 @@ impl Render for ConsoleWindowView {
         let page_content = match nav {
             NavSection::Overview => {
                 views::overview::render_overview(ctrl_entity.clone(), &proj, page_choreo, p, cx)
+            }
+            NavSection::Vaults => {
+                views::vaults::render_vaults_page(ctrl_entity.clone(), page_choreo, p, cx)
+            }
+            NavSection::CleanRoom => {
+                views::cleanroom::render_cleanroom_page(ctrl_entity.clone(), page_choreo, p, cx)
             }
             NavSection::Targets => {
                 views::targets::render_targets_page(ctrl_entity.clone(), page_choreo, p, cx)
@@ -3678,6 +4106,8 @@ impl Render for ConsoleWindowView {
             .on_action(cx.listener(Self::on_nav_5))
             .on_action(cx.listener(Self::on_nav_6))
             .on_action(cx.listener(Self::on_nav_7))
+            .on_action(cx.listener(Self::on_nav_8))
+            .on_action(cx.listener(Self::on_nav_9))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |_, _, _, cx| {
@@ -4811,6 +5241,8 @@ struct DockRenderState {
     pill_geom: Option<(f32, f32)>,
     active_icon_dy: f32,
     active_icon_scale: f32,
+    vault_active: bool,
+    cleanroom_alert: bool,
     targets_alert: bool,
     targets_dirty: bool,
     env_alert: bool,
@@ -4829,6 +5261,8 @@ fn render_ceramic_dock(
         pill_geom,
         active_icon_dy,
         active_icon_scale,
+        vault_active,
+        cleanroom_alert,
         targets_alert,
         targets_dirty,
         env_alert,
@@ -4842,8 +5276,20 @@ fn render_ceramic_dock(
         None
     };
 
-    let items: [(NavSection, &'static str, &'static str, Option<u32>); 7] = [
+    let items: [(NavSection, &'static str, &'static str, Option<u32>); 9] = [
         (NavSection::Overview, "总览", "icons/ui/home.svg", None),
+        (
+            NavSection::Vaults,
+            "多账号仓",
+            "icons/ui/lock.svg",
+            vault_active.then_some(p.badge_pass.dot),
+        ),
+        (
+            NavSection::CleanRoom,
+            "防连坐",
+            "icons/ui/shield.svg",
+            cleanroom_alert.then_some(p.badge_warn.dot),
+        ),
         (
             NavSection::Targets,
             "目标",
@@ -5105,6 +5551,8 @@ pub fn run(args: LaunchArgs) {
                 KeyBinding::new("ctrl-5", NavTab5, Some("ConsoleWindow")),
                 KeyBinding::new("ctrl-6", NavTab6, Some("ConsoleWindow")),
                 KeyBinding::new("ctrl-7", NavTab7, Some("ConsoleWindow")),
+                KeyBinding::new("ctrl-8", NavTab8, Some("ConsoleWindow")),
+                KeyBinding::new("ctrl-9", NavTab9, Some("ConsoleWindow")),
                 KeyBinding::new("escape", DismissHudWindow, Some("HudWindow")),
             ]);
 
@@ -5152,6 +5600,22 @@ fn handle_tray_event(ctrl: Entity<AppController>, event: TrayEvent, cx: &mut App
         TrayEvent::SweepOrphans => {
             ctrl.update(cx, |c, cx| {
                 c.send_request(PipeRequest::SweepOrphans, Some("已清理孤儿进程"), cx);
+            });
+        }
+        TrayEvent::PanicLockdown => {
+            ctrl.update(cx, |c, cx| {
+                if let Some(tray) = c.tray.as_ref() {
+                    tray.show_balloon(
+                        "ClaudeGuard 紧急防封锁死",
+                        "已触发全局紧急防封锁死，所有 AI 客户端出站流量正在瞬间切断！",
+                        true,
+                    );
+                }
+                c.send_request(
+                    PipeRequest::TriggerPanicLockdown,
+                    Some("已触发紧急防封锁死，AI 出站流量已瞬间切断"),
+                    cx,
+                );
             });
         }
         TrayEvent::QuitGuiOnly => {
@@ -5295,6 +5759,11 @@ mod tests {
 
         assert_eq!(parse_args(vec_args(&["--help"])), Err(USAGE.to_string()));
         assert!(parse_args(vec_args(&["--demo", "invalid"])).is_err());
+
+        let vaults = parse_args(vec_args(&["--nav", "vaults"])).expect("nav vaults");
+        assert_eq!(vaults.initial_nav, NavSection::Vaults);
+        let cleanroom = parse_args(vec_args(&["--nav", "cleanroom"])).expect("nav cleanroom");
+        assert_eq!(cleanroom.initial_nav, NavSection::CleanRoom);
     }
 
     #[test]
@@ -5330,6 +5799,24 @@ mod tests {
         assert_eq!(
             AppController::scope_for_request(&PipeRequest::CheckUpdates { component: None }),
             Some(ActionScope::UpdatesAll)
+        );
+        assert_eq!(
+            AppController::scope_for_request(&PipeRequest::RunDeepRiskAudit),
+            Some(ActionScope::DeepRiskAudit)
+        );
+        assert_eq!(
+            AppController::scope_for_request(&PipeRequest::ScanCleanRoom {
+                scope: CleanRoomScope::default(),
+            }),
+            Some(ActionScope::CleanRoomScan)
+        );
+        assert_eq!(
+            AppController::scope_for_request(&PipeRequest::BuildHealthCard { export_png: true }),
+            Some(ActionScope::BuildHealthCard)
+        );
+        assert_eq!(
+            AppController::scope_for_request(&PipeRequest::TriggerPanicLockdown),
+            Some(ActionScope::Flow)
         );
     }
 }

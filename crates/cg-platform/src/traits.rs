@@ -110,6 +110,13 @@ impl PlatformCapabilities {
         }
     }
 
+    /// Native Windows v5 capabilities when the Dynamic WFP kernel sublayer is active.
+    pub fn windows_wfp_default() -> Self {
+        let mut caps = Self::windows_com_default();
+        caps.firewall_engine = "windows-wfp-v5-dynamic".to_string();
+        caps
+    }
+
     /// Non-Windows placeholder reporting Windows-specific backends as unsupported.
     pub fn unsupported_non_windows(os: impl Into<String>) -> Self {
         Self {
@@ -325,6 +332,18 @@ pub trait FirewallEngine: Send + Sync {
 
     /// Idempotently remove all rule instances whose name starts with `prefix`, then verify via readback.
     fn remove_rules_with_prefix(&self, prefix: &str) -> PlatformResult<RemoveReport>;
+
+    /// Query live WFP kernel engine and blocked-packet attribution status.
+    /// Non-WFP backends inherit a default status reporting `active_backend = self.engine_name()`.
+    fn wfp_status(&self) -> cg_protocol::WfpStatus {
+        cg_protocol::WfpStatus {
+            active_backend: self.engine_name().to_string(),
+            ..cg_protocol::WfpStatus::default()
+        }
+    }
+
+    /// Clear the in-memory WFP blocked-packet event ring buffer (no-op for non-WFP backends).
+    fn clear_wfp_events(&self) {}
 }
 
 /// Cross-platform OS driver interface used by `cg-daemon` and `cg-gui`.
@@ -443,6 +462,21 @@ pub trait PlatformDriver: Send + Sync {
 
     /// Delete override default location values.
     fn delete_default_location(&self) -> PlatformResult<()>;
+
+    /// Query live WFP sublayer and blocked-packet telemetry from the active firewall engine.
+    fn wfp_status(&self) -> cg_protocol::WfpStatus {
+        self.firewall().wfp_status()
+    }
+
+    /// Clear the in-memory WFP blocked-packet event ring buffer.
+    fn clear_wfp_events(&self) {
+        self.firewall().clear_wfp_events();
+    }
+
+    /// Detect active routed TUN adapter name and 64-bit `NET_LUID` for WFP `IP_LOCAL_INTERFACE`.
+    fn detect_tun_adapter_with_luid(&self) -> PlatformResult<Option<(String, u64)>> {
+        Ok(None)
+    }
 }
 
 /// Non-Windows firewall backend that cleanly reports `Unsupported` for every operation.

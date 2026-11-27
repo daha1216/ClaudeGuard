@@ -6,9 +6,12 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tempfile::NamedTempFile;
 
-use cg_core::redact::{mask_snapshot, redact};
+use cg_core::redact::{mask_snapshot, mask_text_ips, redact};
 use cg_platform::{env_win, process_win, zip_util};
-use cg_protocol::{AppliedEnv, GuardSnapshot, LogEntry, LogLevel};
+use cg_protocol::{
+    normalize_region, region_name, AppliedEnv, GuardSnapshot, LogEntry, LogLevel, SafetyGrade,
+    SanitizedHealthCard, TargetState,
+};
 use serde::{Deserialize, Serialize};
 
 const ENV_BACKUP_FILE: &str = "env_backup.json";
@@ -694,6 +697,321 @@ pub fn export_redacted_diagnostics_zip(
     Ok(out_path)
 }
 
+/// Scrubs IPv4, IPv6, credentials (`user:pass@`), and user profile paths from a health card string
+/// while preserving safe coarse country badges (`US`, `JP`, etc.).
+fn scrub_health_card_text(raw: &str) -> String {
+    let mut s = mask_text_ips(raw);
+    let mut out_words = Vec::new();
+    for token in s.split_whitespace() {
+        let colon_count = token.bytes().filter(|&b| b == b':').count();
+        let trimmed = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != ':');
+        let is_ipv6_like = colon_count >= 2
+            && !trimmed.is_empty()
+            && trimmed.bytes().all(|b| b.is_ascii_hexdigit() || b == b':');
+        if is_ipv6_like {
+            out_words.push("<REDACTED>");
+        } else {
+            out_words.push(token);
+        }
+    }
+    s = out_words.join(" ");
+
+    for marker in ["\\Users\\", "/Users/", "/home/"] {
+        while let Some(pos) = s.find(marker) {
+            let after = pos + marker.len();
+            let end = s[after..]
+                .find(['\\', '/', ' ', '"', '\'', ')', ']'])
+                .map(|rel| after + rel)
+                .unwrap_or(s.len());
+            if &s[after..end] == "<REDACTED>" {
+                break;
+            }
+            s.replace_range(after..end, "<REDACTED>");
+        }
+    }
+    s
+}
+
+/// Builds a 100% desensitized shareable Pre-Flight Health Card (`M7`) with zero IP/coordinate/PII leaks.
+pub fn build_sanitized_health_card(
+    snap: &GuardSnapshot,
+    data_dir: &Path,
+    now_secs: u64,
+    export_png: bool,
+) -> SanitizedHealthCard {
+    let cg_version = if snap.version.trim().is_empty() {
+        env!("CARGO_PKG_VERSION").to_string()
+    } else {
+        snap.version.clone()
+    };
+
+    let safety_score = if snap.risk_assessment.evaluated_at > 0 {
+        snap.risk_assessment.score
+    } else if snap.all_enabled_pass() {
+        85
+    } else {
+        0
+    };
+    let grade = if snap.risk_assessment.evaluated_at > 0 {
+        snap.risk_assessment.grade
+    } else {
+        SafetyGrade::from_score(safety_score)
+    };
+
+    let raw_country = snap
+        .targets
+        .iter()
+        .find(|t| t.id == "claude" && t.state == TargetState::Pass)
+        .and_then(|t| t.country.as_deref())
+        .or(snap.risk_assessment.ip_purity.country.as_deref())
+        .or_else(|| {
+            snap.targets
+                .iter()
+                .find(|t| t.state == TargetState::Pass && t.country.is_some())
+                .and_then(|t| t.country.as_deref())
+        });
+    let region_badge = raw_country
+        .and_then(normalize_region)
+        .map(|cc| format!("{cc} · {}", region_name(&cc)))
+        .unwrap_or_else(|| "待核验出口地区".to_string());
+
+    let asn_purity_badge = scrub_health_card_text(&format!(
+        "{} · 滥用风险 {}/100",
+        snap.risk_assessment.ip_purity.classification.label_zh(),
+        snap.risk_assessment.ip_purity.abuse_risk_score
+    ));
+
+    let wfp_shield_badge = if snap.wfp.sublayer_registered {
+        format!(
+            "WFP 内核子层已启用 · 已拦截 {} 次直连",
+            snap.wfp.total_blocked_packets
+        )
+    } else if !snap.wfp.active_backend.is_empty() {
+        scrub_health_card_text(&format!("防火墙引擎 {}", snap.wfp.active_backend))
+    } else {
+        "系统防火墙守卫就绪".to_string()
+    };
+
+    let stun_ok = !snap.risk_assessment.stun_leak.leaked;
+    let dns_ok = snap.risk_assessment.dns_coherence.checked_at == 0
+        || snap.risk_assessment.dns_coherence.coherent;
+    let dual_ok = !snap.risk_assessment.ip_purity.dual_stack_split_detected;
+    let electron_ok = snap
+        .risk_assessment
+        .electron_hygiene
+        .unguarded_running_agents
+        .is_empty();
+    let leak_hygiene_badge = format!(
+        "STUN {} · DNS {} · IPv6 {} · Electron {}",
+        if stun_ok { "安全" } else { "泄露风险" },
+        if dns_ok { "一致" } else { "偏移" },
+        if dual_ok { "无分叉" } else { "双栈分叉" },
+        if electron_ok { "合规" } else { "需加固" }
+    );
+
+    let geo_stability_badge = if snap.risk_assessment.geo_velocity_alert.is_some() {
+        format!(
+            "检测到跨国瞬移预警（1h {} 子网 / 24h {} 国家）",
+            snap.risk_assessment.distinct_subnets_1h, snap.risk_assessment.distinct_countries_24h
+        )
+    } else {
+        format!(
+            "轨迹稳定（1h {} 子网 / 24h {} 国家）",
+            snap.risk_assessment.distinct_subnets_1h, snap.risk_assessment.distinct_countries_24h
+        )
+    };
+
+    let vault_isolation_badge = format!(
+        "{} 个隔离分身保险箱（{} 个运行中）",
+        snap.config.vaults.len(),
+        snap.vaults
+            .iter()
+            .filter(|v| !v.running_pids.is_empty())
+            .count()
+    );
+
+    let markdown_snippet = scrub_health_card_text(&format!(
+        "### 🛡️ ClaudeGuard v{cg_version} 防封健康体检卡\n\
+         - **综合安全分**：**{safety_score}/100（{} 级）**\n\
+         - **出口地区**：{region_badge}\n\
+         - **ASN 纯净度**：{asn_purity_badge}\n\
+         - **内核护盾**：{wfp_shield_badge}\n\
+         - **防泄露卫生**：{leak_hygiene_badge}\n\
+         - **地理轨迹**：{geo_stability_badge}\n\
+         - **分身隔离**：{vault_isolation_badge}\n\
+         > 已全程脱敏，零公网 IP / 经纬度 / 账号凭据泄露。",
+        grade.code()
+    ));
+
+    let saved_png_path = if export_png {
+        export_health_card_png(data_dir, safety_score, grade, now_secs)
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+    } else {
+        None
+    };
+
+    SanitizedHealthCard {
+        generated_at: now_secs,
+        cg_version,
+        safety_score,
+        grade,
+        region_badge: scrub_health_card_text(&region_badge),
+        asn_purity_badge,
+        wfp_shield_badge,
+        leak_hygiene_badge,
+        geo_stability_badge,
+        vault_isolation_badge,
+        markdown_snippet,
+        saved_png_path,
+    }
+}
+
+fn export_health_card_png(
+    data_dir: &Path,
+    safety_score: u8,
+    grade: SafetyGrade,
+    now_secs: u64,
+) -> Result<PathBuf, String> {
+    let out_dir = data_dir.join("health_cards");
+    if has_reparse_point_in_chain(&out_dir) {
+        return Err("refusing to export health card PNG through reparse point".into());
+    }
+    fs::create_dir_all(&out_dir).map_err(|e| format!("创建健康卡导出目录失败：{e}"))?;
+
+    let base = format!("ClaudeGuard-HealthCard-{now_secs}");
+    let mut chosen = out_dir.join(format!("{base}.png"));
+    let mut file = None;
+    for suffix in 0u32..100 {
+        let candidate = if suffix == 0 {
+            out_dir.join(format!("{base}.png"))
+        } else {
+            out_dir.join(format!("{base}-{suffix}.png"))
+        };
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => {
+                chosen = candidate;
+                file = Some(f);
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(format!("创建健康卡 PNG 文件失败：{err}")),
+        }
+    }
+    let mut f = file.ok_or_else(|| "无法分配唯一健康卡 PNG 文件名".to_string())?;
+    let bytes = encode_health_card_png(safety_score, grade);
+    f.write_all(&bytes)
+        .and_then(|()| f.sync_all())
+        .map_err(|e| format!("写入健康卡 PNG 失败：{e}"))?;
+    Ok(chosen)
+}
+
+fn encode_health_card_png(safety_score: u8, grade: SafetyGrade) -> Vec<u8> {
+    const W: u32 = 240;
+    const H: u32 = 72;
+    let accent: [u8; 4] = match grade {
+        SafetyGrade::S => [16, 185, 129, 255],
+        SafetyGrade::A => [59, 130, 246, 255],
+        SafetyGrade::B => [234, 179, 8, 255],
+        SafetyGrade::C => [249, 115, 22, 255],
+        SafetyGrade::F => [239, 68, 68, 255],
+    };
+    let bg: [u8; 4] = [18, 24, 38, 255];
+    let track: [u8; 4] = [42, 52, 70, 255];
+    let bar_fill_x = 20u32 + ((W - 40) * (safety_score.min(100) as u32)) / 100;
+
+    let mut raw = Vec::with_capacity((H as usize) * (1 + (W as usize) * 4));
+    for y in 0..H {
+        raw.push(0);
+        for x in 0..W {
+            let px = if !(6..H - 2).contains(&y) || x < 6 {
+                accent
+            } else if (44..56).contains(&y) && (20..W - 20).contains(&x) {
+                if x <= bar_fill_x {
+                    accent
+                } else {
+                    track
+                }
+            } else {
+                bg
+            };
+            raw.extend_from_slice(&px);
+        }
+    }
+
+    let mut zlib = Vec::with_capacity(raw.len() + 32);
+    zlib.push(0x78);
+    zlib.push(0x01);
+    let mut offset = 0usize;
+    while offset < raw.len() {
+        let chunk_len = (raw.len() - offset).min(65_535);
+        let is_final = offset + chunk_len >= raw.len();
+        zlib.push(if is_final { 0x01 } else { 0x00 });
+        let len16 = chunk_len as u16;
+        zlib.extend_from_slice(&len16.to_le_bytes());
+        zlib.extend_from_slice(&(!len16).to_le_bytes());
+        zlib.extend_from_slice(&raw[offset..offset + chunk_len]);
+        offset += chunk_len;
+    }
+    let adler = adler32(&raw);
+    zlib.extend_from_slice(&adler.to_be_bytes());
+
+    let mut png = Vec::with_capacity(zlib.len() + 64);
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&W.to_be_bytes());
+    ihdr.extend_from_slice(&H.to_be_bytes());
+    ihdr.push(8);
+    ihdr.push(6);
+    ihdr.push(0);
+    ihdr.push(0);
+    ihdr.push(0);
+    push_png_chunk(&mut png, b"IHDR", &ihdr);
+    push_png_chunk(&mut png, b"IDAT", &zlib);
+    push_png_chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+fn push_png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    let mut crc_input = Vec::with_capacity(4 + data.len());
+    crc_input.extend_from_slice(kind);
+    crc_input.extend_from_slice(data);
+    out.extend_from_slice(&crc32_ieee(&crc_input).to_be_bytes());
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let mut a: u32 = 1;
+    let mut b: u32 = 0;
+    for &byte in data {
+        a = (a + byte as u32) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    (b << 16) | a
+}
+
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,5 +1331,69 @@ mod tests {
         assert!(z_cur_str.contains("[1700000003] AUDIT [power]"));
         assert!(!z_cur_str.contains("bob_secret"));
         assert!(!z_prev_str.contains("alice_secret"));
+    }
+
+    #[test]
+    fn sanitized_health_card_leaks_zero_ips_usernames_or_credentials_and_exports_png() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let mut snap = GuardSnapshot {
+            version: "5.0.0".into(),
+            ..GuardSnapshot::default()
+        };
+        let mut t = cg_protocol::default_builtin_targets(&["198.51.100.77".into()], &["US".into()])
+            .into_iter()
+            .next()
+            .unwrap();
+        t.id = "claude".into();
+        let mut ts = TargetStatus::from_target(&t, TargetState::Pass);
+        ts.ip = Some("198.51.100.77".into());
+        ts.country = Some("US".into());
+        ts.city = Some("Los Angeles".into());
+        snap.targets.push(ts);
+        snap.wfp.sublayer_registered = true;
+        snap.wfp.total_blocked_packets = 5;
+        snap.risk_assessment.evaluated_at = 1_700_000_123;
+        snap.risk_assessment.score = 94;
+        snap.risk_assessment.grade = SafetyGrade::S;
+        snap.risk_assessment.ip_purity.ip = Some("198.51.100.77".into());
+        snap.risk_assessment.ip_purity.country = Some("US".into());
+        snap.risk_assessment.ip_purity.city = Some("Los Angeles".into());
+        snap.risk_assessment.ip_purity.asn_org =
+            r"Comcast 203.0.113.99 2001:db8::1234 C:\Users\secret_alice\test".into();
+        snap.risk_assessment.stun_leak.reflexive_ip = Some("203.0.113.88".into());
+        snap.risk_assessment.stun_leak.summary = "STUN 203.0.113.88".into();
+        snap.risk_assessment.dns_coherence.coherent = true;
+
+        let card_no_png = build_sanitized_health_card(&snap, &data_dir, 1_700_000_200, false);
+        assert!(card_no_png.saved_png_path.is_none());
+        assert_eq!(card_no_png.safety_score, 94);
+        assert_eq!(card_no_png.grade, SafetyGrade::S);
+        assert!(card_no_png.region_badge.contains("US"));
+        let serialized = serde_json::to_string(&card_no_png).unwrap();
+        for forbidden in [
+            "198.51.100.77",
+            "203.0.113.99",
+            "203.0.113.88",
+            "2001:db8::1234",
+            "Los Angeles",
+            "secret_alice",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "SanitizedHealthCard leaked '{forbidden}': {serialized}"
+            );
+        }
+
+        let card_with_png = build_sanitized_health_card(&snap, &data_dir, 1_700_000_201, true);
+        let png_path = card_with_png
+            .saved_png_path
+            .as_deref()
+            .expect("export_png=true must produce a PNG path");
+        let png_bytes = fs::read(png_path).expect("read exported PNG");
+        assert!(png_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(png_bytes.len() > 64);
     }
 }

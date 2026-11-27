@@ -1,6 +1,7 @@
 pub mod app;
 pub mod assets;
 pub mod demo;
+pub mod health_card;
 pub mod ipc;
 pub mod motion;
 pub mod protocol;

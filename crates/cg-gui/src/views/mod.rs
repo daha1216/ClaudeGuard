@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod breaker;
+pub mod cleanroom;
 pub mod environment;
 pub mod hud;
 pub mod notify;
@@ -9,3 +10,4 @@ pub mod plugins_modal;
 pub mod shared;
 pub mod targets;
 pub mod updates;
+pub mod vaults;

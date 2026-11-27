@@ -4,4 +4,4 @@ version = 4
 
 [[package]]
 name = "cg-v3-bridge"
-version = "4.1.4"
+version = "5.0.0"

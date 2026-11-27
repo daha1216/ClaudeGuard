@@ -7,13 +7,14 @@
 use crate::app::{ActionScope, AppController, ConsoleWindowView, EnvSubTab};
 use crate::assets::{agent_icon_key, brand_icon_scaled, ui_icon};
 use crate::motion::PageChoreo;
-use crate::protocol::{Lifecycle, PipeRequest, TimelineStatus};
-use crate::state::{ConsoleProjection, NavSection};
+use crate::protocol::{Lifecycle, PipeRequest, SafetyGrade, TimelineStatus};
+use crate::state::{ConsoleProjection, NavSection, safety_grade_tone};
 use crate::theme::{BadgeTone, HeroTone, ThemePalette};
 use crate::views::shared::{brand_family_rank, canonical_agent_label};
 use crate::widgets::controls::{
     ButtonKind, action_button, bento_card_bloom, icon_action_button, inset_box, mono_tabular,
     pulse_status_dot, spinning_action_button, spinning_ui_icon, status_dot, toggle_switch,
+    tone_tag,
 };
 use gpui::{
     BoxShadow, Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, relative, rgb,
@@ -27,7 +28,37 @@ fn cleanup_toast_for_agent(agent_id: &str) -> &'static str {
         "chatgpt" => "已清理 ChatGPT / Codex 及孤儿进程",
         "codex" => "已清理 Codex CLI 及孤儿进程",
         "antigravity" => "已清理 Antigravity 及孤儿进程",
+        "cursor" => "已清理 Cursor IDE 及孤儿进程",
+        "windsurf" => "已清理 Windsurf IDE 及孤儿进程",
+        "zed" => "已清理 Zed IDE 及孤儿进程",
+        "trae" => "已清理 Trae IDE 及孤儿进程",
+        "gemini" => "已清理 Gemini CLI 及孤儿进程",
+        "aider" => "已清理 Aider CLI 及孤儿进程",
         _ => "已清理受管 AI 客户端进程",
+    }
+}
+
+fn overview_agent_label<'a>(id: &str, fallback: &'a str) -> &'a str {
+    match id.to_ascii_lowercase().as_str() {
+        "cursor" => "Cursor",
+        "windsurf" => "Windsurf",
+        "zed" => "Zed",
+        "trae" => "Trae",
+        "gemini" => "Gemini CLI",
+        "aider" => "Aider CLI",
+        _ => canonical_agent_label(id, fallback),
+    }
+}
+
+fn overview_agent_rank(id: &str) -> u8 {
+    match id.to_ascii_lowercase().as_str() {
+        "cursor" => 6,
+        "windsurf" => 7,
+        "zed" => 8,
+        "trae" => 9,
+        "gemini" => 11,
+        "aider" => 12,
+        _ => brand_family_rank(id),
     }
 }
 
@@ -647,6 +678,77 @@ pub fn render_overview(
                 ),
         );
 
+    let (risk_score, risk_grade, risk_evaluated) = snap
+        .as_deref()
+        .map(|s| {
+            (
+                s.risk_assessment.score,
+                s.risk_assessment.grade,
+                s.risk_assessment.evaluated_at > 0,
+            )
+        })
+        .unwrap_or((0, SafetyGrade::C, false));
+    let risk_tone = if risk_evaluated {
+        safety_grade_tone(risk_grade)
+    } else {
+        BadgeTone::Muted
+    };
+    let health_card_busy = ctrl_r.is_scope_busy(&ActionScope::BuildHealthCard);
+    let ctrl_to_radar = ctrl.clone();
+    let ctrl_health_card = ctrl.clone();
+
+    let risk_ring_badge = div()
+        .id("ov-risk-score-badge")
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .gap(px(5.5))
+        .hover(|s| s.opacity(0.88))
+        .child(tone_tag(
+            if risk_evaluated {
+                format!("{risk_score}分 · {} 级防封", risk_grade.code())
+            } else {
+                "10D 防封待检".into()
+            },
+            risk_tone,
+            p,
+        ))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |_, _, _, cx| {
+                ctrl_to_radar.update(cx, |c, cx| {
+                    c.env_tab = EnvSubTab::RiskRadar;
+                    c.set_nav(NavSection::Environment, cx);
+                });
+            }),
+        );
+
+    let export_card_btn = icon_action_button(
+        "ov-export-health-card",
+        "icons/ui/shield.svg",
+        if health_card_busy {
+            "生成中…"
+        } else {
+            "导出防封体检卡"
+        },
+        ButtonKind::Secondary,
+        can_act && !health_card_busy,
+        p,
+    )
+    .h(px(25.))
+    .px(px(8.5))
+    .text_size(px(10.5))
+    .when(can_act && !health_card_busy, |b| {
+        b.on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |_, _, _, cx| {
+                ctrl_health_card.update(cx, |c, cx| {
+                    c.build_and_export_health_card(true, cx);
+                });
+            }),
+        )
+    });
+
     let hero_pose = choreo.tile(0, 0);
     let hero_card = bento_card_bloom(p, 18.0, 16.0, hero_pose)
         .flex_1()
@@ -663,19 +765,38 @@ pub fn render_overview(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(7.))
-                        .child(pulse_status_dot(
-                            "hero-status-pulse",
-                            status_dot_color,
-                            7.5,
-                            connected && (proj.hero.tone == HeroTone::Healthy || really_tripped),
-                        ))
+                        .justify_between()
+                        .gap(px(6.))
                         .child(
                             div()
-                                .text_size(px(12.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(status_kicker_color))
-                                .child(status_kicker),
+                                .flex()
+                                .items_center()
+                                .gap(px(7.))
+                                .min_w(px(0.))
+                                .child(pulse_status_dot(
+                                    "hero-status-pulse",
+                                    status_dot_color,
+                                    7.5,
+                                    connected
+                                        && (proj.hero.tone == HeroTone::Healthy || really_tripped),
+                                ))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(status_kicker_color))
+                                        .child(status_kicker),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .flex_shrink_0()
+                                .gap(px(5.))
+                                .child(risk_ring_badge)
+                                .child(export_card_btn),
                         ),
                 )
                 .child(
@@ -1061,22 +1182,24 @@ pub fn render_overview(
     let ctrl_kill_all = ctrl.clone();
     let ctrl_sweep = ctrl.clone();
 
-    // Group managed agents by brand family (Claude + Claude Code, ChatGPT + Codex CLI, Antigravity)
-    // so matching brand colors & icons stay visually cohesive instead of interleaved.
+    // Group managed 7-GUI + 4-CLI matrix cleanly by brand family.
     let mut sorted_agents: Vec<_> = proj.agent_statuses.iter().collect();
-    sorted_agents.sort_by_key(|a| brand_family_rank(&a.id));
+    sorted_agents.sort_by_key(|a| overview_agent_rank(&a.id));
 
     let proc_rows = sorted_agents
-        .into_iter()
-        .take(5)
+        .iter()
+        .filter(|a| !a.kind.contains("CLI") || a.running_count > 0 || a.orphan_count > 0)
+        .take(7)
         .enumerate()
         .map(|(row_idx, a)| {
-            let row_pose = choreo.inner_bloom(1, row_idx);
+            let row_pose = choreo.inner_bloom(1, row_idx.min(4));
             let can_kill = can_act && (a.running_count > 0 || a.orphan_count > 0);
             let aid = a.id.clone();
             let toast = cleanup_toast_for_agent(&a.id);
             let ctrl_k = ctrl.clone();
-            let stat_txt = if a.orphan_count > 0 {
+            let stat_txt = if !a.installed {
+                "未安装".into()
+            } else if a.orphan_count > 0 {
                 format!("{} 运行 · {} 孤儿", a.running_count, a.orphan_count)
             } else {
                 format!("{} 运行", a.running_count)
@@ -1088,7 +1211,7 @@ pub fn render_overview(
             };
             let hover_bg = p.sidebar_hover_bg;
             let icon_key = agent_icon_key(&a.id, &a.kind);
-            let display_name = canonical_agent_label(&a.id, &a.name).to_string();
+            let display_name = overview_agent_label(&a.id, &a.name).to_string();
 
             let row = div()
                 .flex()
@@ -1184,10 +1307,21 @@ pub fn render_overview(
                         .justify_between()
                         .child(
                             div()
-                                .text_size(px(13.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(p.text_primary))
-                                .child("受管进程治理"),
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(p.text_primary))
+                                        .child("7 客户端矩阵治理"),
+                                )
+                                .child(
+                                    mono_tabular(format!("{} 端", proj.agent_statuses.len()))
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(p.text_muted)),
+                                ),
                         )
                         .child(
                             action_button(

@@ -3,11 +3,17 @@
 //! All Named Pipe calls execute on background worker threads via `cx.background_executor()`,
 //! never blocking the GPUI render/UI thread.
 
-use crate::demo::{DemoScenario, build_demo_onboarding_probe, build_demo_snapshot, now_unix_secs};
+use crate::demo::{
+    DemoScenario, build_demo_onboarding_probe, build_demo_snapshot, demo_cleanroom_backups,
+    demo_cleanroom_report, now_unix_secs,
+};
+use crate::health_card::build_sanitized_health_card;
 use crate::protocol::{
-    AgentKind, DEFAULT_PIPE_NAME, ErrorCode, GuardSnapshot, Lifecycle, OperationItemReceipt,
-    OperationReceipt, OperationStatus, PipeRequest, PipeResponse, PolicyPreset, ProtectionState,
-    TargetState, UpdateCheckPhase,
+    AgentKind, CleanRoomBackupMeta, CleanRoomRiskLevel, DEFAULT_PIPE_NAME, ErrorCode,
+    GuardSnapshot, HookDecision, Lifecycle, OperationItemReceipt, OperationReceipt,
+    OperationStatus, PipeRequest, PipeResponse, PolicyPreset, ProtectionState, SafetyGrade,
+    TargetState, UiLabelExt, UpdateCheckPhase, VaultRuntimeState, VaultRuntimeStatus,
+    WfpBlockedEvent, is_valid_vault_id,
 };
 use std::sync::{Arc, Mutex};
 
@@ -47,17 +53,22 @@ impl std::fmt::Display for TransportError {
 pub struct DaemonClient {
     endpoint: TransportEndpoint,
     demo_state: Arc<Mutex<Option<GuardSnapshot>>>,
+    demo_backups: Arc<Mutex<Vec<CleanRoomBackupMeta>>>,
 }
 
 impl DaemonClient {
     pub fn new(endpoint: TransportEndpoint) -> Self {
-        let initial_demo = match &endpoint {
-            TransportEndpoint::Demo(scenario) => Some(build_demo_snapshot(*scenario)),
-            TransportEndpoint::Pipe(_) => None,
+        let (initial_demo, initial_backups) = match &endpoint {
+            TransportEndpoint::Demo(scenario) => (
+                Some(build_demo_snapshot(*scenario)),
+                demo_cleanroom_backups(now_unix_secs()),
+            ),
+            TransportEndpoint::Pipe(_) => (None, Vec::new()),
         };
         Self {
             endpoint,
             demo_state: Arc::new(Mutex::new(initial_demo)),
+            demo_backups: Arc::new(Mutex::new(initial_backups)),
         }
     }
 
@@ -346,6 +357,30 @@ impl DaemonClient {
                     true,
                     "已完成 Lumidarin/agy-capsule 上游版本核验",
                 );
+                touch(
+                    &mut snap.updates.cursor_ide,
+                    "cursor_ide",
+                    false,
+                    "已完成 Cursor IDE 官方最新版本核验",
+                );
+                touch(
+                    &mut snap.updates.windsurf_ide,
+                    "windsurf_ide",
+                    false,
+                    "已完成 Windsurf IDE 官方最新版本核验",
+                );
+                touch(
+                    &mut snap.updates.zed_ide,
+                    "zed_ide",
+                    false,
+                    "已完成 Zed IDE 官方最新版本核验",
+                );
+                touch(
+                    &mut snap.updates.trae_ide,
+                    "trae_ide",
+                    false,
+                    "已完成 Trae IDE 官方最新版本核验",
+                );
                 PipeResponse::Ack {
                     receipt: None,
                     snapshot: Some(Box::new(snap.clone())),
@@ -561,6 +596,526 @@ impl DaemonClient {
                 receipt: None,
                 snapshot: Some(Box::new(snap.clone())),
             },
+            PipeRequest::FastHookGate {
+                agent_id, vault_id, ..
+            } => {
+                let allowed = snap.lifecycle == Lifecycle::Armed
+                    && !snap.is_tripped()
+                    && !snap.lockdown
+                    && !snap.is_paused_at(now)
+                    && snap.all_enabled_pass()
+                    && snap.risk_assessment.score >= snap.config.min_global_safety_score;
+                let decision = if allowed {
+                    HookDecision::Allow
+                } else {
+                    HookDecision::Block
+                };
+                snap.hooks.total_gate_checks = snap.hooks.total_gate_checks.saturating_add(1);
+                if !allowed {
+                    snap.hooks.total_gate_blocks = snap.hooks.total_gate_blocks.saturating_add(1);
+                }
+                snap.hooks.last_gate_latency_us = 620;
+                let reason = if allowed {
+                    format!(
+                        "O(1) 快照门禁放行：{agent_id}{}（安全分 {}）",
+                        vault_id
+                            .as_deref()
+                            .map(|v| format!(" · 仓 {v}"))
+                            .unwrap_or_default(),
+                        snap.risk_assessment.score
+                    )
+                } else {
+                    format!(
+                        "门禁已截停 {agent_id} 首包发送：当前出口不合规或处于锁定态（安全分 {}）",
+                        snap.risk_assessment.score
+                    )
+                };
+                PipeResponse::FastGateVerdict {
+                    allowed,
+                    decision,
+                    safety_score: snap.risk_assessment.score,
+                    reason,
+                    latency_path: "fast_o1_demo".into(),
+                }
+            }
+            PipeRequest::UpsertVault { mut vault } => {
+                vault.normalize();
+                if !is_valid_vault_id(&vault.id) {
+                    return PipeResponse::Error {
+                        code: ErrorCode::ValidationFailed,
+                        message: "隔离仓 ID 不合法，请使用 2-32 位小写字母、数字、- 或 _".into(),
+                        receipt: None,
+                    };
+                }
+                if let Some(existing) = snap.config.vaults.iter_mut().find(|v| v.id == vault.id) {
+                    *existing = vault.clone();
+                } else {
+                    snap.config.vaults.push(vault.clone());
+                }
+                let tripped_now = snap.is_tripped();
+                let next_state = if !vault.enabled {
+                    VaultRuntimeState::Disabled
+                } else if tripped_now {
+                    VaultRuntimeState::EgressMismatch
+                } else {
+                    VaultRuntimeState::Ready
+                };
+                if let Some(rt) = snap.vaults.iter_mut().find(|v| v.id == vault.id) {
+                    rt.name = vault.name.clone();
+                    rt.accent_hex = vault.accent_hex.clone();
+                    if rt.state != VaultRuntimeState::ActiveRunning || !vault.enabled {
+                        rt.state = next_state;
+                    }
+                    rt.egress_matches_contract = !tripped_now;
+                } else {
+                    snap.vaults.push(VaultRuntimeStatus {
+                        id: vault.id.clone(),
+                        name: vault.name.clone(),
+                        accent_hex: vault.accent_hex.clone(),
+                        state: next_state,
+                        running_pids: Vec::new(),
+                        running_apps: Vec::new(),
+                        egress_matches_contract: !tripped_now,
+                        cooldown_remaining_secs: 0,
+                        last_active_at: None,
+                        last_ip_masked: Some("198.51.*.*".into()),
+                        last_country: vault.pinned_regions.first().cloned(),
+                        vault_dir: format!(r"%LOCALAPPDATA%\ClaudeGuard\vaults\{}", vault.id),
+                        summary: "主权隔离目录与独立机器码种子已初始化".into(),
+                    });
+                }
+                snap.cfg_rev += 1;
+                let receipt = OperationReceipt {
+                    id: format!("rcpt-vault-upsert-{now}"),
+                    status: OperationStatus::Verified,
+                    items: vec![OperationItemReceipt {
+                        name: format!("主权隔离仓 {}", vault.id),
+                        status: OperationStatus::Verified,
+                        detail: format!("已保存隔离仓「{}」并核验隔离目录", vault.name),
+                    }],
+                    error: None,
+                    verified_scope: vault.id,
+                    remaining: Vec::new(),
+                };
+                snap.last_receipt = Some(receipt.clone());
+                PipeResponse::Ack {
+                    receipt: Some(receipt),
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::DeleteVault { vault_id, .. } => {
+                let before = snap.config.vaults.len();
+                snap.config.vaults.retain(|v| v.id != vault_id);
+                snap.vaults.retain(|v| v.id != vault_id);
+                if snap.config.vaults.len() == before {
+                    return PipeResponse::Error {
+                        code: ErrorCode::NotFound,
+                        message: format!("未找到隔离仓：{vault_id}"),
+                        receipt: None,
+                    };
+                }
+                snap.cfg_rev += 1;
+                PipeResponse::Ack {
+                    receipt: None,
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::LaunchVault { vault_id, app, .. } => {
+                if snap.is_tripped() || snap.lockdown || snap.lifecycle != Lifecycle::Armed {
+                    return PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: "当前处于熔断/锁定或非布防状态，主权仓启动门禁已拒止".into(),
+                        receipt: None,
+                    };
+                }
+                let Some(rt) = snap.vaults.iter_mut().find(|v| v.id == vault_id) else {
+                    return PipeResponse::Error {
+                        code: ErrorCode::NotFound,
+                        message: format!("未找到隔离仓：{vault_id}"),
+                        receipt: None,
+                    };
+                };
+                if rt.state == VaultRuntimeState::Disabled {
+                    return PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: "该隔离仓已停用，请先启用后再启动".into(),
+                        receipt: None,
+                    };
+                }
+                if rt.cooldown_remaining_secs > 0 {
+                    return PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: format!(
+                            "隔离仓处于防瞬移冷却期，还剩 {} 秒",
+                            rt.cooldown_remaining_secs
+                        ),
+                        receipt: None,
+                    };
+                }
+                rt.state = VaultRuntimeState::ActiveRunning;
+                rt.egress_matches_contract = true;
+                rt.last_active_at = Some(now);
+                let aid = app.agent_id().to_string();
+                if !rt.running_apps.contains(&aid) {
+                    rt.running_apps.push(aid);
+                }
+                let fake_pid = 24_000 + (rt.running_pids.len() as u32) * 17;
+                rt.running_pids.push(fake_pid);
+                rt.summary = format!(
+                    "已在主权仓内安全拉起 {} · 共 {} 个进程受护运行",
+                    app.label(),
+                    rt.running_pids.len()
+                );
+                let receipt = OperationReceipt {
+                    id: format!("rcpt-vault-launch-{now}"),
+                    status: OperationStatus::Verified,
+                    items: vec![OperationItemReceipt {
+                        name: format!("启动 {} ({vault_id})", app.label()),
+                        status: OperationStatus::Verified,
+                        detail: "6 步原子契约核验通过 · 物理隔离环境已注入".into(),
+                    }],
+                    error: None,
+                    verified_scope: format!("{vault_id}:{}", app.agent_id()),
+                    remaining: Vec::new(),
+                };
+                snap.last_receipt = Some(receipt.clone());
+                PipeResponse::Ack {
+                    receipt: Some(receipt),
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::StopVault { vault_id } => {
+                let Some(rt) = snap.vaults.iter_mut().find(|v| v.id == vault_id) else {
+                    return PipeResponse::Error {
+                        code: ErrorCode::NotFound,
+                        message: format!("未找到隔离仓：{vault_id}"),
+                        receipt: None,
+                    };
+                };
+                let stopped = rt.running_pids.len();
+                rt.running_pids.clear();
+                rt.running_apps.clear();
+                if rt.state == VaultRuntimeState::ActiveRunning {
+                    rt.state = VaultRuntimeState::Ready;
+                }
+                rt.summary = format!("已安全停止此仓全部 {stopped} 个进程，隔离目录干净待命");
+                PipeResponse::Ack {
+                    receipt: None,
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::GenerateVaultShortcuts { vault_id } => {
+                let Some(v) = snap.config.vaults.iter().find(|v| v.id == vault_id) else {
+                    return PipeResponse::Error {
+                        code: ErrorCode::NotFound,
+                        message: format!("未找到隔离仓：{vault_id}"),
+                        receipt: None,
+                    };
+                };
+                let receipt = OperationReceipt {
+                    id: format!("rcpt-vault-lnk-{now}"),
+                    status: OperationStatus::Verified,
+                    items: vec![OperationItemReceipt {
+                        name: format!("桌面直启快捷方式 ({})", v.name),
+                        status: OperationStatus::Verified,
+                        detail: format!(
+                            "已生成 [ClaudeGuard - {}] 桌面快捷方式与终端启动命令",
+                            v.name
+                        ),
+                    }],
+                    error: None,
+                    verified_scope: format!("ClaudeGuard-Vault-{vault_id}.lnk"),
+                    remaining: Vec::new(),
+                };
+                snap.last_receipt = Some(receipt.clone());
+                PipeResponse::Ack {
+                    receipt: Some(receipt),
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::ScanCleanRoom { scope } => {
+                let report = demo_cleanroom_report(now, &scope);
+                snap.last_cleanroom_report = Some(report.clone());
+                PipeResponse::CleanRoomScan {
+                    report: Box::new(report),
+                }
+            }
+            PipeRequest::ExecuteCleanRoom {
+                scope,
+                selected_finding_ids,
+            } => {
+                let current = snap
+                    .last_cleanroom_report
+                    .clone()
+                    .unwrap_or_else(|| demo_cleanroom_report(now, &scope));
+                let mut backups = self.demo_backups.lock().expect("demo backups lock");
+                let backup_id = format!("cgbak-{now}");
+                let mut clients = Vec::new();
+                if scope.claude {
+                    clients.push("claude".into());
+                }
+                if scope.chatgpt_codex {
+                    clients.push("chatgpt".into());
+                }
+                if scope.cursor {
+                    clients.push("cursor".into());
+                }
+                if scope.antigravity {
+                    clients.push("antigravity".into());
+                }
+                if scope.windsurf {
+                    clients.push("windsurf".into());
+                }
+                let removed_count = if selected_finding_ids.is_empty() {
+                    current.findings.len()
+                } else {
+                    current
+                        .findings
+                        .iter()
+                        .filter(|f| selected_finding_ids.contains(&f.id))
+                        .count()
+                };
+                backups.insert(
+                    0,
+                    CleanRoomBackupMeta {
+                        backup_id: backup_id.clone(),
+                        created_at: now,
+                        file_path: format!(r"%LOCALAPPDATA%\ClaudeGuard\backups\{backup_id}.cgbak"),
+                        archive_bytes: 184_320,
+                        item_count: removed_count.max(1),
+                        sha256_hex: format!("{now:016x}8a9c4412e7b031f5c2d9a8110044ff23"),
+                        clients_included: clients,
+                    },
+                );
+                snap.cleanroom_backup_count = backups.len();
+                drop(backups);
+
+                let remaining_findings: Vec<_> = if selected_finding_ids.is_empty() {
+                    Vec::new()
+                } else {
+                    current
+                        .findings
+                        .into_iter()
+                        .filter(|f| !selected_finding_ids.contains(&f.id))
+                        .collect()
+                };
+                let new_score: u8 = remaining_findings
+                    .iter()
+                    .map(|f| u16::from(f.risk_weight))
+                    .sum::<u16>()
+                    .min(100) as u8;
+                let new_level = match new_score {
+                    0 => CleanRoomRiskLevel::Clean,
+                    1..=25 => CleanRoomRiskLevel::Low,
+                    26..=69 => CleanRoomRiskLevel::Elevated,
+                    _ => CleanRoomRiskLevel::CriticalChainBanRisk,
+                };
+                snap.last_cleanroom_report = Some(crate::protocol::CleanRoomReport {
+                    scanned_at: now,
+                    scope,
+                    pollution_score: new_score,
+                    risk_level: new_level,
+                    findings: remaining_findings,
+                    preserved_assets_summary: current.preserved_assets_summary,
+                    summary: if new_score == 0 {
+                        "后置复核通过：所选跨号关联源已全部清零，核心资产 100% 完好".into()
+                    } else {
+                        format!("已完成部分洗白（剩余污染指数 {new_score}/100）")
+                    },
+                });
+                let receipt = OperationReceipt {
+                    id: format!("rcpt-cleanroom-{now}"),
+                    status: OperationStatus::Verified,
+                    items: vec![OperationItemReceipt {
+                        name: "防连坐净室加密备份与手术洗白".into(),
+                        status: OperationStatus::Verified,
+                        detail: format!(
+                            "已生成加密时光机备份 {backup_id}.cgbak，并清除 {removed_count} 项关联残留（后置复核通过）"
+                        ),
+                    }],
+                    error: None,
+                    verified_scope: backup_id,
+                    remaining: Vec::new(),
+                };
+                snap.last_receipt = Some(receipt.clone());
+                PipeResponse::Ack {
+                    receipt: Some(receipt),
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::ListCleanRoomBackups => {
+                let backups = self.demo_backups.lock().expect("demo backups lock").clone();
+                PipeResponse::CleanRoomBackups { backups }
+            }
+            PipeRequest::RestoreCleanRoomBackup { backup_id } => {
+                let exists = self
+                    .demo_backups
+                    .lock()
+                    .expect("demo backups lock")
+                    .iter()
+                    .any(|b| b.backup_id == backup_id);
+                if !exists {
+                    return PipeResponse::Error {
+                        code: ErrorCode::NotFound,
+                        message: format!("未找到加密备份：{backup_id}"),
+                        receipt: None,
+                    };
+                }
+                let receipt = OperationReceipt {
+                    id: format!("rcpt-restore-{now}"),
+                    status: OperationStatus::Verified,
+                    items: vec![OperationItemReceipt {
+                        name: format!("时光机还原 {backup_id}"),
+                        status: OperationStatus::Verified,
+                        detail: "CGBAK005 AES-GCM 完整性校验通过，已无损还原配置与凭据".into(),
+                    }],
+                    error: None,
+                    verified_scope: backup_id,
+                    remaining: Vec::new(),
+                };
+                snap.last_receipt = Some(receipt.clone());
+                PipeResponse::Ack {
+                    receipt: Some(receipt),
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::ConfigureCliHooks {
+                install_claude_code,
+                install_pwsh_profile,
+                sync_all_vaults,
+            } => {
+                snap.hooks.claude_code_hook_installed = install_claude_code;
+                snap.hooks.pwsh_profile_wrapped = install_pwsh_profile;
+                snap.hooks.vault_hooks_synced_count = if sync_all_vaults {
+                    snap.config.vaults.len()
+                } else {
+                    0
+                };
+                snap.hooks.summary = if install_claude_code || install_pwsh_profile {
+                    format!(
+                        "Pre-Prompt 门禁已更新：Claude Code={} · PowerShell={} · 已同步 {} 个主权仓",
+                        if install_claude_code {
+                            "已接入"
+                        } else {
+                            "未接入"
+                        },
+                        if install_pwsh_profile {
+                            "已包裹"
+                        } else {
+                            "未包裹"
+                        },
+                        snap.hooks.vault_hooks_synced_count
+                    )
+                } else {
+                    "已安全卸载 Claude Code Hook 与 PowerShell 门禁包裹".into()
+                };
+                PipeResponse::Ack {
+                    receipt: None,
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::SyncWslBridge => {
+                snap.wsl_bridge.enabled = snap.config.wsl_bridge_enabled;
+                snap.wsl_bridge.listening = snap.config.wsl_bridge_enabled;
+                snap.wsl_bridge.token_ready = true;
+                snap.wsl_bridge.proxy_desync_detected = false;
+                if snap.wsl_bridge.synced_distros.is_empty() {
+                    snap.wsl_bridge.synced_distros.push("Ubuntu-24.04".into());
+                }
+                snap.wsl_bridge.summary =
+                    "已同步 WSL2 回环 HMAC 门禁桥接脚本（代理一致性校验通过）".into();
+                PipeResponse::Ack {
+                    receipt: None,
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::TriggerPanicLockdown => {
+                snap.lockdown = true;
+                snap.lockdown_manual = true;
+                snap.protection = ProtectionState::Quarantined;
+                snap.runtime_epoch += 1;
+                snap.wfp.total_blocked_packets = snap.wfp.total_blocked_packets.saturating_add(1);
+                let next_seq = snap
+                    .wfp
+                    .recent_blocked
+                    .first()
+                    .map(|e| e.seq + 1)
+                    .unwrap_or(1);
+                snap.wfp.recent_blocked.insert(
+                    0,
+                    WfpBlockedEvent {
+                        seq: next_seq,
+                        timestamp_ms: now.saturating_mul(1000),
+                        pid: None,
+                        agent_id: "all".into(),
+                        app_path: "PanicLockdown".into(),
+                        remote_ip: "203.0.113.45".into(),
+                        remote_port: 443,
+                        protocol: "tcp".into(),
+                        layer: "ale_auth_connect_v4".into(),
+                        filter_reason: "panic_lockdown".into(),
+                    },
+                );
+                let receipt = OperationReceipt {
+                    id: format!("rcpt-panic-{now}"),
+                    status: OperationStatus::Verified,
+                    items: vec![OperationItemReceipt {
+                        name: "一键全局紧急防封锁死".into(),
+                        status: OperationStatus::Verified,
+                        detail: "WFP 动态子层已瞬间切断全部受管 AI 客户端出站流量".into(),
+                    }],
+                    error: None,
+                    verified_scope: "panic_lockdown".into(),
+                    remaining: Vec::new(),
+                };
+                snap.last_receipt = Some(receipt.clone());
+                PipeResponse::Ack {
+                    receipt: Some(receipt),
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::ClearWfpBlockedEvents => {
+                snap.wfp.recent_blocked.clear();
+                PipeResponse::Ack {
+                    receipt: None,
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::RunDeepRiskAudit => {
+                snap.risk_assessment.evaluated_at = now;
+                snap.risk_assessment.ip_purity.checked_at = now;
+                snap.risk_assessment.stun_leak.checked_at = now;
+                snap.risk_assessment.dns_coherence.checked_at = now;
+                snap.risk_assessment.electron_hygiene.checked_at = now;
+                if !snap.is_tripped() && snap.risk_assessment.score == 0 {
+                    snap.risk_assessment.score = 94;
+                    snap.risk_assessment.grade = SafetyGrade::S;
+                }
+                PipeResponse::Ack {
+                    receipt: None,
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::ClearGeoVelocityCooldown => {
+                snap.risk_assessment.geo_velocity_alert = None;
+                for v in &mut snap.vaults {
+                    if v.state == VaultRuntimeState::CoolingDown {
+                        v.state = VaultRuntimeState::Ready;
+                        v.cooldown_remaining_secs = 0;
+                        v.summary = "已手动解除防瞬移冷却，隔离仓恢复就绪".into();
+                    }
+                }
+                PipeResponse::Ack {
+                    receipt: None,
+                    snapshot: Some(Box::new(snap.clone())),
+                }
+            }
+            PipeRequest::BuildHealthCard { .. } => {
+                let card = build_sanitized_health_card(snap, now);
+                PipeResponse::HealthCard {
+                    card: Box::new(card),
+                }
+            }
         }
     }
 }
@@ -630,13 +1185,22 @@ fn notify_daemon_shutdown_pipe_best_effort(pipe_name: &str) {
 fn request_timeout_ms(req: &PipeRequest) -> u64 {
     match req {
         PipeRequest::NotifySystemShutdown => 250,
+        PipeRequest::FastHookGate { .. } => 2_000,
         PipeRequest::RepairAntigravityProxy => 65_000,
         PipeRequest::CheckUpdates { .. }
         | PipeRequest::RecheckNow { .. }
         | PipeRequest::ProbeOnboarding
         | PipeRequest::SyncLeakShield
         | PipeRequest::TestFeishu { .. }
-        | PipeRequest::CheckLaunchGate { .. } => 30_000,
+        | PipeRequest::CheckLaunchGate { .. }
+        | PipeRequest::RunDeepRiskAudit
+        | PipeRequest::ScanCleanRoom { .. }
+        | PipeRequest::ExecuteCleanRoom { .. }
+        | PipeRequest::RestoreCleanRoomBackup { .. }
+        | PipeRequest::SyncWslBridge
+        | PipeRequest::LaunchVault { .. }
+        | PipeRequest::ConfigureCliHooks { .. }
+        | PipeRequest::BuildHealthCard { .. } => 30_000,
         _ => 8_000,
     }
 }
@@ -1011,13 +1575,19 @@ struct AgentLaunchPlan {
 
 #[cfg(any(windows, test))]
 fn plan_agent_launch(agent_id: &str, user_profile: Option<&std::path::Path>) -> AgentLaunchPlan {
-    if matches!(agent_id, "claude" | "chatgpt" | "antigravity") {
+    if matches!(
+        agent_id,
+        "claude" | "chatgpt" | "antigravity" | "cursor" | "windsurf" | "zed" | "trae"
+    ) {
         AgentLaunchPlan {
             disable_quic: true,
             working_dir: None,
             toast_message: format!("已安全启动 {agent_id}（普通用户权限 · 已禁用 QUIC 泄露）"),
         }
-    } else if matches!(agent_id, "claude-code" | "codex" | "codex-cli" | "gemini") {
+    } else if matches!(
+        agent_id,
+        "claude-code" | "codex" | "codex-cli" | "gemini" | "aider"
+    ) {
         let working_dir = user_profile
             .filter(|p| !p.as_os_str().is_empty() && p.is_dir())
             .map(std::path::Path::to_path_buf);
@@ -1568,5 +2138,244 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "CancelIoEx must abort stalled read promptly, took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn demo_transport_supports_all_v5_vault_cleanroom_wfp_hooks_and_health_card_rpcs() {
+        use crate::health_card::{contains_any_ip_literal, contains_windows_username};
+        use crate::protocol::{AccountVault, CleanRoomScope, MsixIsolationMode, VaultAppTarget};
+
+        let client = DaemonClient::new(TransportEndpoint::Demo(DemoScenario::Pass));
+
+        // 1. FastHookGate returns Allow in Pass scenario.
+        match client
+            .exchange(PipeRequest::FastHookGate {
+                agent_id: "claude-code".into(),
+                vault_id: Some("work-claude-max".into()),
+                hook_event: Some("UserPromptSubmit".into()),
+            })
+            .expect("fast hook gate")
+        {
+            PipeResponse::FastGateVerdict {
+                allowed,
+                decision,
+                safety_score,
+                ..
+            } => {
+                assert!(allowed);
+                assert_eq!(decision, HookDecision::Allow);
+                assert_eq!(safety_score, 94);
+            }
+            other => panic!("unexpected FastHookGate response: {other:?}"),
+        }
+
+        // 2. UpsertVault -> LaunchVault -> GenerateVaultShortcuts -> StopVault -> DeleteVault.
+        let new_vault = AccountVault {
+            id: "test-sg-vault".into(),
+            name: "测试新加坡隔离仓".into(),
+            accent_hex: "#2B4F8D".into(),
+            enabled: true,
+            pinned_regions: vec!["SG".into()],
+            pinned_ips: vec!["198.51.100.0/24".into()],
+            pinned_asn: Some(7473),
+            dedicated_proxy_port: Some(7895),
+            preferred_mihomo_group: Some("Proxy".into()),
+            preferred_mihomo_node: Some("SG-01".into()),
+            auto_align_mihomo_on_vault_launch: false,
+            min_safety_score: 80,
+            cooldown_after_ip_change_secs: 900,
+            share_ide_extensions: true,
+            msix_isolation_mode: MsixIsolationMode::AutoVerifyLock,
+        };
+        match client
+            .exchange(PipeRequest::UpsertVault { vault: new_vault })
+            .expect("upsert vault")
+        {
+            PipeResponse::Ack {
+                snapshot: Some(snap),
+                ..
+            } => assert!(snap.vaults.iter().any(|v| v.id == "test-sg-vault")),
+            other => panic!("unexpected UpsertVault: {other:?}"),
+        }
+
+        match client
+            .exchange(PipeRequest::LaunchVault {
+                vault_id: "test-sg-vault".into(),
+                app: VaultAppTarget::CursorIde,
+                extra_args: Vec::new(),
+            })
+            .expect("launch vault")
+        {
+            PipeResponse::Ack {
+                snapshot: Some(snap),
+                ..
+            } => {
+                let v = snap
+                    .vaults
+                    .iter()
+                    .find(|v| v.id == "test-sg-vault")
+                    .unwrap();
+                assert_eq!(v.state, VaultRuntimeState::ActiveRunning);
+                assert!(v.running_apps.contains(&"cursor".to_string()));
+            }
+            other => panic!("unexpected LaunchVault: {other:?}"),
+        }
+
+        assert!(matches!(
+            client
+                .exchange(PipeRequest::GenerateVaultShortcuts {
+                    vault_id: "test-sg-vault".into(),
+                })
+                .expect("shortcuts"),
+            PipeResponse::Ack {
+                receipt: Some(_),
+                ..
+            }
+        ));
+
+        match client
+            .exchange(PipeRequest::StopVault {
+                vault_id: "test-sg-vault".into(),
+            })
+            .expect("stop vault")
+        {
+            PipeResponse::Ack {
+                snapshot: Some(snap),
+                ..
+            } => {
+                let v = snap
+                    .vaults
+                    .iter()
+                    .find(|v| v.id == "test-sg-vault")
+                    .unwrap();
+                assert_eq!(v.state, VaultRuntimeState::Ready);
+                assert!(v.running_pids.is_empty());
+            }
+            other => panic!("unexpected StopVault: {other:?}"),
+        }
+
+        assert!(matches!(
+            client
+                .exchange(PipeRequest::DeleteVault {
+                    vault_id: "test-sg-vault".into(),
+                    purge_disk_data: false,
+                })
+                .expect("delete vault"),
+            PipeResponse::Ack { .. }
+        ));
+
+        // 3. Clean-Room: Scan -> Execute -> ListBackups -> Restore.
+        let scope = CleanRoomScope {
+            claude: true,
+            cursor: true,
+            ..CleanRoomScope::default()
+        };
+        let scan_resp = client
+            .exchange(PipeRequest::ScanCleanRoom {
+                scope: scope.clone(),
+            })
+            .expect("scan cleanroom");
+        assert!(matches!(scan_resp, PipeResponse::CleanRoomScan { .. }));
+
+        let exec_resp = client
+            .exchange(PipeRequest::ExecuteCleanRoom {
+                scope,
+                selected_finding_ids: Vec::new(),
+            })
+            .expect("exec cleanroom");
+        match exec_resp {
+            PipeResponse::Ack {
+                snapshot: Some(snap),
+                ..
+            } => {
+                let rpt = snap.last_cleanroom_report.expect("cleanroom report");
+                assert_eq!(rpt.pollution_score, 0);
+                assert_eq!(rpt.risk_level, CleanRoomRiskLevel::Clean);
+            }
+            other => panic!("unexpected ExecuteCleanRoom: {other:?}"),
+        }
+
+        let backup_id = match client
+            .exchange(PipeRequest::ListCleanRoomBackups)
+            .expect("list backups")
+        {
+            PipeResponse::CleanRoomBackups { backups } => {
+                assert!(backups.len() >= 3);
+                backups[0].backup_id.clone()
+            }
+            other => panic!("unexpected ListCleanRoomBackups: {other:?}"),
+        };
+        assert!(matches!(
+            client
+                .exchange(PipeRequest::RestoreCleanRoomBackup { backup_id })
+                .expect("restore backup"),
+            PipeResponse::Ack {
+                receipt: Some(_),
+                ..
+            }
+        ));
+
+        // 4. Health card leaks zero IPs and zero usernames.
+        match client
+            .exchange(PipeRequest::BuildHealthCard { export_png: false })
+            .expect("health card")
+        {
+            PipeResponse::HealthCard { card } => {
+                assert!(!contains_any_ip_literal(&card.markdown_snippet));
+                assert!(!contains_windows_username(&card.markdown_snippet));
+            }
+            other => panic!("unexpected BuildHealthCard: {other:?}"),
+        }
+
+        // 5. Hooks, WSL2, DeepRiskAudit, PanicLockdown, ClearWfpBlockedEvents, ClearGeoVelocityCooldown.
+        assert!(matches!(
+            client
+                .exchange(PipeRequest::ConfigureCliHooks {
+                    install_claude_code: true,
+                    install_pwsh_profile: true,
+                    sync_all_vaults: true,
+                })
+                .expect("hooks"),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(matches!(
+            client.exchange(PipeRequest::SyncWslBridge).expect("wsl"),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(matches!(
+            client
+                .exchange(PipeRequest::RunDeepRiskAudit)
+                .expect("deep audit"),
+            PipeResponse::Ack { .. }
+        ));
+        match client
+            .exchange(PipeRequest::TriggerPanicLockdown)
+            .expect("panic")
+        {
+            PipeResponse::Ack {
+                snapshot: Some(snap),
+                ..
+            } => {
+                assert!(snap.lockdown);
+                assert!(snap.lockdown_manual);
+            }
+            other => panic!("unexpected TriggerPanicLockdown: {other:?}"),
+        }
+        match client
+            .exchange(PipeRequest::ClearWfpBlockedEvents)
+            .expect("clear wfp")
+        {
+            PipeResponse::Ack {
+                snapshot: Some(snap),
+                ..
+            } => assert!(snap.wfp.recent_blocked.is_empty()),
+            other => panic!("unexpected ClearWfpBlockedEvents: {other:?}"),
+        }
+        assert!(matches!(
+            client
+                .exchange(PipeRequest::ClearGeoVelocityCooldown)
+                .expect("clear geo"),
+            PipeResponse::Ack { .. }
+        ));
     }
 }

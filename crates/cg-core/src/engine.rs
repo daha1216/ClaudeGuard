@@ -12,11 +12,12 @@ use crate::policy;
 use crate::targets;
 use crate::timeline::{BUCKETS_48, TimelineAggregator};
 use cg_protocol::{
-    AccessEvidence, AgentRuntimeStatus, AnchorKind, AntigravityProxyStatus, AppliedEnv, Config,
-    CutMode, DefenseSelfCheck, EnvCheck, ErrorCode, GuardSnapshot, LeakReport, Lifecycle, LogEntry,
-    LogLevel, OperationReceipt, OperationStatus, PolicyPreset, PolicyVerdict, ProbeResult,
-    ProtectionState, SNAPSHOT_SCHEMA_VERSION, Target, TargetState, TargetStatus, TripInfo,
-    UpdateCheckPhase, UpdateSummary, is_legal_state_pair, normalize_ip,
+    AccessEvidence, AgentRuntimeStatus, AnchorKind, AntigravityProxyStatus, AppliedEnv,
+    AsnClassification, Config, CutMode, DefenseSelfCheck, EnvCheck, ErrorCode, GuardSnapshot,
+    LeakReport, Lifecycle, LogEntry, LogLevel, OperationReceipt, OperationStatus, PolicyPreset,
+    PolicyVerdict, ProbeResult, ProtectionState, RiskAssessment, RiskDimensionItem,
+    SNAPSHOT_SCHEMA_VERSION, SafetyGrade, Target, TargetState, TargetStatus, TripInfo,
+    UpdateCheckPhase, UpdateSummary, WfpStatus, is_legal_state_pair, normalize_ip, region_name,
 };
 
 const MAX_LOG_ENTRIES: usize = 500;
@@ -108,6 +109,8 @@ pub struct EngineState {
     pub env: EnvCheck,
     pub env_applied: Option<AppliedEnv>,
     pub self_check: DefenseSelfCheck,
+    pub risk_assessment: RiskAssessment,
+    pub wfp: WfpStatus,
     pub timeline: TimelineAggregator,
     pub logs: VecDeque<LogEntry>,
     pub next_log_id: u64,
@@ -177,6 +180,8 @@ impl EngineState {
                 checked_at: now_secs,
                 ..DefenseSelfCheck::default()
             },
+            risk_assessment: RiskAssessment::default(),
+            wfp: WfpStatus::default(),
             timeline: TimelineAggregator::new(BUCKETS_48),
             logs: VecDeque::new(),
             next_log_id: 1,
@@ -272,6 +277,8 @@ impl EngineState {
             feishu: cg_protocol::FeishuStatus::default(),
             leak_shield: cg_protocol::LeakShieldStatus::default(),
             mihomo: cg_protocol::MihomoStatus::default(),
+            wfp: self.wfp.clone(),
+            risk_assessment: self.risk_assessment.clone(),
             ..GuardSnapshot::default()
         }
     }
@@ -400,12 +407,19 @@ pub enum EngineEvent {
     UpdatesChecked {
         summary: Box<UpdateSummary>,
     },
+    RiskUpdated {
+        assessment: Box<RiskAssessment>,
+    },
+    WfpUpdated {
+        status: Box<WfpStatus>,
+    },
     SystemShuttingDown,
     AbortFalseShutdownTrip,
     WalHealed,
 }
 
 /// Imperative side-effect commands emitted by [`GuardEngine::step`] for execution by `cg-daemon` / `cg-platform`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EffectCommand {
     ResolveAccessAndProbe {
@@ -692,6 +706,12 @@ impl GuardEngine {
             EngineEvent::UpdatesChecked { summary } => {
                 handle_updates_checked(&mut state, *summary, now_secs, &mut cmds);
             }
+            EngineEvent::RiskUpdated { assessment } => {
+                handle_risk_updated(&mut state, *assessment, now_secs, &mut cmds);
+            }
+            EngineEvent::WfpUpdated { status } => {
+                handle_wfp_updated(&mut state, *status, now_secs, &mut cmds);
+            }
             EngineEvent::SystemShuttingDown => {
                 handle_system_shutting_down(&mut state, now_secs, &mut cmds);
             }
@@ -830,12 +850,180 @@ impl GuardEngine {
                 requires_recheck: true,
             };
         }
+
+        // v5 Module M2 risk gates: enforce ONLY after an actual risk evaluation (`evaluated_at > 0`)
+        // so cold boot and first-run onboarding are never false-blocked.
+        if state.risk_assessment.evaluated_at > 0 {
+            if state.config.enforce_geo_velocity
+                && let Some(alert) = &state.risk_assessment.geo_velocity_alert
+            {
+                let cooldown_active = match alert.cooldown_until {
+                    Some(until) => now_secs < until,
+                    None => true,
+                };
+                if cooldown_active {
+                    let remaining_mins = alert
+                        .cooldown_until
+                        .map(|until| until.saturating_sub(now_secs).div_ceil(60).max(1))
+                        .unwrap_or(1);
+                    return LaunchDecision {
+                        allowed: false,
+                        reason: format!(
+                            "检测到跨国瞬移风控冷却：从 {} ({}) 跳变至 {} ({})（跨越 {} km，等效 {} km/h），建议切回原节点或等待约 {} 分钟冷却后再启动",
+                            region_name(&alert.from_country),
+                            alert.from_city,
+                            region_name(&alert.to_country),
+                            alert.to_city,
+                            alert.distance_km,
+                            alert.implied_speed_kmh,
+                            remaining_mins,
+                        ),
+                        requires_recheck: false,
+                    };
+                }
+            }
+
+            if state.config.block_datacenter_asn
+                && (state.risk_assessment.ip_purity.is_datacenter
+                    || matches!(
+                        state.risk_assessment.ip_purity.classification,
+                        AsnClassification::DatacenterHosting | AsnClassification::PublicProxyVpnTor
+                    ))
+            {
+                let asn_desc = if state.risk_assessment.ip_purity.asn_org.trim().is_empty() {
+                    state
+                        .risk_assessment
+                        .ip_purity
+                        .classification
+                        .label_zh()
+                        .to_string()
+                } else {
+                    format!(
+                        "{} ({})",
+                        state.risk_assessment.ip_purity.asn_org,
+                        state.risk_assessment.ip_purity.classification.label_zh()
+                    )
+                };
+                return LaunchDecision {
+                    allowed: false,
+                    reason: format!(
+                        "已开启禁止云机房 ASN 策略，当前出口属于机房/托管段（{asn_desc}），禁止启动受管客户端"
+                    ),
+                    requires_recheck: false,
+                };
+            }
+
+            if state.config.min_global_safety_score > 0
+                && state.risk_assessment.score < state.config.min_global_safety_score
+            {
+                let mut top_penalties: Vec<(u8, &RiskDimensionItem)> = state
+                    .risk_assessment
+                    .dimensions
+                    .iter()
+                    .filter_map(|d| {
+                        let lost = d.max_score.saturating_sub(d.score);
+                        (lost > 0).then_some((lost, d))
+                    })
+                    .collect();
+                top_penalties.sort_by_key(|a| std::cmp::Reverse(a.0));
+                let top_summary: Vec<String> = top_penalties
+                    .into_iter()
+                    .take(2)
+                    .map(|(lost, d)| format!("{} (-{}分: {})", d.name, lost, d.detail))
+                    .collect();
+                let detail_suffix = if !top_summary.is_empty() {
+                    format!("（主要扣分：{}）", top_summary.join("；"))
+                } else if !state.risk_assessment.headline.trim().is_empty() {
+                    format!("：{}", state.risk_assessment.headline)
+                } else {
+                    String::new()
+                };
+                return LaunchDecision {
+                    allowed: false,
+                    reason: format!(
+                        "当前 10 维出口安全分 {}/100（{} 级）低于最低启动门槛 {}{}",
+                        state.risk_assessment.score,
+                        state.risk_assessment.grade.code(),
+                        state.config.min_global_safety_score,
+                        detail_suffix,
+                    ),
+                    requires_recheck: false,
+                };
+            }
+        }
+
         LaunchDecision {
             allowed: true,
             reason: String::new(),
             requires_recheck: false,
         }
     }
+}
+
+fn handle_risk_updated(
+    state: &mut EngineState,
+    assessment: RiskAssessment,
+    now_secs: u64,
+    cmds: &mut Vec<EffectCommand>,
+) {
+    let new_geo_alert = assessment.geo_velocity_alert.is_some()
+        && state.risk_assessment.geo_velocity_alert != assessment.geo_velocity_alert;
+    let entered_critical = assessment.evaluated_at > 0
+        && assessment.grade == SafetyGrade::F
+        && (state.risk_assessment.evaluated_at == 0
+            || state.risk_assessment.grade != SafetyGrade::F);
+
+    if new_geo_alert && let Some(alert) = &assessment.geo_velocity_alert {
+        log_both(
+            state,
+            now_secs,
+            LogLevel::Warn,
+            "risk",
+            format!(
+                "检测到跨国瞬移：{} ({}) -> {} ({})（{} km，{} km/h）",
+                alert.from_country,
+                alert.from_city,
+                alert.to_country,
+                alert.to_city,
+                alert.distance_km,
+                alert.implied_speed_kmh,
+            ),
+            cmds,
+        );
+    } else if entered_critical {
+        log_both(
+            state,
+            now_secs,
+            LogLevel::Warn,
+            "risk",
+            format!(
+                "10 维出口安全评分降至 F 级（{}/100）：{}",
+                assessment.score, assessment.headline
+            ),
+            cmds,
+        );
+    }
+
+    state.risk_assessment = assessment;
+}
+
+fn handle_wfp_updated(
+    state: &mut EngineState,
+    status: WfpStatus,
+    now_secs: u64,
+    cmds: &mut Vec<EffectCommand>,
+) {
+    if !status.last_error.is_empty() && status.last_error != state.wfp.last_error {
+        log_both(
+            state,
+            now_secs,
+            LogLevel::Warn,
+            "wfp",
+            format!("WFP 内核过滤状态告警：{}", status.last_error),
+            cmds,
+        );
+    }
+    state.wfp = status;
 }
 
 fn initial_target_statuses(cfg: &Config) -> Vec<TargetStatus> {
@@ -6030,5 +6218,178 @@ mod tests {
         assert_eq!(aborted.protection, ProtectionState::Monitoring);
         assert!(aborted.launch_error.is_empty());
         assert_eq!(aborted.runtime_epoch, iso_epoch + 1);
+    }
+
+    #[test]
+    fn v5_risk_and_wfp_events_project_to_snapshot_and_gate_enforces_only_when_evaluated() {
+        let mut cfg = armed_config();
+        cfg.min_global_safety_score = 70;
+        cfg.block_datacenter_asn = true;
+        cfg.enforce_geo_velocity = true;
+
+        let init = EngineState::new(cfg, true, true, 1_000);
+        // Complete a passing monitoring round so baseline launch gate passes.
+        let (state, _) = GuardEngine::step(
+            init,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: pass_probes(),
+            },
+            1_010,
+        );
+
+        // 1) Cold boot (`risk_assessment.evaluated_at == 0`): NEVER false-blocks!
+        assert_eq!(state.risk_assessment.evaluated_at, 0);
+        let cold_gate = GuardEngine::evaluate_launch_gate_for_agent(&state, Some("claude"), 1_015);
+        assert!(
+            cold_gate.allowed,
+            "cold boot must not be blocked before first risk evaluation: {}",
+            cold_gate.reason
+        );
+
+        // 2) WfpUpdated projects cleanly into GuardSnapshot.wfp
+        let wfp = WfpStatus {
+            active_backend: "wfp_dynamic".into(),
+            sublayer_registered: true,
+            dynamic_session_open: true,
+            active_filter_count: 12,
+            net_event_subscribed: true,
+            total_blocked_packets: 3,
+            ..WfpStatus::default()
+        };
+        let (state, _) = GuardEngine::step(
+            state,
+            EngineEvent::WfpUpdated {
+                status: Box::new(wfp.clone()),
+            },
+            1_020,
+        );
+        let snap = state.to_snapshot(1_020, Vec::new());
+        assert_eq!(snap.wfp, wfp);
+
+        // 3) Evaluated residential Grade S (95/100) passes all v5 gates
+        let healthy_risk = RiskAssessment {
+            score: 95,
+            grade: SafetyGrade::S,
+            headline: "S 级（95/100）".into(),
+            ip_purity: cg_protocol::IpPurityReport {
+                classification: AsnClassification::IspResidential,
+                is_datacenter: false,
+                asn_org: "Comcast Cable".into(),
+                checked_at: 1_025,
+                ..cg_protocol::IpPurityReport::default()
+            },
+            evaluated_at: 1_025,
+            ..RiskAssessment::default()
+        };
+        let (state_ok, _) = GuardEngine::step(
+            state.clone(),
+            EngineEvent::RiskUpdated {
+                assessment: Box::new(healthy_risk.clone()),
+            },
+            1_025,
+        );
+        assert_eq!(
+            state_ok.to_snapshot(1_025, Vec::new()).risk_assessment,
+            healthy_risk
+        );
+        assert!(
+            GuardEngine::evaluate_launch_gate_for_agent(&state_ok, Some("claude"), 1_030).allowed
+        );
+
+        // 4) block_datacenter_asn blocks cloud datacenter ASN when enabled
+        let mut dc_risk = healthy_risk.clone();
+        dc_risk.score = 78;
+        dc_risk.grade = SafetyGrade::A;
+        dc_risk.ip_purity.classification = AsnClassification::DatacenterHosting;
+        dc_risk.ip_purity.is_datacenter = true;
+        dc_risk.ip_purity.asn_org = "Amazon AWS".into();
+        let (state_dc, _) = GuardEngine::step(
+            state_ok.clone(),
+            EngineEvent::RiskUpdated {
+                assessment: Box::new(dc_risk),
+            },
+            1_035,
+        );
+        let dc_gate = GuardEngine::evaluate_launch_gate_for_agent(&state_dc, Some("claude"), 1_040);
+        assert!(!dc_gate.allowed);
+        assert!(dc_gate.reason.contains("机房"));
+
+        // Disabling block_datacenter_asn allows the same clean datacenter (78 >= 70)
+        let mut state_dc_allowed = state_dc;
+        state_dc_allowed.config.block_datacenter_asn = false;
+        assert!(
+            GuardEngine::evaluate_launch_gate_for_agent(&state_dc_allowed, Some("claude"), 1_040)
+                .allowed
+        );
+
+        // 5) min_global_safety_score blocks below threshold with top-penalty diagnostics
+        let mut low_risk = healthy_risk.clone();
+        low_risk.score = 45;
+        low_risk.grade = SafetyGrade::C;
+        low_risk.dimensions = vec![RiskDimensionItem {
+            id: "dns_coherence".into(),
+            name: "DNS 地理一致性与防泄露".into(),
+            max_score: 4,
+            score: 0,
+            healthy: false,
+            detail: "检测到国内 DNS 泄露".into(),
+            remediation_action: None,
+        }];
+        let (state_low, _) = GuardEngine::step(
+            state_ok.clone(),
+            EngineEvent::RiskUpdated {
+                assessment: Box::new(low_risk),
+            },
+            1_050,
+        );
+        let low_gate =
+            GuardEngine::evaluate_launch_gate_for_agent(&state_low, Some("claude"), 1_055);
+        assert!(!low_gate.allowed);
+        assert!(low_gate.reason.contains("45/100"));
+        assert!(low_gate.reason.contains("DNS"));
+
+        // 6) enforce_geo_velocity blocks during active impossible-travel cooldown, then unblocks after expiry
+        let mut teleport_risk = healthy_risk;
+        teleport_risk.score = 80; // high enough on score to isolate geo-velocity gate
+        teleport_risk.grade = SafetyGrade::A;
+        teleport_risk.geo_velocity_alert = Some(cg_protocol::GeoVelocityAlert {
+            vault_id: None,
+            from_country: "US".into(),
+            from_city: "LAX".into(),
+            to_country: "JP".into(),
+            to_city: "NRT".into(),
+            distance_km: 8_815,
+            elapsed_secs: 240,
+            implied_speed_kmh: 132_225,
+            cooldown_until: Some(4_000),
+        });
+        let (state_tp, _) = GuardEngine::step(
+            state_ok,
+            EngineEvent::RiskUpdated {
+                assessment: Box::new(teleport_risk),
+            },
+            1_100,
+        );
+        let tp_blocked =
+            GuardEngine::evaluate_launch_gate_for_agent(&state_tp, Some("claude"), 2_000);
+        assert!(!tp_blocked.allowed);
+        assert!(tp_blocked.reason.contains("跨国瞬移"));
+
+        // Once cooldown expires (`now_secs >= 4_000`), launch is permitted again!
+        let tp_expired =
+            GuardEngine::evaluate_launch_gate_for_agent(&state_tp, Some("claude"), 4_000);
+        assert!(tp_expired.allowed);
+
+        // And disabling `enforce_geo_velocity` bypasses the cooldown gate.
+        let mut state_tp_off = state_tp;
+        state_tp_off.config.enforce_geo_velocity = false;
+        assert!(
+            GuardEngine::evaluate_launch_gate_for_agent(&state_tp_off, Some("claude"), 2_000)
+                .allowed
+        );
     }
 }

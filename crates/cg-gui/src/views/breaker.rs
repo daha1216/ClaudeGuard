@@ -9,15 +9,53 @@
 use crate::app::{AppController, BreakerSubTab, ConsoleWindowView};
 use crate::assets::{agent_icon_key, brand_icon_scaled, ui_icon};
 use crate::motion::PageChoreo;
-use crate::protocol::{CUT_MODES, Lifecycle, PipeRequest};
-use crate::state::ConsoleProjection;
-use crate::theme::ThemePalette;
+use crate::protocol::{CUT_MODES, FIREWALL_BACKENDS, FirewallBackendPref, Lifecycle, PipeRequest};
+use crate::state::{ConsoleProjection, format_unix_hm, mask_wfp_event_ip};
+use crate::theme::{BadgeTone, ThemePalette};
 use crate::views::shared::{brand_family_rank, canonical_agent_label, page_guide_card};
 use crate::widgets::controls::{
-    ButtonKind, action_button, bento_card_bloom, mono_tabular, offset_pane, segmented_capsule_item,
-    segmented_capsule_track, status_dot, subtab_bar, subtab_item, toggle_switch,
+    ButtonKind, action_button, bento_card_bloom, inset_box, mono_tabular, offset_pane,
+    segmented_capsule_item, segmented_capsule_track, status_dot, subtab_bar, subtab_item,
+    toggle_switch, tone_tag,
 };
 use gpui::{Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, rgb, rgba};
+
+fn breaker_agent_label<'a>(id: &str, fallback: &'a str) -> &'a str {
+    match id.to_ascii_lowercase().as_str() {
+        "cursor" => "Cursor IDE",
+        "windsurf" => "Windsurf IDE",
+        "zed" => "Zed IDE",
+        "trae" => "Trae IDE",
+        "gemini" => "Gemini CLI",
+        "aider" => "Aider CLI",
+        _ => canonical_agent_label(id, fallback),
+    }
+}
+
+fn breaker_agent_rank(id: &str) -> u8 {
+    match id.to_ascii_lowercase().as_str() {
+        "cursor" => 6,
+        "windsurf" => 7,
+        "zed" => 8,
+        "trae" => 9,
+        "gemini" => 11,
+        "aider" => 12,
+        _ => brand_family_rank(id),
+    }
+}
+
+fn wfp_reason_label(reason: &str) -> &'static str {
+    match reason {
+        "direct_nic_bypass" => "直连网卡旁路",
+        "boot_time_guard" => "开机防抢跑",
+        "app_quarantine" => "熔断隔离阻断",
+        "quic_shield" => "QUIC 护盾",
+        "doh_shield" => "DoH/DNS 护盾",
+        "ipv6_shield" => "IPv6 护盾",
+        "panic_lockdown" => "紧急锁死",
+        _ => "内核规则阻断",
+    }
+}
 
 pub fn render_breaker_page(
     ctrl: Entity<AppController>,
@@ -55,6 +93,10 @@ pub fn render_breaker_page(
     let enforce_access_path = ctrl_r.effective_toggle("br-access", cfg.enforce_access_path);
     let sweep_on_exit = ctrl_r.effective_toggle("br-sweep", cfg.sweep_on_exit);
     let lockdown_on_uncovered = ctrl_r.effective_toggle("br-lock-auto", cfg.lockdown_on_uncovered);
+    let wfp_boot_guard = ctrl_r.effective_toggle("br-wfp-boot", cfg.wfp_boot_guard);
+    let privacy_mask = ctrl_r.privacy_mask;
+    let wfp_filter = ctrl_r.wfp_agent_filter.clone();
+    let wfp = snap.as_ref().map(|s| s.wfp.clone()).unwrap_or_default();
 
     let total_running: usize = proj.agent_statuses.iter().map(|a| a.running_count).sum();
     let total_orphans: usize = proj.agent_statuses.iter().map(|a| a.orphan_count).sum();
@@ -136,9 +178,13 @@ pub fn render_breaker_page(
             });
 
             let agent_chips = [
-                ("claude", "Claude 桌面版"),
+                ("claude", "Claude"),
                 ("chatgpt", "ChatGPT / Codex"),
-                ("antigravity", "反重力 IDE"),
+                ("antigravity", "Antigravity"),
+                ("cursor", "Cursor"),
+                ("windsurf", "Windsurf"),
+                ("zed", "Zed"),
+                ("trae", "Trae"),
             ]
             .into_iter()
             .map(|(aid, lbl)| {
@@ -635,6 +681,148 @@ pub fn render_breaker_page(
                 p,
             );
 
+            let backend_items = FIREWALL_BACKENDS.into_iter().map(|bk| {
+                let active = cfg.firewall_backend == bk;
+                let ctrl_bk = ctrl.clone();
+                let short_lbl = match bk {
+                    FirewallBackendPref::AutoWfpFirst => "WFP 优先 (推荐)",
+                    FirewallBackendPref::WfpOnly => "仅 WFP 内核",
+                    FirewallBackendPref::ComLegacy => "COM 兼容",
+                };
+                segmented_capsule_item(
+                    gpui::ElementId::Name(format!("wfp-bk-{bk:?}").into()),
+                    short_lbl,
+                    active,
+                    p,
+                )
+                .when(can_act, |item| {
+                    item.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            ctrl_bk.update(cx, |c, cx| {
+                                c.save_config_patch(
+                                    move |x| x.firewall_backend = bk,
+                                    "WFP 防火墙引擎偏好已更新",
+                                    cx,
+                                );
+                            });
+                        }),
+                    )
+                })
+            });
+
+            let ctrl_boot = ctrl.clone();
+            let wfp_engine_card = div().w_full().flex().child(
+                bento_card_bloom(p, 17., 13., choreo.tile(1, 0))
+                    .flex_1()
+                    .gap(px(9.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(p.text_primary))
+                                            .child("WFP 内核过滤引擎 (0ms 防抢跑)"),
+                                    )
+                                    .child(tone_tag(
+                                        if wfp.sublayer_registered && wfp.dynamic_session_open {
+                                            format!("动态子层就绪 · {} 条规则", wfp.active_filter_count)
+                                        } else {
+                                            "待激活 / COM 兼容".into()
+                                        },
+                                        if wfp.sublayer_registered {
+                                            BadgeTone::Pass
+                                        } else {
+                                            BadgeTone::Muted
+                                        },
+                                        p,
+                                    )),
+                            )
+                            .child(
+                                mono_tabular(format!(
+                                    "累计拦截 {} 包 · 事件订阅 {}",
+                                    wfp.total_blocked_packets,
+                                    if wfp.net_event_subscribed { "开启" } else { "关闭" }
+                                ))
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_muted)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(16.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex_basis(px(0.))
+                                    .min_w(px(0.))
+                                    .child(segmented_capsule_track(p).children(backend_items)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_1()
+                                    .flex_basis(px(0.))
+                                    .min_w(px(0.))
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(10.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(1.5))
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.5))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(rgb(p.text_primary))
+                                                    .child("开机早期 WFP 防抢跑 (BOOTTIME，默认关闭)"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.5))
+                                                    .text_color(rgb(p.text_muted))
+                                                    .child("显式开启后在系统开机登录前即拦截受管 AI 客户端抢跑直连"),
+                                            ),
+                                    )
+                                    .child(
+                                        toggle_switch("br-wfp-boot", wfp_boot_guard, can_act, p)
+                                            .when(can_act, |sw| {
+                                                sw.on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |_, _, _, cx| {
+                                                        let next = !wfp_boot_guard;
+                                                        ctrl_boot.update(cx, |c, cx| {
+                                                            c.save_toggle_patch(
+                                                                "br-wfp-boot",
+                                                                next,
+                                                                move |x| x.wfp_boot_guard = next,
+                                                                "开机早期 WFP 保护已更新",
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
+                                                )
+                                            }),
+                                    ),
+                            ),
+                    ),
+            );
+
             div()
                 .flex()
                 .flex_col()
@@ -649,6 +837,7 @@ pub fn render_breaker_page(
                         .child(left_top)
                         .child(right_top),
                 )
+                .child(wfp_engine_card)
                 .child(rules_card)
                 .child(choreo.tile(1, 1).apply(guide))
         }
@@ -657,7 +846,7 @@ pub fn render_breaker_page(
             let ctrl_sweep = ctrl.clone();
             let ctrl_force_all = ctrl.clone();
             let mut sorted_rows: Vec<_> = proj.agent_statuses.iter().collect();
-            sorted_rows.sort_by_key(|row| brand_family_rank(&row.id));
+            sorted_rows.sort_by_key(|row| breaker_agent_rank(&row.id));
             let row_count = sorted_rows.len();
 
             let rows = sorted_rows.into_iter().enumerate().map(|(idx, row)| {
@@ -666,7 +855,7 @@ pub fn render_breaker_page(
                 let rid = row.id.clone();
                 let is_cli = row.kind.contains("CLI");
                 let icon_key = agent_icon_key(&row.id, &row.kind);
-                let display_name = canonical_agent_label(&row.id, &row.name).to_string();
+                let display_name = breaker_agent_label(&row.id, &row.name).to_string();
                 let ctrl_k = ctrl.clone();
                 let sub_line = if row.orphan_count > 0 {
                     format!(
@@ -970,13 +1159,216 @@ pub fn render_breaker_page(
                 p,
             );
 
+            let filtered_wfp: Vec<_> = wfp
+                .recent_blocked
+                .iter()
+                .filter(|ev| match wfp_filter.as_deref() {
+                    None => true,
+                    Some(f) => ev.agent_id.eq_ignore_ascii_case(f),
+                })
+                .take(12)
+                .collect();
+
+            let filter_chips = [
+                (None, "全部"),
+                (Some("claude"), "Claude"),
+                (Some("cursor"), "Cursor"),
+                (Some("antigravity"), "Antigravity"),
+                (Some("chatgpt"), "ChatGPT"),
+            ]
+            .into_iter()
+            .map(|(val, lbl)| {
+                let active = wfp_filter.as_deref() == val;
+                let ctrl_f = ctrl.clone();
+                div()
+                    .id(gpui::ElementId::Name(
+                        format!("wfp-flt-{}", val.unwrap_or("all")).into(),
+                    ))
+                    .cursor_pointer()
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(6.))
+                    .bg(rgb(if active { p.accent_soft_bg } else { p.inset_bg }))
+                    .border_1()
+                    .border_color(rgb(if active {
+                        p.accent_soft_border
+                    } else {
+                        p.card_border
+                    }))
+                    .text_size(px(10.5))
+                    .font_weight(if active {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
+                    .text_color(rgb(if active {
+                        p.accent_soft_text
+                    } else {
+                        p.text_secondary
+                    }))
+                    .child(lbl)
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            ctrl_f.update(cx, |c, cx| {
+                                c.wfp_agent_filter = val.map(str::to_string);
+                                cx.notify();
+                            });
+                        }),
+                    )
+            });
+
+            let ctrl_clear_wfp = ctrl.clone();
+            let wfp_rows: Vec<Div> = filtered_wfp
+                .into_iter()
+                .map(|ev| {
+                    let ip_disp = mask_wfp_event_ip(ev, privacy_mask);
+                    let hm = format_unix_hm(ev.timestamp_ms / 1000);
+                    let pid_str = ev
+                        .pid
+                        .map(|pid| format!("PID {pid}"))
+                        .unwrap_or_else(|| "内核".into());
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .px(px(10.))
+                        .py(px(6.5))
+                        .rounded(px(8.))
+                        .bg(rgb(p.inset_bg))
+                        .border_1()
+                        .border_color(rgb(p.card_border))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .min_w(px(0.))
+                                .flex_1()
+                                .child(
+                                    mono_tabular(hm)
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(p.text_muted)),
+                                )
+                                .child(
+                                    mono_tabular(format!("{} ({pid_str})", ev.agent_id))
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(p.text_primary)),
+                                )
+                                .child(
+                                    mono_tabular(format!(
+                                        "{}:{} · {}",
+                                        ip_disp,
+                                        ev.remote_port,
+                                        ev.protocol.to_ascii_uppercase()
+                                    ))
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(p.text_secondary)),
+                                ),
+                        )
+                        .child(tone_tag(
+                            wfp_reason_label(&ev.filter_reason),
+                            BadgeTone::Fail,
+                            p,
+                        ))
+                })
+                .collect();
+
+            let wfp_waterfall_card = div().w_full().flex().child(
+                bento_card_bloom(p, 17., 14., choreo.tile(1, 0))
+                    .flex_1()
+                    .gap(px(9.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(p.text_primary))
+                                            .child("WFP 实时拦截瀑布流"),
+                                    )
+                                    .child(
+                                        mono_tabular(format!(
+                                            "{} · 累计 {} 包",
+                                            wfp.active_backend, wfp.total_blocked_packets
+                                        ))
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(p.text_muted)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .children(filter_chips)
+                                    .child(
+                                        action_button(
+                                            "br-wfp-clear",
+                                            "清空记录",
+                                            ButtonKind::Ghost,
+                                            can_act && !wfp.recent_blocked.is_empty(),
+                                            p,
+                                        )
+                                        .h(px(25.))
+                                        .px(px(9.))
+                                        .text_size(px(10.5))
+                                        .when(
+                                            can_act && !wfp.recent_blocked.is_empty(),
+                                            |b| {
+                                                b.on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |_, _, _, cx| {
+                                                        ctrl_clear_wfp.update(cx, |c, cx| {
+                                                            c.send_request(
+                                                                PipeRequest::ClearWfpBlockedEvents,
+                                                                Some("已清空 WFP 实时拦截事件缓存"),
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
+                                                )
+                                            },
+                                        ),
+                                    ),
+                            ),
+                    )
+                    .child(if wfp_rows.is_empty() {
+                        inset_box(p)
+                            .py(px(14.))
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child("当前筛选范围暂无内核拦截数据包事件"),
+                            )
+                    } else {
+                        div().flex().flex_col().gap(px(5.)).children(wfp_rows)
+                    }),
+            );
+
             div()
                 .flex()
                 .flex_col()
                 .w_full()
                 .gap(px(11.))
                 .child(live_card)
-                .child(choreo.tile(1, 0).apply(guide))
+                .child(wfp_waterfall_card)
+                .child(choreo.tile(1, 1).apply(guide))
         }
     };
 

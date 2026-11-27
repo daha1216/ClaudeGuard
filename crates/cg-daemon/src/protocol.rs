@@ -3,18 +3,23 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use cg_protocol::{
-    decode_frame, encode_frame, read_frame, try_decode_frame, write_frame, AccessEvidence,
-    AccessLevel, AgentKind, AgentRuntimeStatus, AnchorKind, AntigravityProxyState,
-    AntigravityProxyStatus, AppliedEnv, ComponentUpdateStatus, Config, CutMode, DefenseCheckItem,
-    DefenseSelfCheck, EnvCheck, EnvInfo, ErrorCode, Evaluation, FeishuStatus, FrameError,
-    GuardSnapshot, LeakConn, LeakReport, LeakShieldStatus, Lifecycle, LogEntry, LogLevel,
-    MigrationOutcome, MihomoNodeInfo, MihomoStatus, NotifyPrefs, OnboardingOption,
-    OnboardingProbeResult, OnboardingStrategy,
-    OperationItemReceipt, OperationReceipt, OperationStatus, PipeRequest, PipeResponse,
-    PolicyPreset, PolicyVerdict, ProbeResult, ProtectionState, SelfCheckStatus, Target,
+    decode_frame, encode_frame, is_valid_vault_id, read_frame, try_decode_frame, write_frame,
+    AccessEvidence, AccessLevel, AccountVault, AgentKind, AgentRuntimeStatus, AnchorKind,
+    AntigravityProxyState, AntigravityProxyStatus, AppliedEnv, AsnClassification, BurstGuardMode,
+    BurstGuardStatus, CleanRoomBackupMeta, CleanRoomFinding, CleanRoomReport, CleanRoomRiskLevel,
+    CleanRoomScope, CleanRoomVector, ComponentUpdateStatus, Config, CutMode, DefenseCheckItem,
+    DefenseSelfCheck, DnsCoherenceReport, ElectronHygieneReport, EnvCheck, EnvInfo, ErrorCode,
+    Evaluation, FeishuStatus, FirewallBackendPref, FrameError, GeoVelocityAlert, GuardSnapshot,
+    HookDecision, HookFailMode, HookIntegrationStatus, HotkeyStatus, IpPurityReport, LeakConn,
+    LeakReport, LeakShieldStatus, Lifecycle, LogEntry, LogLevel, MigrationOutcome, MihomoNodeInfo,
+    MihomoStatus, MsixIsolationMode, NotifyPrefs, OnboardingOption, OnboardingProbeResult,
+    OnboardingStrategy, OperationItemReceipt, OperationReceipt, OperationStatus, PipeRequest,
+    PipeResponse, PolicyPreset, PolicyVerdict, ProbeResult, ProtectionState, RiskAssessment,
+    RiskDimensionItem, SafetyGrade, SanitizedHealthCard, SelfCheckStatus, StunLeakReport, Target,
     TargetState, TargetStatus, ThemeMode, TimelineBucket, TimelineStatus, ToastNotificationEvent,
-    TripInfo, UpdateCheckPhase, UpdateSummary, DEFAULT_PIPE_NAME, MAX_FRAME_BYTES,
-    SNAPSHOT_SCHEMA_VERSION,
+    TripInfo, UpdateCheckPhase, UpdateSummary, VaultAppTarget, VaultRuntimeState,
+    VaultRuntimeStatus, WfpBlockedEvent, WfpStatus, WslBridgeStatus, DEFAULT_PIPE_NAME,
+    KNOWN_CLI_AGENT_IDS, KNOWN_GUI_AGENT_IDS, MAX_FRAME_BYTES, SNAPSHOT_SCHEMA_VERSION,
 };
 
 /// Daemon package version string.
@@ -25,6 +30,14 @@ pub fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Returns current UNIX timestamp in milliseconds.
+pub fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
 }
 

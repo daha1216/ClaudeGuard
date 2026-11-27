@@ -2,10 +2,10 @@
   <img src="assets/icon.png" alt="ClaudeGuard Logo" width="128" height="128" />
 </p>
 
-<h1 align="center">ClaudeGuard v4（Claude 守护器）</h1>
+<h1 align="center">ClaudeGuard v5（Claude 守护器）</h1>
 
 <p align="center">
-  <strong>Windows Service 后台守护 + 原生 GPUI 桌面端 AI 网络出口门禁</strong>
+  <strong>反封号堡垒：Win32 WFP 内核防漏 + 10 维封号风险雷达 + 独立多账号金库 + &lt;2ms CLI Hook 门禁 + 原生 GPUI 桌面守护</strong>
 </p>
 
 <p align="center">
@@ -14,13 +14,14 @@
 
 <p align="center">
   <a href="https://github.com/daha1216/ClaudeGuard/releases"><img src="https://img.shields.io/github/v/release/daha1216/ClaudeGuard" alt="GitHub Release" /></a>
+  <img src="https://img.shields.io/badge/Version-v5.0.0%20Anti--Ban%20Fortress-0f766e" alt="v5.0.0 反封号堡垒" />
   <img src="https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011%20(x64)-blue" alt="Windows 10/11" />
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Rust" />
   <img src="https://img.shields.io/badge/GUI-Native%20GPUI-111317" alt="Native GPUI" />
   <img src="https://img.shields.io/badge/License-MIT%20%2F%20Apache--2.0-green" alt="License" />
 </p>
 
-> **架构演进说明**：从 **v4.0.0** 起，ClaudeGuard 从 Tauri 2 单文件升级为 **Windows Service 守护端（`claudeguard-daemon.exe`）+ 原生 Rust GPUI 桌面端（`claudeguard-gui.exe`）+ 应急命令行（`claudeguard-cli.exe`）** 三端解耦架构——**摆脱 WebView2 运行时依赖、日常使用零 UAC 弹窗**，内置 WAL 崩溃回滚账本。旧版 v3 代码（含社区 macOS 移植预览）完整保留在 [`v3`](https://github.com/daha1216/ClaudeGuard/tree/v3) 分支与 [`v3.12.5`](https://github.com/daha1216/ClaudeGuard/releases/tag/v3.12.5) 标签。
+> **架构演进说明**：在 **Windows Service 守护端（`claudeguard-daemon.exe`）+ 原生 Rust GPUI 桌面端（`claudeguard-gui.exe`）+ 命令行门禁（`claudeguard-cli.exe`）** 三端解耦、零 WebView2 依赖、日常零 UAC 弹窗与 WAL 崩溃回滚的基础上，**v5.0.0** 全面升级为 **反封号堡垒（M1–M7）**：落地 Win32 WFP 动态内核过滤、10 维风险雷达与 290+ 离线 ASN 库、独立多账号金库、4 维加密无尘室清理、`<2ms` CLI / WSL2 HMAC Hook 门禁及 7 桌面端 + 4 CLI 守护矩阵。旧版 v3 代码完整保留在 [`v3`](https://github.com/daha1216/ClaudeGuard/tree/v3) 分支与 [`v3.12.5`](https://github.com/daha1216/ClaudeGuard/releases/tag/v3.12.5) 标签。
 
 ---
 
@@ -138,20 +139,21 @@ ClaudeGuard 坚持**只读观测、先拦后放**：不干涉用户的代理分�
 
 ---
 
-## v4 核心能力
+## v5 核心能力（反封号堡垒 M1–M7）
 
-1. **Windows Service 权限隔离，日常零 UAC 弹窗**：
-   - `claudeguard-daemon.exe` 注册为开机自启 `ClaudeGuardService`（`LocalSystem`），接管防火墙、进程清理、防漏规则与时区同步；
-   - `claudeguard-gui.exe`（`asInvoker` 普通用户权限）通过设防的 Named Pipe `\\.\pipe\ClaudeGuardV4`（SDDL 授权交互式用户 + `PIPE_REJECT_REMOTE_CLIENTS` 拒绝远程连接）与守护通信，并以普通用户身份通过安全启动台拉起 AI 应用；
-   - `--tray` 驻留模式下仅保留托盘图标，不常驻渲染窗口（**0 窗口显存占用**）。
-2. **WAL 崩溃回滚账本（`journal.json`）**：
-   - 所有改动系统状态的动作先写 WAL 事务并 `sync_all` 落盘再执行 OS 操作；服务启动自检、恢复放行、`--restore` 离线急救均按同一套幂等恢复协议回查清零。
-3. **只读代理探测，绝不直连回退，绝不改分流策略**：
-   - `Claude` → `claude.ai/cdn-cgi/trace`，`Codex` → `chatgpt.com/cdn-cgi/trace`，`Antigravity` → `daily-cloudcode-pa.googleapis.com` 经代理连通性探测，`本机出口`（默认停用）→ `cloudflare.com/cdn-cgi/trace`，并支持新增 HTTP Trace / JSON IP / 页面地区 / 仅可达性四类自定义目标。
-   - 任何探测与 GitHub / npm 更新检查均强制走配置代理或 TUN；代理未接入时守护器绝不带着本机真实 IP 直连外网。
-4. **4 维防漏护盾 + Antigravity 生态深护**：
-   - 将防火墙阻断规则精确绑定到已安装的受管 AI 客户端可执行文件路径，**绝不影响浏览器、游戏和日常软件**；
-   - 专项监控 `antigravity-proxy` 注入文件是否在 IDE 自动更新后被覆盖，并提供 10 组件（含 Antigravity 汉化与两款热门用量插件）的只读上游版本对比。
+1. **M1 · Win32 WFP 动态内核防漏 + 实时阻断瀑布流**：
+   - 默认启用 `AutoWfpFirst` 混合引擎（`FWPM_SESSION_DYNAMIC` 0xFF00 动态子层，守护停止时内核自动清零；可选默认关闭的 `wfp_boot_guard` 持久化开机早期过滤 `0xFF10` 与 COM 回退），并接入 `FwpmNetEventSubscribe4` 实时订阅拦截事件与脱敏瀑布流。
+2. **M2 & M3 · 10 维封号风险雷达、290+ 离线 ASN 库、7 天地理速度账本与 STUN / Electron 卫生治理**：
+   - 0–100（`S`–`D`）多维风险评分 + 290+ 离线 ASN 数据库 + DPAPI-HMAC-SHA256 7 天滚动地理速度账本（`egress_history.json`，磁盘零明文 IP）。
+   - 内置原生 RFC 5389 STUN（UDP/WebRTC 泄露检测）及 `NtQueryInformationProcess(60)` Electron 代理参数卫生审计与 WAL 保护修复。
+3. **M4 & M5 · 独立多账号金库（Sovereign Vaults）与 4 维无尘室清理器（`CGBAK005` 时光机）**：
+   - 为不同账号提供独立配置目录（`--user-data-dir` / `CLAUDE_CONFIG_DIR`）、专属出口基线绑定、一键桌面 `.lnk` 启动器与默认只读硬拦截（`auto_align_mihomo_on_vault_launch: false`）。
+   - 4 维残留扫描 100% 保留用户代码与配置，任何清理前强制生成 `CGBAK005`（Windows CNG AES-256-GCM + DPAPI）加密备份支持一键时光机还原。
+4. **M6 & M7 · `<2ms` O(1) CLI Hook 门禁、WSL2 HMAC 桥接、`BurstGuard` 与 7 桌面端 + 4 CLI 全栈矩阵**：
+   - `claudeguard-cli --hook-gate` 毫秒级拦截，支持 Claude Code `settings.json` 与 PowerShell `$PROFILE` 幂等自动接入、`127.0.0.1:0` WSL2 回环 HMAC-SHA256 防重放桥接以及 `BurstGuard` 高频/机械节拍防护。
+   - 受管矩阵扩展至 **7 款桌面端**（`Claude Desktop`、`ChatGPT / Codex`、`Antigravity IDE`、`Cursor`、`Windsurf`、`Zed`、`Trae`）+ **4 款 CLI**（`Claude Code`、`Codex CLI`、`Gemini CLI`、`Aider CLI`），并新增原生 Win32 `RegisterHotKey` 全局热键与零 IP/用户名泄露的脱敏健康卡（Markdown + 1200×680 无元数据 PNG）。
+5. **Windows Service 权限隔离 + WAL 崩溃回滚**：
+   - `ClaudeGuardService`（`LocalSystem`）与普通用户权限 `claudeguard-gui.exe`（`asInvoker`）经设防 Named Pipe 通信；所有 OS 状态变更先写 WAL 再落盘，异常断电或 `--restore` 均可幂等清零防火墙与持久化 WFP 规则。
 
 ---
 
@@ -159,13 +161,13 @@ ClaudeGuard 坚持**只读观测、先拦后放**：不干涉用户的代理分�
 
 前往 [GitHub Releases](https://github.com/daha1216/ClaudeGuard/releases) 下载最新版：
 
-1. **安装版 `ClaudeGuard-v4.1.4-setup.exe`（推荐）**
+1. **安装版 `ClaudeGuard-v5.0.0-setup.exe`（推荐）**
    - 自动注册并启动 `ClaudeGuardService` 系统服务，同时登记普通用户登录托盘自启（`claudeguard-gui.exe --tray`）。
-   - **支持从 v3 无缝覆盖升级**：沿用同一 Inno Setup `AppId`，自动平滑停止旧版 `ClaudeGuard.exe`、清理旧版开机启动项，并在首次启动时自动将 v2/v3 `config.json` 无损迁移至 v4（保留 `config.v3.bak.json` 备份）。
-   - 卸载时自动停止与注销系统服务，并刻意保留 `%ProgramData%\ClaudeGuard` 与 `%APPDATA%\ClaudeGuard` 下的配置及日志。
-2. **旧版客户端直升级引导 `ClaudeGuard-v4.1.4-upgrade.exe`（供 `v3.x` 客户端内直接更新）**
-   - 供 `v3.x` 在 6 小时后台巡检或手动「检查更新」自动识别并下载；自动将旧版 `%APPDATA%\ClaudeGuard\config.json` 迁移至 `%ProgramData%\ClaudeGuard\config.json`，释放并等待安装器完成覆盖升级后，自动清理旧版程序、快捷方式与暂存文件。
-3. **便携版 `ClaudeGuard-v4.1.4-portable.zip`**
+   - **支持从 v3 / v4 无缝覆盖升级**：沿用同一 Inno Setup `AppId`，自动平滑停止旧版服务与托盘进程、清理旧版开机启动项，并在首次启动时自动将旧版 `config.json` 无损迁移至 v5（保留备份）。
+   - 卸载时先调用 `claudeguard-cli.exe --restore` 清零防火墙与 WFP 规则再注销系统服务，并刻意保留 `%ProgramData%\ClaudeGuard` 与 `%APPDATA%\ClaudeGuard` 下的配置及日志。
+2. **旧版客户端直升级引导 `ClaudeGuard-v5.0.0-upgrade.exe`（供 `v3.x` 客户端内直接更新）**
+   - 供 `v3.x` 在 6 小时后台巡检或手动「检查更新」自动识别并下载；自动将旧版 `%APPDATA%\ClaudeGuard\config.json` 迁移至 `%ProgramData%\ClaudeGuard\config.json`，释放并等待 v5 安装器完成覆盖升级后，自动清理旧版程序、快捷方式与暂存文件。
+3. **便携版 `ClaudeGuard-v5.0.0-portable.zip`**
    - 包含 `claudeguard-daemon.exe`、`claudeguard-cli.exe`、`claudeguard-gui.exe`。以管理员终端运行 `claudeguard-daemon.exe --console`（或 `--install-service --start`），再以普通用户启动 `claudeguard-gui.exe`。
 
 > 可使用发布页提供的 `SHA256SUMS.txt` 校验安装包完整性。
@@ -174,13 +176,16 @@ ClaudeGuard 坚持**只读观测、先拦后放**：不干涉用户的代理分�
 
 ## 命令行与启动参数
 
-### `claudeguard-cli.exe`（脚本预检与应急恢复）
+### `claudeguard-cli.exe`（亚 2ms Hook 门禁、金库启动、无尘室扫描与应急恢复）
 
 ```powershell
-claudeguard-cli.exe --check              # 单次核验并输出结构化 JSON（退出码 0=通过，2=未通过）
-claudeguard-cli.exe --check --recheck    # 先触发新一轮全链路探测，再输出 JSON
-claudeguard-cli.exe --restore            # 紧急撤防并恢复全部防火墙/网络/环境（支持守护离线时的 WAL 回滚）
-claudeguard-cli.exe --status             # 输出守护服务、WAL 账本与当前快照状态 JSON
+claudeguard-cli.exe --hook-gate --agent claude-code        # <2ms O(1) CLI 预检门禁（Claude Code JSON 或 --exit-code-block）
+claudeguard-cli.exe vault launch --vault <ID> --app <APP>  # 在独立多账号金库中安全拉起受管应用
+claudeguard-cli.exe --cleanroom-scan                       # 100% 只读 4 维本地无尘室残留扫描
+claudeguard-cli.exe --check                                # 单次核验并输出结构化 JSON（退出码 0=通过，2=未通过）
+claudeguard-cli.exe --check --recheck                      # 先触发新一轮全链路探测，再输出 JSON
+claudeguard-cli.exe --restore                              # 紧急撤防并恢复全部防火墙/WFP/网络/环境（支持守护离线 WAL 回滚）
+claudeguard-cli.exe --status                               # 输出守护服务、WAL 账本与当前快照状态 JSON
 ```
 
 ### `claudeguard-daemon.exe`（守护服务）
@@ -219,15 +224,19 @@ claudeguard-gui.exe --demo pass                    # 零守护离线演示（pas
 需安装 Rust（`1.98+`，本版基于 `rustc 1.99.0` 验证）、Windows 10/11 SDK 与 [Inno Setup 6](https://jrsoftware.org/isinfo.php)：
 
 ```powershell
-# 1. 核心工作区检查与测试（188 项测试：cg-protocol / cg-core / cg-platform / cg-daemon）
+# 1. 核心工作区检查与测试（330 项测试：cg-protocol / cg-core / cg-platform / cg-daemon）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 
-# 2. 原生 GPUI 客户端检查与测试（25 项测试，含真实守护进程管道 E2E）
+# 2. v3->v5 升级桥检查与测试（4 项测试：cg-v3-bridge）
+cargo clippy --locked --manifest-path crates/cg-v3-bridge/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path crates/cg-v3-bridge/Cargo.toml
+
+# 3. 原生 GPUI 客户端检查与测试（71 项测试，含真实守护进程管道 E2E）
 cargo clippy --locked --manifest-path crates/cg-gui/Cargo.toml --all-targets -- -D warnings
 cargo test --locked --manifest-path crates/cg-gui/Cargo.toml
 
-# 3. 打包 Release 三端程序、Inno Setup 安装包、便携版 zip 与 SHA256SUMS.txt
+# 4. 打包 Release 三端程序、Inno Setup 安装包、便携版 zip 与 SHA256SUMS.txt
 pwsh -NoProfile -ExecutionPolicy Bypass -File make-release.ps1
 ```
 

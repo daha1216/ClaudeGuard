@@ -6,10 +6,10 @@
 use crate::app::{AppController, EnvSubTab, HudWindowView, open_console_window};
 use crate::assets::{brand_icon, ui_icon};
 use crate::protocol::{Lifecycle, PipeRequest};
-use crate::state::{HudProjection, NavSection};
+use crate::state::{HudProjection, NavSection, safety_grade_tone};
 use crate::theme::{BadgeTone, HeroTone, ThemePalette};
 use crate::widgets::controls::{
-    ButtonKind, action_button, inset_box, mono_tabular, pulse_status_dot, status_dot,
+    ButtonKind, action_button, inset_box, mono_tabular, pulse_status_dot, status_dot, tone_tag,
 };
 use gpui::{
     Context, Div, Entity, FontWeight, MouseButton, WindowControlArea, div, prelude::*, px, rgb,
@@ -62,6 +62,18 @@ pub fn render_hud(
         .unwrap_or(0);
     let kill_all_armed = ctrl_r.is_confirm_armed("hud-kill-all");
     let kill_all_enabled = can_act && (total_running > 0 || proj.total_orphans > 0);
+    let panic_armed = ctrl_r.is_confirm_armed("hud-panic-lockdown");
+    let ctrl_panic = ctrl.clone();
+    let hud_score_tone = if proj.safety_evaluated {
+        safety_grade_tone(proj.safety_grade)
+    } else {
+        BadgeTone::Muted
+    };
+    let hud_score_label = if proj.safety_evaluated {
+        format!("{}·{}", proj.safety_score, proj.safety_grade.code())
+    } else {
+        "待检".into()
+    };
 
     let dot_rgb = match proj.hero.tone {
         HeroTone::Healthy => p.badge_pass.dot,
@@ -487,7 +499,8 @@ pub fn render_hud(
                                         .font_weight(FontWeight::BOLD)
                                         .text_color(rgb(p.text_primary))
                                         .child(title_text),
-                                ),
+                                )
+                                .child(tone_tag(hud_score_label, hud_score_tone, p)),
                         )
                         .child(
                             div()
@@ -578,43 +591,85 @@ pub fn render_hud(
                 .border_color(rgb(p.card_border))
                 .gap(px(7.))
                 .child(
-                    action_button(
-                        "hud-kill-all",
-                        if kill_all_armed {
-                            "确认全清？"
-                        } else {
-                            "一键全清"
-                        },
-                        if kill_all_armed {
-                            ButtonKind::DangerSoft
-                        } else {
-                            ButtonKind::Ghost
-                        },
-                        kill_all_enabled,
-                        p,
-                    )
-                    .h(px(28.))
-                    .px(px(10.))
-                    .text_size(px(11.))
-                    .when(kill_all_enabled, |b| {
-                        b.on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(move |_, _, _, cx| {
-                                ctrl_kill_all.update(cx, |c, cx| {
-                                    if c.arm_or_consume_confirm("hud-kill-all", cx) {
-                                        c.send_request(
-                                            PipeRequest::ForceKillAgent {
-                                                agent_id: None,
-                                                include_cli: true,
-                                            },
-                                            Some("已清理全部受管进程"),
-                                            cx,
-                                        );
-                                    }
-                                });
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.))
+                        .child(
+                            action_button(
+                                "hud-panic-lockdown",
+                                if panic_armed {
+                                    "确认锁死"
+                                } else {
+                                    "紧急锁死"
+                                },
+                                if panic_armed {
+                                    ButtonKind::Danger
+                                } else {
+                                    ButtonKind::DangerSoft
+                                },
+                                can_act,
+                                p,
+                            )
+                            .h(px(28.))
+                            .px(px(8.5))
+                            .text_size(px(10.5))
+                            .when(can_act, |b| {
+                                b.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |_, _, _, cx| {
+                                        ctrl_panic.update(cx, |c, cx| {
+                                            if c.arm_or_consume_confirm("hud-panic-lockdown", cx) {
+                                                c.send_request(
+                                                    PipeRequest::TriggerPanicLockdown,
+                                                    Some("已触发紧急防封锁死，AI 出站流量已切断"),
+                                                    cx,
+                                                );
+                                            }
+                                        });
+                                    }),
+                                )
                             }),
                         )
-                    }),
+                        .child(
+                            action_button(
+                                "hud-kill-all",
+                                if kill_all_armed {
+                                    "确认全清"
+                                } else {
+                                    "全清"
+                                },
+                                if kill_all_armed {
+                                    ButtonKind::DangerSoft
+                                } else {
+                                    ButtonKind::Ghost
+                                },
+                                kill_all_enabled,
+                                p,
+                            )
+                            .h(px(28.))
+                            .px(px(8.5))
+                            .text_size(px(10.5))
+                            .when(kill_all_enabled, |b| {
+                                b.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |_, _, _, cx| {
+                                        ctrl_kill_all.update(cx, |c, cx| {
+                                            if c.arm_or_consume_confirm("hud-kill-all", cx) {
+                                                c.send_request(
+                                                    PipeRequest::ForceKillAgent {
+                                                        agent_id: None,
+                                                        include_cli: true,
+                                                    },
+                                                    Some("已清理全部受管进程"),
+                                                    cx,
+                                                );
+                                            }
+                                        });
+                                    }),
+                                )
+                            }),
+                        ),
                 )
                 .child(
                     div()

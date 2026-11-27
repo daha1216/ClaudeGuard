@@ -10,18 +10,23 @@ use crate::assets::brand_icon_scaled;
 use crate::demo::now_unix_secs;
 use crate::motion::PageChoreo;
 use crate::protocol::{
-    AntigravityProxyStatus, PipeRequest, UpdateCheckPhase, UpdateSummary, mask_ip_str,
-    mask_ips_in_text,
+    AntigravityProxyStatus, BURST_GUARD_MODES, BurstGuardMode, HOOK_FAIL_MODES, HookFailMode,
+    PipeRequest, UiLabelExt, UpdateCheckPhase, UpdateSummary, mask_ip_str, mask_ips_in_text,
 };
-use crate::state::{NavSection, project_antigravity_proxy_card};
+use crate::state::{
+    NavSection, format_relative_secs, format_remaining_secs, project_antigravity_proxy_card,
+    safety_grade_tone,
+};
 use crate::theme::{BadgeTone, ThemePalette};
 use crate::views::shared::{ag_diag_tile, page_guide_card, switch_row_gated};
 use crate::widgets::controls::{
-    ButtonKind, action_button, bento_card_bloom, inset_box, mono_tabular, offset_pane,
-    spinning_action_button, spinning_ui_icon, status_dot, status_pill, subtab_bar, subtab_item,
-    tone_tag,
+    ButtonKind, action_button, bento_card_bloom, icon_action_button, inset_box, mono_tabular,
+    offset_pane, segmented_capsule_item, segmented_capsule_track, spinning_action_button,
+    spinning_ui_icon, status_dot, status_pill, subtab_bar, subtab_item, tone_tag,
 };
-use gpui::{Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, rgb, rgba};
+use gpui::{
+    Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, relative, rgb, rgba,
+};
 
 fn mask_windows_user_path(path: &str) -> String {
     let lower = path.to_ascii_lowercase();
@@ -74,6 +79,30 @@ pub fn render_environment_page(
         .unwrap_or_default();
     let env = snap.as_ref().map(|s| s.env.clone()).unwrap_or_default();
     let env_applied = snap.as_ref().and_then(|s| s.env_applied.clone());
+    let risk = snap
+        .as_ref()
+        .map(|s| s.risk_assessment.clone())
+        .unwrap_or_default();
+    let hooks = snap.as_ref().map(|s| s.hooks.clone()).unwrap_or_default();
+    let wsl = snap
+        .as_ref()
+        .map(|s| s.wsl_bridge.clone())
+        .unwrap_or_default();
+    let burst = snap
+        .as_ref()
+        .map(|s| s.burst_guard.clone())
+        .unwrap_or_default();
+    let hotkeys_snap = snap.as_ref().map(|s| s.hotkeys.clone()).unwrap_or_default();
+    let local_hk_report = ctrl_r.hotkey_registration_report();
+    let risk_alert = risk.evaluated_at > 0
+        && (risk.geo_velocity_alert.is_some()
+            || risk.stun_leak.leaked
+            || risk.dns_coherence.domestic_resolver_detected
+            || risk.score < 60);
+    let hooks_alert = wsl.proxy_desync_detected
+        || burst.robotic_cadence_detected
+        || burst.unauthorized_oauth_client_detected;
+
     let require_ag_proxy =
         ctrl_r.effective_toggle("env-ag-require-proxy", cfg.require_antigravity_proxy);
     let auto_repair_ag_proxy =
@@ -83,6 +112,10 @@ pub fn render_environment_page(
     let is_repairing_ag = ctrl_r.is_scope_busy(&ActionScope::RepairAntigravity);
     let is_syncing_shield = ctrl_r.is_scope_busy(&ActionScope::SyncLeakShield);
     let is_aligning_env = ctrl_r.is_scope_busy(&ActionScope::EnvAlign);
+    let is_deep_auditing = ctrl_r.is_scope_busy(&ActionScope::DeepRiskAudit);
+    let is_configuring_hooks = ctrl_r.is_scope_busy(&ActionScope::ConfigureHooks);
+    let is_syncing_wsl = ctrl_r.is_scope_busy(&ActionScope::SyncWslBridge);
+    let is_building_card = ctrl_r.is_scope_busy(&ActionScope::BuildHealthCard);
 
     let quic_on = ctrl_r.effective_toggle("sh-quic", cfg.leak_shield_quic);
     let dns_on = ctrl_r.effective_toggle("sh-dns", cfg.leak_shield_dns_doh);
@@ -92,11 +125,21 @@ pub fn render_environment_page(
     let env_check_on = ctrl_r.effective_toggle("env-check-sw", cfg.env_check);
     let env_align_tz_on = ctrl_r.effective_toggle("env-tz-sw", cfg.env_align_tz);
     let env_align_loc_on = ctrl_r.effective_toggle("env-loc-sw", cfg.env_align_location);
+    let block_dc_asn_on = ctrl_r.effective_toggle("env-block-dc-asn", cfg.block_datacenter_asn);
+    let geo_vel_on = ctrl_r.effective_toggle("env-geo-vel", cfg.enforce_geo_velocity);
+    let electron_hyg_on =
+        ctrl_r.effective_toggle("env-electron-hyg", cfg.enforce_electron_hygiene_flags);
+    let stun_audit_on = ctrl_r.effective_toggle("env-stun-audit", cfg.enable_stun_dns_audit);
+    let wsl_enabled_on = ctrl_r.effective_toggle("env-wsl-enabled", cfg.wsl_bridge_enabled);
+    let hotkeys_enabled_on =
+        ctrl_r.effective_toggle("env-hotkeys-enabled", cfg.global_hotkeys_enabled);
     let shield_unsynced = cfg.leak_shield_quic != shield.quic_blocked
         || cfg.leak_shield_dns_doh != shield.dns_doh_blocked
         || cfg.leak_shield_ipv6 != shield.ipv6_blocked;
 
     let ctrl_t1 = ctrl.clone();
+    let ctrl_t_risk = ctrl.clone();
+    let ctrl_t_hooks = ctrl.clone();
     let ctrl_t2 = ctrl.clone();
     let ctrl_t3 = ctrl.clone();
     let tabs = div().flex().items_center().child(
@@ -115,6 +158,44 @@ pub fn render_environment_page(
                     cx.listener(move |_, _, _, cx| {
                         ctrl_t1.update(cx, |c, cx| {
                             c.env_tab = EnvSubTab::Shield;
+                            cx.notify();
+                        });
+                    }),
+                ),
+            )
+            .child(
+                subtab_item(
+                    "env-tab-risk",
+                    "10D 风险雷达",
+                    tab == EnvSubTab::RiskRadar,
+                    risk_alert.then_some(p.badge_fail.dot),
+                    (risk.evaluated_at > 0).then(|| format!("{}分", risk.score)),
+                    p,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |_, _, _, cx| {
+                        ctrl_t_risk.update(cx, |c, cx| {
+                            c.env_tab = EnvSubTab::RiskRadar;
+                            cx.notify();
+                        });
+                    }),
+                ),
+            )
+            .child(
+                subtab_item(
+                    "env-tab-hooks",
+                    "CLI 门禁 & WSL2",
+                    tab == EnvSubTab::HooksWsl,
+                    hooks_alert.then_some(p.badge_warn.dot),
+                    None,
+                    p,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |_, _, _, cx| {
+                        ctrl_t_hooks.update(cx, |c, cx| {
+                            c.env_tab = EnvSubTab::HooksWsl;
                             cx.notify();
                         });
                     }),
@@ -1096,6 +1177,1208 @@ pub fn render_environment_page(
                 .gap(px(10.))
                 .child(div().w_full().flex().child(main_tz_card))
                 .child(choreo.tile(1, 0).apply(guide))
+        }
+
+        EnvSubTab::RiskRadar => {
+            let now = now_unix_secs();
+            let score_tone = if risk.evaluated_at > 0 {
+                safety_grade_tone(risk.grade)
+            } else {
+                BadgeTone::Muted
+            };
+            let bar_color = match score_tone {
+                BadgeTone::Pass => p.badge_pass.dot,
+                BadgeTone::Warn => p.badge_warn.dot,
+                BadgeTone::Fail => p.badge_fail.dot,
+                BadgeTone::Muted => p.text_muted,
+            };
+            let checked_age =
+                format_relative_secs((risk.evaluated_at > 0).then_some(risk.evaluated_at), now);
+
+            let ctrl_audit = ctrl.clone();
+            let ctrl_card = ctrl.clone();
+            let ctrl_dc = ctrl.clone();
+            let ctrl_gv = ctrl.clone();
+            let ctrl_eh = ctrl.clone();
+            let ctrl_sa = ctrl.clone();
+
+            let header_card = bento_card_bloom(p, 17.0, 14.0, choreo.tile(0, 0))
+                .flex_1()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.))
+                                .min_w(px(0.))
+                                .flex_1()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .child(
+                                            div()
+                                                .text_size(px(13.5))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(p.text_primary))
+                                                .child("10D 风险与出口纯净度雷达"),
+                                        )
+                                        .child(tone_tag(
+                                            if risk.evaluated_at > 0 {
+                                                format!("{} / 100 · {}", risk.score, risk.grade.label())
+                                            } else {
+                                                "尚未执行深度体检".into()
+                                            },
+                                            score_tone,
+                                            p,
+                                        )),
+                                )
+                                .child(
+                                    mono_tabular(format!(
+                                        "{} · 上次评估：{checked_age} · 1h 子网 {} 个 · 24h 跨国 {} 国",
+                                        if risk.headline.is_empty() {
+                                            "点击右侧「立即深度体检」评估 ASN、STUN 与 DNS 纯净度"
+                                        } else {
+                                            &risk.headline
+                                        },
+                                        risk.distinct_subnets_1h,
+                                        risk.distinct_countries_24h
+                                    ))
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(p.text_secondary)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .flex_shrink_0()
+                                .gap(px(7.))
+                                .child(
+                                    icon_action_button(
+                                        "env-export-health-card",
+                                        "icons/ui/shield.svg",
+                                        if is_building_card {
+                                            "生成中…"
+                                        } else {
+                                            "导出防封体检卡"
+                                        },
+                                        ButtonKind::Secondary,
+                                        can_act && !is_building_card,
+                                        p,
+                                    )
+                                    .when(can_act && !is_building_card, |b| {
+                                        b.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _, _, cx| {
+                                                ctrl_card.update(cx, |c, cx| {
+                                                    c.build_and_export_health_card(true, cx);
+                                                });
+                                            }),
+                                        )
+                                    }),
+                                )
+                                .child(
+                                    spinning_action_button(
+                                        "env-run-deep-audit",
+                                        "icons/ui/radar.svg",
+                                        if is_deep_auditing {
+                                            "深度体检中…"
+                                        } else {
+                                            "立即深度体检"
+                                        },
+                                        ButtonKind::Primary,
+                                        can_act && !is_deep_auditing,
+                                        is_deep_auditing,
+                                        p,
+                                    )
+                                    .when(can_act && !is_deep_auditing, |b| {
+                                        b.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _, _, cx| {
+                                                ctrl_audit.update(cx, |c, cx| {
+                                                    c.send_request(
+                                                        PipeRequest::RunDeepRiskAudit,
+                                                        Some("10D 深度防封体检已完成"),
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                        )
+                                    }),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(7.))
+                        .rounded(px(999.))
+                        .bg(rgb(p.inset_bg))
+                        .border_1()
+                        .border_color(rgb(p.card_border))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .h_full()
+                                .w(relative((f32::from(risk.score) / 100.0).clamp(0.02, 1.0)))
+                                .rounded(px(999.))
+                                .bg(rgb(bar_color)),
+                        ),
+                );
+
+            // Optional Impossible-Travel Geo-Velocity Alert Banner with Manual Cooldown Clear
+            let geo_alert_el = risk.geo_velocity_alert.as_ref().map(|alert| {
+                let ctrl_clear_geo = ctrl.clone();
+                let rem_txt = format_remaining_secs(alert.cooldown_until, now)
+                    .unwrap_or_else(|| "已就绪".into());
+                bento_card_bloom(p, 16.0, 12.0, choreo.tile(0, 1))
+                    .flex_1()
+                    .bg(rgba(p.hero_tripped.bg))
+                    .border_color(rgba(p.hero_tripped.border))
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.))
+                            .min_w(px(0.))
+                            .flex_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.))
+                                    .child(status_dot(p.badge_fail.dot, 6.5))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(p.badge_fail.text))
+                                            .child("7 日时空轨迹预警 · 检测到超音速跨洲瞬移"),
+                                    ),
+                            )
+                            .child(
+                                mono_tabular(format!(
+                                    "{} ({}) → {} ({}) · 位移 {} km / 间隔 {}s · 等效时速 {} km/h · 冷却剩余 {}",
+                                    alert.from_country,
+                                    alert.from_city,
+                                    alert.to_country,
+                                    alert.to_city,
+                                    alert.distance_km,
+                                    alert.elapsed_secs,
+                                    alert.implied_speed_kmh,
+                                    rem_txt
+                                ))
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_primary)),
+                            ),
+                    )
+                    .child(
+                        action_button(
+                            "env-clear-geo-cooldown",
+                            "解除瞬移冷却",
+                            ButtonKind::DangerSoft,
+                            can_act,
+                            p,
+                        )
+                        .when(can_act, |b| {
+                            b.on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, _, cx| {
+                                    ctrl_clear_geo.update(cx, |c, cx| {
+                                        c.send_request(
+                                            PipeRequest::ClearGeoVelocityCooldown,
+                                            Some("已手动解除防瞬移冷却锁"),
+                                            cx,
+                                        );
+                                    });
+                                }),
+                            )
+                        }),
+                    )
+            });
+
+            let purity = &risk.ip_purity;
+            let ip_disp = purity
+                .ip
+                .as_deref()
+                .map(|ip| {
+                    if mask {
+                        mask_ip_str(ip)
+                    } else {
+                        ip.to_string()
+                    }
+                })
+                .unwrap_or_else(|| "待探测".into());
+            let asn_disp = purity
+                .asn
+                .map(|n| format!("AS{n}"))
+                .unwrap_or_else(|| "未知 ASN".into());
+            let bps_pct = format!("{:.2}%", f64::from(purity.abuser_score_bps) / 100.0);
+
+            let asn_card = bento_card_bloom(p, 16.0, 14.0, choreo.tile(1, 0))
+                .flex_1()
+                .gap(px(9.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(p.text_primary))
+                                .child("IP 纯净度 & ASN 威胁情报"),
+                        )
+                        .child(tone_tag(
+                            purity.classification.label(),
+                            if purity.is_tor || purity.is_datacenter || purity.is_proxy_or_vpn {
+                                BadgeTone::Fail
+                            } else {
+                                BadgeTone::Pass
+                            },
+                            p,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(7.))
+                        .child(ag_diag_tile(
+                            "出口 ASN 与运营商",
+                            asn_disp,
+                            if purity.asn_org.is_empty() {
+                                ip_disp.clone()
+                            } else {
+                                purity.asn_org.clone()
+                            },
+                            p.text_primary,
+                            true,
+                            p,
+                        ))
+                        .child(ag_diag_tile(
+                            "欺诈指数 / 邻段污染",
+                            format!("{}% · /24 {bps_pct}", purity.abuse_risk_score),
+                            format!(
+                                "{} · {}",
+                                purity.country.as_deref().unwrap_or("--"),
+                                ip_disp
+                            ),
+                            if purity.abuse_risk_score >= 50 {
+                                p.badge_fail.text
+                            } else if purity.abuse_risk_score >= 20 {
+                                p.badge_warn.text
+                            } else {
+                                p.badge_pass.text
+                            },
+                            true,
+                            p,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            switch_row_gated(
+                                "env-block-dc-asn",
+                                "硬拦截云机房 / VPS 段 ASN（默认关闭）",
+                                "显式开启后，识别到云机房段出口时启动门禁将直接拒止",
+                                block_dc_asn_on,
+                                can_act,
+                                p,
+                                cx.listener(move |_, _, _, cx| {
+                                    let next = !block_dc_asn_on;
+                                    ctrl_dc.update(cx, |c, cx| {
+                                        c.save_toggle_patch(
+                                            "env-block-dc-asn",
+                                            next,
+                                            move |x| x.block_datacenter_asn = next,
+                                            "机房 ASN 拦截策略已更新",
+                                            cx,
+                                        );
+                                    });
+                                }),
+                            )
+                            .border_b_1()
+                            .border_color(rgb(p.card_border)),
+                        )
+                        .child(switch_row_gated(
+                            "env-geo-vel",
+                            "启用 7 日时空轨迹防瞬移门禁",
+                            "同仓短时跨洲切换 (>900 km/h) 触发防封冷却（同国 350km 豁免）",
+                            geo_vel_on,
+                            can_act,
+                            p,
+                            cx.listener(move |_, _, _, cx| {
+                                let next = !geo_vel_on;
+                                ctrl_gv.update(cx, |c, cx| {
+                                    c.save_toggle_patch(
+                                        "env-geo-vel",
+                                        next,
+                                        move |x| x.enforce_geo_velocity = next,
+                                        "防瞬移时空门禁已更新",
+                                        cx,
+                                    );
+                                });
+                            }),
+                        )),
+                );
+
+            let stun = &risk.stun_leak;
+            let dns = &risk.dns_coherence;
+            let hyg = &risk.electron_hygiene;
+            let stun_card = bento_card_bloom(p, 16.0, 14.0, choreo.tile(1, 1))
+                .flex_1()
+                .gap(px(9.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(p.text_primary))
+                                .child("STUN / DNS 一致性与 Electron 启动卫生"),
+                        )
+                        .child(tone_tag(
+                            if stun.leaked || dns.domestic_resolver_detected {
+                                "发现泄露项"
+                            } else {
+                                "协议零泄露"
+                            },
+                            if stun.leaked || dns.domestic_resolver_detected {
+                                BadgeTone::Fail
+                            } else {
+                                BadgeTone::Pass
+                            },
+                            p,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(7.))
+                        .child(ag_diag_tile(
+                            "RFC 5389 WebRTC STUN",
+                            if stun.leaked {
+                                "存在 UDP 穿透泄露".into()
+                            } else {
+                                "0 泄露".into()
+                            },
+                            if mask {
+                                mask_ips_in_text(&stun.summary)
+                            } else {
+                                stun.summary.clone()
+                            },
+                            if stun.leaked {
+                                p.badge_fail.text
+                            } else {
+                                p.badge_pass.text
+                            },
+                            false,
+                            p,
+                        ))
+                        .child(ag_diag_tile(
+                            "DNS 解析地理一致性",
+                            if dns.domestic_resolver_detected {
+                                "国内递归泄露".into()
+                            } else if dns.coherent {
+                                format!("一致 ({})", dns.resolver_countries.join("/"))
+                            } else {
+                                "待核验".into()
+                            },
+                            dns.summary.clone(),
+                            if dns.domestic_resolver_detected {
+                                p.badge_fail.text
+                            } else if dns.coherent {
+                                p.badge_pass.text
+                            } else {
+                                p.text_muted
+                            },
+                            false,
+                            p,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            switch_row_gated(
+                                "env-stun-audit",
+                                "周期性运行 UDP STUN 与 DNS 一致性体检",
+                                "定时核查底层 UDP 反射出口与 DNS 递归归属",
+                                stun_audit_on,
+                                can_act,
+                                p,
+                                cx.listener(move |_, _, _, cx| {
+                                    let next = !stun_audit_on;
+                                    ctrl_sa.update(cx, |c, cx| {
+                                        c.save_toggle_patch(
+                                            "env-stun-audit",
+                                            next,
+                                            move |x| x.enable_stun_dns_audit = next,
+                                            "STUN / DNS 周期审计已更新",
+                                            cx,
+                                        );
+                                    });
+                                }),
+                            )
+                            .border_b_1()
+                            .border_color(rgb(p.card_border)),
+                        )
+                        .child(switch_row_gated(
+                            "env-electron-hyg",
+                            "启动 Electron 应用自动注入防漏卫生参数",
+                            "注入 --disable-quic 与 WebRTC 策略（系统代理模式附加主机解析防泄露）",
+                            electron_hyg_on,
+                            can_act,
+                            p,
+                            cx.listener(move |_, _, _, cx| {
+                                let next = !electron_hyg_on;
+                                ctrl_eh.update(cx, |c, cx| {
+                                    c.save_toggle_patch(
+                                        "env-electron-hyg",
+                                        next,
+                                        move |x| x.enforce_electron_hygiene_flags = next,
+                                        "Electron 防漏卫生策略已更新",
+                                        cx,
+                                    );
+                                });
+                            }),
+                        ))
+                        .when(!hyg.summary.is_empty(), |col| {
+                            col.child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(p.text_muted))
+                                    .child(hyg.summary.clone()),
+                            )
+                        }),
+                );
+
+            let dim_rows: Vec<Div> = risk
+                .dimensions
+                .iter()
+                .map(|d| {
+                    let detail = if mask {
+                        mask_ips_in_text(&d.detail)
+                    } else {
+                        d.detail.clone()
+                    };
+                    inset_box(p)
+                        .flex_1()
+                        .flex_basis(px(0.))
+                        .min_w(px(0.))
+                        .px(px(10.))
+                        .py(px(7.))
+                        .gap(px(2.5))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(5.5))
+                                        .child(status_dot(
+                                            if d.healthy {
+                                                p.badge_pass.dot
+                                            } else {
+                                                p.badge_fail.dot
+                                            },
+                                            5.5,
+                                        ))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(p.text_primary))
+                                                .child(d.name.clone()),
+                                        ),
+                                )
+                                .child(
+                                    mono_tabular(format!("{}/{}", d.score, d.max_score))
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(if d.healthy {
+                                            p.badge_pass.text
+                                        } else {
+                                            p.badge_fail.text
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(10.5))
+                                .text_color(rgb(p.text_secondary))
+                                .child(detail),
+                        )
+                })
+                .collect();
+
+            let mut dim_grid = Vec::new();
+            let mut dim_iter = dim_rows.into_iter();
+            while let Some(first) = dim_iter.next() {
+                let mut row = div().flex().flex_row().w_full().gap(px(8.)).child(first);
+                if let Some(second) = dim_iter.next() {
+                    row = row.child(second);
+                }
+                dim_grid.push(row);
+            }
+
+            let dims_card = bento_card_bloom(p, 16.0, 13.0, choreo.tile(2, 0))
+                .flex_1()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(p.text_primary))
+                                .child("10 维度安全评分明细"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_muted))
+                                .child(
+                                    "高危项（Tor / STUN / 超音速瞬移 / 国内 DNS）具备封顶否决权",
+                                ),
+                        ),
+                )
+                .child(div().flex().flex_col().gap(px(7.)).children(dim_grid));
+
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .gap(px(11.))
+                .child(div().w_full().flex().child(header_card))
+                .when_some(geo_alert_el, |col, alert| {
+                    col.child(div().w_full().flex().child(alert))
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .w_full()
+                        .gap(px(11.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex_basis(px(0.))
+                                .min_w(px(0.))
+                                .flex()
+                                .child(asn_card),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex_basis(px(0.))
+                                .min_w(px(0.))
+                                .flex()
+                                .child(stun_card),
+                        ),
+                )
+                .child(div().w_full().flex().child(dims_card))
+        }
+
+        EnvSubTab::HooksWsl => {
+            let ctrl_inst_hooks = ctrl.clone();
+            let ctrl_uninst_hooks = ctrl.clone();
+            let ctrl_wsl_sw = ctrl.clone();
+            let ctrl_wsl_sync = ctrl.clone();
+            let ctrl_hk_sw = ctrl.clone();
+
+            let fail_mode_items = HOOK_FAIL_MODES.into_iter().map(|fm| {
+                let active = cfg.hook_fail_mode == fm;
+                let ctrl_fm = ctrl.clone();
+                let short_lbl = match fm {
+                    HookFailMode::FailClosed => "服务离线截停 (推荐)",
+                    HookFailMode::FailOpenWithWarn => "离线告警放行",
+                };
+                segmented_capsule_item(
+                    gpui::ElementId::Name(format!("hook-fm-{fm:?}").into()),
+                    short_lbl,
+                    active,
+                    p,
+                )
+                .when(can_act, |item| {
+                    item.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            ctrl_fm.update(cx, |c, cx| {
+                                c.save_config_patch(
+                                    move |x| x.hook_fail_mode = fm,
+                                    "CLI 门禁降级策略已更新",
+                                    cx,
+                                );
+                            });
+                        }),
+                    )
+                })
+            });
+
+            let burst_items = BURST_GUARD_MODES.into_iter().map(|bm| {
+                let active = cfg.burst_guard_mode == bm;
+                let ctrl_bm = ctrl.clone();
+                let short_lbl = match bm {
+                    BurstGuardMode::Off => "关闭",
+                    BurstGuardMode::WarnOnly => "仅告警",
+                    BurstGuardMode::ThrottleGate => "门禁限速",
+                };
+                segmented_capsule_item(
+                    gpui::ElementId::Name(format!("burst-mode-{bm:?}").into()),
+                    short_lbl,
+                    active,
+                    p,
+                )
+                .when(can_act, |item| {
+                    item.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            ctrl_bm.update(cx, |c, cx| {
+                                c.save_config_patch(
+                                    move |x| x.burst_guard_mode = bm,
+                                    "BurstGuard 速率防风控模式已更新",
+                                    cx,
+                                );
+                            });
+                        }),
+                    )
+                })
+            });
+
+            let lat_display = if hooks.last_gate_latency_us == 0 {
+                "--".into()
+            } else if hooks.last_gate_latency_us < 1000 {
+                format!("{} μs", hooks.last_gate_latency_us)
+            } else {
+                format!("{:.2} ms", hooks.last_gate_latency_us as f64 / 1000.0)
+            };
+
+            let hooks_card = bento_card_bloom(p, 16.0, 14.0, choreo.tile(0, 0))
+                .flex_1()
+                .justify_between()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(9.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(p.text_primary))
+                                        .child("亚毫秒级 CLI Pre-Prompt 门禁钩子"),
+                                )
+                                .child(tone_tag(
+                                    if hooks.claude_code_hook_installed {
+                                        format!("已接入 · 延迟 {lat_display}")
+                                    } else {
+                                        "未接入".into()
+                                    },
+                                    if hooks.claude_code_hook_installed {
+                                        BadgeTone::Pass
+                                    } else {
+                                        BadgeTone::Muted
+                                    },
+                                    p,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(7.))
+                                .child(ag_diag_tile(
+                                    "Claude Code Hook",
+                                    if hooks.claude_code_hook_installed {
+                                        "已注入".into()
+                                    } else {
+                                        "未安装".into()
+                                    },
+                                    format!("已同步 {} 个主权仓", hooks.vault_hooks_synced_count),
+                                    if hooks.claude_code_hook_installed {
+                                        p.badge_pass.text
+                                    } else {
+                                        p.text_muted
+                                    },
+                                    false,
+                                    p,
+                                ))
+                                .child(ag_diag_tile(
+                                    "PowerShell 包装 & 统计",
+                                    if hooks.pwsh_profile_wrapped {
+                                        "已包裹".into()
+                                    } else {
+                                        "未包裹".into()
+                                    },
+                                    format!(
+                                        "放行 {} / 截停 {}",
+                                        hooks.total_gate_checks, hooks.total_gate_blocks
+                                    ),
+                                    p.text_primary,
+                                    true,
+                                    p,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(5.))
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(p.text_muted))
+                                        .child("守护离线时门禁策略 (Fail-Mode)"),
+                                )
+                                .child(segmented_capsule_track(p).children(fail_mode_items)),
+                        )
+                        .when(!hooks.summary.is_empty(), |col| {
+                            col.child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(p.text_secondary))
+                                    .child(hooks.summary.clone()),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .pt(px(8.))
+                        .border_t_1()
+                        .border_color(rgb(p.card_border))
+                        .child(
+                            action_button(
+                                "env-hooks-uninstall",
+                                "卸载钩子",
+                                ButtonKind::Ghost,
+                                can_act
+                                    && !is_configuring_hooks
+                                    && (hooks.claude_code_hook_installed
+                                        || hooks.pwsh_profile_wrapped),
+                                p,
+                            )
+                            .h(px(28.))
+                            .when(
+                                can_act
+                                    && !is_configuring_hooks
+                                    && (hooks.claude_code_hook_installed
+                                        || hooks.pwsh_profile_wrapped),
+                                |b| {
+                                    b.on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            ctrl_uninst_hooks.update(cx, |c, cx| {
+                                                c.send_request(
+                                                    PipeRequest::ConfigureCliHooks {
+                                                        install_claude_code: false,
+                                                        install_pwsh_profile: false,
+                                                        sync_all_vaults: false,
+                                                    },
+                                                    Some("已卸载 CLI 门禁钩子"),
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                    )
+                                },
+                            ),
+                        )
+                        .child(
+                            spinning_action_button(
+                                "env-hooks-install",
+                                "icons/ui/shield.svg",
+                                if is_configuring_hooks {
+                                    "接入中…"
+                                } else {
+                                    "一键接入 CLI 门禁 & 同步主权仓"
+                                },
+                                ButtonKind::Primary,
+                                can_act && !is_configuring_hooks,
+                                is_configuring_hooks,
+                                p,
+                            )
+                            .h(px(28.))
+                            .when(can_act && !is_configuring_hooks, |b| {
+                                b.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |_, _, _, cx| {
+                                        ctrl_inst_hooks.update(cx, |c, cx| {
+                                            c.send_request(
+                                                PipeRequest::ConfigureCliHooks {
+                                                    install_claude_code: true,
+                                                    install_pwsh_profile: true,
+                                                    sync_all_vaults: true,
+                                                },
+                                                Some("已完成 Claude Code & PowerShell 门禁一键接入"),
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                                )
+                            }),
+                        ),
+                );
+
+            let wsl_card = bento_card_bloom(p, 16.0, 14.0, choreo.tile(0, 1))
+                .flex_1()
+                .justify_between()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(9.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(p.text_primary))
+                                        .child("WSL2 跨子系统 HMAC 门禁桥接"),
+                                )
+                                .child(tone_tag(
+                                    if wsl.proxy_desync_detected {
+                                        "代理失步预警"
+                                    } else if wsl.listening {
+                                        "回环桥接运行中"
+                                    } else {
+                                        "未监听"
+                                    },
+                                    if wsl.proxy_desync_detected {
+                                        BadgeTone::Fail
+                                    } else if wsl.listening {
+                                        BadgeTone::Pass
+                                    } else {
+                                        BadgeTone::Muted
+                                    },
+                                    p,
+                                )),
+                        )
+                        .child(switch_row_gated(
+                            "env-wsl-enabled",
+                            "启用 WSL2 本地回环 HMAC 门禁桥",
+                            "允许 WSL2 内 Claude Code / Codex CLI 共享宿主机亚 5ms 门禁与代理同步检查",
+                            wsl_enabled_on,
+                            can_act,
+                            p,
+                            cx.listener(move |_, _, _, cx| {
+                                let next = !wsl_enabled_on;
+                                ctrl_wsl_sw.update(cx, |c, cx| {
+                                    c.save_toggle_patch(
+                                        "env-wsl-enabled",
+                                        next,
+                                        move |x| x.wsl_bridge_enabled = next,
+                                        "WSL2 门禁桥接开关已更新",
+                                        cx,
+                                    );
+                                });
+                            }),
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(7.))
+                                .child(ag_diag_tile(
+                                    "桥接监听端点",
+                                    wsl.bound_port
+                                        .map(|pt| format!("127.0.0.1:{pt}"))
+                                        .unwrap_or_else(|| "未绑定".into()),
+                                    if wsl.token_ready {
+                                        "HMAC 令牌已就绪".into()
+                                    } else {
+                                        "待签发令牌".into()
+                                    },
+                                    p.text_primary,
+                                    true,
+                                    p,
+                                ))
+                                .child(ag_diag_tile(
+                                    "已同步发行版",
+                                    if wsl.synced_distros.is_empty() {
+                                        "0 个".into()
+                                    } else {
+                                        wsl.synced_distros.join(", ")
+                                    },
+                                    if wsl.proxy_desync_detected {
+                                        "检测到 WSL 代理与宿主机不一致".into()
+                                    } else {
+                                        "代理环境与宿主机一致".into()
+                                    },
+                                    if wsl.proxy_desync_detected {
+                                        p.badge_fail.text
+                                    } else {
+                                        p.badge_pass.text
+                                    },
+                                    false,
+                                    p,
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .pt(px(8.))
+                        .border_t_1()
+                        .border_color(rgb(p.card_border))
+                        .child(
+                            div()
+                                .truncate()
+                                .flex_1()
+                                .text_size(px(10.5))
+                                .text_color(rgb(p.text_muted))
+                                .child(if wsl.summary.is_empty() {
+                                    "同步后自动在 WSL2 发行版部署极轻量探针脚本".to_string()
+                                } else {
+                                    wsl.summary.clone()
+                                }),
+                        )
+                        .child(
+                            spinning_action_button(
+                                "env-wsl-sync",
+                                "icons/ui/refresh.svg",
+                                if is_syncing_wsl {
+                                    "同步中…"
+                                } else {
+                                    "同步 WSL2 桥接"
+                                },
+                                ButtonKind::Secondary,
+                                can_act && wsl_enabled_on && !is_syncing_wsl,
+                                is_syncing_wsl,
+                                p,
+                            )
+                            .h(px(28.))
+                            .when(can_act && wsl_enabled_on && !is_syncing_wsl, |b| {
+                                b.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |_, _, _, cx| {
+                                        ctrl_wsl_sync.update(cx, |c, cx| {
+                                            c.send_request(
+                                                PipeRequest::SyncWslBridge,
+                                                Some("已完成 WSL2 跨子系统门禁同步"),
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                                )
+                            }),
+                        ),
+                );
+
+            let panic_ok = local_hk_report.panic_ok || hotkeys_snap.panic_registered_ok;
+            let hud_ok = local_hk_report.hud_ok || hotkeys_snap.hud_registered_ok;
+            let hk_conflict = if !local_hk_report.conflict_note.is_empty() {
+                local_hk_report.conflict_note.clone()
+            } else {
+                hotkeys_snap.conflict_note.clone()
+            };
+
+            let burst_and_hotkey_card = bento_card_bloom(p, 16.0, 14.0, choreo.tile(1, 0))
+                .flex_1()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(16.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex_basis(px(0.))
+                                .min_w(px(0.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_size(px(12.5))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(p.text_primary))
+                                                .child("BurstGuard 速率防风控护栏"),
+                                        )
+                                        .child(tone_tag(
+                                            if burst.robotic_cadence_detected {
+                                                "疑似机械节律"
+                                            } else {
+                                                burst.mode.label()
+                                            },
+                                            if burst.robotic_cadence_detected
+                                                || burst.unauthorized_oauth_client_detected
+                                            {
+                                                BadgeTone::Fail
+                                            } else {
+                                                BadgeTone::Pass
+                                            },
+                                            p,
+                                        )),
+                                )
+                                .child(segmented_capsule_track(p).children(burst_items))
+                                .child(
+                                    mono_tabular(format!(
+                                        "近 1 分钟 {} 次 · 近 15 分钟 {} 次（告警阈值 {} RPM / 限速 {} RPM）",
+                                        burst.prompts_last_1m,
+                                        burst.prompts_last_15m,
+                                        cfg.burst_warn_rpm,
+                                        cfg.burst_throttle_rpm
+                                    ))
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(p.text_secondary)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex_basis(px(0.))
+                                .min_w(px(0.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.))
+                                .child(switch_row_gated(
+                                    "env-hotkeys-enabled",
+                                    "全局原生紧急热键 (Win32 RegisterHotKey)",
+                                    "零键盘钩子无反作弊误报 · 50ms 触发紧急锁死或呼出迷你 HUD",
+                                    hotkeys_enabled_on,
+                                    can_act,
+                                    p,
+                                    cx.listener(move |_, _, _, cx| {
+                                        let next = !hotkeys_enabled_on;
+                                        ctrl_hk_sw.update(cx, |c, cx| {
+                                            c.save_toggle_patch(
+                                                "env-hotkeys-enabled",
+                                                next,
+                                                move |x| x.global_hotkeys_enabled = next,
+                                                "全局紧急热键开关已更新",
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap(px(6.))
+                                        .child(tone_tag(
+                                            format!(
+                                                "紧急锁死 {} {}",
+                                                cfg.hotkey_panic_lockdown,
+                                                if panic_ok { "✓" } else { "!" }
+                                            ),
+                                            if panic_ok {
+                                                BadgeTone::Pass
+                                            } else {
+                                                BadgeTone::Warn
+                                            },
+                                            p,
+                                        ))
+                                        .child(tone_tag(
+                                            format!(
+                                                "快捷 HUD {} {}",
+                                                cfg.hotkey_quick_hud,
+                                                if hud_ok { "✓" } else { "!" }
+                                            ),
+                                            if hud_ok {
+                                                BadgeTone::Pass
+                                            } else {
+                                                BadgeTone::Warn
+                                            },
+                                            p,
+                                        )),
+                                )
+                                .when(!hk_conflict.is_empty(), |col| {
+                                    col.child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(rgb(p.badge_warn.text))
+                                            .child(format!("热键冲突提示：{hk_conflict}")),
+                                    )
+                                }),
+                        ),
+                );
+
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .gap(px(11.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .w_full()
+                        .gap(px(11.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex_basis(px(0.))
+                                .min_w(px(0.))
+                                .flex()
+                                .child(hooks_card),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex_basis(px(0.))
+                                .min_w(px(0.))
+                                .flex()
+                                .child(wsl_card),
+                        ),
+                )
+                .child(div().w_full().flex().child(burst_and_hotkey_card))
         }
     };
 

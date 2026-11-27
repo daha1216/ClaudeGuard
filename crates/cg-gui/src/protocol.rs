@@ -1,18 +1,25 @@
 //! Wire protocol re-exports from `cg-protocol` plus thin UI display/masking helpers.
 
 pub use cg_protocol::{
-    AccessEvidence, AccessLevel, AgentKind, AgentRuntimeStatus, AnchorKind, AntigravityProxyState,
-    AntigravityProxyStatus, AppliedEnv, BUILTIN_TARGET_IDS, CONFIG_VERSION, ComponentUpdateStatus,
-    Config, CutMode, DEFAULT_PIPE_NAME, DefenseCheckItem, DefenseSelfCheck, EnvCheck, EnvInfo,
-    ErrorCode, FeishuStatus, FrameError, GuardSnapshot, KNOWN_GUI_AGENT_IDS, LeakConn, LeakReport,
-    LeakShieldStatus, Lifecycle, LogEntry, LogLevel, MAX_FRAME_BYTES, MihomoNodeInfo, MihomoStatus,
-    NotifyPrefs, OnboardingOption, OnboardingProbeResult, OnboardingStrategy, OperationItemReceipt,
-    OperationReceipt, OperationStatus, PipeRequest, PipeResponse, PolicyPreset, PolicyVerdict,
-    ProbeResult, ProtectionState, SNAPSHOT_SCHEMA_VERSION, SelfCheckStatus, Target, TargetState,
-    TargetStatus, ThemeMode, TimelineBucket, TimelineStatus, ToastNotificationEvent, TripInfo,
-    UpdateCheckPhase, UpdateSummary, clean_guarded_agents, decode_frame, default_builtin_targets,
-    encode_frame, ensure_builtin_targets, is_known_region, normalize_ip, normalize_ip_or_cidr,
-    normalize_region, read_frame, region_name, try_decode_frame, write_frame,
+    AccessEvidence, AccessLevel, AccountVault, AgentKind, AgentRuntimeStatus, AnchorKind,
+    AntigravityProxyState, AntigravityProxyStatus, AppliedEnv, AsnClassification,
+    BUILTIN_TARGET_IDS, BurstGuardMode, BurstGuardStatus, CONFIG_VERSION, CleanRoomBackupMeta,
+    CleanRoomFinding, CleanRoomReport, CleanRoomRiskLevel, CleanRoomScope, CleanRoomVector,
+    ComponentUpdateStatus, Config, CutMode, DEFAULT_PIPE_NAME, DefenseCheckItem, DefenseSelfCheck,
+    DnsCoherenceReport, ElectronHygieneReport, EnvCheck, EnvInfo, ErrorCode, FeishuStatus,
+    FirewallBackendPref, FrameError, GeoVelocityAlert, GuardSnapshot, HookDecision, HookFailMode,
+    HookIntegrationStatus, HotkeyStatus, IpPurityReport, KNOWN_CLI_AGENT_IDS, KNOWN_GUI_AGENT_IDS,
+    LeakConn, LeakReport, LeakShieldStatus, Lifecycle, LogEntry, LogLevel, MAX_FRAME_BYTES,
+    MihomoNodeInfo, MihomoStatus, MsixIsolationMode, NotifyPrefs, OnboardingOption,
+    OnboardingProbeResult, OnboardingStrategy, OperationItemReceipt, OperationReceipt,
+    OperationStatus, PipeRequest, PipeResponse, PolicyPreset, PolicyVerdict, ProbeResult,
+    ProtectionState, RiskAssessment, RiskDimensionItem, SNAPSHOT_SCHEMA_VERSION, SafetyGrade,
+    SanitizedHealthCard, SelfCheckStatus, StunLeakReport, Target, TargetState, TargetStatus,
+    ThemeMode, TimelineBucket, TimelineStatus, ToastNotificationEvent, TripInfo, UpdateCheckPhase,
+    UpdateSummary, VaultAppTarget, VaultRuntimeState, VaultRuntimeStatus, WfpBlockedEvent,
+    WfpStatus, WslBridgeStatus, clean_guarded_agents, decode_frame, default_builtin_targets,
+    encode_frame, ensure_builtin_targets, is_known_region, is_valid_vault_id, normalize_ip,
+    normalize_ip_or_cidr, normalize_region, read_frame, region_name, try_decode_frame, write_frame,
 };
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -25,6 +32,30 @@ pub const POLICY_PRESETS: [PolicyPreset; 3] = [
 
 /// Supported network cut-mode choices in display order (excludes unimplemented NIC driver).
 pub const CUT_MODES: [CutMode; 2] = [CutMode::Off, CutMode::Firewall];
+
+/// Supported v5 firewall isolation engine preferences.
+pub const FIREWALL_BACKENDS: [FirewallBackendPref; 3] = [
+    FirewallBackendPref::AutoWfpFirst,
+    FirewallBackendPref::WfpOnly,
+    FirewallBackendPref::ComLegacy,
+];
+
+/// Supported v5 CLI Hook fallback modes.
+pub const HOOK_FAIL_MODES: [HookFailMode; 2] =
+    [HookFailMode::FailClosed, HookFailMode::FailOpenWithWarn];
+
+/// Supported v5 BurstGuard rate-control modes.
+pub const BURST_GUARD_MODES: [BurstGuardMode; 3] = [
+    BurstGuardMode::Off,
+    BurstGuardMode::WarnOnly,
+    BurstGuardMode::ThrottleGate,
+];
+
+/// Supported MSIX isolation strategies for Sovereign Account Vaults.
+pub const MSIX_ISOLATION_MODES: [MsixIsolationMode; 2] = [
+    MsixIsolationMode::AutoVerifyLock,
+    MsixIsolationMode::ExclusiveSwapLock,
+];
 
 /// Anchor parser choices when cycling target anchor kinds.
 pub const ANCHOR_KINDS: [AnchorKind; 5] = [
@@ -121,6 +152,110 @@ impl UiLabelExt for AntigravityProxyState {
 impl UiLabelExt for UpdateCheckPhase {
     fn label(self) -> &'static str {
         self.label_zh()
+    }
+}
+
+impl UiLabelExt for FirewallBackendPref {
+    fn label(self) -> &'static str {
+        self.label_zh()
+    }
+}
+
+impl UiLabelExt for AsnClassification {
+    fn label(self) -> &'static str {
+        self.label_zh()
+    }
+}
+
+impl UiLabelExt for SafetyGrade {
+    fn label(self) -> &'static str {
+        match self {
+            Self::S => "S 级 · 极低风险",
+            Self::A => "A 级 · 纯净合规",
+            Self::B => "B 级 · 轻度提示",
+            Self::C => "C 级 · 存在风险",
+            Self::F => "F 级 · 极高封号风险",
+        }
+    }
+}
+
+impl UiLabelExt for VaultRuntimeState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "待命就绪",
+            Self::ActiveRunning => "守护运行中",
+            Self::CoolingDown => "换 IP 冷却中",
+            Self::EgressMismatch => "出口违约锁定",
+            Self::Disabled => "已停用",
+        }
+    }
+}
+
+impl UiLabelExt for CleanRoomRiskLevel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Clean => "洁净无污染",
+            Self::Low => "低风险残留",
+            Self::Elevated => "中度关联风险",
+            Self::CriticalChainBanRisk => "极高危连坐风险",
+        }
+    }
+}
+
+impl UiLabelExt for CleanRoomVector {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ClaudeCodeState => "V1 · CLI 身份与遥测队列",
+            Self::DesktopChromiumAndCrashpad => "V2 · 桌面/MSIX 与崩溃信封",
+            Self::WindowsCredentialManager => "V3 · 系统凭据钥匙串",
+            Self::OrphanMemoryProcess => "V4 · 内存驻留孤儿进程",
+        }
+    }
+}
+
+impl UiLabelExt for HookFailMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::FailClosed => "服务离线时安全截停 (Fail-Closed)",
+            Self::FailOpenWithWarn => "离线告警放行 (Fail-Open)",
+        }
+    }
+}
+
+impl UiLabelExt for BurstGuardMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "关闭",
+            Self::WarnOnly => "仅告警提醒",
+            Self::ThrottleGate => "门禁硬限速",
+        }
+    }
+}
+
+impl UiLabelExt for MsixIsolationMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AutoVerifyLock => "自动核验多开锁",
+            Self::ExclusiveSwapLock => "严格单实例独占锁",
+        }
+    }
+}
+
+impl UiLabelExt for VaultAppTarget {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ClaudeDesktop => "Claude",
+            Self::ChatgptDesktop => "ChatGPT / Codex",
+            Self::AntigravityIde => "Antigravity",
+            Self::CursorIde => "Cursor",
+            Self::WindsurfIde => "Windsurf",
+            Self::ZedIde => "Zed",
+            Self::TraeIde => "Trae",
+            Self::ClaudeCodeCli => "Claude Code",
+            Self::CodexCli => "Codex CLI",
+            Self::GeminiCli => "Gemini CLI",
+            Self::AiderCli => "Aider CLI",
+        }
     }
 }
 
@@ -238,6 +373,20 @@ mod tests {
                 agent_id: Some("claude".into()),
                 include_cli: true,
             },
+            PipeRequest::FastHookGate {
+                agent_id: "claude-code".into(),
+                vault_id: Some("work-claude-max".into()),
+                hook_event: Some("UserPromptSubmit".into()),
+            },
+            PipeRequest::ScanCleanRoom {
+                scope: CleanRoomScope::default(),
+            },
+            PipeRequest::ListCleanRoomBackups,
+            PipeRequest::TriggerPanicLockdown,
+            PipeRequest::ClearWfpBlockedEvents,
+            PipeRequest::RunDeepRiskAudit,
+            PipeRequest::ClearGeoVelocityCooldown,
+            PipeRequest::BuildHealthCard { export_png: true },
         ];
 
         for req in reqs {

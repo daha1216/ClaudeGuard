@@ -1,24 +1,48 @@
-//! Scriptable and emergency CLI (`claudeguard-cli`) implementation.
+//! Scriptable, sub-2ms CLI Hook Gate, and emergency CLI (`claudeguard-cli`) implementation.
 //!
 //! Commands:
+//! - `--hook-gate` / `hook-gate`: sub-2ms O(1) Pre-Prompt CLI / IDE Hook gate (`PipeRequest::FastHookGate`),
+//!   emitting official Claude Code hook JSON (`{"decision":"block","reason":"..."}`) on block
+//!   (or exit code `2` with `--exit-code-block` for PowerShell `$PROFILE` wrappers) and honoring
+//!   configured `HookFailMode` when the daemon is offline.
+//! - `--launch-vault <id>` / `vault launch --vault <id> --app <app>`: launches an app inside a Sovereign Vault.
+//! - `--cleanroom-scan` / `cleanroom-scan`: runs a 100% read-only local residue scan.
 //! - `--check` / `check`: queries daemon snapshot (with optional `--recheck`), prints structured JSON,
 //!   exits `0` if passed or `2` if not passed (including offline/unconfigured/disarmed/unverified).
 //! - `--restore` / `restore`: contacts live daemon over Named Pipe for Flow B disarm & restore,
-//!   automatically falling back to offline WAL journal recovery when the service is down.
+//!   automatically falling back to offline WAL journal + persistent WFP cleanup when the service is down.
 //! - `--status` / `status`: prints service, WAL journal, disarm marker, and live snapshot status as JSON.
 
 use std::path::{Path, PathBuf};
 
+use crate::config_store::{ConfigStore, LoadedConfig};
 use crate::disarm;
 use crate::ipc_pipe::{resolve_pipe_name, PipeClient, PipeError};
 use crate::journal::{self, JournalStore, LoadedJournal, RecoveryExecutor};
-use crate::protocol::{snapshot_is_check_passed, PipeRequest, PipeResponse, DAEMON_VERSION};
+use crate::protocol::{
+    snapshot_is_check_passed, CleanRoomScope, HookDecision, HookFailMode, PipeRequest,
+    PipeResponse, VaultAppTarget, DAEMON_VERSION,
+};
 use crate::service_win;
 
 /// Parsed CLI command mode.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliCommand {
-    Check { recheck: bool },
+    Check {
+        recheck: bool,
+    },
+    HookGate {
+        agent: String,
+        vault: Option<String>,
+        hook_event: Option<String>,
+        exit_code_block: bool,
+    },
+    LaunchVault {
+        vault_id: String,
+        app: VaultAppTarget,
+        extra_args: Vec<String>,
+    },
+    CleanRoomScan,
     Restore,
     Status,
     Version,
@@ -32,6 +56,7 @@ pub struct CliArgs {
     pub pipe_name: Option<String>,
     pub data_dir: Option<PathBuf>,
     pub timeout_ms: u32,
+    pub timeout_explicit: bool,
 }
 
 /// Structured output returned by [`run_cli_with_executor`].
@@ -44,47 +69,124 @@ pub struct CliOutput {
 }
 
 const HELP_TEXT: &str = "\
-ClaudeGuard v4 CLI (claudeguard-cli)
+ClaudeGuard v5 CLI (claudeguard-cli)
 
 USAGE:
-    claudeguard-cli [--check | --restore | --status] [OPTIONS]
+    claudeguard-cli [--hook-gate | --check | --launch-vault <ID> | --cleanroom-scan | --restore | --status] [OPTIONS]
+    claudeguard-cli vault launch --vault <ID> [--app <APP>] [OPTIONS]
 
 COMMANDS:
-    --check,   check     Verify egress compliance via daemon; exit 0=pass, 2=not passed
-    --restore, restore   Disarm and restore network/firewall (live pipe or offline WAL fallback)
-    --status,  status    Print daemon, Windows Service, and WAL journal status JSON
-    --version            Print version
-    --help, -h           Print this help
+    --hook-gate, hook-gate         Sub-2ms Pre-Prompt CLI Hook gate (Claude Code JSON or --exit-code-block)
+    --launch-vault <ID>            Safe-launch an app inside a Sovereign Account Vault
+    vault launch --vault <ID>      Alias invoked by desktop .lnk vault shortcuts
+    --cleanroom-scan               Run 100% read-only local Clean-Room residue scan
+    --check,   check               Verify egress compliance via daemon; exit 0=pass, 2=not passed
+    --restore, restore             Disarm and restore network/firewall/WFP (live pipe or offline WAL fallback)
+    --status,  status              Print daemon, Windows Service, and WAL journal status JSON
+    --version                      Print version
+    --help, -h                     Print this help
 
 OPTIONS:
-    --recheck            With --check: trigger RecheckNow before reading snapshot
-    --pipe <NAME>        Override Named Pipe (or set CG_PIPE_NAME)
-    --data-dir <PATH>    Override WAL data dir (or set CG_DATA_DIR)
-    --timeout-ms <MS>    Pipe connect timeout in milliseconds (default: 3000)
+    --agent <ID>                   With --hook-gate: CLI agent ID (default: claude-code)
+    --vault <ID>                   With --hook-gate / vault launch: Sovereign Vault ID (or CG_VAULT_ID env)
+    --hook-event, --event <NAME>   With --hook-gate: hook lifecycle event (UserPromptSubmit | PreToolUse)
+    --exit-code-block              With --hook-gate: emit stderr and exit 2 on block (for PowerShell wrappers)
+    --app <TARGET>                 With --launch-vault / vault launch: claude_desktop | claude_code_cli | cursor_ide | ...
+    --recheck                      With --check: trigger RecheckNow before reading snapshot
+    --pipe <NAME>                  Override Named Pipe (or set CG_PIPE_NAME)
+    --data-dir <PATH>              Override WAL data dir (or set CG_DATA_DIR)
+    --timeout-ms <MS>              Pipe connect timeout in milliseconds (default: 3000; 500 for --hook-gate)
 ";
+
+/// Parses a `VaultAppTarget` from a CLI flag value.
+pub fn parse_vault_app_target(raw: &str) -> Result<VaultAppTarget, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "claude_desktop" | "claude-desktop" | "claude" => Ok(VaultAppTarget::ClaudeDesktop),
+        "chatgpt_desktop" | "chatgpt-desktop" | "chatgpt" => Ok(VaultAppTarget::ChatgptDesktop),
+        "antigravity_ide" | "antigravity-ide" | "antigravity" => Ok(VaultAppTarget::AntigravityIde),
+        "cursor_ide" | "cursor-ide" | "cursor" => Ok(VaultAppTarget::CursorIde),
+        "windsurf_ide" | "windsurf-ide" | "windsurf" => Ok(VaultAppTarget::WindsurfIde),
+        "zed_ide" | "zed-ide" | "zed" => Ok(VaultAppTarget::ZedIde),
+        "trae_ide" | "trae-ide" | "trae" => Ok(VaultAppTarget::TraeIde),
+        "claude_code_cli" | "claude-code-cli" | "claude-code" | "claude_code" => {
+            Ok(VaultAppTarget::ClaudeCodeCli)
+        }
+        "codex_cli" | "codex-cli" | "codex" => Ok(VaultAppTarget::CodexCli),
+        "gemini_cli" | "gemini-cli" | "gemini" => Ok(VaultAppTarget::GeminiCli),
+        "aider_cli" | "aider-cli" | "aider" => Ok(VaultAppTarget::AiderCli),
+        other => Err(format!("unknown vault app target '{other}'")),
+    }
+}
 
 /// Parses command-line arguments (excluding `argv[0]`).
 pub fn parse_args(args: &[String]) -> Result<CliArgs, String> {
-    let mut command: Option<CliCommand> = None;
+    let mut mode: Option<&str> = None;
     let mut recheck = false;
+    let mut agent = "claude-code".to_string();
+    let mut vault: Option<String> = None;
+    let mut hook_event: Option<String> = None;
+    let mut exit_code_block = false;
+    let mut vault_app = VaultAppTarget::ClaudeDesktop;
+    let mut extra_args: Vec<String> = Vec::new();
     let mut pipe_name: Option<String> = None;
     let mut data_dir: Option<PathBuf> = None;
     let mut timeout_ms: u32 = 3000;
+    let mut timeout_explicit = false;
 
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
         match arg {
-            "--check" | "check" => command = Some(CliCommand::Check { recheck }),
-            "--restore" | "restore" => command = Some(CliCommand::Restore),
-            "--status" | "status" => command = Some(CliCommand::Status),
-            "--version" | "-V" => command = Some(CliCommand::Version),
-            "--help" | "-h" => command = Some(CliCommand::Help),
+            "--" => {
+                extra_args.extend(args[i + 1..].iter().cloned());
+                break;
+            }
+            "--check" | "check" => mode = Some("check"),
+            "--hook-gate" | "hook-gate" => mode = Some("hook_gate"),
+            "--cleanroom-scan" | "cleanroom-scan" => mode = Some("cleanroom_scan"),
+            "--launch-vault" => {
+                i += 1;
+                let val = args.get(i).ok_or("--launch-vault requires a vault ID")?;
+                vault = Some(val.clone());
+                mode = Some("launch_vault");
+            }
+            "vault" => {
+                if args.get(i + 1).map(String::as_str) == Some("launch") {
+                    i += 1;
+                    mode = Some("launch_vault");
+                } else {
+                    return Err("expected `vault launch --vault <ID>` (run with --help)".into());
+                }
+            }
+            "--restore" | "restore" => mode = Some("restore"),
+            "--status" | "status" => mode = Some("status"),
+            "--version" | "-V" => mode = Some("version"),
+            "--help" | "-h" => mode = Some("help"),
             "--recheck" => {
                 recheck = true;
-                if let Some(CliCommand::Check { recheck: ref mut r }) = command {
-                    *r = true;
-                }
+            }
+            "--agent" => {
+                i += 1;
+                let val = args.get(i).ok_or("--agent requires a value")?;
+                agent = val.clone();
+            }
+            "--vault" => {
+                i += 1;
+                let val = args.get(i).ok_or("--vault requires a value")?;
+                vault = Some(val.clone());
+            }
+            "--hook-event" | "--event" => {
+                i += 1;
+                let val = args.get(i).ok_or("--hook-event requires a value")?;
+                hook_event = Some(val.clone());
+            }
+            "--exit-code-block" => {
+                exit_code_block = true;
+            }
+            "--app" => {
+                i += 1;
+                let val = args.get(i).ok_or("--app requires a value")?;
+                vault_app = parse_vault_app_target(val)?;
             }
             "--pipe" => {
                 i += 1;
@@ -102,6 +204,7 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, String> {
                 timeout_ms = val
                     .parse::<u32>()
                     .map_err(|_| format!("invalid --timeout-ms value: {val}"))?;
+                timeout_explicit = true;
             }
             other => {
                 return Err(format!("unknown argument '{other}' (run with --help)"));
@@ -110,12 +213,41 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, String> {
         i += 1;
     }
 
-    let command = command.unwrap_or(CliCommand::Help);
+    let command = match mode {
+        Some("check") => CliCommand::Check { recheck },
+        Some("hook_gate") => CliCommand::HookGate {
+            agent,
+            vault,
+            hook_event,
+            exit_code_block,
+        },
+        Some("launch_vault") => {
+            let vault_id = vault
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or("vault launch requires --vault <ID>")?
+                .to_string();
+            CliCommand::LaunchVault {
+                vault_id,
+                app: vault_app,
+                extra_args,
+            }
+        }
+        Some("cleanroom_scan") => CliCommand::CleanRoomScan,
+        Some("restore") => CliCommand::Restore,
+        Some("status") => CliCommand::Status,
+        Some("version") => CliCommand::Version,
+        Some("help") | None => CliCommand::Help,
+        _ => CliCommand::Help,
+    };
+
     Ok(CliArgs {
         command,
         pipe_name,
         data_dir,
         timeout_ms,
+        timeout_explicit,
     })
 }
 
@@ -157,11 +289,268 @@ pub fn run_cli_with_executor(
             text: Some(HELP_TEXT.to_string()),
             stderr: None,
         },
+        CliCommand::HookGate {
+            agent,
+            vault,
+            hook_event,
+            exit_code_block,
+        } => {
+            let effective_timeout = if parsed.timeout_explicit {
+                parsed.timeout_ms
+            } else {
+                500
+            };
+            let resolved_vault = vault.or_else(|| {
+                std::env::var("CG_VAULT_ID")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
+            run_hook_gate(
+                &pipe_name,
+                &data_dir,
+                effective_timeout,
+                &agent,
+                resolved_vault,
+                hook_event,
+                exit_code_block,
+            )
+        }
+        CliCommand::LaunchVault {
+            vault_id,
+            app,
+            extra_args,
+        } => run_launch_vault(&pipe_name, parsed.timeout_ms, vault_id, app, extra_args),
+        CliCommand::CleanRoomScan => run_cleanroom_scan(&pipe_name, parsed.timeout_ms),
         CliCommand::Check { recheck } => run_check(&pipe_name, parsed.timeout_ms, recheck),
         CliCommand::Restore => {
             run_restore(&pipe_name, &data_dir, parsed.timeout_ms, offline_executor)
         }
         CliCommand::Status => run_status(&pipe_name, &data_dir, parsed.timeout_ms),
+    }
+}
+
+fn read_configured_hook_fail_mode(data_dir: &Path) -> HookFailMode {
+    match ConfigStore::new(data_dir).load_readonly() {
+        LoadedConfig::Loaded(outcome) => outcome.config.hook_fail_mode,
+        _ => HookFailMode::FailClosed,
+    }
+}
+
+fn format_hook_block_output(
+    reason: String,
+    safety_score: u8,
+    latency_path: &str,
+    exit_code_block: bool,
+) -> CliOutput {
+    if exit_code_block {
+        CliOutput {
+            exit_code: 2,
+            json: None,
+            text: None,
+            stderr: Some(reason),
+        }
+    } else {
+        // Official Claude Code UserPromptSubmit / PreToolUse JSON hook contract:
+        // exit 0 + stdout `{"decision":"block","reason":"..."}`.
+        CliOutput {
+            exit_code: 0,
+            json: Some(serde_json::json!({
+                "decision": "block",
+                "reason": reason,
+                "safety_score": safety_score,
+                "latency_path": latency_path,
+            })),
+            text: None,
+            stderr: None,
+        }
+    }
+}
+
+fn run_hook_gate(
+    pipe_name: &str,
+    data_dir: &Path,
+    timeout_ms: u32,
+    agent_id: &str,
+    vault_id: Option<String>,
+    hook_event: Option<String>,
+    exit_code_block: bool,
+) -> CliOutput {
+    let req = PipeRequest::FastHookGate {
+        agent_id: agent_id.to_string(),
+        vault_id,
+        hook_event,
+    };
+
+    let call_res = PipeClient::connect(pipe_name, timeout_ms).and_then(|mut c| {
+        c.set_call_timeout_ms(timeout_ms.max(500));
+        c.call(&req)
+    });
+
+    match call_res {
+        Ok(PipeResponse::FastGateVerdict {
+            allowed,
+            decision,
+            safety_score,
+            reason,
+            latency_path,
+        }) => {
+            if allowed && decision == HookDecision::Allow {
+                CliOutput {
+                    exit_code: 0,
+                    json: None,
+                    text: None,
+                    stderr: None,
+                }
+            } else {
+                format_hook_block_output(reason, safety_score, &latency_path, exit_code_block)
+            }
+        }
+        Ok(PipeResponse::Error { message, .. }) => format_hook_block_output(
+            format!("🛡️ [ClaudeGuard 门禁错误] {message}"),
+            0,
+            "ipc_error",
+            exit_code_block,
+        ),
+        Ok(other) => format_hook_block_output(
+            format!("🛡️ [ClaudeGuard 门禁协议异常] 收到非预期响应：{other:?}"),
+            0,
+            "ipc_unexpected",
+            exit_code_block,
+        ),
+        Err(err) => {
+            let fail_mode = read_configured_hook_fail_mode(data_dir);
+            match fail_mode {
+                HookFailMode::FailOpenWithWarn => CliOutput {
+                    exit_code: 0,
+                    json: None,
+                    text: None,
+                    stderr: Some(format!(
+                        "[ClaudeGuard 警告] 守护服务暂不可达（{err}），已按 FailOpenWithWarn 放行提示词"
+                    )),
+                },
+                HookFailMode::FailClosed => format_hook_block_output(
+                    format!(
+                        "🛡️ [ClaudeGuard 离线防裸连拦截] 守护服务未响应（{err}），已按 FailClosed 安全策略拦截提示词发送。请先启动 ClaudeGuard。"
+                    ),
+                    0,
+                    "offline_fail_closed",
+                    exit_code_block,
+                ),
+            }
+        }
+    }
+}
+
+fn run_launch_vault(
+    pipe_name: &str,
+    timeout_ms: u32,
+    vault_id: String,
+    app: VaultAppTarget,
+    extra_args: Vec<String>,
+) -> CliOutput {
+    let res = PipeClient::connect(pipe_name, timeout_ms).and_then(|mut c| {
+        c.call(&PipeRequest::LaunchVault {
+            vault_id: vault_id.clone(),
+            app,
+            extra_args,
+        })
+    });
+    match res {
+        Ok(PipeResponse::Ack { receipt, .. }) => CliOutput {
+            exit_code: 0,
+            json: Some(serde_json::json!({
+                "ok": true,
+                "vault_id": vault_id,
+                "app": app,
+                "receipt": receipt,
+            })),
+            text: None,
+            stderr: None,
+        },
+        Ok(PipeResponse::Error {
+            code,
+            message,
+            receipt,
+        }) => CliOutput {
+            exit_code: 2,
+            json: Some(serde_json::json!({
+                "ok": false,
+                "vault_id": vault_id,
+                "app": app,
+                "error_code": code,
+                "error": message,
+                "receipt": receipt,
+            })),
+            text: None,
+            stderr: Some(message),
+        },
+        Ok(other) => CliOutput {
+            exit_code: 2,
+            json: Some(serde_json::json!({
+                "ok": false,
+                "error": format!("unexpected IPC response: {other:?}"),
+            })),
+            text: None,
+            stderr: Some("unexpected IPC response".into()),
+        },
+        Err(err) => CliOutput {
+            exit_code: 2,
+            json: Some(serde_json::json!({
+                "ok": false,
+                "error": err.to_string(),
+            })),
+            text: None,
+            stderr: Some(err.to_string()),
+        },
+    }
+}
+
+fn run_cleanroom_scan(pipe_name: &str, timeout_ms: u32) -> CliOutput {
+    let scope = CleanRoomScope {
+        claude: true,
+        chatgpt_codex: true,
+        cursor: true,
+        antigravity: true,
+        windsurf: true,
+    };
+    let res = PipeClient::connect(pipe_name, timeout_ms)
+        .and_then(|mut c| c.call(&PipeRequest::ScanCleanRoom { scope }));
+    match res {
+        Ok(PipeResponse::CleanRoomScan { report }) => CliOutput {
+            exit_code: 0,
+            json: Some(serde_json::to_value(report).unwrap_or_else(|_| serde_json::json!({}))),
+            text: None,
+            stderr: None,
+        },
+        Ok(PipeResponse::Error { code, message, .. }) => CliOutput {
+            exit_code: 1,
+            json: Some(serde_json::json!({
+                "ok": false,
+                "error_code": code,
+                "error": message,
+            })),
+            text: None,
+            stderr: Some(message),
+        },
+        Ok(other) => CliOutput {
+            exit_code: 1,
+            json: Some(serde_json::json!({
+                "ok": false,
+                "error": format!("unexpected IPC response: {other:?}"),
+            })),
+            text: None,
+            stderr: Some("unexpected IPC response".into()),
+        },
+        Err(err) => CliOutput {
+            exit_code: 1,
+            json: Some(serde_json::json!({
+                "ok": false,
+                "error": err.to_string(),
+            })),
+            text: None,
+            stderr: Some(err.to_string()),
+        },
     }
 }
 
@@ -214,6 +603,8 @@ fn run_check(pipe_name: &str, timeout_ms: u32, recheck: bool) -> CliOutput {
                     "protection": snapshot.protection,
                     "preset": snapshot.preset,
                     "access_level": snapshot.access.level,
+                    "safety_score": snapshot.risk_assessment.score,
+                    "safety_grade": snapshot.risk_assessment.grade,
                     "last_error": snapshot.last_error,
                     "tripped": snapshot.tripped,
                     "checked_at": snapshot.checked_at,
@@ -390,6 +781,8 @@ fn run_offline_restore(
 ) -> CliOutput {
     let store = JournalStore::new(data_dir);
     let report = journal::heal_offline(&store, offline_executor);
+    // Guarantee persistent boot-time WFP filters are purged even if no WAL remained.
+    let wfp_cleared = offline_executor.clear_wfp_persistent_filters().ok();
     let _ = cg_platform::leak_shield_win::clear_leak_shield();
     let env_rollback_err = crate::diagnostics::rollback_env_alignment(data_dir).err();
 
@@ -432,6 +825,7 @@ fn run_offline_restore(
             "ok": ok,
             "mode": "offline_wal",
             "verified": report.verified,
+            "wfp_persistent_cleared": wfp_cleared,
             "elevated": elevated,
             "elevation_hint": elevation_hint,
             "env_rollback_error": env_rollback_err,
@@ -528,10 +922,14 @@ pub fn run_from_env(offline_executor: &dyn RecoveryExecutor) -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let out = run_cli_with_executor(&args, None, None, offline_executor);
     if let Some(json) = out.json {
-        println!(
-            "{}",
+        // Keep `--hook-gate` output compact single-line JSON for Claude Code hooks.
+        let is_hook_json = json.get("decision").is_some() && json.get("version").is_none();
+        let rendered = if is_hook_json {
+            serde_json::to_string(&json).unwrap_or_else(|_| "{}".to_string())
+        } else {
             serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string())
-        );
+        };
+        println!("{rendered}");
     } else if let Some(text) = out.text {
         print!("{text}");
         if !text.ends_with('\n') {
@@ -638,6 +1036,183 @@ mod tests {
             target.expect_regions = vec!["US".into()];
         }
         cfg
+    }
+
+    #[test]
+    fn cli_parses_v5_hook_gate_vault_launch_and_cleanroom_scan_args() {
+        let parsed = parse_args(&[
+            "--hook-gate".into(),
+            "--agent".into(),
+            "codex".into(),
+            "--vault".into(),
+            "work-us".into(),
+            "--hook-event".into(),
+            "PreToolUse".into(),
+            "--exit-code-block".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            CliCommand::HookGate {
+                agent: "codex".into(),
+                vault: Some("work-us".into()),
+                hook_event: Some("PreToolUse".into()),
+                exit_code_block: true,
+            }
+        );
+
+        let vault_cmd = parse_args(&[
+            "vault".into(),
+            "launch".into(),
+            "--vault".into(),
+            "jp-max".into(),
+            "--app".into(),
+            "claude_code_cli".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            vault_cmd.command,
+            CliCommand::LaunchVault {
+                vault_id: "jp-max".into(),
+                app: VaultAppTarget::ClaudeCodeCli,
+                extra_args: Vec::new(),
+            }
+        );
+
+        let cr = parse_args(&["--cleanroom-scan".into()]).unwrap();
+        assert_eq!(cr.command, CliCommand::CleanRoomScan);
+    }
+
+    #[test]
+    fn cli_hook_gate_allows_blocks_and_honors_exit_code_block_and_offline_fail_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let pipe = test_pipe();
+        let exec = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
+
+        // 1) Offline daemon with default FailClosed => Claude Code JSON block (exit 0) and --exit-code-block (exit 2).
+        let off_json = run_cli_with_executor(
+            &[
+                "--hook-gate".into(),
+                "--agent".into(),
+                "claude-code".into(),
+                "--timeout-ms".into(),
+                "80".into(),
+            ],
+            Some(&pipe),
+            Some(dir.path()),
+            &*exec,
+        );
+        assert_eq!(off_json.exit_code, 0);
+        let j = off_json.json.expect("Claude Code block JSON");
+        assert_eq!(j["decision"], "block");
+        assert!(j["reason"].as_str().unwrap().contains("FailClosed"));
+
+        let off_exit2 = run_cli_with_executor(
+            &[
+                "--hook-gate".into(),
+                "--agent".into(),
+                "claude-code".into(),
+                "--exit-code-block".into(),
+                "--timeout-ms".into(),
+                "80".into(),
+            ],
+            Some(&pipe),
+            Some(dir.path()),
+            &*exec,
+        );
+        assert_eq!(off_exit2.exit_code, 2);
+        assert!(off_exit2.stderr.is_some());
+
+        // 2) Offline daemon with persisted FailOpenWithWarn => allow (exit 0, no block JSON, stderr warn).
+        let mut open_cfg = valid_test_config();
+        open_cfg.hook_fail_mode = HookFailMode::FailOpenWithWarn;
+        ConfigStore::new(dir.path())
+            .save_verified(&open_cfg)
+            .unwrap();
+        let off_warn = run_cli_with_executor(
+            &[
+                "--hook-gate".into(),
+                "--agent".into(),
+                "claude-code".into(),
+                "--timeout-ms".into(),
+                "80".into(),
+            ],
+            Some(&pipe),
+            Some(dir.path()),
+            &*exec,
+        );
+        assert_eq!(off_warn.exit_code, 0);
+        assert!(off_warn.json.is_none());
+        assert!(off_warn.stderr.unwrap().contains("FailOpenWithWarn"));
+
+        // 3) Online daemon: Armed + Pass => silent exit 0; Tripped => block JSON / exit 2.
+        let driver: Arc<dyn PlatformDriver> = Arc::new(UnsupportedPlatformDriver::default());
+        let pass_flag = Arc::new(AtomicBool::new(true));
+        let runner: Arc<dyn ProbeRunner> = Arc::new(SwitchableProbeRunner {
+            pass: pass_flag.clone(),
+        });
+        let rt = DaemonRuntime::start(
+            DaemonConfig {
+                pipe_name: pipe.clone(),
+                data_dir: dir.path().to_path_buf(),
+                shutdown_policy: ShutdownPolicy::default(),
+                service_mode: false,
+                enable_background_loop: false,
+            },
+            driver,
+            runner,
+            exec.clone(),
+        )
+        .unwrap();
+
+        let mut client = PipeClient::connect(&pipe, 2000).unwrap();
+        assert!(matches!(
+            client
+                .call(&PipeRequest::RecheckNow { target_id: None })
+                .unwrap(),
+            PipeResponse::Ack { .. }
+        ));
+        drop(client);
+
+        let allow_out = run_cli_with_executor(
+            &["--hook-gate".into(), "--agent".into(), "claude-code".into()],
+            Some(&pipe),
+            Some(dir.path()),
+            &*exec,
+        );
+        assert_eq!(allow_out.exit_code, 0);
+        assert!(allow_out.json.is_none());
+
+        // Trigger mismatch -> tripped -> blocked by FastHookGate!
+        pass_flag.store(false, Ordering::Release);
+        let mut client2 = PipeClient::connect(&pipe, 2000).unwrap();
+        let _ = client2.call(&PipeRequest::RecheckNow { target_id: None });
+        drop(client2);
+
+        let block_json = run_cli_with_executor(
+            &["--hook-gate".into(), "--agent".into(), "claude-code".into()],
+            Some(&pipe),
+            Some(dir.path()),
+            &*exec,
+        );
+        assert_eq!(block_json.exit_code, 0);
+        assert_eq!(block_json.json.unwrap()["decision"], "block");
+
+        let block_pwsh = run_cli_with_executor(
+            &[
+                "--hook-gate".into(),
+                "--agent".into(),
+                "claude-code".into(),
+                "--exit-code-block".into(),
+            ],
+            Some(&pipe),
+            Some(dir.path()),
+            &*exec,
+        );
+        assert_eq!(block_pwsh.exit_code, 2);
+        assert!(block_pwsh.stderr.is_some());
+
+        rt.shutdown_graceful(StopBehavior::RunFlowBCleanup).unwrap();
     }
 
     #[test]
@@ -798,35 +1373,17 @@ mod tests {
         )
         .unwrap();
 
-        let mut client = PipeClient::connect(&pipe, 2000).unwrap();
-        assert!(matches!(
-            client
-                .call(&PipeRequest::CompleteOnboarding {
-                    config: valid_test_config(),
-                })
-                .unwrap(),
-            PipeResponse::Ack { .. }
-        ));
-        drop(client);
-
-        // Simulate a managed firewall rule present during runtime so online Flow B has cleanup work to verify.
-        exec.state
-            .lock()
-            .unwrap()
-            .firewall_rules
-            .push("ClaudeGuard Block Out (claude)".into());
-
         let online_restore =
             run_cli_with_executor(&["--restore".into()], Some(&pipe), Some(dir.path()), &*exec);
         assert_eq!(online_restore.exit_code, 0);
-        let online_json = online_restore.json.unwrap();
-        assert_eq!(online_json["mode"], "online_pipe");
-        assert_eq!(online_json["ok"], true);
+        let ojson = online_restore.json.unwrap();
+        assert_eq!(ojson["ok"], true);
+        assert_eq!(ojson["mode"], "online_pipe");
+        assert_eq!(ojson["verified"], true);
+        assert_eq!(ojson["lifecycle"], serde_json::json!("disarmed"));
         assert_eq!(rt.coordinator().snapshot().lifecycle, Lifecycle::Disarmed);
-        assert!(exec.state.lock().unwrap().firewall_rules.is_empty());
-        assert!(should_fallback_offline(&PipeError::Disconnected));
+        assert!(disarm::read_disarmed(dir.path()).unwrap().is_some());
 
-        rt.shutdown_graceful(StopBehavior::PreserveFailClosed)
-            .unwrap();
+        rt.shutdown_graceful(StopBehavior::RunFlowBCleanup).unwrap();
     }
 }

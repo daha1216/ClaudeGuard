@@ -34,6 +34,8 @@ pub const CODEX_CLI_REPO: &str = "openai/codex";
 /// Official Antigravity Desktop generic updater manifest base URL.
 pub const ANTIGRAVITY_DEFAULT_MANIFEST_BASE: &str =
     "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest";
+/// Official GitHub repository for Zed IDE releases.
+pub const ZED_IDE_REPO: &str = "zed-industries/zed";
 /// Default HTTP timeout for update API checks.
 pub const DEFAULT_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -49,6 +51,28 @@ pub struct LocalClientVersions {
     pub antigravity_cn: Option<String>,
     pub ag_usage_monitor: Option<String>,
     pub ag_capsule: Option<String>,
+}
+
+/// v5 extended local IDE versions (`cursor_ide`, `windsurf_ide`, `zed_ide`, `trae_ide`),
+/// kept separate from `LocalClientVersions` so existing struct literal callers stay 100% compatible.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct V5LocalIdeVersions {
+    pub cursor_ide: Option<String>,
+    pub windsurf_ide: Option<String>,
+    pub zed_ide: Option<String>,
+    pub trae_ide: Option<String>,
+}
+
+impl V5LocalIdeVersions {
+    /// Detect installed local versions for Cursor, Windsurf, Zed, and Trae IDEs.
+    pub fn detect() -> Self {
+        Self {
+            cursor_ide: crate::process_win::installed_cursor_ide_version(),
+            windsurf_ide: crate::process_win::installed_windsurf_ide_version(),
+            zed_ide: crate::process_win::installed_zed_ide_version(),
+            trae_ide: crate::process_win::installed_trae_ide_version(),
+        }
+    }
 }
 
 /// Remote version discovery result for desktop MSIX, npm CLI, and Antigravity clients.
@@ -2006,10 +2030,120 @@ where
     out
 }
 
-/// Live network check across all 10 tracked components strictly honoring `ProbeRoute`.
+fn hydrate_local_only_ide_slot(
+    slot: &mut ComponentUpdateStatus,
+    id: &str,
+    name: &str,
+    repo: &str,
+    installed: Option<&str>,
+    now_secs: u64,
+) {
+    ensure_slot(slot, id, name, repo);
+    let clean = installed.map(normalize_version).filter(|s| !s.is_empty());
+    slot.installed_version = clean.clone();
+    slot.checked_at = Some(now_secs);
+    match clean.as_deref() {
+        Some(ver) => {
+            if let Some(latest) = slot.latest_version.as_deref().filter(|s| !s.is_empty()) {
+                if is_version_newer(latest, ver) {
+                    slot.phase = UpdateCheckPhase::UpdateAvailable;
+                    slot.note = format!("发现新版本：当前 v{ver} -> 最新 v{latest}");
+                } else {
+                    slot.phase = UpdateCheckPhase::UpToDate;
+                    slot.note = format!("当前 v{ver} 已是最新官方版本");
+                }
+            } else {
+                slot.phase = UpdateCheckPhase::UpToDate;
+                slot.note = format!("本机已安装 v{ver}（应用内自动更新渠道）");
+            }
+        }
+        None => {
+            slot.phase = UpdateCheckPhase::NotInstalled;
+            slot.note = format!("本机未检测到 {name}");
+        }
+    }
+}
+
+/// Hydrate v5 IDE slots (`cursor_ide`, `windsurf_ide`, `zed_ide`, `trae_ide`) onto an
+/// `UpdateSummary` using locally detected versions without breaking existing `LocalClientVersions` callers.
+pub fn hydrate_v5_ide_updates(
+    summary: &mut UpdateSummary,
+    v5_local: &V5LocalIdeVersions,
+    now_secs: u64,
+) {
+    hydrate_local_only_ide_slot(
+        &mut summary.cursor_ide,
+        "cursor_ide",
+        "Cursor IDE",
+        "Anysphere 官方渠道",
+        v5_local.cursor_ide.as_deref(),
+        now_secs,
+    );
+    hydrate_local_only_ide_slot(
+        &mut summary.windsurf_ide,
+        "windsurf_ide",
+        "Windsurf IDE",
+        "Codeium 官方渠道",
+        v5_local.windsurf_ide.as_deref(),
+        now_secs,
+    );
+    ensure_slot(&mut summary.zed_ide, "zed_ide", "Zed IDE", ZED_IDE_REPO);
+    if summary.zed_ide.release_url.is_none() {
+        summary.zed_ide.release_url = Some(format!("https://github.com/{ZED_IDE_REPO}/releases"));
+    }
+    hydrate_local_only_ide_slot(
+        &mut summary.zed_ide,
+        "zed_ide",
+        "Zed IDE",
+        ZED_IDE_REPO,
+        v5_local.zed_ide.as_deref(),
+        now_secs,
+    );
+    hydrate_local_only_ide_slot(
+        &mut summary.trae_ide,
+        "trae_ide",
+        "Trae IDE",
+        "Trae 官方渠道",
+        v5_local.trae_ide.as_deref(),
+        now_secs,
+    );
+}
+
+/// Hydrate v5 IDE slots and optionally compare `zed_ide` against an injected GitHub Release fetcher.
+pub fn apply_v5_ide_updates_with_zed_fetcher<F>(
+    summary: &mut UpdateSummary,
+    v5_local: &V5LocalIdeVersions,
+    component_filter: Option<&str>,
+    now_secs: u64,
+    mut zed_fetcher: F,
+) where
+    F: FnMut() -> PlatformResult<RemoteClientVersion>,
+{
+    hydrate_v5_ide_updates(summary, v5_local, now_secs);
+    let filter = component_filter
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let wants_zed = filter
+        .as_deref()
+        .is_none_or(|f| matches!(f, "zed_ide" | "zed-ide" | "zed"));
+    if wants_zed {
+        summary.zed_ide = apply_client_update_check(
+            &summary.zed_ide,
+            "zed_ide",
+            "Zed IDE",
+            ZED_IDE_REPO,
+            summary.zed_ide.installed_version.as_deref(),
+            now_secs,
+            &mut zed_fetcher,
+        );
+    }
+}
+
+/// Live network check across all tracked components strictly honoring `ProbeRoute`.
 ///
 /// Pre-fetches all requested components concurrently via `std::thread::scope` and feeds the
-/// collected results into `check_all_updates_full_with_fetchers`.
+/// collected results into `check_all_updates_full_with_fetchers`, then hydrates v5 IDE slots
+/// (`cursor_ide`, `windsurf_ide`, `zed_ide`, `trae_ide`).
 #[allow(clippy::too_many_arguments)]
 pub fn check_all_updates_full(
     route: &ProbeRoute,
@@ -2179,6 +2313,20 @@ pub fn check_all_updates_full(
                 }),
             ));
         }
+        if matches(&["zed_ide", "zed-ide", "zed"]) {
+            client_handles.push((
+                "zed_ide",
+                s.spawn(|| {
+                    fetch_github_latest_release(
+                        route,
+                        ZED_IDE_REPO,
+                        &[".exe", ".zip"],
+                        DEFAULT_UPDATE_CHECK_TIMEOUT,
+                    )
+                    .map(|rel| remote_from_github_release(rel, ZED_IDE_REPO))
+                }),
+            ));
+        }
 
         for (repo, handle) in gh_handles {
             let res = handle.join().unwrap_or_else(|_| {
@@ -2194,7 +2342,7 @@ pub fn check_all_updates_full(
         }
     });
 
-    check_all_updates_full_with_fetchers(
+    let mut out = check_all_updates_full_with_fetchers(
         cg_version,
         ag_proxy,
         local,
@@ -2216,7 +2364,22 @@ pub fn check_all_updates_full(
                 .remove(component_id)
                 .unwrap_or_else(|| Err(PlatformError::InvalidInput(component_id.to_string())))
         },
-    )
+    );
+
+    let v5_local = V5LocalIdeVersions::detect();
+    let mut zed_res = client_results.remove("zed_ide");
+    apply_v5_ide_updates_with_zed_fetcher(&mut out, &v5_local, component_filter, now_secs, || {
+        zed_res.take().unwrap_or_else(|| {
+            fetch_github_latest_release(
+                route,
+                ZED_IDE_REPO,
+                &[".exe", ".zip"],
+                DEFAULT_UPDATE_CHECK_TIMEOUT,
+            )
+            .map(|rel| remote_from_github_release(rel, ZED_IDE_REPO))
+        })
+    });
+    out
 }
 
 /// Check updates across ClaudeGuard and `yuaotian/antigravity-proxy`, plus MSIX versions.
@@ -3055,5 +3218,69 @@ abcdef0123456789abcdef0123456789abcdef01 AnthropicClaude-1.1.381-full.nupkg 1185
         .is_err());
         assert_eq!(normalize_version("v2026-11-24"), "2026.11.24");
         assert!(is_version_newer("2026-11-24", "2026.11.20"));
+    }
+
+    #[test]
+    fn hydrates_v5_ide_versions_and_compares_zed_updates_without_breaking_local_client_versions() {
+        let mut summary = UpdateSummary::default();
+        let v5_local = V5LocalIdeVersions {
+            cursor_ide: Some("v0.48.6".into()),
+            windsurf_ide: Some("1.4.2".into()),
+            zed_ide: Some("0.175.0".into()),
+            trae_ide: None,
+        };
+
+        apply_v5_ide_updates_with_zed_fetcher(&mut summary, &v5_local, None, 9000, || {
+            Ok(RemoteClientVersion {
+                version: "0.178.1".into(),
+                release_url: Some(
+                    "https://github.com/zed-industries/zed/releases/tag/v0.178.1".into(),
+                ),
+                asset_url: None,
+                published_ymd: None,
+            })
+        });
+
+        assert_eq!(
+            summary.cursor_ide.installed_version.as_deref(),
+            Some("0.48.6")
+        );
+        assert_eq!(summary.cursor_ide.phase, UpdateCheckPhase::UpToDate);
+        assert_eq!(
+            summary.windsurf_ide.installed_version.as_deref(),
+            Some("1.4.2")
+        );
+        assert_eq!(summary.windsurf_ide.phase, UpdateCheckPhase::UpToDate);
+        assert_eq!(
+            summary.zed_ide.installed_version.as_deref(),
+            Some("0.175.0")
+        );
+        assert_eq!(summary.zed_ide.latest_version.as_deref(), Some("0.178.1"));
+        assert_eq!(summary.zed_ide.phase, UpdateCheckPhase::UpdateAvailable);
+        assert_eq!(summary.trae_ide.installed_version, None);
+        assert_eq!(summary.trae_ide.phase, UpdateCheckPhase::NotInstalled);
+
+        // Component filter for another component skips Zed remote fetch while still hydrating locals
+        let mut filtered = UpdateSummary::default();
+        let mut zed_called = false;
+        apply_v5_ide_updates_with_zed_fetcher(
+            &mut filtered,
+            &v5_local,
+            Some("claude_desktop"),
+            9001,
+            || {
+                zed_called = true;
+                Err(PlatformError::Network("should not be called".into()))
+            },
+        );
+        assert!(!zed_called);
+        assert_eq!(
+            filtered.cursor_ide.installed_version.as_deref(),
+            Some("0.48.6")
+        );
+        assert_eq!(
+            filtered.zed_ide.installed_version.as_deref(),
+            Some("0.175.0")
+        );
     }
 }

@@ -3,13 +3,19 @@
 //! Uses ONLY RFC 5737 test-net IPv4 addresses (`198.51.100.98`, `198.51.100.0/24`, `203.0.113.45`).
 
 use crate::protocol::{
-    AccessEvidence, AccessLevel, AgentKind, AgentRuntimeStatus, AnchorKind, AntigravityProxyState,
-    AntigravityProxyStatus, ComponentUpdateStatus, Config, CutMode, DefenseCheckItem,
-    DefenseSelfCheck, EnvCheck, EnvInfo, GuardSnapshot, LeakConn, LeakReport, Lifecycle, LogEntry,
-    LogLevel, OnboardingOption, OnboardingProbeResult, OnboardingStrategy, OperationItemReceipt,
-    OperationReceipt, OperationStatus, PolicyPreset, ProbeResult, ProtectionState, SelfCheckStatus,
+    AccessEvidence, AccessLevel, AccountVault, AgentKind, AgentRuntimeStatus, AnchorKind,
+    AntigravityProxyState, AntigravityProxyStatus, AsnClassification, BurstGuardMode,
+    BurstGuardStatus, CleanRoomBackupMeta, CleanRoomFinding, CleanRoomReport, CleanRoomRiskLevel,
+    CleanRoomScope, CleanRoomVector, ComponentUpdateStatus, Config, CutMode, DefenseCheckItem,
+    DefenseSelfCheck, DnsCoherenceReport, ElectronHygieneReport, EnvCheck, EnvInfo,
+    FirewallBackendPref, GeoVelocityAlert, GuardSnapshot, HookIntegrationStatus, HotkeyStatus,
+    IpPurityReport, LeakConn, LeakReport, Lifecycle, LogEntry, LogLevel, MsixIsolationMode,
+    OnboardingOption, OnboardingProbeResult, OnboardingStrategy, OperationItemReceipt,
+    OperationReceipt, OperationStatus, PolicyPreset, ProbeResult, ProtectionState, RiskAssessment,
+    RiskDimensionItem, SNAPSHOT_SCHEMA_VERSION, SafetyGrade, SelfCheckStatus, StunLeakReport,
     Target, TargetState, TargetStatus, TimelineBucket, TimelineStatus, TripInfo, UpdateCheckPhase,
-    UpdateSummary, default_builtin_targets,
+    UpdateSummary, VaultRuntimeState, VaultRuntimeStatus, WfpBlockedEvent, WfpStatus,
+    WslBridgeStatus, default_builtin_targets,
 };
 use crate::theme::ThemeMode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,6 +57,45 @@ pub fn now_unix_secs() -> u64 {
         .unwrap_or(1_760_000_000)
 }
 
+fn demo_vault_configs() -> Vec<AccountVault> {
+    vec![
+        AccountVault {
+            id: "work-claude-max".into(),
+            name: "Work-Max · 美国静态住宅".into(),
+            accent_hex: "#5B69D0".into(),
+            enabled: true,
+            pinned_regions: vec!["US".into()],
+            pinned_ips: vec!["198.51.100.0/24".into()],
+            pinned_asn: Some(7922),
+            dedicated_proxy_port: Some(7890),
+            preferred_mihomo_group: Some("Proxy".into()),
+            preferred_mihomo_node: Some("US-LAX-ISP-01".into()),
+            auto_align_mihomo_on_vault_launch: false,
+            min_safety_score: 85,
+            cooldown_after_ip_change_secs: 900,
+            share_ide_extensions: true,
+            msix_isolation_mode: MsixIsolationMode::AutoVerifyLock,
+        },
+        AccountVault {
+            id: "personal-jp-lab".into(),
+            name: "Personal-Lab · 日本独立仓".into(),
+            accent_hex: "#16A34A".into(),
+            enabled: true,
+            pinned_regions: vec!["JP".into(), "SG".into()],
+            pinned_ips: Vec::new(),
+            pinned_asn: Some(4713),
+            dedicated_proxy_port: Some(7892),
+            preferred_mihomo_group: Some("Proxy".into()),
+            preferred_mihomo_node: Some("JP-NRT-03".into()),
+            auto_align_mihomo_on_vault_launch: false,
+            min_safety_score: 75,
+            cooldown_after_ip_change_secs: 900,
+            share_ide_extensions: true,
+            msix_isolation_mode: MsixIsolationMode::ExclusiveSwapLock,
+        },
+    ]
+}
+
 fn demo_config(first_run: bool) -> Config {
     let mut targets =
         default_builtin_targets(&["198.51.100.98".into()], &["US".into(), "SG".into()]);
@@ -69,8 +114,16 @@ fn demo_config(first_run: bool) -> Config {
     Config {
         first_run,
         targets,
-        guarded_agents: vec!["claude".into(), "chatgpt".into(), "antigravity".into()],
+        guarded_agents: vec![
+            "claude".into(),
+            "chatgpt".into(),
+            "antigravity".into(),
+            "cursor".into(),
+        ],
         theme_mode: ThemeMode::Auto,
+        firewall_backend: FirewallBackendPref::AutoWfpFirst,
+        wfp_boot_guard: false,
+        vaults: demo_vault_configs(),
         ..Config::default()
     }
 }
@@ -198,6 +251,56 @@ fn demo_agents(tripped: bool) -> Vec<AgentRuntimeStatus> {
             install_paths: vec![r"D:\Program Files\Antigravity\Antigravity.exe".into()],
         },
         AgentRuntimeStatus {
+            id: "cursor".into(),
+            name: "Cursor IDE".into(),
+            kind: AgentKind::Gui,
+            installed: true,
+            guarded: true,
+            running_count: if tripped { 0 } else { 1 },
+            orphan_count: 0,
+            quarantined: tripped,
+            firewall_rules: 0,
+            install_paths: vec![r"C:\Users\demo\AppData\Local\Programs\cursor\Cursor.exe".into()],
+        },
+        AgentRuntimeStatus {
+            id: "windsurf".into(),
+            name: "Windsurf IDE".into(),
+            kind: AgentKind::Gui,
+            installed: true,
+            guarded: false,
+            running_count: 0,
+            orphan_count: 0,
+            quarantined: false,
+            firewall_rules: 0,
+            install_paths: vec![
+                r"C:\Users\demo\AppData\Local\Programs\Windsurf\Windsurf.exe".into(),
+            ],
+        },
+        AgentRuntimeStatus {
+            id: "zed".into(),
+            name: "Zed IDE".into(),
+            kind: AgentKind::Gui,
+            installed: true,
+            guarded: false,
+            running_count: 0,
+            orphan_count: 0,
+            quarantined: false,
+            firewall_rules: 0,
+            install_paths: vec![r"C:\Users\demo\AppData\Local\Programs\Zed\Zed.exe".into()],
+        },
+        AgentRuntimeStatus {
+            id: "trae".into(),
+            name: "Trae IDE".into(),
+            kind: AgentKind::Gui,
+            installed: false,
+            guarded: false,
+            running_count: 0,
+            orphan_count: 0,
+            quarantined: false,
+            firewall_rules: 0,
+            install_paths: Vec::new(),
+        },
+        AgentRuntimeStatus {
             id: "claude-code".into(),
             name: "Claude Code CLI".into(),
             kind: AgentKind::Cli,
@@ -220,6 +323,30 @@ fn demo_agents(tripped: bool) -> Vec<AgentRuntimeStatus> {
             quarantined: false,
             firewall_rules: 0,
             install_paths: vec![r"C:\Users\demo\AppData\Roaming\npm\codex.cmd".into()],
+        },
+        AgentRuntimeStatus {
+            id: "gemini".into(),
+            name: "Gemini CLI".into(),
+            kind: AgentKind::Cli,
+            installed: true,
+            guarded: true,
+            running_count: 0,
+            orphan_count: 0,
+            quarantined: false,
+            firewall_rules: 0,
+            install_paths: vec![r"C:\Users\demo\AppData\Roaming\npm\gemini.cmd".into()],
+        },
+        AgentRuntimeStatus {
+            id: "aider".into(),
+            name: "Aider CLI".into(),
+            kind: AgentKind::Cli,
+            installed: false,
+            guarded: false,
+            running_count: 0,
+            orphan_count: 0,
+            quarantined: false,
+            firewall_rules: 0,
+            install_paths: Vec::new(),
         },
     ]
 }
@@ -542,6 +669,66 @@ fn demo_updates(now: u64, scenario: DemoScenario) -> UpdateSummary {
         checked_at: Some(now.saturating_sub(18)),
         note: "当前 v1.1.2 已是最新官方版本".into(),
     };
+    let cursor_ide = ComponentUpdateStatus {
+        id: "cursor_ide".into(),
+        name: "Cursor IDE".into(),
+        repo: "Anysphere 官方渠道".into(),
+        phase: UpdateCheckPhase::UpToDate,
+        installed_version: Some("0.51.4".into()),
+        latest_version: Some("0.51.4".into()),
+        release_url: Some("https://www.cursor.com/downloads".into()),
+        asset_url: None,
+        checked_at: Some(now.saturating_sub(18)),
+        note: "当前 v0.51.4 已是最新官方版本".into(),
+    };
+    let windsurf_ide = ComponentUpdateStatus {
+        id: "windsurf_ide".into(),
+        name: "Windsurf IDE".into(),
+        repo: "Codeium 官方渠道".into(),
+        phase: if scenario == DemoScenario::Trip {
+            UpdateCheckPhase::UpdateAvailable
+        } else {
+            UpdateCheckPhase::UpToDate
+        },
+        installed_version: Some("1.9.2".into()),
+        latest_version: Some(if scenario == DemoScenario::Trip {
+            "1.10.0".into()
+        } else {
+            "1.9.2".into()
+        }),
+        release_url: Some("https://windsurf.com/download".into()),
+        asset_url: None,
+        checked_at: Some(now.saturating_sub(18)),
+        note: if scenario == DemoScenario::Trip {
+            "发现新版本：当前 v1.9.2 -> 最新 v1.10.0".into()
+        } else {
+            "当前 v1.9.2 已是最新官方版本".into()
+        },
+    };
+    let zed_ide = ComponentUpdateStatus {
+        id: "zed_ide".into(),
+        name: "Zed IDE".into(),
+        repo: "zed-industries/zed".into(),
+        phase: UpdateCheckPhase::UpToDate,
+        installed_version: Some("0.188.3".into()),
+        latest_version: Some("0.188.3".into()),
+        release_url: Some("https://github.com/zed-industries/zed/releases".into()),
+        asset_url: None,
+        checked_at: Some(now.saturating_sub(18)),
+        note: "当前 v0.188.3 已是最新官方版本".into(),
+    };
+    let trae_ide = ComponentUpdateStatus {
+        id: "trae_ide".into(),
+        name: "Trae IDE".into(),
+        repo: "Trae 官方渠道".into(),
+        phase: UpdateCheckPhase::NotInstalled,
+        installed_version: None,
+        latest_version: Some("1.4.2".into()),
+        release_url: Some("https://www.trae.ai/".into()),
+        asset_url: None,
+        checked_at: Some(now.saturating_sub(18)),
+        note: "本机未检测到 Trae IDE 安装路径".into(),
+    };
     UpdateSummary {
         claudeguard,
         antigravity_proxy,
@@ -553,9 +740,634 @@ fn demo_updates(now: u64, scenario: DemoScenario) -> UpdateSummary {
         antigravity_cn,
         ag_usage_monitor,
         ag_capsule,
+        cursor_ide,
+        windsurf_ide,
+        zed_ide,
+        trae_ide,
         claude_msix_version: Some("5.1231.2.0".into()),
         codex_msix_version: Some("26.1111.2228.0".into()),
     }
+}
+
+pub fn demo_cleanroom_report(now: u64, scope: &CleanRoomScope) -> CleanRoomReport {
+    let mut findings = Vec::new();
+    if scope.claude {
+        findings.push(CleanRoomFinding {
+            id: "v1-claude-json".into(),
+            client_id: "claude".into(),
+            vector: CleanRoomVector::ClaudeCodeState,
+            risk_weight: 40,
+            location_display: "%USERPROFILE%\\.claude.json & telemetry\\".into(),
+            correlation_keys: vec![
+                "userID".into(),
+                "anonymousId".into(),
+                "oauthAccount".into(),
+                "cachedStatsigGates".into(),
+            ],
+            masked_preview: "anonymousId=anon-9f*** · 3 批未上传遥测缓存".into(),
+            bytes_size: 48_320,
+            preservation_note: "100% 保留 mcpServers / CLAUDE.md / settings.json / skills/".into(),
+        });
+        findings.push(CleanRoomFinding {
+            id: "v2-claude-msix-crashpad".into(),
+            client_id: "claude".into(),
+            vector: CleanRoomVector::DesktopChromiumAndCrashpad,
+            risk_weight: 35,
+            location_display: "Packages\\Claude_*\\LocalCache\\Roaming\\Claude\\Crashpad".into(),
+            correlation_keys: vec![
+                "Network\\Cookies".into(),
+                "Local Storage\\leveldb".into(),
+                "Crashpad\\pending".into(),
+            ],
+            masked_preview: "Cookies + LevelDB + 2 份挂起崩溃信封".into(),
+            bytes_size: 1_942_016,
+            preservation_note: "100% 保留 claude_desktop_config.json (桌面 MCP 配置)".into(),
+        });
+        findings.push(CleanRoomFinding {
+            id: "v3-win-cred-anthropic".into(),
+            client_id: "claude".into(),
+            vector: CleanRoomVector::WindowsCredentialManager,
+            risk_weight: 15,
+            location_display: "Windows 凭据管理器 (Generic)".into(),
+            correlation_keys: vec!["Claude Safe Storage".into(), "claude-code-oauth".into()],
+            masked_preview: "2 条 OAuth / SafeStorage 加密元数据（绝不读取明文）".into(),
+            bytes_size: 1_024,
+            preservation_note: "清理前自动封入 CGBAK005 加密时光机备份".into(),
+        });
+        findings.push(CleanRoomFinding {
+            id: "v4-orphan-claude-proc".into(),
+            client_id: "claude".into(),
+            vector: CleanRoomVector::OrphanMemoryProcess,
+            risk_weight: 10,
+            location_display: "内存常驻子进程树".into(),
+            correlation_keys: vec!["cowork-svc.exe".into(), "claude.exe".into()],
+            masked_preview: "1 个孤儿驻留进程存在退出回写竞态风险".into(),
+            bytes_size: 0,
+            preservation_note: "清理第 0 步先清退进程并验证句柄释放".into(),
+        });
+    }
+    if scope.chatgpt_codex {
+        findings.push(CleanRoomFinding {
+            id: "v1-codex-auth".into(),
+            client_id: "chatgpt".into(),
+            vector: CleanRoomVector::ClaudeCodeState,
+            risk_weight: 25,
+            location_display: "%USERPROFILE%\\.codex\\auth.json".into(),
+            correlation_keys: vec!["auth.json".into(), "OpenAI.Codex LocalCache".into()],
+            masked_preview: "已缓存 OpenAI 会话令牌与历史日志".into(),
+            bytes_size: 16_384,
+            preservation_note: "保留用户自定义 config.toml 与项目指令".into(),
+        });
+    }
+    if scope.cursor {
+        findings.push(CleanRoomFinding {
+            id: "v2-cursor-storage".into(),
+            client_id: "cursor".into(),
+            vector: CleanRoomVector::DesktopChromiumAndCrashpad,
+            risk_weight: 20,
+            location_display: "%APPDATA%\\Cursor\\User\\globalStorage\\storage.json".into(),
+            correlation_keys: vec![
+                "telemetry.machineId".into(),
+                "telemetry.macMachineId".into(),
+                "telemetry.devDeviceId".into(),
+            ],
+            masked_preview: "需重置 3 项 Cursor 机器码遥测键".into(),
+            bytes_size: 24_576,
+            preservation_note: "100% 保留已装扩展、主题与快捷键".into(),
+        });
+    }
+    if scope.antigravity {
+        findings.push(CleanRoomFinding {
+            id: "v2-ag-session".into(),
+            client_id: "antigravity".into(),
+            vector: CleanRoomVector::DesktopChromiumAndCrashpad,
+            risk_weight: 15,
+            location_display: "%APPDATA%\\Antigravity\\Network\\Cookies".into(),
+            correlation_keys: vec!["Cookies".into(), "Local Storage".into()],
+            masked_preview: "浏览器内核会话缓存与旧账号状态".into(),
+            bytes_size: 312_000,
+            preservation_note: "100% 保留 version.dll 代理注入配置与 MCP 技能".into(),
+        });
+    }
+    if scope.windsurf {
+        findings.push(CleanRoomFinding {
+            id: "v2-windsurf-storage".into(),
+            client_id: "windsurf".into(),
+            vector: CleanRoomVector::DesktopChromiumAndCrashpad,
+            risk_weight: 15,
+            location_display: "%APPDATA%\\Windsurf\\User\\globalStorage\\storage.json".into(),
+            correlation_keys: vec!["telemetry.machineId".into(), "Cookies".into()],
+            masked_preview: "Windsurf 机器标识与会话缓存".into(),
+            bytes_size: 18_432,
+            preservation_note: "100% 保留扩展与工作区配置".into(),
+        });
+    }
+
+    let pollution_score: u8 = findings
+        .iter()
+        .map(|f| u16::from(f.risk_weight))
+        .sum::<u16>()
+        .min(100) as u8;
+    let risk_level = match pollution_score {
+        0 => CleanRoomRiskLevel::Clean,
+        1..=25 => CleanRoomRiskLevel::Low,
+        26..=69 => CleanRoomRiskLevel::Elevated,
+        _ => CleanRoomRiskLevel::CriticalChainBanRisk,
+    };
+    let summary = if findings.is_empty() {
+        "净室复核通过 · 未发现跨号关联污染残留".into()
+    } else {
+        format!(
+            "只读深度扫描命中 {} 项跨号关联源（污染指数 {}/100）",
+            findings.len(),
+            pollution_score
+        )
+    };
+    CleanRoomReport {
+        scanned_at: now,
+        scope: scope.clone(),
+        pollution_score,
+        risk_level,
+        findings,
+        preserved_assets_summary: vec![
+            "CLAUDE.md（全局与项目指令 100% 保留）".into(),
+            "settings.json（模型偏好与 CLI Hook 100% 保留）".into(),
+            "mcpServers & claude_desktop_config.json（全部 MCP 工具 100% 保留）".into(),
+            "skills/ · commands/ · agents/（自定义技能与工作流 100% 保留）".into(),
+        ],
+        summary,
+    }
+}
+
+pub fn demo_cleanroom_backups(now: u64) -> Vec<CleanRoomBackupMeta> {
+    vec![
+        CleanRoomBackupMeta {
+            backup_id: "cgbak-20261126-2110".into(),
+            created_at: now.saturating_sub(86_400),
+            file_path: r"%LOCALAPPDATA%\ClaudeGuard\backups\cgbak-20261126-2110.cgbak".into(),
+            archive_bytes: 214_528,
+            item_count: 6,
+            sha256_hex: "9f3b8c2a11d4e7054f90aa21cc0178d5a9e33b102f8c74a1".into(),
+            clients_included: vec!["claude".into(), "cursor".into()],
+        },
+        CleanRoomBackupMeta {
+            backup_id: "cgbak-20261120-0945".into(),
+            created_at: now.saturating_sub(86_400 * 6),
+            file_path: r"%LOCALAPPDATA%\ClaudeGuard\backups\cgbak-20261120-0945.cgbak".into(),
+            archive_bytes: 142_336,
+            item_count: 4,
+            sha256_hex: "4a12e8b07f6690c21b33e905a170cd82ee4119fa6d0b3412".into(),
+            clients_included: vec!["claude".into()],
+        },
+    ]
+}
+
+fn demo_wfp_status(now: u64, scenario: DemoScenario) -> WfpStatus {
+    let now_ms = now.saturating_mul(1000);
+    let mut recent = vec![
+        WfpBlockedEvent {
+            seq: 304,
+            timestamp_ms: now_ms.saturating_sub(14_000),
+            pid: Some(18420),
+            agent_id: "claude".into(),
+            app_path: "Claude.exe".into(),
+            remote_ip: "198.51.100.42".into(),
+            remote_port: 443,
+            protocol: "udp".into(),
+            layer: "ale_auth_connect_v4".into(),
+            filter_reason: "quic_shield".into(),
+        },
+        WfpBlockedEvent {
+            seq: 303,
+            timestamp_ms: now_ms.saturating_sub(58_000),
+            pid: Some(22910),
+            agent_id: "cursor".into(),
+            app_path: "Cursor.exe".into(),
+            remote_ip: "203.0.113.45".into(),
+            remote_port: 443,
+            protocol: "tcp".into(),
+            layer: "ale_auth_connect_v4".into(),
+            filter_reason: "direct_nic_bypass".into(),
+        },
+        WfpBlockedEvent {
+            seq: 302,
+            timestamp_ms: now_ms.saturating_sub(182_000),
+            pid: Some(15604),
+            agent_id: "antigravity".into(),
+            app_path: "language_server_windows_x64.exe".into(),
+            remote_ip: "198.51.100.53".into(),
+            remote_port: 443,
+            protocol: "tcp".into(),
+            layer: "ale_auth_connect_v4".into(),
+            filter_reason: "doh_shield".into(),
+        },
+    ];
+    if scenario == DemoScenario::Trip {
+        recent.insert(
+            0,
+            WfpBlockedEvent {
+                seq: 305,
+                timestamp_ms: now_ms.saturating_sub(4_000),
+                pid: Some(18420),
+                agent_id: "claude".into(),
+                app_path: "Claude.exe".into(),
+                remote_ip: "203.0.113.45".into(),
+                remote_port: 443,
+                protocol: "tcp".into(),
+                layer: "ale_auth_connect_v4".into(),
+                filter_reason: "app_quarantine".into(),
+            },
+        );
+    }
+    WfpStatus {
+        active_backend: "WFP 内核动态子层 (Dynamic Session)".into(),
+        sublayer_registered: scenario != DemoScenario::Disarmed,
+        dynamic_session_open: scenario != DemoScenario::Disarmed,
+        boot_time_filters_armed: false,
+        active_filter_count: if scenario == DemoScenario::Disarmed {
+            0
+        } else if scenario == DemoScenario::Trip {
+            22
+        } else {
+            14
+        },
+        net_event_subscribed: scenario != DemoScenario::Disarmed,
+        total_blocked_packets: if scenario == DemoScenario::Trip {
+            27
+        } else {
+            12
+        },
+        recent_blocked: recent,
+        last_error: String::new(),
+    }
+}
+
+fn demo_risk_assessment(now: u64, scenario: DemoScenario) -> RiskAssessment {
+    match scenario {
+        DemoScenario::Trip => RiskAssessment {
+            score: 28,
+            grade: SafetyGrade::F,
+            headline: "检测到跨洲瞬移与机房出口漂移 · 极高封号风险".into(),
+            dimensions: vec![
+                RiskDimensionItem {
+                    id: "asn_purity".into(),
+                    name: "ASN 住宅纯净度".into(),
+                    max_score: 20,
+                    score: 4,
+                    healthy: false,
+                    detail: "当前出口为云机房/VPS 段 (AS45102)".into(),
+                    remediation_action: Some("切换至原生住宅 ISP 节点".into()),
+                },
+                RiskDimensionItem {
+                    id: "abuse_score".into(),
+                    name: "威胁情报欺诈值".into(),
+                    max_score: 15,
+                    score: 3,
+                    healthy: false,
+                    detail: "综合欺诈指数 78% · 邻近 /24 污染偏高".into(),
+                    remediation_action: Some("更换独享静态住宅 IP".into()),
+                },
+                RiskDimensionItem {
+                    id: "geo_velocity".into(),
+                    name: "7 日时空轨迹".into(),
+                    max_score: 15,
+                    score: 0,
+                    healthy: false,
+                    detail: "7 分钟内 US→HK 位移 11,640 km（超音速瞬移）".into(),
+                    remediation_action: Some("等待 15 分钟冷却或确认换仓".into()),
+                },
+                RiskDimensionItem {
+                    id: "webrtc_stun".into(),
+                    name: "WebRTC STUN 穿透".into(),
+                    max_score: 10,
+                    score: 0,
+                    healthy: false,
+                    detail: "UDP 直连暴露反射出口 CN".into(),
+                    remediation_action: Some("启用 Electron 防漏参数与 WFP 护盾".into()),
+                },
+                RiskDimensionItem {
+                    id: "dns_coherence".into(),
+                    name: "DNS 地理一致性".into(),
+                    max_score: 10,
+                    score: 2,
+                    healthy: false,
+                    detail: "检测到国内递归 DNS 泄露".into(),
+                    remediation_action: Some("开启阻断 DNS / DoH 直连".into()),
+                },
+                RiskDimensionItem {
+                    id: "wfp_shield".into(),
+                    name: "WFP 内核防抢跑".into(),
+                    max_score: 10,
+                    score: 10,
+                    healthy: true,
+                    detail: "动态子层已实时截停 27 个越界包".into(),
+                    remediation_action: None,
+                },
+                RiskDimensionItem {
+                    id: "dual_stack".into(),
+                    name: "IPv6 双栈一致性".into(),
+                    max_score: 5,
+                    score: 5,
+                    healthy: true,
+                    detail: "未发现 IPv6 旁路分流".into(),
+                    remediation_action: None,
+                },
+                RiskDimensionItem {
+                    id: "electron_hygiene".into(),
+                    name: "Electron 启动卫生".into(),
+                    max_score: 5,
+                    score: 4,
+                    healthy: true,
+                    detail: "QUIC / WebRTC 启动参数已注入".into(),
+                    remediation_action: None,
+                },
+                RiskDimensionItem {
+                    id: "tz_locale".into(),
+                    name: "时区与语言指纹".into(),
+                    max_score: 5,
+                    score: 0,
+                    healthy: false,
+                    detail: "系统时区与 HK 出口不一致".into(),
+                    remediation_action: None,
+                },
+                RiskDimensionItem {
+                    id: "burst_guard".into(),
+                    name: "交互速率防风控".into(),
+                    max_score: 5,
+                    score: 0,
+                    healthy: true,
+                    detail: "当前已熔断暂停".into(),
+                    remediation_action: None,
+                },
+            ],
+            recommendations: vec![
+                "立即切回美国原生住宅 ISP 静态出口并等待防瞬移冷却".into(),
+                "开启 DNS / DoH 护盾以消除国内递归解析泄露".into(),
+            ],
+            geo_velocity_alert: Some(GeoVelocityAlert {
+                vault_id: Some("work-claude-max".into()),
+                from_country: "US".into(),
+                from_city: "洛杉矶".into(),
+                to_country: "HK".into(),
+                to_city: "香港".into(),
+                distance_km: 11_640,
+                elapsed_secs: 420,
+                implied_speed_kmh: 99_771,
+                cooldown_until: Some(now + 780),
+            }),
+            distinct_subnets_1h: 3,
+            distinct_countries_24h: 2,
+            ip_purity: IpPurityReport {
+                ip: Some("203.0.113.45".into()),
+                country: Some("HK".into()),
+                city: Some("香港".into()),
+                lat_tenths: Some(223),
+                lon_tenths: Some(1142),
+                asn: Some(45102),
+                asn_org: "Datacenter Relay Hosting".into(),
+                classification: AsnClassification::DatacenterHosting,
+                abuse_risk_score: 78,
+                abuser_score_bps: 1450,
+                is_datacenter: true,
+                is_proxy_or_vpn: true,
+                is_tor: false,
+                is_bogon_or_relay: false,
+                dual_stack_split_detected: false,
+                ipv6_egress_country: None,
+                source_tag: "demo_intel".into(),
+                checked_at: now.saturating_sub(10),
+            },
+            stun_leak: StunLeakReport {
+                checked_at: now.saturating_sub(10),
+                stun_reachable_direct: true,
+                leaked: true,
+                reflexive_ip: Some("203.0.113.45".into()),
+                reflexive_country: Some("CN".into()),
+                summary: "警告：UDP STUN 穿透暴露非代理反射 IP".into(),
+            },
+            dns_coherence: DnsCoherenceReport {
+                checked_at: now.saturating_sub(10),
+                coherent: false,
+                domestic_resolver_detected: true,
+                fake_ip_active: false,
+                resolver_countries: vec!["CN".into(), "HK".into()],
+                summary: "检测到国内递归 DNS 分流，存在域名归属泄露风险".into(),
+            },
+            electron_hygiene: ElectronHygieneReport {
+                checked_at: now.saturating_sub(10),
+                webrtc_flag_enforced: true,
+                quic_disabled_flag: true,
+                host_resolver_enforced: true,
+                unguarded_running_agents: Vec::new(),
+                summary: "Electron 防漏参数配置正常".into(),
+            },
+            evaluated_at: now.saturating_sub(10),
+        },
+        _ => RiskAssessment {
+            score: 94,
+            grade: SafetyGrade::S,
+            headline: "原生住宅 ISP 出口纯净 · 极低封号风险".into(),
+            dimensions: vec![
+                RiskDimensionItem {
+                    id: "asn_purity".into(),
+                    name: "ASN 住宅纯净度".into(),
+                    max_score: 20,
+                    score: 20,
+                    healthy: true,
+                    detail: "AS7922 · 原生住宅 ISP (Comcast Cable)".into(),
+                    remediation_action: None,
+                },
+                RiskDimensionItem {
+                    id: "abuse_score".into(),
+                    name: "威胁情报欺诈值".into(),
+                    max_score: 15,
+                    score: 14,
+                    healthy: true,
+                    detail: "综合欺诈指数 2% · /24 邻段极净 (0.35%)".into(),
+                    remediation_action: None,
+                },
+                RiskDimensionItem {
+                    id: "geo_velocity".into(),
+                    name: "7 日时空轨迹".into(),
+                    max_score: 15,
+                    score: 15,
+                    healthy: true,
+                    detail: "0 次跨洲瞬移 · 24h 稳定单国 US".into(),
+                    remediation_action: None,
+                },
+                RiskDimensionItem {
+                    id: "webrtc_stun".into(),
+                    name: "WebRTC STUN 穿透".into(),
+                    max_score: 10,
+                    score: 10,
+                    healthy: true,
+                    detail: "RFC 5389 UDP STUN 实测 0 直连泄露".into(),
+                    remediation_action: None,
+                },
+                RiskDimensionItem {
+                    id: "dns_coherence".into(),
+                    name: "DNS 地理一致性".into(),
+                    max_score: 10,
+                    score: 9,
+                    healthy: true,
+                    detail: "远端解析 US 一致 · 无国内 DNS 泄露".into(),
+                    remediation_action: None,
+                },
+                RiskDimensionItem {
+                    id: "wfp_shield".into(),
+                    name: "WFP 内核防抢跑".into(),
+                    max_score: 10,
+                    score: 8,
+                    healthy: true,
+                    detail: "动态子层已激活 (14 条过滤规则)".into(),
+                    remediation_action: None,
+                },
+                RiskDimensionItem {
+                    id: "dual_stack".into(),
+                    name: "IPv6 双栈一致性".into(),
+                    max_score: 5,
+                    score: 5,
+                    healthy: true,
+                    detail: "无 IPv4/IPv6 出口撕裂".into(),
+                    remediation_action: None,
+                },
+                RiskDimensionItem {
+                    id: "electron_hygiene".into(),
+                    name: "Electron 启动卫生".into(),
+                    max_score: 5,
+                    score: 4,
+                    healthy: true,
+                    detail: "QUIC/WebRTC/HostResolver 参数已生效".into(),
+                    remediation_action: None,
+                },
+                RiskDimensionItem {
+                    id: "tz_locale".into(),
+                    name: "时区与语言指纹".into(),
+                    max_score: 5,
+                    score: 5,
+                    healthy: true,
+                    detail: "太平洋时间 (UTC-08:00) 与洛杉矶出口对齐".into(),
+                    remediation_action: None,
+                },
+                RiskDimensionItem {
+                    id: "burst_guard".into(),
+                    name: "交互速率防风控".into(),
+                    max_score: 5,
+                    score: 4,
+                    healthy: true,
+                    detail: "4 次/分钟 · 人类自然交互节律".into(),
+                    remediation_action: None,
+                },
+            ],
+            recommendations: vec![
+                "当前出口纯净度达到 S 级，建议保持静态住宅节点稳定不频繁切国".into(),
+            ],
+            geo_velocity_alert: None,
+            distinct_subnets_1h: 1,
+            distinct_countries_24h: 1,
+            ip_purity: IpPurityReport {
+                ip: Some("198.51.100.98".into()),
+                country: Some("US".into()),
+                city: Some("洛杉矶".into()),
+                lat_tenths: Some(340),
+                lon_tenths: Some(-1182),
+                asn: Some(7922),
+                asn_org: "Comcast Cable Communications".into(),
+                classification: AsnClassification::IspResidential,
+                abuse_risk_score: 2,
+                abuser_score_bps: 35,
+                is_datacenter: false,
+                is_proxy_or_vpn: false,
+                is_tor: false,
+                is_bogon_or_relay: false,
+                dual_stack_split_detected: false,
+                ipv6_egress_country: None,
+                source_tag: "demo_intel".into(),
+                checked_at: now.saturating_sub(4),
+            },
+            stun_leak: StunLeakReport {
+                checked_at: now.saturating_sub(4),
+                stun_reachable_direct: false,
+                leaked: false,
+                reflexive_ip: None,
+                reflexive_country: None,
+                summary: "未检测到 WebRTC UDP STUN 直连反射泄露".into(),
+            },
+            dns_coherence: DnsCoherenceReport {
+                checked_at: now.saturating_sub(4),
+                coherent: true,
+                domestic_resolver_detected: false,
+                fake_ip_active: false,
+                resolver_countries: vec!["US".into()],
+                summary: "DNS 解析归属 (US) 与代理出口完全一致".into(),
+            },
+            electron_hygiene: ElectronHygieneReport {
+                checked_at: now.saturating_sub(4),
+                webrtc_flag_enforced: true,
+                quic_disabled_flag: true,
+                host_resolver_enforced: true,
+                unguarded_running_agents: Vec::new(),
+                summary: "全部运行中 Electron 客户端均携带防漏卫生参数".into(),
+            },
+            evaluated_at: now.saturating_sub(4),
+        },
+    }
+}
+
+fn demo_vault_statuses(now: u64, scenario: DemoScenario) -> Vec<VaultRuntimeStatus> {
+    let tripped = scenario == DemoScenario::Trip;
+    vec![
+        VaultRuntimeStatus {
+            id: "work-claude-max".into(),
+            name: "Work-Max · 美国静态住宅".into(),
+            accent_hex: "#5B69D0".into(),
+            state: if tripped {
+                VaultRuntimeState::EgressMismatch
+            } else {
+                VaultRuntimeState::ActiveRunning
+            },
+            running_pids: if tripped { vec![] } else { vec![18420, 19204] },
+            running_apps: if tripped {
+                vec![]
+            } else {
+                vec!["claude".into(), "claude-code".into()]
+            },
+            egress_matches_contract: !tripped,
+            cooldown_remaining_secs: 0,
+            last_active_at: Some(now.saturating_sub(180)),
+            last_ip_masked: Some("198.51.*.*".into()),
+            last_country: Some("US".into()),
+            vault_dir: r"%LOCALAPPDATA%\ClaudeGuard\vaults\work-claude-max".into(),
+            summary: if tripped {
+                "当前出口 HK 与契约 (US / AS7922) 不符，已阻断启动".into()
+            } else {
+                "物理隔离目录与独立机器码生效 · 2 个进程运行中".into()
+            },
+        },
+        VaultRuntimeStatus {
+            id: "personal-jp-lab".into(),
+            name: "Personal-Lab · 日本独立仓".into(),
+            accent_hex: "#16A34A".into(),
+            state: if tripped {
+                VaultRuntimeState::CoolingDown
+            } else {
+                VaultRuntimeState::Ready
+            },
+            running_pids: Vec::new(),
+            running_apps: Vec::new(),
+            egress_matches_contract: !tripped,
+            cooldown_remaining_secs: if tripped { 515 } else { 0 },
+            last_active_at: Some(now.saturating_sub(3_400)),
+            last_ip_masked: Some("198.51.*.*".into()),
+            last_country: Some("JP".into()),
+            vault_dir: r"%LOCALAPPDATA%\ClaudeGuard\vaults\personal-jp-lab".into(),
+            summary: if tripped {
+                "换 IP 防瞬移冷却倒计时中（08:35）".into()
+            } else {
+                "独立端口 :7892 · 严格 MSIX 独占锁待命就绪".into()
+            },
+        },
+    ]
 }
 
 /// Builds a rich synthetic snapshot for the requested [`DemoScenario`].
@@ -870,7 +1682,7 @@ pub fn build_demo_snapshot(scenario: DemoScenario) -> GuardSnapshot {
     };
 
     GuardSnapshot {
-        schema_version: 4,
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
         version: env!("CARGO_PKG_VERSION").into(),
         platform: "windows".into(),
         network_isolation_supported: true,
@@ -988,6 +1800,50 @@ pub fn build_demo_snapshot(scenario: DemoScenario) -> GuardSnapshot {
             } else {
                 "Mihomo v1.19.12 · 组 [Proxy] 当前节点：US-LAX-ISP-01（58ms）".into()
             },
+        },
+        wfp: demo_wfp_status(now, scenario),
+        risk_assessment: demo_risk_assessment(now, scenario),
+        vaults: demo_vault_statuses(now, scenario),
+        last_cleanroom_report: Some(demo_cleanroom_report(now, &CleanRoomScope::default())),
+        cleanroom_backup_count: 2,
+        hooks: HookIntegrationStatus {
+            claude_code_hook_installed: true,
+            pwsh_profile_wrapped: true,
+            vault_hooks_synced_count: 2,
+            total_gate_checks: 148,
+            total_gate_blocks: if scenario == DemoScenario::Trip { 5 } else { 2 },
+            last_gate_latency_us: 840,
+            summary: "Pre-Prompt 门禁钩子已接管 Claude Code & PowerShell（平均耗时 0.84ms）".into(),
+        },
+        wsl_bridge: WslBridgeStatus {
+            enabled: true,
+            listening: scenario != DemoScenario::Disarmed,
+            bound_port: Some(17891),
+            token_ready: true,
+            synced_distros: vec!["Ubuntu-24.04".into()],
+            proxy_desync_detected: scenario == DemoScenario::Trip,
+            summary: if scenario == DemoScenario::Trip {
+                "警告：检测到 Ubuntu-24.04 代理环境变量与宿主机失步".into()
+            } else {
+                "127.0.0.1:17891 HMAC 桥接运行中 · 已同步 1 个 WSL2 发行版".into()
+            },
+        },
+        burst_guard: BurstGuardStatus {
+            mode: BurstGuardMode::WarnOnly,
+            prompts_last_1m: 4,
+            prompts_last_15m: 26,
+            robotic_cadence_detected: false,
+            unauthorized_oauth_client_detected: false,
+            suspicious_processes: Vec::new(),
+            summary: "当前速率 4 次/分 · 交互节律自然，未发现异常 OAuth 代理占用".into(),
+        },
+        hotkeys: HotkeyStatus {
+            enabled: true,
+            panic_lockdown_chord: "Ctrl+Alt+Shift+L".into(),
+            quick_hud_chord: "Ctrl+Alt+Shift+H".into(),
+            panic_registered_ok: true,
+            hud_registered_ok: true,
+            conflict_note: String::new(),
         },
     }
 }

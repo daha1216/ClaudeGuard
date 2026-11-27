@@ -19,7 +19,7 @@
 //!   to eliminate PID-reuse collateral damage (R04), ordered children-first so parents cannot
 //!   respawn helpers mid-sweep.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -49,6 +49,22 @@ pub const GUI_AGENTS: &[GuiAgentDef] = &[
         id: "antigravity",
         name: "反重力",
     },
+    GuiAgentDef {
+        id: "cursor",
+        name: "Cursor",
+    },
+    GuiAgentDef {
+        id: "windsurf",
+        name: "Windsurf",
+    },
+    GuiAgentDef {
+        id: "zed",
+        name: "Zed",
+    },
+    GuiAgentDef {
+        id: "trae",
+        name: "Trae",
+    },
 ];
 
 /// CLI agents (monitored for awareness; NEVER killed on trip).
@@ -56,6 +72,7 @@ pub const CLI_AGENTS: &[(&str, &str)] = &[
     ("claude-code", "Claude Code"),
     ("codex", "Codex CLI"),
     ("gemini", "Gemini CLI"),
+    ("aider", "Aider CLI"),
 ];
 
 pub fn agent_ids() -> Vec<&'static str> {
@@ -218,6 +235,15 @@ pub fn gui_agent_matches(
                 || exe_path_l.contains(r"\programs\antigravity\")
                 || exe_path_l.contains(r"\programs\antigravity ide\")
         }
+        "cursor" => exe_name_l == "cursor.exe" || exe_path_l.contains(r"\programs\cursor\"),
+        "windsurf" => exe_name_l == "windsurf.exe" || exe_path_l.contains(r"\programs\windsurf\"),
+        "zed" => {
+            exe_name_l == "zed.exe"
+                || exe_name_l == "zed-cli.exe"
+                || exe_path_l.contains(r"\programs\zed\")
+                || exe_path_l.contains(r"\scoop\apps\zed\")
+        }
+        "trae" => exe_name_l == "trae.exe" || exe_path_l.contains(r"\programs\trae\"),
         _ => false,
     }
 }
@@ -264,6 +290,22 @@ pub fn cli_agent_matches_with_dirs(
             );
             is_js_runtime
                 && (cmd_l.contains("@google/gemini-cli") || cmd_l.contains(r"@google\gemini-cli"))
+        }
+        "aider" => {
+            let is_py_runtime = matches!(
+                exe_name_l,
+                "python.exe" | "python" | "pythonw.exe" | "python3.exe" | "uv.exe" | "uv"
+            );
+            exe_name_l == "aider.exe"
+                || exe_name_l == "aider"
+                || exe_path_l.contains(r"\aider-chat\")
+                || exe_path_l.contains(r"\uv\tools\aider")
+                || (is_py_runtime
+                    && (cmd_l.contains("aider-chat")
+                        || cmd_l.contains("aider_chat")
+                        || cmd_l.contains(" -m aider")
+                        || cmd_l.contains(r"\aider")
+                        || cmd_l.contains("/aider")))
         }
         _ => false,
     }
@@ -659,6 +701,9 @@ pub fn pick_gui_agent_kill_tree_with_dirs(
                     .iter()
                     .any(|d| path_under_dir_l(&child.path_l, d))
                     || gui_agent_matches("chatgpt", &child.name_l, &child.path_l, None)
+            }
+            "cursor" | "windsurf" | "zed" | "trae" => {
+                gui_agent_matches(agent_id, &child.name_l, &child.path_l, None)
             }
             _ => false,
         },
@@ -1769,6 +1814,10 @@ struct DiscoveryCacheState {
     claude_dirs: Vec<PathBuf>,
     chatgpt_dirs: Vec<PathBuf>,
     antigravity_dirs: Vec<PathBuf>,
+    cursor_dirs: Vec<PathBuf>,
+    windsurf_dirs: Vec<PathBuf>,
+    zed_dirs: Vec<PathBuf>,
+    trae_dirs: Vec<PathBuf>,
 }
 
 fn discovery_cache_slot() -> &'static Mutex<Option<DiscoveryCacheState>> {
@@ -1802,12 +1851,20 @@ fn with_discovery_cache<R>(f: impl FnOnce(&DiscoveryCacheState) -> R) -> R {
     let claude_dirs = compute_claude_covered_dirs(&uninstall_records);
     let chatgpt_dirs = compute_chatgpt_covered_dirs(&uninstall_records);
     let antigravity_dirs = compute_antigravity_covered_dirs(&uninstall_records);
+    let cursor_dirs = compute_cursor_covered_dirs(&uninstall_records);
+    let windsurf_dirs = compute_windsurf_covered_dirs(&uninstall_records);
+    let zed_dirs = compute_zed_covered_dirs(&uninstall_records);
+    let trae_dirs = compute_trae_covered_dirs(&uninstall_records);
     let fresh = DiscoveryCacheState {
         populated_at: Instant::now(),
         uninstall_records,
         claude_dirs,
         chatgpt_dirs,
         antigravity_dirs,
+        cursor_dirs,
+        windsurf_dirs,
+        zed_dirs,
+        trae_dirs,
     };
     let out = f(&fresh);
     let mut guard = discovery_cache_slot()
@@ -2024,6 +2081,169 @@ pub fn discover_antigravity_exes_from_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
 pub fn discover_antigravity_exes_in(local_app_data: Option<&Path>) -> Vec<PathBuf> {
     let dirs = antigravity_covered_dirs_from_roots(local_app_data, None, None);
     discover_antigravity_exes_from_dirs(&dirs)
+}
+
+fn discover_ide_exes_from_dirs(dirs: &[PathBuf], primary_names: &[&str]) -> Vec<PathBuf> {
+    let mut exes = Vec::new();
+    for dir in dirs {
+        for primary_name in primary_names {
+            let primary = dir.join(primary_name);
+            if primary.is_file() && !contains_path_ci(&exes, &primary) {
+                exes.push(primary);
+            }
+        }
+    }
+    for dir in dirs {
+        collect_exes_filtered(dir, 0, 5, &mut exes);
+    }
+    exes
+}
+
+fn compute_cursor_covered_dirs(uninstall_records: &[UninstallRecord]) -> Vec<PathBuf> {
+    let per_user = per_user_local_app_subdirs(&[r"Programs\cursor", r"Programs\Cursor"]);
+    let mut reg_dirs = Vec::new();
+    for rec in uninstall_records {
+        let dn = rec.display_name.to_ascii_lowercase();
+        let kn = rec.key_name.to_ascii_lowercase();
+        if dn == "cursor"
+            || dn.starts_with("cursor ")
+            || (kn.contains("dadadada") && dn.contains("cursor"))
+        {
+            if let Some(dir) = rec.install_dir.as_ref().filter(|d| {
+                d.is_dir() && (d.join("Cursor.exe").is_file() || d.join("resources").is_dir())
+            }) {
+                reg_dirs.push(dir.clone());
+            }
+        }
+    }
+    for env_key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(pf) = std::env::var_os(env_key).map(PathBuf::from) {
+            let d = pf.join("Cursor");
+            if d.is_dir() && d.join("Cursor.exe").is_file() {
+                reg_dirs.push(d);
+            }
+        }
+    }
+    merge_covered_dirs(per_user, reg_dirs)
+}
+
+pub fn cursor_covered_dirs() -> Vec<PathBuf> {
+    with_discovery_cache(|c| c.cursor_dirs.clone())
+}
+
+pub fn discover_cursor_exes_from_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    discover_ide_exes_from_dirs(dirs, &["Cursor.exe"])
+}
+
+fn compute_windsurf_covered_dirs(uninstall_records: &[UninstallRecord]) -> Vec<PathBuf> {
+    let per_user = per_user_local_app_subdirs(&[r"Programs\Windsurf", r"Programs\windsurf"]);
+    let mut reg_dirs = Vec::new();
+    for rec in uninstall_records {
+        let dn = rec.display_name.to_ascii_lowercase();
+        let kn = rec.key_name.to_ascii_lowercase();
+        if dn == "windsurf" || dn.starts_with("windsurf") || kn.contains("windsurf") {
+            if let Some(dir) = rec.install_dir.as_ref().filter(|d| {
+                d.is_dir() && (d.join("Windsurf.exe").is_file() || d.join("resources").is_dir())
+            }) {
+                reg_dirs.push(dir.clone());
+            }
+        }
+    }
+    for env_key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(pf) = std::env::var_os(env_key).map(PathBuf::from) {
+            let d = pf.join("Windsurf");
+            if d.is_dir() && d.join("Windsurf.exe").is_file() {
+                reg_dirs.push(d);
+            }
+        }
+    }
+    merge_covered_dirs(per_user, reg_dirs)
+}
+
+pub fn windsurf_covered_dirs() -> Vec<PathBuf> {
+    with_discovery_cache(|c| c.windsurf_dirs.clone())
+}
+
+pub fn discover_windsurf_exes_from_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    discover_ide_exes_from_dirs(dirs, &["Windsurf.exe"])
+}
+
+fn compute_zed_covered_dirs(uninstall_records: &[UninstallRecord]) -> Vec<PathBuf> {
+    let per_user = per_user_local_app_subdirs(&[r"Programs\Zed", r"Programs\zed"]);
+    let mut extra_dirs = Vec::new();
+    for home in user_home_dirs() {
+        let scoop_cur = home.join("scoop").join("apps").join("zed").join("current");
+        if scoop_cur.is_dir() {
+            extra_dirs.push(scoop_cur);
+        }
+    }
+    let global_scoop_cur = program_data_scoop_root()
+        .join("apps")
+        .join("zed")
+        .join("current");
+    if global_scoop_cur.is_dir() {
+        extra_dirs.push(global_scoop_cur);
+    }
+    for rec in uninstall_records {
+        let dn = rec.display_name.to_ascii_lowercase();
+        if dn == "zed" || dn.starts_with("zed ") || dn == "zed editor" {
+            if let Some(dir) = rec.install_dir.as_ref().filter(|d| {
+                d.is_dir() && (d.join("Zed.exe").is_file() || d.join("zed.exe").is_file())
+            }) {
+                extra_dirs.push(dir.clone());
+            }
+        }
+    }
+    for env_key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(pf) = std::env::var_os(env_key).map(PathBuf::from) {
+            let d = pf.join("Zed");
+            if d.is_dir() && (d.join("Zed.exe").is_file() || d.join("zed.exe").is_file()) {
+                extra_dirs.push(d);
+            }
+        }
+    }
+    merge_covered_dirs(per_user, extra_dirs)
+}
+
+pub fn zed_covered_dirs() -> Vec<PathBuf> {
+    with_discovery_cache(|c| c.zed_dirs.clone())
+}
+
+pub fn discover_zed_exes_from_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    discover_ide_exes_from_dirs(dirs, &["Zed.exe", "zed.exe", "zed-cli.exe"])
+}
+
+fn compute_trae_covered_dirs(uninstall_records: &[UninstallRecord]) -> Vec<PathBuf> {
+    let per_user = per_user_local_app_subdirs(&[r"Programs\Trae", r"Programs\trae"]);
+    let mut reg_dirs = Vec::new();
+    for rec in uninstall_records {
+        let dn = rec.display_name.to_ascii_lowercase();
+        let kn = rec.key_name.to_ascii_lowercase();
+        if dn == "trae" || dn.starts_with("trae ") || kn.contains("trae") {
+            if let Some(dir) = rec.install_dir.as_ref().filter(|d| {
+                d.is_dir() && (d.join("Trae.exe").is_file() || d.join("resources").is_dir())
+            }) {
+                reg_dirs.push(dir.clone());
+            }
+        }
+    }
+    for env_key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(pf) = std::env::var_os(env_key).map(PathBuf::from) {
+            let d = pf.join("Trae");
+            if d.is_dir() && d.join("Trae.exe").is_file() {
+                reg_dirs.push(d);
+            }
+        }
+    }
+    merge_covered_dirs(per_user, reg_dirs)
+}
+
+pub fn trae_covered_dirs() -> Vec<PathBuf> {
+    with_discovery_cache(|c| c.trae_dirs.clone())
+}
+
+pub fn discover_trae_exes_from_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    discover_ide_exes_from_dirs(dirs, &["Trae.exe"])
 }
 
 fn push_unique_dir(out: &mut Vec<PathBuf>, dir: PathBuf) {
@@ -2472,12 +2692,46 @@ pub fn discover_cli_exes_in_homes(cli_id: &str, homes: &[PathBuf]) -> Vec<PathBu
                 collect_exes_matching(&scoop_codex, 0, 4, &|n| n.starts_with("codex"), &mut exes);
             }
         }
+        "aider" => {
+            for home in homes {
+                for direct in [
+                    home.join(".local").join("bin").join("aider.exe"),
+                    home.join(".cargo").join("bin").join("aider.exe"),
+                    home.join("AppData")
+                        .join("Roaming")
+                        .join("uv")
+                        .join("tools")
+                        .join("aider-chat")
+                        .join("Scripts")
+                        .join("aider.exe"),
+                    home.join("AppData")
+                        .join("Local")
+                        .join("uv")
+                        .join("tools")
+                        .join("aider-chat")
+                        .join("Scripts")
+                        .join("aider.exe"),
+                    home.join(".local")
+                        .join("pipx")
+                        .join("venvs")
+                        .join("aider-chat")
+                        .join("Scripts")
+                        .join("aider.exe"),
+                ] {
+                    if direct.is_file() && !contains_path_ci(&exes, &direct) {
+                        exes.push(direct);
+                    }
+                }
+                let scoop_aider = home.join("scoop").join("apps").join("aider");
+                collect_exes_matching(&scoop_aider, 0, 4, &|n| n == "aider.exe", &mut exes);
+            }
+        }
         _ => {}
     }
     exes
 }
 
-/// Discover standalone native CLI binaries for `claude-code` or `codex` across all user homes and global Scoop.
+/// Discover standalone native CLI binaries (`claude-code`, `codex`, `aider`) across all user homes and global Scoop.
 pub fn discover_cli_exes(cli_id: &str) -> Vec<PathBuf> {
     let mut exes = discover_cli_exes_in_homes(cli_id, &user_home_dirs());
     let global_scoop = program_data_scoop_root();
@@ -2497,6 +2751,15 @@ pub fn discover_cli_exes(cli_id: &str) -> Vec<PathBuf> {
                 0,
                 4,
                 &|n| n.starts_with("codex"),
+                &mut exes,
+            );
+        }
+        "aider" => {
+            collect_exes_matching(
+                &global_scoop.join("apps").join("aider"),
+                0,
+                4,
+                &|n| n == "aider.exe",
                 &mut exes,
             );
         }
@@ -2560,7 +2823,8 @@ pub fn discover_chatgpt_exes_from_dirs_and_homes(
     exes
 }
 
-/// Discover covered executables for `claude`, `chatgpt`, or `antigravity`.
+/// Discover covered executables across all 7 GUI agents (`claude`, `chatgpt`, `antigravity`,
+/// `cursor`, `windsurf`, `zed`, `trae`).
 pub fn discover_agent_exes(agent_id: &str) -> Vec<PathBuf> {
     match agent_id {
         "claude" => {
@@ -2570,6 +2834,10 @@ pub fn discover_agent_exes(agent_id: &str) -> Vec<PathBuf> {
             discover_chatgpt_exes_from_dirs_and_homes(&chatgpt_covered_dirs(), &user_home_dirs())
         }
         "antigravity" => discover_antigravity_exes_from_dirs(&antigravity_covered_dirs()),
+        "cursor" => discover_cursor_exes_from_dirs(&cursor_covered_dirs()),
+        "windsurf" => discover_windsurf_exes_from_dirs(&windsurf_covered_dirs()),
+        "zed" => discover_zed_exes_from_dirs(&zed_covered_dirs()),
+        "trae" => discover_trae_exes_from_dirs(&trae_covered_dirs()),
         _ => Vec::new(),
     }
 }
@@ -2960,6 +3228,129 @@ pub fn installed_antigravity_ide_info() -> (Option<String>, Option<String>) {
     installed_antigravity_ide_info_in_dirs(&antigravity_covered_dirs())
 }
 
+fn installed_electron_ide_version_in_dirs(dirs: &[PathBuf], exe_names: &[&str]) -> Option<String> {
+    let mut best: Option<String> = None;
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut dir_ver: Option<String> = None;
+        for exe_name in exe_names {
+            let exe = dir.join(exe_name);
+            if let Some(v) = read_pe_file_version(&exe) {
+                pick_newer_version(&mut dir_ver, &v);
+            }
+        }
+        if dir_ver.is_none() {
+            if let Some(v) =
+                read_package_json_version(&dir.join("resources").join("app").join("package.json"))
+            {
+                pick_newer_version(&mut dir_ver, &v);
+            }
+        }
+        if dir_ver.is_none() {
+            if let Some(v) = read_package_json_version(&dir.join("manifest.json")) {
+                pick_newer_version(&mut dir_ver, &v);
+            }
+        }
+        if dir_ver.is_none() {
+            if let Ok(raw) = std::fs::read_to_string(dir.join("version")) {
+                pick_newer_version(&mut dir_ver, &raw);
+            }
+        }
+        if let Some(ref dv) = dir_ver {
+            pick_newer_version(&mut best, dv);
+        }
+    }
+    best
+}
+
+/// Testable detector reading newest installed Cursor IDE version from explicit install dirs.
+pub fn installed_cursor_ide_version_in_dirs(dirs: &[PathBuf]) -> Option<String> {
+    installed_electron_ide_version_in_dirs(dirs, &["Cursor.exe"])
+}
+
+/// Detect installed Cursor IDE version across install dirs and Uninstall registry.
+pub fn installed_cursor_ide_version() -> Option<String> {
+    let mut best = installed_cursor_ide_version_in_dirs(&cursor_covered_dirs());
+    for rec in scan_uninstall_records() {
+        let dn = rec.display_name.to_ascii_lowercase();
+        let kn = rec.key_name.to_ascii_lowercase();
+        if dn == "cursor"
+            || dn.starts_with("cursor ")
+            || (kn.contains("dadadada") && dn.contains("cursor"))
+        {
+            if let Some(ref dv) = rec.display_version {
+                pick_newer_version(&mut best, dv);
+            }
+        }
+    }
+    best
+}
+
+/// Testable detector reading newest installed Windsurf IDE version from explicit install dirs.
+pub fn installed_windsurf_ide_version_in_dirs(dirs: &[PathBuf]) -> Option<String> {
+    installed_electron_ide_version_in_dirs(dirs, &["Windsurf.exe"])
+}
+
+/// Detect installed Windsurf IDE version across install dirs and Uninstall registry.
+pub fn installed_windsurf_ide_version() -> Option<String> {
+    let mut best = installed_windsurf_ide_version_in_dirs(&windsurf_covered_dirs());
+    for rec in scan_uninstall_records() {
+        let dn = rec.display_name.to_ascii_lowercase();
+        let kn = rec.key_name.to_ascii_lowercase();
+        if dn == "windsurf" || dn.starts_with("windsurf") || kn.contains("windsurf") {
+            if let Some(ref dv) = rec.display_version {
+                pick_newer_version(&mut best, dv);
+            }
+        }
+    }
+    best
+}
+
+/// Testable detector reading newest installed Zed IDE version from explicit install dirs.
+pub fn installed_zed_ide_version_in_dirs(dirs: &[PathBuf]) -> Option<String> {
+    installed_electron_ide_version_in_dirs(dirs, &["Zed.exe", "zed.exe"])
+}
+
+/// Detect installed Zed IDE version across install dirs, Scoop manifests, and Uninstall registry.
+pub fn installed_zed_ide_version() -> Option<String> {
+    let mut best = installed_zed_ide_version_in_dirs(&zed_covered_dirs());
+    for home in user_home_dirs() {
+        scan_scoop_app_version(&home.join("scoop"), "zed", &mut best);
+    }
+    scan_scoop_app_version(&program_data_scoop_root(), "zed", &mut best);
+    for rec in scan_uninstall_records() {
+        let dn = rec.display_name.to_ascii_lowercase();
+        if dn == "zed" || dn.starts_with("zed ") || dn == "zed editor" {
+            if let Some(ref dv) = rec.display_version {
+                pick_newer_version(&mut best, dv);
+            }
+        }
+    }
+    best
+}
+
+/// Testable detector reading newest installed Trae IDE version from explicit install dirs.
+pub fn installed_trae_ide_version_in_dirs(dirs: &[PathBuf]) -> Option<String> {
+    installed_electron_ide_version_in_dirs(dirs, &["Trae.exe"])
+}
+
+/// Detect installed Trae IDE version across install dirs and Uninstall registry.
+pub fn installed_trae_ide_version() -> Option<String> {
+    let mut best = installed_trae_ide_version_in_dirs(&trae_covered_dirs());
+    for rec in scan_uninstall_records() {
+        let dn = rec.display_name.to_ascii_lowercase();
+        let kn = rec.key_name.to_ascii_lowercase();
+        if dn == "trae" || dn.starts_with("trae ") || kn.contains("trae") {
+            if let Some(ref dv) = rec.display_version {
+                pick_newer_version(&mut best, dv);
+            }
+        }
+    }
+    best
+}
+
 fn plugin_folder_matches(folder_l: &str, patterns: &[&str]) -> bool {
     patterns.iter().any(|raw_pat| {
         let pat = raw_pat.trim().to_ascii_lowercase();
@@ -3275,6 +3666,10 @@ impl CachedProcessSnapshot {
         let guard_claude = guarded_agents.iter().any(|g| g == "claude");
         let guard_chatgpt = guarded_agents.iter().any(|g| g == "chatgpt");
         let guard_ag = guarded_agents.iter().any(|g| g == "antigravity");
+        let guard_cursor = guarded_agents.iter().any(|g| g == "cursor");
+        let guard_windsurf = guarded_agents.iter().any(|g| g == "windsurf");
+        let guard_zed = guarded_agents.iter().any(|g| g == "zed");
+        let guard_trae = guarded_agents.iter().any(|g| g == "trae");
 
         let is_main_gui_exe = |owner_id: &str, exe_name_l: &str| -> bool {
             match owner_id {
@@ -3284,6 +3679,10 @@ impl CachedProcessSnapshot {
                     "chatgpt.exe" | "chatgpt classic.exe" | "codex.exe"
                 ),
                 "antigravity" => matches!(exe_name_l, "antigravity.exe" | "antigravity ide.exe"),
+                "cursor" => exe_name_l == "cursor.exe",
+                "windsurf" => exe_name_l == "windsurf.exe",
+                "zed" => matches!(exe_name_l, "zed.exe" | "zed-cli.exe"),
+                "trae" => exe_name_l == "trae.exe",
                 _ => false,
             }
         };
@@ -3384,6 +3783,22 @@ impl CachedProcessSnapshot {
                 if visited_pids.insert(p.pid) {
                     queue.push((p.pid, label, "antigravity"));
                 }
+                continue;
+            }
+            for (enabled, gid) in [
+                (guard_cursor, "cursor"),
+                (guard_windsurf, "windsurf"),
+                (guard_zed, "zed"),
+                (guard_trae, "trae"),
+            ] {
+                if enabled && gui_agent_matches(gid, &p.name_l, &p.path_l, None) {
+                    let label = gui_agent_name(gid).to_string();
+                    out.insert(p.pid, primary_proc_label(&label, gid, &p.name_l));
+                    if visited_pids.insert(p.pid) {
+                        queue.push((p.pid, label, gid));
+                    }
+                    break;
+                }
             }
         }
 
@@ -3410,6 +3825,9 @@ impl CachedProcessSnapshot {
                             .iter()
                             .any(|d| path_under_dir_l(&child.path_l, d))
                             || gui_agent_matches("chatgpt", &child.name_l, &child.path_l, None)
+                    }
+                    "cursor" | "windsurf" | "zed" | "trae" => {
+                        gui_agent_matches(owner_id, &child.name_l, &child.path_l, None)
                     }
                     _ => false,
                 };
@@ -3464,6 +3882,9 @@ fn primary_gui_matches_with_dirs(
                     .any(|d| path_under_dir_l(&p.path_l, d))
         }
         "antigravity" => is_antigravity_dir_proc(p, ag_dirs_l),
+        "cursor" | "windsurf" | "zed" | "trae" => {
+            gui_agent_matches(agent_id, &p.name_l, &p.path_l, None)
+        }
         _ => false,
     }
 }
@@ -4324,7 +4745,79 @@ pub enum LaunchTarget {
     /// Launch packaged MSIX app via `explorer.exe shell:AppsFolder\<app_user_model_id>`.
     AppsFolder { app_user_model_id: String },
     /// Launch standard desktop executable directly (must be an existing `.exe` file).
-    Executable { path: PathBuf, args: Vec<String> },
+    Executable {
+        path: PathBuf,
+        args: Vec<String>,
+        /// Case-insensitive environment overrides merged into the target user's env block.
+        #[serde(default)]
+        extra_env: BTreeMap<String, String>,
+        /// Optional explicit working directory (defaults to the executable's parent directory).
+        #[serde(default)]
+        working_dir: Option<PathBuf>,
+    },
+}
+
+impl Default for LaunchTarget {
+    fn default() -> Self {
+        Self::Executable {
+            path: PathBuf::new(),
+            args: Vec::new(),
+            extra_env: BTreeMap::new(),
+            working_dir: None,
+        }
+    }
+}
+
+impl LaunchTarget {
+    /// Convenience constructor for an `Executable` target with empty `extra_env` and default `working_dir`.
+    pub fn executable(path: PathBuf, args: Vec<String>) -> Self {
+        Self::Executable {
+            path,
+            args,
+            extra_env: BTreeMap::new(),
+            working_dir: None,
+        }
+    }
+
+    /// Convenience constructor for an `Executable` target carrying explicit `extra_env` and optional `working_dir`.
+    pub fn executable_with_env(
+        path: PathBuf,
+        args: Vec<String>,
+        extra_env: BTreeMap<String, String>,
+        working_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::Executable {
+            path,
+            args,
+            extra_env,
+            working_dir,
+        }
+    }
+
+    /// Borrow `extra_env` overrides when this target is `LaunchTarget::Executable`.
+    pub fn extra_env(&self) -> Option<&BTreeMap<String, String>> {
+        match self {
+            Self::Executable { extra_env, .. } => Some(extra_env),
+            Self::AppsFolder { .. } => None,
+        }
+    }
+}
+
+/// Pure validator rejecting NUL bytes, empty keys, or `'='` inside `extra_env` variable names.
+pub fn validate_extra_env(extra_env: &BTreeMap<String, String>) -> PlatformResult<()> {
+    for (k, v) in extra_env {
+        if k.trim().is_empty() || k.contains('\0') || k.contains('=') {
+            return Err(PlatformError::InvalidInput(format!(
+                "invalid environment variable name `{k}`"
+            )));
+        }
+        if v.contains('\0') {
+            return Err(PlatformError::InvalidInput(format!(
+                "environment variable `{k}` value contains embedded NUL"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Pure builder validating `LaunchTarget` and constructing `(program, args)`.
@@ -4345,7 +4838,13 @@ pub fn build_launch_command(target: &LaunchTarget) -> PlatformResult<(PathBuf, V
                 .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\explorer.exe"));
             Ok((explorer, vec![format!("shell:AppsFolder\\{aumid}")]))
         }
-        LaunchTarget::Executable { path, args } => {
+        LaunchTarget::Executable {
+            path,
+            args,
+            extra_env,
+            ..
+        } => {
+            validate_extra_env(extra_env)?;
             if !path.is_file() {
                 return Err(PlatformError::InvalidInput(format!(
                     "executable not found: {}",
@@ -4355,6 +4854,106 @@ pub fn build_launch_command(target: &LaunchTarget) -> PlatformResult<(PathBuf, V
             Ok((path.clone(), args.clone()))
         }
     }
+}
+
+fn split_windows_env_entry(entry: &str) -> Option<(String, String)> {
+    if entry.is_empty() {
+        return None;
+    }
+    // Preserve Windows drive-current-directory pseudo-variables like `=C:=C:\Windows`.
+    let eq_idx = if entry.starts_with('=') {
+        entry.get(1..)?.find('=').map(|i| i + 1)?
+    } else {
+        entry.find('=')?
+    };
+    let key = entry.get(..eq_idx)?;
+    let val = entry.get(eq_idx + 1..)?;
+    if key.is_empty() {
+        return None;
+    }
+    Some((key.to_string(), val.to_string()))
+}
+
+/// Parse a double-NUL-terminated Windows UTF-16 environment block into `(key, value)` pairs.
+pub fn decode_windows_unicode_env_block(block: &[u16]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < block.len() {
+        if block[start] == 0 {
+            break;
+        }
+        let end = block[start..]
+            .iter()
+            .position(|&u| u == 0)
+            .map(|rel| start + rel)
+            .unwrap_or(block.len());
+        let entry = String::from_utf16_lossy(&block[start..end]);
+        if let Some(pair) = split_windows_env_entry(&entry) {
+            out.push(pair);
+        }
+        if end >= block.len() {
+            break;
+        }
+        start = end + 1;
+    }
+    out
+}
+
+/// Encode `(key, value)` pairs as a sorted, double-NUL-terminated UTF-16 Windows environment block.
+pub fn encode_env_pairs_utf16(pairs: &[(String, String)]) -> PlatformResult<Vec<u16>> {
+    let mut sorted: Vec<(&str, &str)> = Vec::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        if k.is_empty() || k.contains('\0') || v.contains('\0') {
+            return Err(PlatformError::InvalidInput(format!(
+                "invalid environment entry `{k}`"
+            )));
+        }
+        sorted.push((k.as_str(), v.as_str()));
+    }
+    sorted.sort_by_key(|(k, _)| k.to_ascii_uppercase());
+
+    let mut block: Vec<u16> = Vec::new();
+    for (k, v) in sorted {
+        block.extend(k.encode_utf16());
+        block.push(b'=' as u16);
+        block.extend(v.encode_utf16());
+        block.push(0);
+    }
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    Ok(block)
+}
+
+/// Pure case-insensitive Windows UTF-16 environment block merger.
+///
+/// Parses `base_utf16` (double-NUL-terminated UTF-16 as returned by `CreateEnvironmentBlock`),
+/// overrides matching keys or appends new keys from `extra_env` case-insensitively, sorts
+/// entries in Windows case-insensitive key order, and returns a double-NUL-terminated `Vec<u16>`.
+pub fn merge_windows_unicode_env_block(
+    base_utf16: &[u16],
+    extra_env: &BTreeMap<String, String>,
+) -> PlatformResult<Vec<u16>> {
+    validate_extra_env(extra_env)?;
+    let mut merged = decode_windows_unicode_env_block(base_utf16);
+
+    for (extra_k, extra_v) in extra_env {
+        let mut replaced = false;
+        for (k, v) in &mut merged {
+            if k.eq_ignore_ascii_case(extra_k) {
+                *k = extra_k.clone();
+                *v = extra_v.clone();
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            merged.push((extra_k.clone(), extra_v.clone()));
+        }
+    }
+
+    encode_env_pairs_utf16(&merged)
 }
 
 fn push_quoted_win32_arg(out: &mut String, arg: &str, force_quotes: bool) {
@@ -4484,20 +5083,69 @@ fn build_user_unicode_env_block_for_service() -> Option<Vec<u16>> {
     env_map.push(("LOCALAPPDATA".into(), local_s));
     env_map.push(("TEMP".into(), temp.clone()));
     env_map.push(("TMP".into(), temp));
-    env_map.sort_by_key(|a| a.0.to_ascii_uppercase());
+    encode_env_pairs_utf16(&env_map).ok()
+}
 
-    let mut block: Vec<u16> = Vec::new();
-    for (k, v) in env_map {
-        if k.contains('\0') || v.contains('\0') {
-            continue;
+#[cfg(windows)]
+fn build_merged_user_env_block(
+    user_token: windows::Win32::Foundation::HANDLE,
+    extra_env: &BTreeMap<String, String>,
+    session_zero_fallback: bool,
+) -> PlatformResult<Option<Vec<u16>>> {
+    use core::ffi::c_void;
+    use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+
+    validate_extra_env(extra_env)?;
+
+    struct EnvBlockGuard(*mut c_void);
+    impl Drop for EnvBlockGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let _ = DestroyEnvironmentBlock(self.0);
+                }
+            }
         }
-        block.extend(k.encode_utf16());
-        block.push(b'=' as u16);
-        block.extend(v.encode_utf16());
-        block.push(0);
     }
-    block.push(0);
-    Some(block)
+
+    let mut raw_env: *mut c_void = core::ptr::null_mut();
+    let created = unsafe { CreateEnvironmentBlock(&mut raw_env, user_token, false) };
+    if created.is_ok() && !raw_env.is_null() {
+        let _guard = EnvBlockGuard(raw_env);
+        // Bounded scan for double-NUL terminator (max 1 MiB UTF-16 units = 2 MiB)
+        const MAX_UTF16_UNITS: usize = 512 * 1024;
+        let ptr = raw_env.cast::<u16>();
+        let mut len = 0usize;
+        unsafe {
+            while len + 1 < MAX_UTF16_UNITS {
+                let cur = *ptr.add(len);
+                let next = *ptr.add(len + 1);
+                if cur == 0 && next == 0 {
+                    len += 2;
+                    break;
+                }
+                len += 1;
+            }
+        }
+        let base_slice = unsafe { core::slice::from_raw_parts(ptr, len) };
+        return Ok(Some(merge_windows_unicode_env_block(
+            base_slice, extra_env,
+        )?));
+    }
+
+    if session_zero_fallback {
+        if let Some(base) = build_user_unicode_env_block_for_service() {
+            return Ok(Some(merge_windows_unicode_env_block(&base, extra_env)?));
+        }
+    }
+
+    if extra_env.is_empty() {
+        return Ok(None);
+    }
+
+    let cur_pairs: Vec<(String, String)> = std::env::vars().collect();
+    let base = encode_env_pairs_utf16(&cur_pairs)?;
+    Ok(Some(merge_windows_unicode_env_block(&base, extra_env)?))
 }
 
 #[cfg(windows)]
@@ -4505,6 +5153,7 @@ fn launch_from_session_zero(
     program: &Path,
     args: &[String],
     cwd: Option<&Path>,
+    extra_env: &BTreeMap<String, String>,
 ) -> PlatformResult<()> {
     use core::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
@@ -4563,7 +5212,7 @@ fn launch_from_session_zero(
         .as_ref()
         .map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr()));
     let mut desktop_w: Vec<u16> = "winsta0\\default".encode_utf16().chain(Some(0)).collect();
-    let env_block = build_user_unicode_env_block_for_service();
+    let env_block = build_merged_user_env_block(primary_tok, extra_env, true)?;
     let flags = if env_block.is_some() {
         CREATE_UNICODE_ENVIRONMENT
     } else {
@@ -4609,7 +5258,9 @@ fn try_launch_via_shell_token(
     program: &Path,
     args: &[String],
     cwd: Option<&Path>,
+    extra_env: &BTreeMap<String, String>,
 ) -> PlatformResult<()> {
+    use core::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -4618,9 +5269,9 @@ fn try_launch_via_shell_token(
         TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
     };
     use windows::Win32::System::Threading::{
-        CreateProcessWithTokenW, OpenProcess, OpenProcessToken, LOGON_WITH_PROFILE,
-        PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-        STARTUPINFOW,
+        CreateProcessWithTokenW, OpenProcess, OpenProcessToken, CREATE_UNICODE_ENVIRONMENT,
+        LOGON_WITH_PROFILE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+        PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
@@ -4681,6 +5332,16 @@ fn try_launch_via_shell_token(
         let cwd_pcwstr = cwd_w
             .as_ref()
             .map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr()));
+        let env_block = if extra_env.is_empty() {
+            None
+        } else {
+            build_merged_user_env_block(primary_tok, extra_env, false)?
+        };
+        let flags = if env_block.is_some() {
+            CREATE_UNICODE_ENVIRONMENT
+        } else {
+            PROCESS_CREATION_FLAGS(0)
+        };
         let si = STARTUPINFOW {
             cb: core::mem::size_of::<STARTUPINFOW>() as u32,
             ..Default::default()
@@ -4692,8 +5353,8 @@ fn try_launch_via_shell_token(
             LOGON_WITH_PROFILE,
             PCWSTR(prog_w.as_ptr()),
             PWSTR(cmd_w.as_mut_ptr()),
-            PROCESS_CREATION_FLAGS(0),
-            None,
+            flags,
+            env_block.as_ref().map(|b| b.as_ptr().cast::<c_void>()),
             cwd_pcwstr,
             &si,
             &mut pi,
@@ -4707,29 +5368,39 @@ fn try_launch_via_shell_token(
 }
 
 /// Launch a desktop app under the normal-privilege interactive user token:
-/// - In Session 0 (`LocalSystem` service): `WTSQueryUserToken` -> `DuplicateTokenEx` -> `CreateProcessAsUserW` (`winsta0\default`).
-/// - When elevated in an interactive session: `GetShellWindow` (`explorer.exe`) -> `CreateProcessWithTokenW(LOGON_WITH_PROFILE)` (falling back to `Command::spawn` if shell token unavailable).
-/// - When already unelevated: `std::process::Command::spawn`.
+/// - In Session 0 (`LocalSystem` service): `WTSQueryUserToken` -> `DuplicateTokenEx` -> `CreateEnvironmentBlock` + `merge_windows_unicode_env_block` -> `CreateProcessAsUserW` (`winsta0\default`).
+/// - When elevated in an interactive session: `GetShellWindow` (`explorer.exe`) -> `CreateProcessWithTokenW(LOGON_WITH_PROFILE)` (with merged env block when `extra_env` is non-empty).
+/// - When already unelevated: `std::process::Command::spawn` with `extra_env`.
 #[cfg(windows)]
 pub fn launch_normal_privilege(target: &LaunchTarget) -> PlatformResult<()> {
     let (program, args) = build_launch_command(target)?;
+    let empty_env = BTreeMap::new();
+    let extra_env = target.extra_env().unwrap_or(&empty_env);
     let cwd = match target {
-        LaunchTarget::Executable { path, .. } => path.parent().filter(|p| p.is_dir()),
+        LaunchTarget::Executable {
+            path, working_dir, ..
+        } => working_dir
+            .as_deref()
+            .filter(|d| d.is_dir())
+            .or_else(|| path.parent().filter(|p| p.is_dir())),
         LaunchTarget::AppsFolder { .. } => None,
     };
 
     if crate::access_win::is_session_zero() {
-        return launch_from_session_zero(&program, &args, cwd);
+        return launch_from_session_zero(&program, &args, cwd, extra_env);
     }
 
     if crate::access_win::is_elevated().unwrap_or(false)
-        && try_launch_via_shell_token(&program, &args, cwd).is_ok()
+        && try_launch_via_shell_token(&program, &args, cwd, extra_env).is_ok()
     {
         return Ok(());
     }
 
     let mut cmd = std::process::Command::new(&program);
     cmd.args(&args);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -4744,6 +5415,11 @@ pub fn launch_normal_privilege(_target: &LaunchTarget) -> PlatformResult<()> {
         "launch_app",
         "Windows shell launcher is only supported on Windows",
     ))
+}
+
+/// Alias for `launch_normal_privilege` preserving v5 Vault launcher naming.
+pub fn spawn_normal_user(target: &LaunchTarget) -> PlatformResult<()> {
+    launch_normal_privilege(target)
 }
 
 #[cfg(test)]
@@ -5464,10 +6140,10 @@ mod tests {
             app_user_model_id: "bad&calc.exe".into(),
         })
         .is_err());
-        assert!(build_launch_command(&LaunchTarget::Executable {
-            path: PathBuf::from(r"Z:\definitely\missing\app.exe"),
-            args: vec![],
-        })
+        assert!(build_launch_command(&LaunchTarget::executable(
+            PathBuf::from(r"Z:\definitely\missing\app.exe"),
+            vec![],
+        ))
         .is_err());
     }
 
@@ -6583,5 +7259,184 @@ mod tests {
         );
         let status = guard.0.wait().expect("wait terminated ping.exe");
         assert!(!status.success());
+    }
+
+    #[test]
+    fn v5_seven_gui_and_four_cli_discovery_and_version_helpers() {
+        assert_eq!(GUI_AGENTS.len(), 7);
+        assert_eq!(CLI_AGENTS.len(), 4);
+        assert!(gui_agent_matches(
+            "cursor",
+            "cursor.exe",
+            r"c:\users\a\appdata\local\programs\cursor\cursor.exe",
+            None
+        ));
+        assert!(gui_agent_matches(
+            "windsurf",
+            "windsurf.exe",
+            r"c:\users\a\appdata\local\programs\windsurf\windsurf.exe",
+            None
+        ));
+        assert!(gui_agent_matches(
+            "zed",
+            "zed.exe",
+            r"c:\users\a\scoop\apps\zed\current\zed.exe",
+            None
+        ));
+        assert!(gui_agent_matches(
+            "trae",
+            "trae.exe",
+            r"c:\users\a\appdata\local\programs\trae\trae.exe",
+            None
+        ));
+        assert!(cli_agent_matches(
+            "aider",
+            "aider.exe",
+            r"c:\users\a\.local\bin\aider.exe",
+            ""
+        ));
+        assert!(cli_agent_matches(
+            "aider",
+            "python.exe",
+            r"c:\python\python.exe",
+            "python -m aider"
+        ));
+
+        let root = unique_temp_dir("v5-ides");
+        let cursor_dir = root.join("cursor");
+        let windsurf_dir = root.join("windsurf");
+        let zed_dir = root.join("zed");
+        let trae_dir = root.join("trae");
+        let home = root.join("home");
+
+        std::fs::create_dir_all(cursor_dir.join("resources").join("app")).unwrap();
+        std::fs::write(cursor_dir.join("Cursor.exe"), b"stub").unwrap();
+        std::fs::write(
+            cursor_dir
+                .join("resources")
+                .join("app")
+                .join("package.json"),
+            r#"{"name":"cursor","version":"0.48.6"}"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(windsurf_dir.join("resources").join("app")).unwrap();
+        std::fs::write(windsurf_dir.join("Windsurf.exe"), b"stub").unwrap();
+        std::fs::write(
+            windsurf_dir
+                .join("resources")
+                .join("app")
+                .join("package.json"),
+            r#"{"name":"windsurf","version":"1.4.2"}"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(&zed_dir).unwrap();
+        std::fs::write(zed_dir.join("Zed.exe"), b"stub").unwrap();
+        std::fs::write(zed_dir.join("manifest.json"), r#"{"version":"0.175.0"}"#).unwrap();
+
+        std::fs::create_dir_all(trae_dir.join("resources").join("app")).unwrap();
+        std::fs::write(trae_dir.join("Trae.exe"), b"stub").unwrap();
+        std::fs::write(
+            trae_dir.join("resources").join("app").join("package.json"),
+            r#"{"name":"trae","version":"1.2.8"}"#,
+        )
+        .unwrap();
+
+        let aider_bin = home.join(".local").join("bin").join("aider.exe");
+        std::fs::create_dir_all(aider_bin.parent().unwrap()).unwrap();
+        std::fs::write(&aider_bin, b"stub").unwrap();
+
+        assert_eq!(
+            discover_cursor_exes_from_dirs(std::slice::from_ref(&cursor_dir)).len(),
+            1
+        );
+        assert_eq!(
+            discover_windsurf_exes_from_dirs(std::slice::from_ref(&windsurf_dir)).len(),
+            1
+        );
+        assert_eq!(
+            discover_zed_exes_from_dirs(std::slice::from_ref(&zed_dir)).len(),
+            1
+        );
+        assert_eq!(
+            discover_trae_exes_from_dirs(std::slice::from_ref(&trae_dir)).len(),
+            1
+        );
+        assert_eq!(discover_cli_exes_in_homes("aider", &[home]).len(), 1);
+
+        assert_eq!(
+            installed_cursor_ide_version_in_dirs(&[cursor_dir]).as_deref(),
+            Some("0.48.6")
+        );
+        assert_eq!(
+            installed_windsurf_ide_version_in_dirs(&[windsurf_dir]).as_deref(),
+            Some("1.4.2")
+        );
+        assert_eq!(
+            installed_zed_ide_version_in_dirs(&[zed_dir]).as_deref(),
+            Some("0.175.0")
+        );
+        assert_eq!(
+            installed_trae_ide_version_in_dirs(&[trae_dir]).as_deref(),
+            Some("1.2.8")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn merges_windows_unicode_env_block_case_insensitively_and_rejects_nul() {
+        let base_pairs = vec![
+            ("=C:".to_string(), r"C:\Windows".to_string()),
+            ("Path".to_string(), r"C:\Windows\System32".to_string()),
+            ("USERPROFILE".to_string(), r"C:\Users\Alice".to_string()),
+            (
+                "HTTP_PROXY".to_string(),
+                "http://127.0.0.1:7890".to_string(),
+            ),
+        ];
+        let base_block = encode_env_pairs_utf16(&base_pairs).unwrap();
+
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "http_proxy".to_string(),
+            "http://127.0.0.1:7892".to_string(),
+        );
+        extra.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            r"C:\Vaults\work\claude".to_string(),
+        );
+
+        let merged = merge_windows_unicode_env_block(&base_block, &extra).unwrap();
+        // Must be double-NUL terminated
+        assert!(merged.len() >= 2);
+        assert_eq!(merged[merged.len() - 1], 0);
+        assert_eq!(merged[merged.len() - 2], 0);
+
+        let decoded = decode_windows_unicode_env_block(&merged);
+        assert_eq!(decoded.len(), 5);
+        assert!(decoded
+            .iter()
+            .any(|(k, v)| k == "=C:" && v == r"C:\Windows"));
+        assert!(decoded
+            .iter()
+            .any(|(k, v)| k == "http_proxy" && v == "http://127.0.0.1:7892"));
+        assert!(decoded
+            .iter()
+            .any(|(k, v)| k == "CLAUDE_CONFIG_DIR" && v == r"C:\Vaults\work\claude"));
+        // Verify sorted case-insensitively
+        for pair in decoded.windows(2) {
+            assert!(pair[0].0.to_ascii_uppercase() <= pair[1].0.to_ascii_uppercase());
+        }
+
+        // Reject NUL in value or '=' in key
+        let mut bad_nul = BTreeMap::new();
+        bad_nul.insert("BAD".to_string(), "val\0injected".to_string());
+        assert!(merge_windows_unicode_env_block(&base_block, &bad_nul).is_err());
+
+        let mut bad_eq = BTreeMap::new();
+        bad_eq.insert("A=B".to_string(), "1".to_string());
+        assert!(merge_windows_unicode_env_block(&base_block, &bad_eq).is_err());
     }
 }

@@ -405,6 +405,126 @@ pub fn set_windows_timezone(_tz_key: &str) -> PlatformResult<String> {
     ))
 }
 
+/// Normalize a Windows `GetUserDefaultGeoName` / Registry `Geo\Name` value (ISO 3166-1 alpha-2
+/// or UN M.49 numeric code) into a clean uppercase string.
+pub fn normalize_geo_name(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_end_matches('\0')
+        .trim()
+        .to_ascii_uppercase();
+    if trimmed.len() == 2 && trimmed.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return Some(trimmed);
+    }
+    if trimmed.len() == 3 && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(trimmed);
+    }
+    None
+}
+
+#[cfg(windows)]
+fn read_user_geo_name_from_reg() -> Option<String> {
+    let key = crate::access_win::open_interactive_user_subkey(r"Control Panel\International\Geo")?;
+    let name: String = key.get_value("Name").ok()?;
+    normalize_geo_name(&name)
+}
+
+#[cfg(windows)]
+fn read_user_geo_name_win32() -> Option<String> {
+    use windows::Win32::Globalization::GetUserDefaultGeoName;
+
+    let mut buf = [0u16; 16];
+    let written = unsafe { GetUserDefaultGeoName(&mut buf) };
+    if written <= 0 {
+        return None;
+    }
+    let len = (written as usize).min(buf.len());
+    let raw = String::from_utf16_lossy(&buf[..len]);
+    normalize_geo_name(&raw)
+}
+
+/// Read the active user's Windows Region / Home Location ISO code (e.g. `"US"`, `"CN"`, `"JP"`)
+/// via `Win32::Globalization::GetUserDefaultGeoName` (prioritizing the interactive user registry
+/// hive when running under Session-0 `LocalSystem`).
+#[cfg(windows)]
+pub fn read_user_geo_name() -> Option<String> {
+    if crate::access_win::is_session_zero() {
+        if let Some(reg_geo) = read_user_geo_name_from_reg() {
+            return Some(reg_geo);
+        }
+        return read_user_geo_name_win32();
+    }
+    read_user_geo_name_win32().or_else(read_user_geo_name_from_reg)
+}
+
+#[cfg(not(windows))]
+pub fn read_user_geo_name() -> Option<String> {
+    None
+}
+
+fn push_accept_lang_tag(tags: &mut Vec<String>, raw: &str) {
+    let clean = raw.trim().replace('_', "-");
+    if clean.is_empty() {
+        return;
+    }
+    if !tags.iter().any(|t| t.eq_ignore_ascii_case(&clean)) {
+        tags.push(clean.clone());
+    }
+    if let Some((base, _)) = clean.split_once('-') {
+        let base_l = base.to_ascii_lowercase();
+        if !base_l.is_empty() && !tags.iter().any(|t| t.eq_ignore_ascii_case(&base_l)) {
+            tags.push(base_l);
+        }
+    }
+}
+
+/// Pure formatter converting Windows preferred UI languages + fallback locale into a standard
+/// HTTP `Accept-Language` header hint (e.g. `"en-US,en;q=0.9,zh-CN;q=0.8"`).
+pub fn format_accept_language_hint(
+    preferred_languages: &[String],
+    fallback_locale: &str,
+) -> String {
+    let mut tags: Vec<String> = Vec::new();
+    for lang in preferred_languages {
+        push_accept_lang_tag(&mut tags, lang);
+    }
+    if tags.is_empty() {
+        push_accept_lang_tag(&mut tags, fallback_locale);
+    }
+    if tags.is_empty() {
+        return "en-US,en;q=0.9".to_string();
+    }
+
+    let mut parts = Vec::with_capacity(tags.len().min(6));
+    for (idx, tag) in tags.into_iter().take(6).enumerate() {
+        if idx == 0 {
+            parts.push(tag);
+        } else {
+            let q_tenths = 10u8.saturating_sub(idx as u8).max(1);
+            parts.push(format!("{tag};q=0.{q_tenths}"));
+        }
+    }
+    parts.join(",")
+}
+
+/// Read the active Windows interactive user's preferred UI languages (`Control Panel\International\User Profile`)
+/// and format them into an `Accept-Language` hint for OS environment coherence auditing.
+#[cfg(windows)]
+pub fn read_accept_language_hint() -> String {
+    let preferred: Vec<String> = crate::access_win::open_interactive_user_subkey(
+        r"Control Panel\International\User Profile",
+    )
+    .and_then(|key| key.get_value::<Vec<String>, _>("Languages").ok())
+    .unwrap_or_default();
+    let fallback = read_locale_reg();
+    format_accept_language_hint(&preferred, &fallback)
+}
+
+#[cfg(not(windows))]
+pub fn read_accept_language_hint() -> String {
+    "en-US,en;q=0.9".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,6 +581,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn geo_name_normalization_and_accept_language_formatting() {
+        assert_eq!(normalize_geo_name("us\0"), Some("US".into()));
+        assert_eq!(normalize_geo_name(" cn "), Some("CN".into()));
+        assert_eq!(normalize_geo_name("419"), Some("419".into()));
+        assert_eq!(normalize_geo_name("invalid-geo"), None);
+
+        assert_eq!(
+            format_accept_language_hint(&["en-US".into(), "zh-CN".into()], "zh-CN"),
+            "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7"
+        );
+        assert_eq!(format_accept_language_hint(&[], "ja_JP"), "ja-JP,ja;q=0.9");
+        assert_eq!(format_accept_language_hint(&[], ""), "en-US,en;q=0.9");
+    }
+
     #[cfg(windows)]
     #[test]
     fn registry_timezone_and_locale_readable() {
@@ -470,5 +605,11 @@ mod tests {
             "TimeZoneKeyName should be readable"
         );
         let _ = read_default_location().expect("location query should not fail");
+        let geo = read_user_geo_name();
+        assert!(
+            geo.as_deref().is_some_and(|g| g.len() == 2 || g.len() == 3),
+            "GetUserDefaultGeoName should return a valid ISO/M.49 code: {geo:?}"
+        );
+        assert!(!read_accept_language_hint().is_empty());
     }
 }
