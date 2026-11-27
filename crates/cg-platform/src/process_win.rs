@@ -12,7 +12,7 @@
 //!   (putting `Antigravity.exe` / `Antigravity IDE.exe` first for Safe Launch while covering
 //!   `resources\bin\language_server.exe`, `webm_encoder.exe`, `elevate.exe`, `agy.exe`, etc.
 //!   in COM Firewall rules, excluding uninstallers).
-//! - CLI agents (`claude-code`, `codex`, `gemini-cli`) are NEVER killed during a trip;
+//! - CLI agents (`claude-code`, `codex`) are NEVER killed during a trip;
 //!   only optional orphan residual sweep cleans CLI processes whose parent terminal (`ppid`)
 //!   is already dead.
 //! - Every termination re-verifies `(pid, start_time, exe_path)` immediately prior to `kill()`
@@ -49,31 +49,10 @@ pub const GUI_AGENTS: &[GuiAgentDef] = &[
         id: "antigravity",
         name: "反重力",
     },
-    GuiAgentDef {
-        id: "cursor",
-        name: "Cursor",
-    },
-    GuiAgentDef {
-        id: "windsurf",
-        name: "Windsurf",
-    },
-    GuiAgentDef {
-        id: "zed",
-        name: "Zed",
-    },
-    GuiAgentDef {
-        id: "trae",
-        name: "Trae",
-    },
 ];
 
 /// CLI agents (monitored for awareness; NEVER killed on trip).
-pub const CLI_AGENTS: &[(&str, &str)] = &[
-    ("claude-code", "Claude Code"),
-    ("codex", "Codex CLI"),
-    ("gemini", "Gemini CLI"),
-    ("aider", "Aider CLI"),
-];
+pub const CLI_AGENTS: &[(&str, &str)] = &[("claude-code", "Claude Code"), ("codex", "Codex CLI")];
 
 pub fn agent_ids() -> Vec<&'static str> {
     GUI_AGENTS.iter().map(|a| a.id).collect()
@@ -205,14 +184,11 @@ fn is_claude_cli_path_l(exe_path_l: &str) -> bool {
 }
 
 /// Pure, zero-I/O classifier returning `true` ONLY when `(agent_id, exe_path, cmdline)`
-/// identifies a root main Electron GUI executable (excluding `Zed.exe` native GPUI, CLI
+/// identifies a root main Electron GUI executable (excluding CLI
 /// tools, uninstallers, SCM services, Chromium `--type=` child workers, and LSP/MCP helpers).
 pub fn is_root_electron_gui_process(agent_id: &str, exe_path: &str, cmdline: Option<&str>) -> bool {
     let id = agent_id.trim().to_ascii_lowercase();
-    if !matches!(
-        id.as_str(),
-        "claude" | "chatgpt" | "antigravity" | "cursor" | "windsurf" | "trae"
-    ) {
+    if !matches!(id.as_str(), "claude" | "chatgpt" | "antigravity") {
         return false;
     }
     let path_l = strip_verbatim_win32_str(exe_path)
@@ -247,9 +223,6 @@ pub fn is_root_electron_gui_process(agent_id: &str, exe_path: &str, cmdline: Opt
                 )
         }
         "antigravity" => matches!(exe_name_l, "antigravity.exe" | "antigravity ide.exe"),
-        "cursor" => exe_name_l == "cursor.exe",
-        "windsurf" => exe_name_l == "windsurf.exe",
-        "trae" => matches!(exe_name_l, "trae.exe" | "trae cn.exe"),
         _ => false,
     }
 }
@@ -290,20 +263,6 @@ pub fn gui_agent_matches(
                 || exe_path_l.contains(r"\programs\antigravity\")
                 || exe_path_l.contains(r"\programs\antigravity ide\")
         }
-        "cursor" => exe_name_l == "cursor.exe" || exe_path_l.contains(r"\programs\cursor\"),
-        "windsurf" => exe_name_l == "windsurf.exe" || exe_path_l.contains(r"\programs\windsurf\"),
-        "zed" => {
-            exe_name_l == "zed.exe"
-                || exe_name_l == "zed-cli.exe"
-                || exe_path_l.contains(r"\programs\zed\")
-                || exe_path_l.contains(r"\scoop\apps\zed\")
-        }
-        "trae" => {
-            exe_name_l == "trae.exe"
-                || exe_name_l == "trae cn.exe"
-                || exe_path_l.contains(r"\programs\trae\")
-                || exe_path_l.contains(r"\programs\trae cn\")
-        }
         _ => false,
     }
 }
@@ -342,34 +301,6 @@ pub fn cli_agent_matches_with_dirs(
                     || exe_path_l.contains(r"@openai\codex")
                     || exe_path_l.contains("@openai/codex")
                     || exe_path_l.contains("codex-win32-"))
-        }
-        "gemini" => {
-            let is_js_runtime = matches!(
-                exe_name_l,
-                "node.exe" | "node" | "bun.exe" | "bun" | "deno.exe" | "deno"
-            );
-            exe_name_l == "gemini.exe"
-                || exe_name_l == "gemini"
-                || exe_path_l.contains(r"\scoop\apps\gemini-cli\")
-                || (is_js_runtime
-                    && (cmd_l.contains("@google/gemini-cli")
-                        || cmd_l.contains(r"@google\gemini-cli")))
-        }
-        "aider" => {
-            let is_py_runtime = matches!(
-                exe_name_l,
-                "python.exe" | "python" | "pythonw.exe" | "python3.exe" | "uv.exe" | "uv"
-            );
-            exe_name_l == "aider.exe"
-                || exe_name_l == "aider"
-                || exe_path_l.contains(r"\aider-chat\")
-                || exe_path_l.contains(r"\uv\tools\aider")
-                || (is_py_runtime
-                    && (cmd_l.contains("aider-chat")
-                        || cmd_l.contains("aider_chat")
-                        || cmd_l.contains(" -m aider")
-                        || cmd_l.contains(r"\aider")
-                        || cmd_l.contains("/aider")))
         }
         _ => false,
     }
@@ -766,9 +697,6 @@ pub fn pick_gui_agent_kill_tree_with_dirs(
                     .any(|d| path_under_dir_l(&child.path_l, d))
                     || gui_agent_matches("chatgpt", &child.name_l, &child.path_l, None)
             }
-            "cursor" | "windsurf" | "zed" | "trae" => {
-                gui_agent_matches(agent_id, &child.name_l, &child.path_l, None)
-            }
             _ => false,
         },
     );
@@ -779,7 +707,7 @@ pub fn pick_gui_agent_kill_tree_with_dirs(
         .collect()
 }
 
-/// Pure selector building the complete kill tree for a CLI agent (`claude-code`, `codex`, `gemini`),
+/// Pure selector building the complete kill tree for a CLI agent (`claude-code`, `codex`),
 /// walking descendant worker/MCP processes children-first and NEVER touching ancestor terminals.
 pub fn pick_cli_agent_kill_tree(cli_id: &str, procs: &[ProcInfo]) -> Vec<ProcessIdentity> {
     pick_cli_agent_kill_tree_with_dirs(cli_id, procs, &[])
@@ -855,7 +783,7 @@ fn cmd_references_dir_l(cmd_l: &str, dir_l: &str) -> bool {
 ///   `webm_encoder.exe`, etc.), their non-shell helper children, and orphaned Antigravity
 ///   sidecar/extension `node.exe` processes (`sidecar_sdk`, `.antigravity\extensions`, or `ag_dirs_l`)
 ///   whose `ppid` is dead are returned (never killing user dev servers in `.gemini\antigravity\scratch`
-///   or Claude/Cursor MCP servers).
+///   or unrelated user MCP servers).
 /// - **Case B (Mid-run detached crash-orphan)**: Even while a live root Antigravity GUI is running,
 ///   any Antigravity-dir process whose `ppid` ancestor chain does NOT reach any live root Antigravity GUI
 ///   AND whose immediate `ppid` is dead (plus its non-shell children) is returned.
@@ -1106,7 +1034,7 @@ pub fn pick_chatgpt_codex_orphans(procs: &[ProcInfo], chatgpt_dirs_l: &[String])
     postorder_indices(&selected, procs)
 }
 
-/// Pure detector for orphaned CLI sessions (`claude-code`, `codex`, `gemini`) whose launching
+/// Pure detector for orphaned CLI sessions (`claude-code`, `codex`) whose launching
 /// parent terminal (`ppid`) is dead, plus their non-shell descendant helpers, ordered **children-first**.
 pub fn pick_cli_orphans(cli_id: &str, procs: &[ProcInfo]) -> Vec<usize> {
     pick_cli_orphans_with_dirs(cli_id, procs, &[])
@@ -1878,10 +1806,6 @@ struct DiscoveryCacheState {
     claude_dirs: Vec<PathBuf>,
     chatgpt_dirs: Vec<PathBuf>,
     antigravity_dirs: Vec<PathBuf>,
-    cursor_dirs: Vec<PathBuf>,
-    windsurf_dirs: Vec<PathBuf>,
-    zed_dirs: Vec<PathBuf>,
-    trae_dirs: Vec<PathBuf>,
 }
 
 fn discovery_cache_slot() -> &'static Mutex<Option<DiscoveryCacheState>> {
@@ -1915,20 +1839,12 @@ fn with_discovery_cache<R>(f: impl FnOnce(&DiscoveryCacheState) -> R) -> R {
     let claude_dirs = compute_claude_covered_dirs(&uninstall_records);
     let chatgpt_dirs = compute_chatgpt_covered_dirs(&uninstall_records);
     let antigravity_dirs = compute_antigravity_covered_dirs(&uninstall_records);
-    let cursor_dirs = compute_cursor_covered_dirs(&uninstall_records);
-    let windsurf_dirs = compute_windsurf_covered_dirs(&uninstall_records);
-    let zed_dirs = compute_zed_covered_dirs(&uninstall_records);
-    let trae_dirs = compute_trae_covered_dirs(&uninstall_records);
     let fresh = DiscoveryCacheState {
         populated_at: Instant::now(),
         uninstall_records,
         claude_dirs,
         chatgpt_dirs,
         antigravity_dirs,
-        cursor_dirs,
-        windsurf_dirs,
-        zed_dirs,
-        trae_dirs,
     };
     let out = f(&fresh);
     let mut guard = discovery_cache_slot()
@@ -2145,179 +2061,6 @@ pub fn discover_antigravity_exes_from_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
 pub fn discover_antigravity_exes_in(local_app_data: Option<&Path>) -> Vec<PathBuf> {
     let dirs = antigravity_covered_dirs_from_roots(local_app_data, None, None);
     discover_antigravity_exes_from_dirs(&dirs)
-}
-
-fn discover_ide_exes_from_dirs(dirs: &[PathBuf], primary_names: &[&str]) -> Vec<PathBuf> {
-    let mut exes = Vec::new();
-    for dir in dirs {
-        for primary_name in primary_names {
-            let primary = dir.join(primary_name);
-            if primary.is_file() && !contains_path_ci(&exes, &primary) {
-                exes.push(primary);
-            }
-        }
-    }
-    for dir in dirs {
-        collect_exes_filtered(dir, 0, 5, &mut exes);
-    }
-    exes
-}
-
-fn compute_cursor_covered_dirs(uninstall_records: &[UninstallRecord]) -> Vec<PathBuf> {
-    let per_user = per_user_local_app_subdirs(&[r"Programs\cursor", r"Programs\Cursor"]);
-    let mut reg_dirs = Vec::new();
-    for rec in uninstall_records {
-        let dn = rec.display_name.to_ascii_lowercase();
-        let kn = rec.key_name.to_ascii_lowercase();
-        if dn == "cursor"
-            || dn.starts_with("cursor ")
-            || (kn.contains("dadadada") && dn.contains("cursor"))
-        {
-            if let Some(dir) = rec.install_dir.as_ref().filter(|d| {
-                d.is_dir() && (d.join("Cursor.exe").is_file() || d.join("resources").is_dir())
-            }) {
-                reg_dirs.push(dir.clone());
-            }
-        }
-    }
-    for env_key in ["ProgramFiles", "ProgramFiles(x86)"] {
-        if let Some(pf) = std::env::var_os(env_key).map(PathBuf::from) {
-            let d = pf.join("Cursor");
-            if d.is_dir() && d.join("Cursor.exe").is_file() {
-                reg_dirs.push(d);
-            }
-        }
-    }
-    merge_covered_dirs(per_user, reg_dirs)
-}
-
-pub fn cursor_covered_dirs() -> Vec<PathBuf> {
-    with_discovery_cache(|c| c.cursor_dirs.clone())
-}
-
-pub fn discover_cursor_exes_from_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
-    discover_ide_exes_from_dirs(dirs, &["Cursor.exe"])
-}
-
-fn compute_windsurf_covered_dirs(uninstall_records: &[UninstallRecord]) -> Vec<PathBuf> {
-    let per_user = per_user_local_app_subdirs(&[r"Programs\Windsurf", r"Programs\windsurf"]);
-    let mut reg_dirs = Vec::new();
-    for rec in uninstall_records {
-        let dn = rec.display_name.to_ascii_lowercase();
-        let kn = rec.key_name.to_ascii_lowercase();
-        if dn == "windsurf" || dn.starts_with("windsurf") || kn.contains("windsurf") {
-            if let Some(dir) = rec.install_dir.as_ref().filter(|d| {
-                d.is_dir() && (d.join("Windsurf.exe").is_file() || d.join("resources").is_dir())
-            }) {
-                reg_dirs.push(dir.clone());
-            }
-        }
-    }
-    for env_key in ["ProgramFiles", "ProgramFiles(x86)"] {
-        if let Some(pf) = std::env::var_os(env_key).map(PathBuf::from) {
-            let d = pf.join("Windsurf");
-            if d.is_dir() && d.join("Windsurf.exe").is_file() {
-                reg_dirs.push(d);
-            }
-        }
-    }
-    merge_covered_dirs(per_user, reg_dirs)
-}
-
-pub fn windsurf_covered_dirs() -> Vec<PathBuf> {
-    with_discovery_cache(|c| c.windsurf_dirs.clone())
-}
-
-pub fn discover_windsurf_exes_from_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
-    discover_ide_exes_from_dirs(dirs, &["Windsurf.exe"])
-}
-
-fn compute_zed_covered_dirs(uninstall_records: &[UninstallRecord]) -> Vec<PathBuf> {
-    let per_user = per_user_local_app_subdirs(&[r"Programs\Zed", r"Programs\zed"]);
-    let mut extra_dirs = Vec::new();
-    for home in user_home_dirs() {
-        let scoop_cur = home.join("scoop").join("apps").join("zed").join("current");
-        if scoop_cur.is_dir() {
-            extra_dirs.push(scoop_cur);
-        }
-    }
-    let global_scoop_cur = program_data_scoop_root()
-        .join("apps")
-        .join("zed")
-        .join("current");
-    if global_scoop_cur.is_dir() {
-        extra_dirs.push(global_scoop_cur);
-    }
-    for rec in uninstall_records {
-        let dn = rec.display_name.to_ascii_lowercase();
-        if dn == "zed" || dn.starts_with("zed ") || dn == "zed editor" {
-            if let Some(dir) = rec.install_dir.as_ref().filter(|d| {
-                d.is_dir() && (d.join("Zed.exe").is_file() || d.join("zed.exe").is_file())
-            }) {
-                extra_dirs.push(dir.clone());
-            }
-        }
-    }
-    for env_key in ["ProgramFiles", "ProgramFiles(x86)"] {
-        if let Some(pf) = std::env::var_os(env_key).map(PathBuf::from) {
-            let d = pf.join("Zed");
-            if d.is_dir() && (d.join("Zed.exe").is_file() || d.join("zed.exe").is_file()) {
-                extra_dirs.push(d);
-            }
-        }
-    }
-    merge_covered_dirs(per_user, extra_dirs)
-}
-
-pub fn zed_covered_dirs() -> Vec<PathBuf> {
-    with_discovery_cache(|c| c.zed_dirs.clone())
-}
-
-pub fn discover_zed_exes_from_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
-    discover_ide_exes_from_dirs(dirs, &["Zed.exe", "zed.exe", "zed-cli.exe"])
-}
-
-fn compute_trae_covered_dirs(uninstall_records: &[UninstallRecord]) -> Vec<PathBuf> {
-    let per_user = per_user_local_app_subdirs(&[
-        r"Programs\Trae",
-        r"Programs\trae",
-        r"Programs\Trae CN",
-        r"Programs\trae cn",
-    ]);
-    let mut reg_dirs = Vec::new();
-    for rec in uninstall_records {
-        let dn = rec.display_name.to_ascii_lowercase();
-        let kn = rec.key_name.to_ascii_lowercase();
-        if dn == "trae" || dn.starts_with("trae ") || kn.contains("trae") {
-            if let Some(dir) = rec.install_dir.as_ref().filter(|d| {
-                d.is_dir()
-                    && (d.join("Trae.exe").is_file()
-                        || d.join("Trae CN.exe").is_file()
-                        || d.join("resources").is_dir())
-            }) {
-                reg_dirs.push(dir.clone());
-            }
-        }
-    }
-    for env_key in ["ProgramFiles", "ProgramFiles(x86)"] {
-        if let Some(pf) = std::env::var_os(env_key).map(PathBuf::from) {
-            for sub in ["Trae", "Trae CN"] {
-                let d = pf.join(sub);
-                if d.is_dir() && (d.join("Trae.exe").is_file() || d.join("Trae CN.exe").is_file()) {
-                    reg_dirs.push(d);
-                }
-            }
-        }
-    }
-    merge_covered_dirs(per_user, reg_dirs)
-}
-
-pub fn trae_covered_dirs() -> Vec<PathBuf> {
-    with_discovery_cache(|c| c.trae_dirs.clone())
-}
-
-pub fn discover_trae_exes_from_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
-    discover_ide_exes_from_dirs(dirs, &["Trae.exe", "Trae CN.exe"])
 }
 
 fn push_unique_dir(out: &mut Vec<PathBuf>, dir: PathBuf) {
@@ -2904,126 +2647,12 @@ pub fn discover_cli_exes_in_homes(cli_id: &str, homes: &[PathBuf]) -> Vec<PathBu
                 }
             }
         }
-        "gemini" => {
-            for home in homes {
-                for direct in [
-                    home.join(".local").join("bin").join("gemini.exe"),
-                    home.join(".bun").join("bin").join("gemini.exe"),
-                    home.join("AppData")
-                        .join("Local")
-                        .join("Volta")
-                        .join("bin")
-                        .join("gemini.exe"),
-                ] {
-                    push_unique_file(&mut exes, direct);
-                }
-                let scoop_gemini = home.join("scoop").join("apps").join("gemini-cli");
-                collect_exes_matching(&scoop_gemini, 0, 4, &|n| n == "gemini.exe", &mut exes);
-                for pkg_dir in candidate_cli_package_dirs_for_home(home, "@google", "gemini-cli") {
-                    collect_exes_matching(&pkg_dir, 0, 6, &|n| n == "gemini.exe", &mut exes);
-                }
-            }
-            if exes.is_empty() {
-                for home in homes {
-                    for shim in [
-                        home.join("AppData")
-                            .join("Roaming")
-                            .join("npm")
-                            .join("gemini.cmd"),
-                        home.join("AppData")
-                            .join("Local")
-                            .join("pnpm")
-                            .join("gemini.cmd"),
-                        home.join("scoop").join("shims").join("gemini.cmd"),
-                        home.join("AppData")
-                            .join("Roaming")
-                            .join("npm")
-                            .join("gemini.ps1"),
-                        home.join("AppData")
-                            .join("Local")
-                            .join("pnpm")
-                            .join("gemini.ps1"),
-                    ] {
-                        push_unique_file(&mut exes, shim);
-                    }
-                }
-            }
-        }
-        "aider" => {
-            for home in homes {
-                for direct in [
-                    home.join(".local").join("bin").join("aider.exe"),
-                    home.join(".cargo").join("bin").join("aider.exe"),
-                    home.join("AppData")
-                        .join("Local")
-                        .join("Volta")
-                        .join("bin")
-                        .join("aider.exe"),
-                    home.join("AppData")
-                        .join("Roaming")
-                        .join("uv")
-                        .join("tools")
-                        .join("aider-chat")
-                        .join("Scripts")
-                        .join("aider.exe"),
-                    home.join("AppData")
-                        .join("Local")
-                        .join("uv")
-                        .join("tools")
-                        .join("aider-chat")
-                        .join("Scripts")
-                        .join("aider.exe"),
-                    home.join(".local")
-                        .join("pipx")
-                        .join("venvs")
-                        .join("aider-chat")
-                        .join("Scripts")
-                        .join("aider.exe"),
-                ] {
-                    push_unique_file(&mut exes, direct);
-                }
-                for py_root in [
-                    home.join("AppData").join("Roaming").join("Python"),
-                    home.join("AppData")
-                        .join("Local")
-                        .join("Programs")
-                        .join("Python"),
-                ] {
-                    if let Ok(rd) = std::fs::read_dir(&py_root) {
-                        for entry in rd.flatten() {
-                            push_unique_file(
-                                &mut exes,
-                                entry.path().join("Scripts").join("aider.exe"),
-                            );
-                        }
-                    }
-                }
-                let scoop_aider = home.join("scoop").join("apps").join("aider");
-                collect_exes_matching(&scoop_aider, 0, 4, &|n| n == "aider.exe", &mut exes);
-            }
-            if exes.is_empty() {
-                for home in homes {
-                    for shim in [
-                        home.join("AppData")
-                            .join("Roaming")
-                            .join("npm")
-                            .join("aider.cmd"),
-                        home.join("AppData")
-                            .join("Local")
-                            .join("pnpm")
-                            .join("aider.cmd"),
-                    ] {
-                        push_unique_file(&mut exes, shim);
-                    }
-                }
-            }
-        }
         _ => {}
     }
     exes
 }
 
-/// Discover standalone native CLI binaries (`claude-code`, `codex`, `gemini`, `aider`) across all user homes and global Scoop.
+/// Discover standalone native CLI binaries (`claude-code`, `codex`) across all user homes and global Scoop.
 pub fn discover_cli_exes(cli_id: &str) -> Vec<PathBuf> {
     let mut exes = discover_cli_exes_in_homes(cli_id, &user_home_dirs());
     let global_scoop = program_data_scoop_root();
@@ -3043,24 +2672,6 @@ pub fn discover_cli_exes(cli_id: &str) -> Vec<PathBuf> {
                 0,
                 4,
                 &|n| n.starts_with("codex"),
-                &mut exes,
-            );
-        }
-        "gemini" => {
-            collect_exes_matching(
-                &global_scoop.join("apps").join("gemini-cli"),
-                0,
-                4,
-                &|n| n == "gemini.exe",
-                &mut exes,
-            );
-        }
-        "aider" => {
-            collect_exes_matching(
-                &global_scoop.join("apps").join("aider"),
-                0,
-                4,
-                &|n| n == "aider.exe",
                 &mut exes,
             );
         }
@@ -3133,8 +2744,7 @@ pub fn discover_chatgpt_exes_from_dirs_and_homes(
     exes
 }
 
-/// Discover covered executables across all 7 GUI agents (`claude`, `chatgpt`, `antigravity`,
-/// `cursor`, `windsurf`, `zed`, `trae`).
+/// Discover covered executables across the 3 core GUI agents (`claude`, `chatgpt`, `antigravity`).
 pub fn discover_agent_exes(agent_id: &str) -> Vec<PathBuf> {
     match agent_id {
         "claude" => {
@@ -3144,10 +2754,6 @@ pub fn discover_agent_exes(agent_id: &str) -> Vec<PathBuf> {
             discover_chatgpt_exes_from_dirs_and_homes(&chatgpt_covered_dirs(), &user_home_dirs())
         }
         "antigravity" => discover_antigravity_exes_from_dirs(&antigravity_covered_dirs()),
-        "cursor" => discover_cursor_exes_from_dirs(&cursor_covered_dirs()),
-        "windsurf" => discover_windsurf_exes_from_dirs(&windsurf_covered_dirs()),
-        "zed" => discover_zed_exes_from_dirs(&zed_covered_dirs()),
-        "trae" => discover_trae_exes_from_dirs(&trae_covered_dirs()),
         _ => Vec::new(),
     }
 }
@@ -3571,129 +3177,6 @@ pub fn installed_antigravity_ide_info() -> (Option<String>, Option<String>) {
     installed_antigravity_ide_info_in_dirs(&antigravity_covered_dirs())
 }
 
-fn installed_electron_ide_version_in_dirs(dirs: &[PathBuf], exe_names: &[&str]) -> Option<String> {
-    let mut best: Option<String> = None;
-    for dir in dirs {
-        if !dir.is_dir() {
-            continue;
-        }
-        let mut dir_ver: Option<String> = None;
-        for exe_name in exe_names {
-            let exe = dir.join(exe_name);
-            if let Some(v) = read_pe_file_version(&exe) {
-                pick_newer_version(&mut dir_ver, &v);
-            }
-        }
-        if dir_ver.is_none() {
-            if let Some(v) =
-                read_package_json_version(&dir.join("resources").join("app").join("package.json"))
-            {
-                pick_newer_version(&mut dir_ver, &v);
-            }
-        }
-        if dir_ver.is_none() {
-            if let Some(v) = read_package_json_version(&dir.join("manifest.json")) {
-                pick_newer_version(&mut dir_ver, &v);
-            }
-        }
-        if dir_ver.is_none() {
-            if let Ok(raw) = std::fs::read_to_string(dir.join("version")) {
-                pick_newer_version(&mut dir_ver, &raw);
-            }
-        }
-        if let Some(ref dv) = dir_ver {
-            pick_newer_version(&mut best, dv);
-        }
-    }
-    best
-}
-
-/// Testable detector reading newest installed Cursor IDE version from explicit install dirs.
-pub fn installed_cursor_ide_version_in_dirs(dirs: &[PathBuf]) -> Option<String> {
-    installed_electron_ide_version_in_dirs(dirs, &["Cursor.exe"])
-}
-
-/// Detect installed Cursor IDE version across install dirs and Uninstall registry.
-pub fn installed_cursor_ide_version() -> Option<String> {
-    let mut best = installed_cursor_ide_version_in_dirs(&cursor_covered_dirs());
-    for rec in scan_uninstall_records() {
-        let dn = rec.display_name.to_ascii_lowercase();
-        let kn = rec.key_name.to_ascii_lowercase();
-        if dn == "cursor"
-            || dn.starts_with("cursor ")
-            || (kn.contains("dadadada") && dn.contains("cursor"))
-        {
-            if let Some(ref dv) = rec.display_version {
-                pick_newer_version(&mut best, dv);
-            }
-        }
-    }
-    best
-}
-
-/// Testable detector reading newest installed Windsurf IDE version from explicit install dirs.
-pub fn installed_windsurf_ide_version_in_dirs(dirs: &[PathBuf]) -> Option<String> {
-    installed_electron_ide_version_in_dirs(dirs, &["Windsurf.exe"])
-}
-
-/// Detect installed Windsurf IDE version across install dirs and Uninstall registry.
-pub fn installed_windsurf_ide_version() -> Option<String> {
-    let mut best = installed_windsurf_ide_version_in_dirs(&windsurf_covered_dirs());
-    for rec in scan_uninstall_records() {
-        let dn = rec.display_name.to_ascii_lowercase();
-        let kn = rec.key_name.to_ascii_lowercase();
-        if dn == "windsurf" || dn.starts_with("windsurf") || kn.contains("windsurf") {
-            if let Some(ref dv) = rec.display_version {
-                pick_newer_version(&mut best, dv);
-            }
-        }
-    }
-    best
-}
-
-/// Testable detector reading newest installed Zed IDE version from explicit install dirs.
-pub fn installed_zed_ide_version_in_dirs(dirs: &[PathBuf]) -> Option<String> {
-    installed_electron_ide_version_in_dirs(dirs, &["Zed.exe", "zed.exe"])
-}
-
-/// Detect installed Zed IDE version across install dirs, Scoop manifests, and Uninstall registry.
-pub fn installed_zed_ide_version() -> Option<String> {
-    let mut best = installed_zed_ide_version_in_dirs(&zed_covered_dirs());
-    for home in user_home_dirs() {
-        scan_scoop_app_version(&home.join("scoop"), "zed", &mut best);
-    }
-    scan_scoop_app_version(&program_data_scoop_root(), "zed", &mut best);
-    for rec in scan_uninstall_records() {
-        let dn = rec.display_name.to_ascii_lowercase();
-        if dn == "zed" || dn.starts_with("zed ") || dn == "zed editor" {
-            if let Some(ref dv) = rec.display_version {
-                pick_newer_version(&mut best, dv);
-            }
-        }
-    }
-    best
-}
-
-/// Testable detector reading newest installed Trae IDE version from explicit install dirs.
-pub fn installed_trae_ide_version_in_dirs(dirs: &[PathBuf]) -> Option<String> {
-    installed_electron_ide_version_in_dirs(dirs, &["Trae.exe"])
-}
-
-/// Detect installed Trae IDE version across install dirs and Uninstall registry.
-pub fn installed_trae_ide_version() -> Option<String> {
-    let mut best = installed_trae_ide_version_in_dirs(&trae_covered_dirs());
-    for rec in scan_uninstall_records() {
-        let dn = rec.display_name.to_ascii_lowercase();
-        let kn = rec.key_name.to_ascii_lowercase();
-        if dn == "trae" || dn.starts_with("trae ") || kn.contains("trae") {
-            if let Some(ref dv) = rec.display_version {
-                pick_newer_version(&mut best, dv);
-            }
-        }
-    }
-    best
-}
-
 fn plugin_folder_matches(folder_l: &str, patterns: &[&str]) -> bool {
     patterns.iter().any(|raw_pat| {
         let pat = raw_pat.trim().to_ascii_lowercase();
@@ -4009,51 +3492,8 @@ impl CachedProcessSnapshot {
         let guard_claude = guarded_agents.iter().any(|g| g == "claude");
         let guard_chatgpt = guarded_agents.iter().any(|g| g == "chatgpt");
         let guard_ag = guarded_agents.iter().any(|g| g == "antigravity");
-        let guard_cursor = guarded_agents.iter().any(|g| g == "cursor");
-        let guard_windsurf = guarded_agents.iter().any(|g| g == "windsurf");
-        let guard_zed = guarded_agents.iter().any(|g| g == "zed");
-        let guard_trae = guarded_agents.iter().any(|g| g == "trae");
         let guard_claude_cli = guard_claude || guarded_agents.iter().any(|g| g == "claude-code");
         let guard_codex_cli = guard_chatgpt || guarded_agents.iter().any(|g| g == "codex");
-        let guard_gemini_cli = guard_ag || guarded_agents.iter().any(|g| g == "gemini");
-        let guard_aider_cli = guarded_agents.iter().any(|g| g == "aider")
-            || guard_claude
-            || guard_chatgpt
-            || guard_cursor;
-
-        let (cached_cursor, cached_windsurf, cached_zed, cached_trae) =
-            if guard_cursor || guard_windsurf || guard_zed || guard_trae {
-                if let Ok(slot) = discovery_cache_slot().lock() {
-                    if let Some(ref st) = *slot {
-                        (
-                            dirs_to_lowercase(st.cursor_dirs.clone()),
-                            dirs_to_lowercase(st.windsurf_dirs.clone()),
-                            dirs_to_lowercase(st.zed_dirs.clone()),
-                            dirs_to_lowercase(st.trae_dirs.clone()),
-                        )
-                    } else {
-                        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-                    }
-                } else {
-                    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-                }
-            } else {
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-            };
-
-        let extra_ide_matches = |gid: &str, p: &ProcInfo| -> bool {
-            if gui_agent_matches(gid, &p.name_l, &p.path_l, None) {
-                return true;
-            }
-            let dirs = match gid {
-                "cursor" => &cached_cursor,
-                "windsurf" => &cached_windsurf,
-                "zed" => &cached_zed,
-                "trae" => &cached_trae,
-                _ => return false,
-            };
-            dirs.iter().any(|d| path_under_dir_l(&p.path_l, d))
-        };
 
         let is_main_gui_exe = |owner_id: &str, exe_name_l: &str| -> bool {
             match owner_id {
@@ -4063,10 +3503,6 @@ impl CachedProcessSnapshot {
                     "chatgpt.exe" | "chatgpt classic.exe" | "codex.exe"
                 ),
                 "antigravity" => matches!(exe_name_l, "antigravity.exe" | "antigravity ide.exe"),
-                "cursor" => exe_name_l == "cursor.exe",
-                "windsurf" => exe_name_l == "windsurf.exe",
-                "zed" => matches!(exe_name_l, "zed.exe" | "zed-cli.exe"),
-                "trae" => matches!(exe_name_l, "trae.exe" | "trae cn.exe"),
                 _ => false,
             }
         };
@@ -4129,38 +3565,6 @@ impl CachedProcessSnapshot {
                 }
                 continue;
             }
-            if guard_gemini_cli
-                && cli_agent_matches_with_dirs(
-                    "gemini",
-                    &p.name_l,
-                    &p.path_l,
-                    &p.cmd_l,
-                    chatgpt_dirs_l,
-                )
-            {
-                let label = "Gemini CLI".to_string();
-                out.insert(p.pid, label.clone());
-                if visited_pids.insert(p.pid) {
-                    queue.push((p.pid, label, "antigravity"));
-                }
-                continue;
-            }
-            if guard_aider_cli
-                && cli_agent_matches_with_dirs(
-                    "aider",
-                    &p.name_l,
-                    &p.path_l,
-                    &p.cmd_l,
-                    chatgpt_dirs_l,
-                )
-            {
-                let label = "Aider".to_string();
-                out.insert(p.pid, label.clone());
-                if visited_pids.insert(p.pid) {
-                    queue.push((p.pid, label, "aider"));
-                }
-                continue;
-            }
             if guard_claude
                 && primary_gui_matches_with_dirs(
                     "claude",
@@ -4201,21 +3605,6 @@ impl CachedProcessSnapshot {
                 }
                 continue;
             }
-            for (enabled, gid) in [
-                (guard_cursor, "cursor"),
-                (guard_windsurf, "windsurf"),
-                (guard_zed, "zed"),
-                (guard_trae, "trae"),
-            ] {
-                if enabled && extra_ide_matches(gid, p) {
-                    let label = gui_agent_name(gid).to_string();
-                    out.insert(p.pid, primary_proc_label(&label, gid, &p.name_l));
-                    if visited_pids.insert(p.pid) {
-                        queue.push((p.pid, label, gid));
-                    }
-                    break;
-                }
-            }
         }
 
         // Walk descendant trees across ALL guarded GUI & CLI processes (through `cmd.exe /c` & SCM services,
@@ -4242,7 +3631,6 @@ impl CachedProcessSnapshot {
                             .any(|d| path_under_dir_l(&child.path_l, d))
                             || gui_agent_matches("chatgpt", &child.name_l, &child.path_l, None)
                     }
-                    "cursor" | "windsurf" | "zed" | "trae" => extra_ide_matches(owner_id, child),
                     _ => false,
                 };
                 if !in_agent_dir && is_interactive_shell_proc(child) {
@@ -4296,39 +3684,8 @@ fn primary_gui_matches_with_dirs(
                     .any(|d| path_under_dir_l(&p.path_l, d))
         }
         "antigravity" => is_antigravity_dir_proc(p, ag_dirs_l),
-        "cursor" | "windsurf" | "zed" | "trae" => {
-            gui_agent_matches(agent_id, &p.name_l, &p.path_l, None)
-        }
         _ => false,
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn primary_gui_matches_with_all_ide_dirs(
-    agent_id: &str,
-    p: &ProcInfo,
-    claude_dirs_l: &[String],
-    chatgpt_dirs_l: &[String],
-    ag_dirs_l: &[String],
-    cursor_dirs_l: &[String],
-    windsurf_dirs_l: &[String],
-    zed_dirs_l: &[String],
-    trae_dirs_l: &[String],
-) -> bool {
-    if primary_gui_matches_with_dirs(agent_id, p, claude_dirs_l, chatgpt_dirs_l, ag_dirs_l) {
-        return true;
-    }
-    if is_uninstaller_exe(&p.name_l) || is_any_cli_agent_with_dirs(p, chatgpt_dirs_l) {
-        return false;
-    }
-    let extra_dirs = match agent_id {
-        "cursor" => cursor_dirs_l,
-        "windsurf" => windsurf_dirs_l,
-        "zed" => zed_dirs_l,
-        "trae" => trae_dirs_l,
-        _ => return false,
-    };
-    extra_dirs.iter().any(|d| path_under_dir_l(&p.path_l, d))
 }
 
 /// Pure snapshot builder over a full process table: identifies primary GUI/CLI agent processes,
@@ -4339,31 +3696,6 @@ pub fn build_process_snapshot_from_table(
     claude_dirs_l: &[String],
     chatgpt_dirs_l: &[String],
     ag_dirs_l: &[String],
-    scanned_at_unix: u64,
-) -> CachedProcessSnapshot {
-    build_process_snapshot_from_table_with_ide_dirs(
-        all_procs,
-        claude_dirs_l,
-        chatgpt_dirs_l,
-        ag_dirs_l,
-        &[],
-        &[],
-        &[],
-        &[],
-        scanned_at_unix,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_process_snapshot_from_table_with_ide_dirs(
-    all_procs: Vec<ProcInfo>,
-    claude_dirs_l: &[String],
-    chatgpt_dirs_l: &[String],
-    ag_dirs_l: &[String],
-    cursor_dirs_l: &[String],
-    windsurf_dirs_l: &[String],
-    zed_dirs_l: &[String],
-    trae_dirs_l: &[String],
     scanned_at_unix: u64,
 ) -> CachedProcessSnapshot {
     let children_by_ppid = build_children_map(&all_procs);
@@ -4399,17 +3731,7 @@ pub fn build_process_snapshot_from_table_with_ide_dirs(
 
     for (idx, p) in all_procs.iter().enumerate() {
         let is_gui = GUI_AGENTS.iter().any(|a| {
-            primary_gui_matches_with_all_ide_dirs(
-                a.id,
-                p,
-                claude_dirs_l,
-                chatgpt_dirs_l,
-                ag_dirs_l,
-                cursor_dirs_l,
-                windsurf_dirs_l,
-                zed_dirs_l,
-                trae_dirs_l,
-            )
+            primary_gui_matches_with_dirs(a.id, p, claude_dirs_l, chatgpt_dirs_l, ag_dirs_l)
         });
         if is_gui {
             keep_indices.insert(idx);
@@ -4511,16 +3833,12 @@ pub fn build_process_snapshot_from_table_with_ide_dirs(
                     _ => false,
                 };
                 if !is_orphan
-                    && primary_gui_matches_with_all_ide_dirs(
+                    && primary_gui_matches_with_dirs(
                         a.id,
                         info,
                         claude_dirs_l,
                         chatgpt_dirs_l,
                         ag_dirs_l,
-                        cursor_dirs_l,
-                        windsurf_dirs_l,
-                        zed_dirs_l,
-                        trae_dirs_l,
                     )
                 {
                     *gui_counts.entry(a.id.to_string()).or_default() += 1;
@@ -4670,10 +3988,6 @@ impl ProcessScanner {
         let claude_dirs_l = dirs_to_lowercase(claude_covered_dirs());
         let chatgpt_dirs_l = dirs_to_lowercase(chatgpt_covered_dirs());
         let ag_dirs_l = dirs_to_lowercase(antigravity_covered_dirs());
-        let cursor_dirs_l = dirs_to_lowercase(cursor_covered_dirs());
-        let windsurf_dirs_l = dirs_to_lowercase(windsurf_covered_dirs());
-        let zed_dirs_l = dirs_to_lowercase(zed_covered_dirs());
-        let trae_dirs_l = dirs_to_lowercase(trae_covered_dirs());
 
         let all_procs = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -4685,15 +3999,11 @@ impl ProcessScanner {
             collected
         };
 
-        let snap = build_process_snapshot_from_table_with_ide_dirs(
+        let snap = build_process_snapshot_from_table(
             all_procs,
             &claude_dirs_l,
             &chatgpt_dirs_l,
             &ag_dirs_l,
-            &cursor_dirs_l,
-            &windsurf_dirs_l,
-            &zed_dirs_l,
-            &trae_dirs_l,
             unix_now(),
         );
         *self.cache.write().unwrap_or_else(|e| e.into_inner()) = snap.clone();
@@ -5018,7 +4328,7 @@ pub fn kill_gui_agent(agent_id: &str) -> Vec<ProcessIdentity> {
     terminate_identities_native(&candidates).killed
 }
 
-/// Kill CLI session process tree matching `cli_id` (`claude-code`, `codex`, `gemini`)
+/// Kill CLI session process tree matching `cli_id` (`claude-code`, `codex`)
 /// children-first with handle-pinned PID-reuse identity re-verification (never touches ancestor terminals).
 pub fn kill_cli_agent(cli_id: &str) -> Vec<ProcessIdentity> {
     use sysinfo::System;
@@ -5875,7 +5185,7 @@ fn is_cli_or_script_launch_target(program: &Path) -> bool {
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if is_claude_cli_path_l(&path_l) || matches!(name_l.as_str(), "gemini.exe" | "aider.exe") {
+    if is_claude_cli_path_l(&path_l) {
         return true;
     }
     if name_l == "codex.exe" {
@@ -6372,14 +5682,6 @@ mod tests {
             ""
         ));
 
-        // Gemini CLI
-        assert!(cli_agent_matches(
-            "gemini",
-            "node.exe",
-            "",
-            "node @google/gemini-cli/dist/index.js"
-        ));
-
         // Antigravity main + language_server & uninstaller exclusion
         assert!(gui_agent_matches(
             "antigravity",
@@ -6790,7 +6092,7 @@ mod tests {
                 r"c:\nodejs\node.exe",
                 r"node c:\users\u\.antigravity\extensions\agy-mcp\index.js",
             ),
-            // User dev server in `.gemini\antigravity\scratch` & Cursor MCP & unreadable-cmd node MUST be spared!
+            // User dev server in `.gemini\antigravity\scratch` & unrelated MCP & unreadable-cmd node MUST be spared!
             mk(
                 601,
                 9999,
@@ -6803,7 +6105,7 @@ mod tests {
                 9999,
                 "node.exe",
                 r"c:\nodejs\node.exe",
-                r"node c:\users\u\.cursor\mcp\server.js",
+                r"node c:\users\u\.vscode\mcp\server.js",
             ),
             mk(603, 9999, "node.exe", r"c:\nodejs\node.exe", ""),
         ];
@@ -7893,7 +7195,7 @@ mod tests {
     }
 
     #[test]
-    fn conpty_interactive_cmd_winget_codex_dir_gemini_and_claude_residual_sweep() {
+    fn conpty_interactive_cmd_winget_codex_dir_and_claude_residual_sweep() {
         // 1. ConPTY / interactive cmd.exe without `/c` vs batch `cmd.exe /c`
         let mk = |pid: u32, ppid: u32, name: &str, path: &str, cmd: &str| ProcInfo {
             pid,
@@ -7985,21 +7287,7 @@ mod tests {
         );
         assert_eq!(gpt_tree.len(), 1);
 
-        // 4. Gemini CLI requires JS runtime (`node`/`bun`/`deno`) + `@google/gemini-cli`
-        assert!(cli_agent_matches(
-            "gemini",
-            "bun.exe",
-            r"c:\bun\bun.exe",
-            r"bun c:\node_modules\@google\gemini-cli\dist\index.js"
-        ));
-        assert!(!cli_agent_matches(
-            "gemini",
-            "code.exe",
-            r"c:\vscode\code.exe",
-            "code gemini-cli"
-        ));
-
-        // 5. `pick_residual` sweeps orphaned Claude `--type=gpu-process` / `github-mcp-server.exe` -> `node.exe` children-first!
+        // 4. `pick_residual` sweeps orphaned Claude `--type=gpu-process` / `github-mcp-server.exe` -> `node.exe` children-first!
         let claude_dir = r"c:\program files\windowsapps\claude_5.1231.2.0_x64__pzs8sxrjxfjjc";
         let residual_procs = vec![
             mk(
@@ -8119,11 +7407,6 @@ mod tests {
             Some("--type=renderer")
         ));
         assert!(!is_root_electron_gui_process(
-            "zed",
-            r"C:\Users\u\AppData\Local\Programs\Zed\Zed.exe",
-            None
-        ));
-        assert!(!is_root_electron_gui_process(
             "claude",
             r"C:\Users\u\.local\share\claude\versions\2.1.88\claude.exe",
             None
@@ -8134,8 +7417,8 @@ mod tests {
             None
         ));
         assert!(is_root_electron_gui_process(
-            "trae",
-            r"C:\Users\u\AppData\Local\Programs\Trae CN\Trae CN.exe",
+            "chatgpt",
+            r"C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.0\app\ChatGPT.exe",
             None
         ));
         assert!(parse_app_update_url("url: http://insecure.example/feed\n").is_none());
@@ -8147,127 +7430,14 @@ mod tests {
     }
 
     #[test]
-    fn v5_seven_gui_and_four_cli_discovery_and_version_helpers() {
-        assert_eq!(GUI_AGENTS.len(), 7);
-        assert_eq!(CLI_AGENTS.len(), 4);
-        assert!(gui_agent_matches(
-            "cursor",
-            "cursor.exe",
-            r"c:\users\a\appdata\local\programs\cursor\cursor.exe",
-            None
-        ));
-        assert!(gui_agent_matches(
-            "windsurf",
-            "windsurf.exe",
-            r"c:\users\a\appdata\local\programs\windsurf\windsurf.exe",
-            None
-        ));
-        assert!(gui_agent_matches(
-            "zed",
-            "zed.exe",
-            r"c:\users\a\scoop\apps\zed\current\zed.exe",
-            None
-        ));
-        assert!(gui_agent_matches(
-            "trae",
-            "trae.exe",
-            r"c:\users\a\appdata\local\programs\trae\trae.exe",
-            None
-        ));
-        assert!(cli_agent_matches(
-            "aider",
-            "aider.exe",
-            r"c:\users\a\.local\bin\aider.exe",
-            ""
-        ));
-        assert!(cli_agent_matches(
-            "aider",
-            "python.exe",
-            r"c:\python\python.exe",
-            "python -m aider"
-        ));
-
-        let root = unique_temp_dir("v5-ides");
-        let cursor_dir = root.join("cursor");
-        let windsurf_dir = root.join("windsurf");
-        let zed_dir = root.join("zed");
-        let trae_dir = root.join("trae");
-        let home = root.join("home");
-
-        std::fs::create_dir_all(cursor_dir.join("resources").join("app")).unwrap();
-        std::fs::write(cursor_dir.join("Cursor.exe"), b"stub").unwrap();
-        std::fs::write(
-            cursor_dir
-                .join("resources")
-                .join("app")
-                .join("package.json"),
-            r#"{"name":"cursor","version":"0.48.6"}"#,
-        )
-        .unwrap();
-
-        std::fs::create_dir_all(windsurf_dir.join("resources").join("app")).unwrap();
-        std::fs::write(windsurf_dir.join("Windsurf.exe"), b"stub").unwrap();
-        std::fs::write(
-            windsurf_dir
-                .join("resources")
-                .join("app")
-                .join("package.json"),
-            r#"{"name":"windsurf","version":"1.4.2"}"#,
-        )
-        .unwrap();
-
-        std::fs::create_dir_all(&zed_dir).unwrap();
-        std::fs::write(zed_dir.join("Zed.exe"), b"stub").unwrap();
-        std::fs::write(zed_dir.join("manifest.json"), r#"{"version":"0.175.0"}"#).unwrap();
-
-        std::fs::create_dir_all(trae_dir.join("resources").join("app")).unwrap();
-        std::fs::write(trae_dir.join("Trae.exe"), b"stub").unwrap();
-        std::fs::write(
-            trae_dir.join("resources").join("app").join("package.json"),
-            r#"{"name":"trae","version":"1.2.8"}"#,
-        )
-        .unwrap();
-
-        let aider_bin = home.join(".local").join("bin").join("aider.exe");
-        std::fs::create_dir_all(aider_bin.parent().unwrap()).unwrap();
-        std::fs::write(&aider_bin, b"stub").unwrap();
-
+    fn core_three_gui_and_two_cli_agent_contract() {
+        assert_eq!(GUI_AGENTS.len(), 3);
+        assert_eq!(CLI_AGENTS.len(), 2);
+        assert_eq!(agent_ids(), vec!["claude", "chatgpt", "antigravity"]);
         assert_eq!(
-            discover_cursor_exes_from_dirs(std::slice::from_ref(&cursor_dir)).len(),
-            1
+            CLI_AGENTS.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec!["claude-code", "codex"]
         );
-        assert_eq!(
-            discover_windsurf_exes_from_dirs(std::slice::from_ref(&windsurf_dir)).len(),
-            1
-        );
-        assert_eq!(
-            discover_zed_exes_from_dirs(std::slice::from_ref(&zed_dir)).len(),
-            1
-        );
-        assert_eq!(
-            discover_trae_exes_from_dirs(std::slice::from_ref(&trae_dir)).len(),
-            1
-        );
-        assert_eq!(discover_cli_exes_in_homes("aider", &[home]).len(), 1);
-
-        assert_eq!(
-            installed_cursor_ide_version_in_dirs(&[cursor_dir]).as_deref(),
-            Some("0.48.6")
-        );
-        assert_eq!(
-            installed_windsurf_ide_version_in_dirs(&[windsurf_dir]).as_deref(),
-            Some("1.4.2")
-        );
-        assert_eq!(
-            installed_zed_ide_version_in_dirs(&[zed_dir]).as_deref(),
-            Some("0.175.0")
-        );
-        assert_eq!(
-            installed_trae_ide_version_in_dirs(&[trae_dir]).as_deref(),
-            Some("1.2.8")
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

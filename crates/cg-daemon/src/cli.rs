@@ -91,7 +91,7 @@ OPTIONS:
     --vault <ID>                   With --hook-gate / vault launch: Sovereign Vault ID (or CG_VAULT_ID env)
     --hook-event, --event <NAME>   With --hook-gate: hook lifecycle event (UserPromptSubmit | PreToolUse)
     --exit-code-block              With --hook-gate: emit stderr and exit 2 on block (for PowerShell wrappers)
-    --app <TARGET>                 With --launch-vault / vault launch: claude_desktop | claude_code_cli | cursor_ide | ...
+    --app <TARGET>                 With --launch-vault / vault launch: claude_desktop | chatgpt_desktop | antigravity_ide | claude_code_cli | codex_cli
     --recheck                      With --check: trigger RecheckNow before reading snapshot
     --pipe <NAME>                  Override Named Pipe (or set CG_PIPE_NAME)
     --data-dir <PATH>              Override WAL data dir (or set CG_DATA_DIR)
@@ -104,16 +104,10 @@ pub fn parse_vault_app_target(raw: &str) -> Result<VaultAppTarget, String> {
         "claude_desktop" | "claude-desktop" | "claude" => Ok(VaultAppTarget::ClaudeDesktop),
         "chatgpt_desktop" | "chatgpt-desktop" | "chatgpt" => Ok(VaultAppTarget::ChatgptDesktop),
         "antigravity_ide" | "antigravity-ide" | "antigravity" => Ok(VaultAppTarget::AntigravityIde),
-        "cursor_ide" | "cursor-ide" | "cursor" => Ok(VaultAppTarget::CursorIde),
-        "windsurf_ide" | "windsurf-ide" | "windsurf" => Ok(VaultAppTarget::WindsurfIde),
-        "zed_ide" | "zed-ide" | "zed" => Ok(VaultAppTarget::ZedIde),
-        "trae_ide" | "trae-ide" | "trae" => Ok(VaultAppTarget::TraeIde),
         "claude_code_cli" | "claude-code-cli" | "claude-code" | "claude_code" => {
             Ok(VaultAppTarget::ClaudeCodeCli)
         }
         "codex_cli" | "codex-cli" | "codex" => Ok(VaultAppTarget::CodexCli),
-        "gemini_cli" | "gemini-cli" | "gemini" => Ok(VaultAppTarget::GeminiCli),
-        "aider_cli" | "aider-cli" | "aider" => Ok(VaultAppTarget::AiderCli),
         other => Err(format!("unknown vault app target '{other}'")),
     }
 }
@@ -521,9 +515,7 @@ fn run_cleanroom_scan(pipe_name: &str, timeout_ms: u32) -> CliOutput {
     let scope = CleanRoomScope {
         claude: true,
         chatgpt_codex: true,
-        cursor: true,
         antigravity: true,
-        windsurf: true,
     };
     let res = PipeClient::connect(pipe_name, timeout_ms)
         .and_then(|mut c| c.call(&PipeRequest::ScanCleanRoom { scope }));

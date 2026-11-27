@@ -17,18 +17,11 @@ pub const HOST_RESOLVER_RULES_VALUE: &str =
     "MAP * ~NOTFOUND , EXCLUDE localhost , EXCLUDE 127.0.0.1 , EXCLUDE ::1";
 
 /// Electron / Chromium-based GUI agents that accept Chromium networking flags.
-pub const ELECTRON_AGENT_IDS: &[&str] = &[
-    "claude",
-    "chatgpt",
-    "antigravity",
-    "cursor",
-    "windsurf",
-    "trae",
-];
+pub const ELECTRON_AGENT_IDS: &[&str] = &["claude", "chatgpt", "antigravity"];
 
 /// Returns `true` when `agent_id` is an Electron / Chromium-based desktop client.
 ///
-/// Native Rust apps such as `zed` and CLI tools return `false`.
+/// CLI tools and unknown non-Electron clients return `false`.
 pub fn is_electron_agent(agent_id: &str) -> bool {
     let norm = agent_id.trim();
     ELECTRON_AGENT_IDS
@@ -242,7 +235,7 @@ mod tests {
 
     #[test]
     fn system_proxy_injects_full_hygiene_including_proxy_and_host_resolver_rules() {
-        for agent in ["claude", "chatgpt", "cursor", "windsurf", "trae"] {
+        for agent in ["claude", "chatgpt", "antigravity"] {
             let args = plan_electron_hygiene_args(
                 agent,
                 AccessLevel::SystemProxy,
@@ -337,10 +330,11 @@ mod tests {
 
     #[test]
     fn non_electron_disabled_and_missing_proxy_behave_safely() {
-        assert!(!is_electron_agent("zed"));
+        assert!(!is_electron_agent("claude-code"));
+        assert!(!is_electron_agent("codex"));
         assert!(
             plan_electron_hygiene_args(
-                "zed",
+                "claude-code",
                 AccessLevel::SystemProxy,
                 Some("127.0.0.1:7890"),
                 false

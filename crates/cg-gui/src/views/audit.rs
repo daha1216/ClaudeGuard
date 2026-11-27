@@ -12,8 +12,8 @@ use crate::protocol::{LogLevel, PipeRequest, TimelineStatus, UiLabelExt};
 use crate::state::{ConsoleProjection, format_unix_hm, format_unix_ymdhms};
 use crate::theme::ThemePalette;
 use crate::widgets::controls::{
-    ButtonKind, action_button, bento_card_bloom, inset_box, mono_tabular, spinning_ui_icon,
-    status_dot,
+    ButtonKind, action_button, bento_card_bloom, inset_box, mono_tabular, spinning_action_button,
+    spinning_ui_icon, status_dot,
 };
 use gpui::{
     BoxShadow, Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, rgb, rgba,
@@ -37,6 +37,7 @@ pub fn render_audit_page(
     let search_input = ctrl_r.inputs.search.clone();
     let logs_loading = ctrl_r.logs_loading;
     let export_busy = ctrl_r.is_scope_busy(&ActionScope::ExportDiagnostics);
+    let health_card_busy = ctrl_r.is_scope_busy(&ActionScope::BuildHealthCard);
     let total_server = ctrl_r.queried_logs_total;
     let connected = ctrl_r.connected;
     let busy = ctrl_r.busy_action;
@@ -44,6 +45,7 @@ pub fn render_audit_page(
     let ctrl_clear = ctrl.clone();
     let ctrl_refresh = ctrl.clone();
     let ctrl_copy_batch = ctrl.clone();
+    let ctrl_health_card = ctrl.clone();
     let ctrl_export = ctrl.clone();
     let ctrl_reset_all = ctrl.clone();
     let ctrl_clear_search = ctrl.clone();
@@ -379,6 +381,7 @@ pub fn render_audit_page(
     };
     let can_pull = connected && !logs_loading;
     let can_export = connected && !busy;
+    let can_export_health = connected && !busy && !health_card_busy;
     let hover_tile = p.sidebar_hover_bg;
 
     let ctrl_copy_log = ctrl.clone();
@@ -652,6 +655,36 @@ pub fn render_audit_page(
                                             }),
                                         )
                                     }),
+                                )
+                                .child(
+                                    spinning_action_button(
+                                        "audit-export-health-card",
+                                        "icons/ui/shield.svg",
+                                        if health_card_busy {
+                                            "生成中…"
+                                        } else {
+                                            "导出防封体检图"
+                                        },
+                                        ButtonKind::Secondary,
+                                        can_export_health,
+                                        health_card_busy,
+                                        p,
+                                    )
+                                    .h(px(28.))
+                                    .px(px(10.))
+                                    .when(
+                                        can_export_health,
+                                        |b| {
+                                            b.on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |_, _, _, cx| {
+                                                    ctrl_health_card.update(cx, |c, cx| {
+                                                        c.build_and_export_health_card(true, cx);
+                                                    });
+                                                }),
+                                            )
+                                        },
+                                    ),
                                 )
                                 .child(
                                     action_button(

@@ -3969,7 +3969,7 @@ mod tests {
         store.insert_filter_meta(
             702,
             WfpFilterAttribution {
-                agent_id: "cursor".into(),
+                agent_id: "antigravity".into(),
                 filter_reason: "ipv6_shield".into(),
                 layer: "ale_auth_connect_v6".into(),
             },
@@ -4096,7 +4096,7 @@ mod tests {
         assert_eq!(events[0].app_path, r"\device\harddiskvolume3\claude.exe");
 
         assert_eq!(events[1].seq, 2);
-        assert_eq!(events[1].agent_id, "cursor");
+        assert_eq!(events[1].agent_id, "antigravity");
         assert_eq!(events[1].filter_reason, "ipv6_shield");
         assert_eq!(events[1].protocol, "tcp");
         assert_eq!(events[1].remote_ip, "2606:4700:4700::1111");

@@ -6,7 +6,7 @@
 
 ## [5.0.0] - 2026-11-27
 
-**反封号堡垒大版本（Anti-Ban Fortress，M1–M7 全模块落地）**：全面引入 Win32 WFP 内核态动态过滤与实时拦截瀑布流、10 维封号风险雷达与 290+ 离线 ASN 库、DPAPI-HMAC 7 天地理速度账本、原生 RFC 5389 STUN 与 Electron 参数卫生治理、独立多账号金库（Sovereign Vaults）、4 维无尘室清理器与 `CGBAK005` 加密时光机、`<2ms` O(1) CLI Hook 门禁与 WSL2 HMAC 桥接，并将受管矩阵扩展至 7 款 AI 桌面客户端 + 4 款 CLI。
+**反封号堡垒大版本（Anti-Ban Fortress，M1–M7 全模块落地）**：全面引入 Win32 WFP 内核态动态过滤与实时拦截瀑布流、10 维封号风险雷达与 290+ 离线 ASN 库、DPAPI-HMAC 7 天地理速度账本、原生 RFC 5389 STUN 与 Electron 参数卫生治理、独立多账号金库（Sovereign Vaults）、4 维无尘室清理器与 `CGBAK005` 加密时光机、`<2ms` O(1) CLI Hook 门禁与 WSL2 HMAC 桥接，聚焦守护核心 AI 套件（`Claude`、`Claude Code`、`ChatGPT`、`Codex CLI`、`Antigravity`）并精简总览交互布局。
 
 ### M1 · Win32 WFP 内核态防漏引擎与实时阻断瀑布流
 
@@ -50,13 +50,13 @@
   - 仅监听 `127.0.0.1:0` 的 WSL2 桥接服务，基于每次启动轮换的 256-bit `.claudeguard-wsl-token`（受限用户 DACL）、HMAC-SHA256、60 秒时间窗与 512 容量 LRU Nonce 防重放缓存，并检测宿主机与 WSL2 代理失步。
   - `BurstGuard` 追踪高频请求与机械等间隔自动化节拍，及时预警或节流降低风控触发概率。
 
-### M7 · 7 桌面端 + 4 CLI 全栈矩阵、全局快捷键与零泄露健康卡
+### M7 · 核心 AI 套件全栈守护、全局快捷键与零泄露健康卡
 
-- **7 GUI + 4 CLI 扩展守护矩阵（`cg-core::agents` / `cg-platform::process_win` / `cg-platform::update_check`）**：
-  - 桌面端新增 `Cursor`、`Windsurf`、`Zed`、`Trae`（连同 `Claude Desktop`、`ChatGPT / Codex`、`Antigravity IDE` 共 7 款）守护与本地版本检测；CLI 扩展至 `Claude Code`、`Codex CLI`、`Gemini CLI`、`Aider CLI`（共 4 款）。
+- **聚焦核心 AI 套件深度守护（`cg-core::agents` / `cg-platform::process_win` / `cg-platform::update_check`）**：
+  - 聚焦核心 3 桌面端 + 2 CLI 受管矩阵（`Claude Desktop`、`ChatGPT / Codex`、`Antigravity IDE`、`Claude Code`、`Codex CLI`），去除低相关冗余客户端噪音，保留原生安装包、MSIX、Volta/Scoop/Bun/Winget 与 Session-0 全路径深度探测及 10 组件只读更新巡检。
 - **原生 Win32 全局热键与零 IP 泄露健康诊断卡（`cg-gui::tray_win` / `cg-gui::health_card`）**：
   - 通过托盘隐藏窗口原生 `RegisterHotKey` 注册全局「紧急一键锁死」与「快捷 HUD」热键（零 `SetWindowsHookEx` 钩子、退出自动注销、冲突优雅提示）。
-  - 新增零外部依赖纯 Rust 脱敏健康卡（Markdown 文本 + `1200×680` Frost Ceramic / Obsidian 无元数据 PNG 导出），单元测试强约束零 IP、零 Windows 用户名泄露。
+  - 新增零外部依赖纯 Rust 脱敏健康卡（Markdown 文本 + `1200×680` Frost Ceramic / Obsidian 无元数据 PNG 导出），单元测试强约束零 IP、零 Windows 用户名泄露，支持在「防泄露 → 10D 风险雷达」与「审计」页顶栏一键导出。
 
 ### 深度安全加固、零误锁网络门禁与全栈交互精修
 
@@ -67,8 +67,8 @@
   - 严格限定仅在 `TUN` 模式下执行守护进程原始 UDP STUN 探测，消除 `SystemProxy` 用户误锁、Clash 规则分流下 EDNS/Tier-3 归属地污染、Null Island `(0,0)` 缺省坐标引发的同国瞬移误锁及合规跨国 IPv6 双栈误否决；拆分 `--hook-gate` 连接与同步重探超时（`500ms` / `6500ms`）消除冷启动假阻断。
   - 支持多账号金库 `dedicated_proxy_port` 独立端口出口探测与缓存、完整 `GuardEngine` 启动门禁校验、句柄绑定进程身份终止及重 I/O 管道请求异步线程卸载；补齐 `mask_snapshot` 与诊断压缩包对全部 v5 新增字段的零泄露脱敏。
 - **GPUI 全闭环交互升级与「说人话」体验重塑（`cg-gui`）**：
-  - 升级 `1020×720` 宽屏 7 核心导航坞 + 顶栏工具胶囊，安全启动台与多账号仓完整覆盖 7 GUI + 4 CLI（对齐 Electron 防漏参数注入、豁免原生 `Zed.exe` 并通过交互式终端启动 `.cmd`/`.ps1` CLI，配置新增 6 款客户端专属徽标）。
-  - 10 维体检分、总览提示条与账号仓支持原地一键修复与冷却秒解，快捷 HUD 与系统托盘右键菜单支持多账号仓一键切换启动；修复无尘室末项取消反选与逐项还原加载态，全面落地零术语中文界面文案。
+  - 升级 `1020×720` 宽屏 7 核心导航坞 + 顶栏工具胶囊；精简总览 Hero 顶栏（移除重复导出按钮、体检评分徽章清爽右对齐），安全启动台保持固定 2×2 核心入口（`Claude`、`Antigravity`、`ChatGPT`、`Code CLI`），受管进程治理与多账号仓精准覆盖 5 大核心受管端（`Claude`、`Claude Code`、`ChatGPT`、`Codex CLI`、`Antigravity`，对齐 Electron 防漏参数注入并通过交互式终端启动 `.cmd`/`.ps1` CLI）。
+  - 10 维体检分、总览提示条与账号仓支持原地一键修复与冷却秒解，快捷 HUD 与系统托盘右键菜单支持多账号仓一键切换启动；防封体检图导出入口统一收口至「防泄露 → 10D 风险雷达」与「审计」页顶栏，修复无尘室末项取消反选与逐项还原加载态，全面落地零术语中文界面文案。
 
 ## [4.1.4] - 2026-11-27
 

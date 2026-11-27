@@ -194,8 +194,6 @@ fn hydrate_local_updates(
     local: &update_check::LocalClientVersions,
 ) {
     update_check::hydrate_summary_locals(updates, cg_version, ag_proxy, local);
-    let v5_local = update_check::V5LocalIdeVersions::detect();
-    update_check::hydrate_v5_ide_updates(updates, &v5_local, now_unix_secs());
 }
 
 fn merge_slot(dst: &mut ComponentUpdateStatus, incoming: ComponentUpdateStatus) {
@@ -231,10 +229,6 @@ fn merge_telemetry_updates(dst: &mut UpdateSummary, incoming: UpdateSummary) {
     merge_slot(&mut dst.antigravity_cn, incoming.antigravity_cn);
     merge_slot(&mut dst.ag_usage_monitor, incoming.ag_usage_monitor);
     merge_slot(&mut dst.ag_capsule, incoming.ag_capsule);
-    merge_slot(&mut dst.cursor_ide, incoming.cursor_ide);
-    merge_slot(&mut dst.windsurf_ide, incoming.windsurf_ide);
-    merge_slot(&mut dst.zed_ide, incoming.zed_ide);
-    merge_slot(&mut dst.trae_ide, incoming.trae_ide);
 }
 
 fn parse_update_component_filter(
@@ -267,14 +261,6 @@ fn parse_update_component_filter(
                 Ok((false, false, Some("ag_usage_monitor".to_string())))
             }
             "ag_capsule" | "agy-capsule" => Ok((false, false, Some("ag_capsule".to_string()))),
-            "cursor_ide" | "cursor-ide" | "cursor" => {
-                Ok((false, false, Some("cursor_ide".to_string())))
-            }
-            "windsurf_ide" | "windsurf-ide" | "windsurf" => {
-                Ok((false, false, Some("windsurf_ide".to_string())))
-            }
-            "zed_ide" | "zed-ide" | "zed" => Ok((false, false, Some("zed_ide".to_string()))),
-            "trae_ide" | "trae-ide" | "trae" => Ok((false, false, Some("trae_ide".to_string()))),
             "plugins" | "antigravity_plugins" => {
                 Ok((false, true, Some("antigravity_plugins".to_string())))
             }
@@ -330,10 +316,6 @@ fn build_skipped_update_summary(
         ("antigravity_cn", &mut out.antigravity_cn),
         ("ag_usage_monitor", &mut out.ag_usage_monitor),
         ("ag_capsule", &mut out.ag_capsule),
-        ("cursor_ide", &mut out.cursor_ide),
-        ("windsurf_ide", &mut out.windsurf_ide),
-        ("zed_ide", &mut out.zed_ide),
-        ("trae_ide", &mut out.trae_ide),
     ] {
         if component_matches_filter(norm.as_deref(), id) {
             slot.phase = UpdateCheckPhase::Failed;
@@ -3420,14 +3402,8 @@ impl RealEngineActor {
                                 },
                             ),
                             "antigravity" => (vec!["antigravity".to_string()], Vec::new()),
-                            "cursor" => (vec!["cursor".to_string()], Vec::new()),
-                            "windsurf" => (vec!["windsurf".to_string()], Vec::new()),
-                            "zed" => (vec!["zed".to_string()], Vec::new()),
-                            "trae" => (vec!["trae".to_string()], Vec::new()),
                             "claude-code" => (Vec::new(), vec!["claude-code"]),
                             "codex" => (Vec::new(), vec!["codex"]),
-                            "gemini" => (Vec::new(), vec!["gemini"]),
-                            "aider" => (Vec::new(), vec!["aider"]),
                             _ => {
                                 let _ = reply.send(PipeResponse::Error {
                                     code: ErrorCode::InvalidRequest,
@@ -5802,24 +5778,6 @@ fn is_root_electron_gui_proc(
         "claude" => process_win::is_live_root_claude_gui(p, by_pid, &procs.claude_dirs_l),
         "chatgpt" => process_win::is_live_root_chatgpt_codex_gui(p, by_pid, &procs.chatgpt_dirs_l),
         "antigravity" => process_win::is_live_root_antigravity_gui(p, by_pid),
-        "cursor" => {
-            p.name_l == "cursor.exe"
-                && !by_pid
-                    .get(&p.ppid)
-                    .is_some_and(|parent| parent.name_l == "cursor.exe")
-        }
-        "windsurf" => {
-            p.name_l == "windsurf.exe"
-                && !by_pid
-                    .get(&p.ppid)
-                    .is_some_and(|parent| parent.name_l == "windsurf.exe")
-        }
-        "trae" => {
-            matches!(p.name_l.as_str(), "trae.exe" | "trae cn.exe")
-                && !by_pid.get(&p.ppid).is_some_and(|parent| {
-                    matches!(parent.name_l.as_str(), "trae.exe" | "trae cn.exe")
-                })
-        }
         _ => false,
     }
 }
@@ -5828,8 +5786,7 @@ fn is_root_electron_gui_proc(
 /// for live command-line anti-leak hygiene auditing (`NtQueryInformationProcess(60)`).
 ///
 /// Strictly filters out Chromium child helpers (`--type=*`), `ELECTRON_RUN_AS_NODE` sidecars,
-/// LSP/MCP helper binaries (`language_server.exe`, `resources\codex.exe`, `rg.exe`), SCM services,
-/// and non-Electron clients such as `zed` (`#42 [HIGH-3]`).
+/// LSP/MCP helper binaries (`language_server.exe`, `resources\codex.exe`, `rg.exe`), and SCM services.
 pub fn collect_electron_agent_pids(procs: &CachedProcessSnapshot) -> Vec<(String, u32)> {
     let by_pid: HashMap<u32, &process_win::ProcInfo> =
         procs.procs.iter().map(|p| (p.pid, p)).collect();
@@ -6940,26 +6897,6 @@ impl CoordinatorActor for RealEngineActor {
                     &mut next_summary.ag_capsule,
                     &incoming.ag_capsule,
                 );
-                let did_cursor = merge_checked_slot(
-                    check_client("cursor_ide"),
-                    &mut next_summary.cursor_ide,
-                    &incoming.cursor_ide,
-                );
-                let did_windsurf = merge_checked_slot(
-                    check_client("windsurf_ide"),
-                    &mut next_summary.windsurf_ide,
-                    &incoming.windsurf_ide,
-                );
-                let did_zed = merge_checked_slot(
-                    check_client("zed_ide"),
-                    &mut next_summary.zed_ide,
-                    &incoming.zed_ide,
-                );
-                let did_trae = merge_checked_slot(
-                    check_client("trae_ide"),
-                    &mut next_summary.trae_ide,
-                    &incoming.trae_ide,
-                );
 
                 self.step_and_run(
                     EngineEvent::UpdatesChecked {
@@ -7017,10 +6954,6 @@ impl CoordinatorActor for RealEngineActor {
                     record_slot("antigravity_cn", did_cn, &next_summary.antigravity_cn);
                     record_slot("ag_usage_monitor", did_um, &next_summary.ag_usage_monitor);
                     record_slot("ag_capsule", did_cap, &next_summary.ag_capsule);
-                    record_slot("cursor_ide", did_cursor, &next_summary.cursor_ide);
-                    record_slot("windsurf_ide", did_windsurf, &next_summary.windsurf_ide);
-                    record_slot("zed_ide", did_zed, &next_summary.zed_ide);
-                    record_slot("trae_ide", did_trae, &next_summary.trae_ide);
 
                     receipt.verified_scope = scope_parts.join(", ");
                     if failed_count == 0 {
@@ -7840,10 +7773,6 @@ fn has_any_failed_update_slot(u: &UpdateSummary) -> bool {
         &u.antigravity_cn,
         &u.ag_usage_monitor,
         &u.ag_capsule,
-        &u.cursor_ide,
-        &u.windsurf_ide,
-        &u.zed_ide,
-        &u.trae_ide,
     ]
     .into_iter()
     .any(|slot| slot.phase == UpdateCheckPhase::Failed)
@@ -9853,7 +9782,7 @@ mod tests {
             .any(|l| l.category == "trip" && l.message.contains("CLI 3")));
         assert_eq!(
             driver.cli_killed_calls.lock().unwrap().as_slice(),
-            &["claude-code", "codex", "gemini", "aider"]
+            &["claude-code", "codex"]
         );
 
         // Next round while still Quarantined triggers KillGuardedAgents -> also kills both CLIs.
@@ -9864,7 +9793,7 @@ mod tests {
         ));
         assert_eq!(
             driver.cli_killed_calls.lock().unwrap().as_slice(),
-            &["claude-code", "codex", "gemini", "aider"]
+            &["claude-code", "codex"]
         );
 
         // Recover via Flow A, disable kill_cli_on_fail, trip again -> zero CLI kills!
@@ -9948,25 +9877,24 @@ mod tests {
         let proc_snap = CachedProcessSnapshot {
             scanned_at_unix: 1_700_000_600,
             gui_counts: HashMap::from([("claude".into(), 1), ("chatgpt".into(), 2)]),
-            cli_counts: HashMap::from([("gemini".into(), 1)]),
+            cli_counts: HashMap::from([("codex".into(), 1)]),
             orphan_counts: HashMap::from([
                 ("claude".into(), 1),
                 ("chatgpt".into(), 2),
                 ("antigravity".into(), 3),
                 ("claude-code".into(), 4),
                 ("codex".into(), 5),
-                ("gemini".into(), 6),
             ]),
             ..Default::default()
         };
         let rows = build_agent_statuses(&cfg, &proc_snap, &*driver, &[], None);
+        assert_eq!(rows.len(), 5, "3 core GUI + 2 core CLI agents");
         for (id, expected_orphan) in [
             ("claude", 1usize),
             ("chatgpt", 2),
             ("antigravity", 3),
             ("claude-code", 4),
             ("codex", 5),
-            ("gemini", 6),
         ] {
             let row = rows.iter().find(|r| r.id == id).unwrap();
             assert_eq!(row.orphan_count, expected_orphan, "agent {id}");
@@ -9980,16 +9908,14 @@ mod tests {
         );
         let codex_row = rows.iter().find(|r| r.id == "codex").unwrap();
         assert!(codex_row.installed);
-        assert!(codex_row.guarded);
+        assert!(
+            codex_row.guarded,
+            "kill_cli_on_fail covers all KNOWN_CLI_AGENT_IDS"
+        );
+        assert_eq!(codex_row.running_count, 1);
         assert_eq!(
             codex_row.install_paths,
             vec![r"C:\Users\dev\.cargo\bin\codex.exe".to_string()]
-        );
-        let gemini_row = rows.iter().find(|r| r.id == "gemini").unwrap();
-        assert!(gemini_row.installed, "running > 0 marks gemini installed");
-        assert!(
-            gemini_row.guarded,
-            "kill_cli_on_fail covers all KNOWN_CLI_AGENT_IDS"
         );
 
         // Now test PipeRequest::ForceKillAgent via actor.
@@ -10066,7 +9992,7 @@ mod tests {
         );
         assert_eq!(
             driver.cli_killed_calls.lock().unwrap().as_slice(),
-            &["claude-code", "codex", "gemini", "aider"]
+            &["claude-code", "codex"]
         );
 
         coord.shutdown();
@@ -11901,17 +11827,18 @@ mod tests {
                 process_win::ProcInfo {
                     pid: 201,
                     ppid: 10,
-                    name_l: "cursor.exe".into(),
-                    path_l: r"c:\users\alice\appdata\local\programs\cursor\cursor.exe".into(),
-                    cmd_l: "cursor.exe".into(),
+                    name_l: "antigravity.exe".into(),
+                    path_l: r"c:\users\alice\appdata\local\programs\antigravity\antigravity.exe"
+                        .into(),
+                    cmd_l: "antigravity.exe".into(),
                     start_time: 5,
                 },
                 process_win::ProcInfo {
                     pid: 301,
                     ppid: 10,
-                    name_l: "zed.exe".into(),
-                    path_l: r"c:\users\alice\appdata\local\programs\zed\zed.exe".into(),
-                    cmd_l: "zed.exe".into(),
+                    name_l: "language_server.exe".into(),
+                    path_l: r"c:\users\alice\appdata\local\programs\antigravity\resources\bin\language_server.exe".into(),
+                    cmd_l: "language_server.exe".into(),
                     start_time: 6,
                 },
                 process_win::ProcInfo {
@@ -11929,7 +11856,10 @@ mod tests {
         let found = collect_electron_agent_pids(&snap);
         assert_eq!(
             found,
-            vec![("claude".to_string(), 101), ("cursor".to_string(), 201)]
+            vec![
+                ("claude".to_string(), 101),
+                ("antigravity".to_string(), 201)
+            ]
         );
     }
 
@@ -11965,9 +11895,10 @@ mod tests {
                 process_win::ProcInfo {
                     pid: 5003,
                     ppid: 10,
-                    name_l: "cursor.exe".into(),
-                    path_l: r"c:\users\alice\appdata\local\programs\cursor\cursor.exe".into(),
-                    cmd_l: "cursor.exe --user-data-dir=c:/users/alice/appdata/local/claudeguard/vaults/jp/cursor-ide".into(),
+                    name_l: "antigravity.exe".into(),
+                    path_l: r"c:\users\alice\appdata\local\programs\antigravity\antigravity.exe"
+                        .into(),
+                    cmd_l: "antigravity.exe --user-data-dir=c:/users/alice/appdata/local/claudeguard/vaults/jp/antigravity_ide".into(),
                     start_time: 4,
                 },
             ],
@@ -11978,7 +11909,10 @@ mod tests {
         let jp_pids = discover_vault_pids_in_snapshot(&procs, vaults_root, "jp");
         assert_eq!(
             jp_pids,
-            vec![(5001, "claude".to_string()), (5003, "cursor".to_string())]
+            vec![
+                (5001, "claude".to_string()),
+                (5003, "antigravity".to_string())
+            ]
         );
         let jp_work_pids = discover_vault_pids_in_snapshot(&procs, vaults_root, "jp-work");
         assert_eq!(jp_work_pids, vec![(5002, "claude".to_string())]);

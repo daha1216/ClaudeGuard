@@ -247,14 +247,8 @@ impl UiLabelExt for VaultAppTarget {
             Self::ClaudeDesktop => "Claude",
             Self::ChatgptDesktop => "ChatGPT / Codex",
             Self::AntigravityIde => "Antigravity",
-            Self::CursorIde => "Cursor",
-            Self::WindsurfIde => "Windsurf",
-            Self::ZedIde => "Zed",
-            Self::TraeIde => "Trae",
             Self::ClaudeCodeCli => "Claude Code",
             Self::CodexCli => "Codex CLI",
-            Self::GeminiCli => "Gemini CLI",
-            Self::AiderCli => "Aider CLI",
         }
     }
 }

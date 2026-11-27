@@ -103,12 +103,6 @@ pub fn friendly_agent_display_name(id: &str) -> &str {
         "chatgpt" | "codex_desktop" | "codex-desktop" => "ChatGPT",
         "codex" | "codex-cli" | "codex_cli" => "Codex CLI",
         "antigravity" | "antigravity_ide" | "antigravity-ide" => "Antigravity",
-        "cursor" | "cursor_ide" | "cursor-ide" => "Cursor",
-        "windsurf" | "windsurf_ide" | "windsurf-ide" => "Windsurf",
-        "zed" | "zed_ide" | "zed-ide" => "Zed",
-        "trae" | "trae_ide" | "trae-ide" => "Trae",
-        "gemini" | "gemini-cli" | "gemini_cli" => "Gemini CLI",
-        "aider" | "aider-cli" | "aider_cli" => "Aider CLI",
         _ => id,
     }
 }
@@ -1204,22 +1198,14 @@ pub fn project_target_card(target: &TargetStatus, privacy_mask: bool) -> TargetC
 pub fn project_launch_apps(snap: Option<&GuardSnapshot>) -> Vec<SafeLaunchAppViewModel> {
     let canonical = [
         ("claude", "Claude Desktop", "桌面端"),
-        ("claude-code", "Claude Code", "CLI"),
-        ("cursor", "Cursor", "IDE"),
         ("antigravity", "Antigravity", "IDE"),
         ("chatgpt", "ChatGPT", "Codex"),
-        ("windsurf", "Windsurf", "IDE"),
-        ("zed", "Zed", "IDE"),
-        ("trae", "Trae", "IDE"),
-        ("codex", "Codex CLI", "CLI"),
-        ("gemini", "Gemini CLI", "CLI"),
-        ("aider", "Aider CLI", "CLI"),
+        ("claude-code", "Claude Code", "CLI"),
     ];
 
-    let mut ranked: Vec<(u8, usize, SafeLaunchAppViewModel)> = canonical
+    canonical
         .into_iter()
-        .enumerate()
-        .map(|(canon_idx, (id, label, badge))| {
+        .map(|(id, label, badge)| {
             let ag_proxy_blocked = id == "antigravity"
                 && snap.is_some_and(|s| {
                     s.config.require_antigravity_proxy
@@ -1230,14 +1216,8 @@ pub fn project_launch_apps(snap: Option<&GuardSnapshot>) -> Vec<SafeLaunchAppVie
                 && snap.is_some_and(|s| {
                     s.antigravity_proxy.installed && s.antigravity_proxy.is_ready_for_launch()
                 });
-            let guarded = snap.is_some_and(|s| {
-                s.config
-                    .guarded_agents
-                    .iter()
-                    .any(|g| g.eq_ignore_ascii_case(id))
-            });
             let found = snap.and_then(|s| s.agents.iter().find(|a| a.id == id));
-            let vm = match found {
+            match found {
                 Some(agent) => SafeLaunchAppViewModel {
                     agent_id: id.into(),
                     label: label.into(),
@@ -1262,20 +1242,9 @@ pub fn project_launch_apps(snap: Option<&GuardSnapshot>) -> Vec<SafeLaunchAppVie
                     orphan_count: 0,
                     install_paths: Vec::new(),
                 },
-            };
-            let tier = if vm.installed && guarded {
-                0
-            } else if vm.installed {
-                1
-            } else {
-                2
-            };
-            (tier, canon_idx, vm)
+            }
         })
-        .collect();
-
-    ranked.sort_by_key(|(tier, canon_idx, _)| (*tier, *canon_idx));
-    ranked.into_iter().map(|(_, _, vm)| vm).collect()
+        .collect()
 }
 
 pub fn project_hud(
@@ -2505,19 +2474,7 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec![
-                "claude",
-                "chatgpt",
-                "antigravity",
-                "cursor",
-                "windsurf",
-                "zed",
-                "trae",
-                "claude-code",
-                "codex",
-                "gemini",
-                "aider"
-            ]
+            vec!["claude", "chatgpt", "antigravity", "claude-code", "codex"]
         );
         let claude_row = pass_view
             .agent_statuses
@@ -2754,11 +2711,20 @@ mod tests {
         assert_eq!(hud.wfp_blocked_total, 12);
         assert!(hud.active_vault_name.is_some());
         assert!(!hud.vaults.is_empty());
-        assert_eq!(hud.launch_apps.len(), 11);
+        assert_eq!(hud.launch_apps.len(), 4);
+        let launch_ids: Vec<&str> = hud
+            .launch_apps
+            .iter()
+            .map(|a| a.agent_id.as_str())
+            .collect();
+        assert_eq!(
+            launch_ids,
+            vec!["claude", "antigravity", "chatgpt", "claude-code"]
+        );
 
         // When snapshot is None, launch apps default to installed=false and offline hero has zero pipe jargon.
         let offline_apps = project_launch_apps(None);
-        assert_eq!(offline_apps.len(), 11);
+        assert_eq!(offline_apps.len(), 4);
         assert!(offline_apps.iter().all(|a| !a.installed));
         let offline_hero = project_hero(None, false, false, 0);
         assert!(!offline_hero.subtitle.contains(r"\\.\pipe"));

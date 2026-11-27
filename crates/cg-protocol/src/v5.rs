@@ -403,14 +403,8 @@ pub enum VaultAppTarget {
     ClaudeDesktop,
     ChatgptDesktop,
     AntigravityIde,
-    CursorIde,
-    WindsurfIde,
-    ZedIde,
-    TraeIde,
     ClaudeCodeCli,
     CodexCli,
-    GeminiCli,
-    AiderCli,
 }
 
 impl VaultAppTarget {
@@ -419,22 +413,13 @@ impl VaultAppTarget {
             Self::ClaudeDesktop => "claude",
             Self::ChatgptDesktop => "chatgpt",
             Self::AntigravityIde => "antigravity",
-            Self::CursorIde => "cursor",
-            Self::WindsurfIde => "windsurf",
-            Self::ZedIde => "zed",
-            Self::TraeIde => "trae",
             Self::ClaudeCodeCli => "claude-code",
             Self::CodexCli => "codex",
-            Self::GeminiCli => "gemini",
-            Self::AiderCli => "aider",
         }
     }
 
     pub fn is_cli(self) -> bool {
-        matches!(
-            self,
-            Self::ClaudeCodeCli | Self::CodexCli | Self::GeminiCli | Self::AiderCli
-        )
+        matches!(self, Self::ClaudeCodeCli | Self::CodexCli)
     }
 }
 
@@ -635,11 +620,7 @@ pub struct CleanRoomScope {
     #[serde(default)]
     pub chatgpt_codex: bool,
     #[serde(default)]
-    pub cursor: bool,
-    #[serde(default)]
     pub antigravity: bool,
-    #[serde(default)]
-    pub windsurf: bool,
 }
 
 impl Default for CleanRoomScope {
@@ -647,9 +628,7 @@ impl Default for CleanRoomScope {
         Self {
             claude: true,
             chatgpt_codex: false,
-            cursor: false,
             antigravity: false,
-            windsurf: false,
         }
     }
 }
@@ -870,5 +849,30 @@ mod tests {
         assert_eq!(SafetyGrade::from_score(40), SafetyGrade::C);
         assert_eq!(SafetyGrade::from_score(39), SafetyGrade::F);
         assert_eq!(SafetyGrade::from_score(0), SafetyGrade::F);
+    }
+
+    #[test]
+    fn vault_app_target_covers_core_five_suite() {
+        let cases = [
+            (VaultAppTarget::ClaudeDesktop, "claude", false),
+            (VaultAppTarget::ChatgptDesktop, "chatgpt", false),
+            (VaultAppTarget::AntigravityIde, "antigravity", false),
+            (VaultAppTarget::ClaudeCodeCli, "claude-code", true),
+            (VaultAppTarget::CodexCli, "codex", true),
+        ];
+        for (target, expected_id, expected_cli) in cases {
+            assert_eq!(target.agent_id(), expected_id);
+            assert_eq!(target.is_cli(), expected_cli);
+            let json = serde_json::to_string(&target).expect("serialize target");
+            let back: VaultAppTarget = serde_json::from_str(&json).expect("deserialize target");
+            assert_eq!(back, target);
+        }
+
+        let scope: CleanRoomScope =
+            serde_json::from_str(r#"{"claude":true,"antigravity":true,"extraClient":true}"#)
+                .expect("deserialize scope ignoring unknown legacy fields");
+        assert!(scope.claude);
+        assert!(!scope.chatgpt_codex);
+        assert!(scope.antigravity);
     }
 }

@@ -357,30 +357,6 @@ impl DaemonClient {
                     true,
                     "已完成 Lumidarin/agy-capsule 上游版本核验",
                 );
-                touch(
-                    &mut snap.updates.cursor_ide,
-                    "cursor_ide",
-                    false,
-                    "已完成 Cursor IDE 官方最新版本核验",
-                );
-                touch(
-                    &mut snap.updates.windsurf_ide,
-                    "windsurf_ide",
-                    false,
-                    "已完成 Windsurf IDE 官方最新版本核验",
-                );
-                touch(
-                    &mut snap.updates.zed_ide,
-                    "zed_ide",
-                    false,
-                    "已完成 Zed IDE 官方最新版本核验",
-                );
-                touch(
-                    &mut snap.updates.trae_ide,
-                    "trae_ide",
-                    false,
-                    "已完成 Trae IDE 官方最新版本核验",
-                );
                 PipeResponse::Ack {
                     receipt: None,
                     snapshot: Some(Box::new(snap.clone())),
@@ -864,14 +840,8 @@ impl DaemonClient {
                 if scope.chatgpt_codex {
                     clients.push("chatgpt".into());
                 }
-                if scope.cursor {
-                    clients.push("cursor".into());
-                }
                 if scope.antigravity {
                     clients.push("antigravity".into());
-                }
-                if scope.windsurf {
-                    clients.push("windsurf".into());
                 }
                 let removed_count = current
                     .findings
@@ -1589,11 +1559,11 @@ impl Default for LaunchHygieneContext {
     }
 }
 
-/// Returns `true` ONLY for Chromium / Electron GUI clients (NEVER native Rust `zed` or CLIs).
+/// Returns `true` ONLY for managed Chromium / Electron GUI clients (never CLIs).
 pub fn is_electron_gui_agent(agent_id: &str) -> bool {
     matches!(
         agent_id.trim().to_ascii_lowercase().as_str(),
-        "claude" | "chatgpt" | "antigravity" | "cursor" | "windsurf" | "trae"
+        "claude" | "chatgpt" | "antigravity"
     )
 }
 
@@ -1601,7 +1571,7 @@ pub fn is_electron_gui_agent(agent_id: &str) -> bool {
 pub fn is_cli_launch_agent(agent_id: &str) -> bool {
     matches!(
         agent_id.trim().to_ascii_lowercase().as_str(),
-        "claude-code" | "codex" | "codex-cli" | "gemini" | "aider"
+        "claude-code" | "codex" | "codex-cli"
     )
 }
 
@@ -1611,14 +1581,8 @@ pub fn friendly_launch_name(agent_id: &str) -> &str {
         "claude" => "Claude Desktop",
         "chatgpt" => "ChatGPT",
         "antigravity" => "Antigravity",
-        "cursor" => "Cursor",
-        "windsurf" => "Windsurf",
-        "zed" => "Zed",
-        "trae" => "Trae",
         "claude-code" => "Claude Code",
         "codex" | "codex-cli" => "Codex CLI",
-        "gemini" => "Gemini CLI",
-        "aider" => "Aider CLI",
         _ => agent_id,
     }
 }
@@ -1707,14 +1671,6 @@ fn plan_agent_launch(
             is_cli: false,
             working_dir: None,
             toast_message,
-        }
-    } else if agent_id.trim().eq_ignore_ascii_case("zed") {
-        // Native Rust GPUI editor (`clap` CLI) — NEVER pass Chromium `--disable-quic` flags!
-        AgentLaunchPlan {
-            hygiene_args: Vec::new(),
-            is_cli: false,
-            working_dir: None,
-            toast_message: format!("已安全启动 {display}"),
         }
     } else if is_cli_launch_agent(agent_id) {
         let working_dir = user_profile
@@ -2168,7 +2124,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_launch_plan_distinguishes_electron_hygiene_native_zed_and_cli_privacy() {
+    fn agent_launch_plan_distinguishes_electron_hygiene_and_cli_privacy() {
         let existing_dir = std::env::temp_dir();
         assert!(existing_dir.is_dir());
 
@@ -2181,14 +2137,7 @@ mod tests {
             privacy_mask: false,
         };
 
-        for gui_id in [
-            "claude",
-            "chatgpt",
-            "antigravity",
-            "cursor",
-            "windsurf",
-            "trae",
-        ] {
+        for gui_id in ["claude", "chatgpt", "antigravity"] {
             let plan = plan_agent_launch(gui_id, Some(&existing_dir), &sys_ctx);
             assert!(
                 plan.hygiene_args.contains(&"--disable-quic".to_string()),
@@ -2236,7 +2185,7 @@ mod tests {
         // TUN mode injects QUIC + WebRTC locks ONLY (never --host-resolver-rules).
         let mut tun_ctx = sys_ctx.clone();
         tun_ctx.access_level = AccessLevel::Tun;
-        let tun_plan = plan_agent_launch("cursor", None, &tun_ctx);
+        let tun_plan = plan_agent_launch("chatgpt", None, &tun_ctx);
         assert_eq!(tun_plan.hygiene_args.len(), 3);
         assert!(
             !tun_plan
@@ -2254,15 +2203,7 @@ mod tests {
                 .is_empty()
         );
 
-        // Native Rust Zed MUST NEVER receive Chromium --disable-quic flags!
-        let zed_plan = plan_agent_launch("zed", Some(&existing_dir), &sys_ctx);
-        assert!(
-            zed_plan.hygiene_args.is_empty(),
-            "Zed is native GPUI, must receive 0 Chromium flags"
-        );
-        assert!(!zed_plan.is_cli);
-
-        for cli_id in ["claude-code", "codex", "codex-cli", "gemini", "aider"] {
+        for cli_id in ["claude-code", "codex", "codex-cli"] {
             let plan = plan_agent_launch(cli_id, Some(&existing_dir), &sys_ctx);
             assert!(
                 plan.hygiene_args.is_empty(),
@@ -2472,7 +2413,7 @@ mod tests {
         match client
             .exchange(PipeRequest::LaunchVault {
                 vault_id: "test-sg-vault".into(),
-                app: VaultAppTarget::CursorIde,
+                app: VaultAppTarget::AntigravityIde,
                 extra_args: Vec::new(),
             })
             .expect("launch vault")
@@ -2487,7 +2428,7 @@ mod tests {
                     .find(|v| v.id == "test-sg-vault")
                     .unwrap();
                 assert_eq!(v.state, VaultRuntimeState::ActiveRunning);
-                assert!(v.running_apps.contains(&"cursor".to_string()));
+                assert!(v.running_apps.contains(&"antigravity".to_string()));
             }
             other => panic!("unexpected LaunchVault: {other:?}"),
         }
@@ -2538,7 +2479,7 @@ mod tests {
         // 3. Clean-Room: Scan -> Execute -> ListBackups -> Restore.
         let scope = CleanRoomScope {
             claude: true,
-            cursor: true,
+            antigravity: true,
             ..CleanRoomScope::default()
         };
         let scan_resp = client

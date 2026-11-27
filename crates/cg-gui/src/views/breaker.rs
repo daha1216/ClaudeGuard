@@ -20,30 +20,6 @@ use crate::widgets::controls::{
 };
 use gpui::{Context, Div, Entity, FontWeight, MouseButton, div, prelude::*, px, rgb, rgba};
 
-fn breaker_agent_label<'a>(id: &str, fallback: &'a str) -> &'a str {
-    match id.to_ascii_lowercase().as_str() {
-        "cursor" => "Cursor IDE",
-        "windsurf" => "Windsurf IDE",
-        "zed" => "Zed IDE",
-        "trae" => "Trae IDE",
-        "gemini" => "Gemini CLI",
-        "aider" => "Aider CLI",
-        _ => canonical_agent_label(id, fallback),
-    }
-}
-
-fn breaker_agent_rank(id: &str) -> u8 {
-    match id.to_ascii_lowercase().as_str() {
-        "cursor" => 6,
-        "windsurf" => 7,
-        "zed" => 8,
-        "trae" => 9,
-        "gemini" => 11,
-        "aider" => 12,
-        _ => brand_family_rank(id),
-    }
-}
-
 fn wfp_reason_label(reason: &str) -> &'static str {
     match reason {
         "direct_nic_bypass" => "直连网卡旁路",
@@ -181,10 +157,6 @@ pub fn render_breaker_page(
                 ("claude", "Claude"),
                 ("chatgpt", "ChatGPT / Codex"),
                 ("antigravity", "Antigravity"),
-                ("cursor", "Cursor"),
-                ("windsurf", "Windsurf"),
-                ("zed", "Zed"),
-                ("trae", "Trae"),
             ]
             .into_iter()
             .map(|(aid, lbl)| {
@@ -846,7 +818,7 @@ pub fn render_breaker_page(
             let ctrl_sweep = ctrl.clone();
             let ctrl_force_all = ctrl.clone();
             let mut sorted_rows: Vec<_> = proj.agent_statuses.iter().collect();
-            sorted_rows.sort_by_key(|row| breaker_agent_rank(&row.id));
+            sorted_rows.sort_by_key(|row| brand_family_rank(&row.id));
             let row_count = sorted_rows.len();
 
             let rows = sorted_rows.into_iter().enumerate().map(|(idx, row)| {
@@ -855,7 +827,7 @@ pub fn render_breaker_page(
                 let rid = row.id.clone();
                 let is_cli = row.kind.contains("CLI");
                 let icon_key = agent_icon_key(&row.id, &row.kind);
-                let display_name = breaker_agent_label(&row.id, &row.name).to_string();
+                let display_name = canonical_agent_label(&row.id, &row.name).to_string();
                 let ctrl_k = ctrl.clone();
                 let sub_line = if row.orphan_count > 0 {
                     format!(
@@ -1172,9 +1144,8 @@ pub fn render_breaker_page(
             let filter_chips = [
                 (None, "全部"),
                 (Some("claude"), "Claude"),
-                (Some("cursor"), "Cursor"),
-                (Some("antigravity"), "Antigravity"),
                 (Some("chatgpt"), "ChatGPT"),
+                (Some("antigravity"), "Antigravity"),
             ]
             .into_iter()
             .map(|(val, lbl)| {

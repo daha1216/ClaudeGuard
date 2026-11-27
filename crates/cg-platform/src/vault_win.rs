@@ -25,18 +25,9 @@ pub struct VaultPaths {
     pub chatgpt_desktop: PathBuf,
     pub antigravity_ide: PathBuf,
     pub antigravity_extensions: PathBuf,
-    pub cursor_ide: PathBuf,
-    pub cursor_extensions: PathBuf,
-    pub windsurf_ide: PathBuf,
-    pub windsurf_extensions: PathBuf,
-    pub zed_ide: PathBuf,
-    pub trae_ide: PathBuf,
     pub claude_code_home: PathBuf,
     pub codex_home: PathBuf,
     pub codex_sqlite_home: PathBuf,
-    pub gemini_home: PathBuf,
-    pub gemini_config_dir: PathBuf,
-    pub aider_home: PathBuf,
     pub shortcuts_dir: PathBuf,
 }
 
@@ -44,10 +35,7 @@ impl VaultPaths {
     /// Derive deterministic isolated paths rooted under `vault_root`.
     pub fn from_root(vault_id: &str, vault_root: PathBuf) -> Self {
         let antigravity_ide = vault_root.join("antigravity_ide");
-        let cursor_ide = vault_root.join("cursor_ide");
-        let windsurf_ide = vault_root.join("windsurf_ide");
         let codex_home = vault_root.join("codex_home");
-        let gemini_home = vault_root.join("gemini_home");
         Self {
             vault_id: vault_id.to_string(),
             meta_json: vault_root.join("meta.json"),
@@ -57,18 +45,9 @@ impl VaultPaths {
             chatgpt_desktop: vault_root.join("chatgpt_desktop"),
             antigravity_extensions: antigravity_ide.join("extensions"),
             antigravity_ide,
-            cursor_extensions: cursor_ide.join("extensions"),
-            cursor_ide,
-            windsurf_extensions: windsurf_ide.join("extensions"),
-            windsurf_ide,
-            zed_ide: vault_root.join("zed_ide"),
-            trae_ide: vault_root.join("trae_ide"),
             claude_code_home: vault_root.join("claude_code_home"),
             codex_sqlite_home: codex_home.join("sqlite"),
             codex_home,
-            gemini_config_dir: gemini_home.join(".gemini"),
-            gemini_home,
-            aider_home: vault_root.join("aider_home"),
             shortcuts_dir: vault_root.join("shortcuts"),
             vault_root,
         }
@@ -81,18 +60,9 @@ impl VaultPaths {
             &self.chatgpt_desktop,
             &self.antigravity_ide,
             &self.antigravity_extensions,
-            &self.cursor_ide,
-            &self.cursor_extensions,
-            &self.windsurf_ide,
-            &self.windsurf_extensions,
-            &self.zed_ide,
-            &self.trae_ide,
             &self.claude_code_home,
             &self.codex_home,
             &self.codex_sqlite_home,
-            &self.gemini_home,
-            &self.gemini_config_dir,
-            &self.aider_home,
             &self.shortcuts_dir,
         ]
     }
@@ -443,15 +413,8 @@ pub fn ensure_vault_layout_in(
         safe_create_dir_all_no_reparse(dir)?;
     }
 
-    // Seed unique randomized machine IDs for VS Code-family IDEs (idempotent: preserves existing IDs).
-    for ide_dir in [
-        &paths.antigravity_ide,
-        &paths.cursor_ide,
-        &paths.windsurf_ide,
-        &paths.trae_ide,
-    ] {
-        seed_isolated_ide_telemetry_ids(ide_dir)?;
-    }
+    // Seed unique randomized machine IDs for Antigravity IDE (idempotent: preserves existing IDs).
+    seed_isolated_ide_telemetry_ids(&paths.antigravity_ide)?;
 
     // Seed a fresh uncorrelated anonymousId in Claude Code isolated home if not yet initialized.
     seed_isolated_claude_code_state(&paths.claude_code_home)?;
@@ -679,53 +642,6 @@ pub fn plan_vault_launch_env_and_args_in(
                 &mut args,
             );
         }
-        VaultAppTarget::CursorIde => {
-            configure_vscode_family_launch(
-                &paths.cursor_ide,
-                &paths.cursor_extensions,
-                user_home,
-                ".cursor",
-                vault.share_ide_extensions,
-                &mut user_data_dir,
-                &mut extensions_dir,
-                &mut args,
-            );
-        }
-        VaultAppTarget::WindsurfIde => {
-            configure_vscode_family_launch(
-                &paths.windsurf_ide,
-                &paths.windsurf_extensions,
-                user_home,
-                ".windsurf",
-                vault.share_ide_extensions,
-                &mut user_data_dir,
-                &mut extensions_dir,
-                &mut args,
-            );
-        }
-        VaultAppTarget::TraeIde => {
-            configure_vscode_family_launch(
-                &paths.trae_ide,
-                &paths.trae_ide.join("extensions"),
-                user_home,
-                ".trae",
-                vault.share_ide_extensions,
-                &mut user_data_dir,
-                &mut extensions_dir,
-                &mut args,
-            );
-        }
-        VaultAppTarget::ZedIde => {
-            user_data_dir = Some(paths.zed_ide.clone());
-            env.insert(
-                "ZED_DATA_DIR".into(),
-                paths.zed_ide.to_string_lossy().to_string(),
-            );
-            env.insert(
-                "XDG_CONFIG_HOME".into(),
-                paths.zed_ide.to_string_lossy().to_string(),
-            );
-        }
         VaultAppTarget::ClaudeCodeCli => {
             env.insert(
                 "CLAUDE_CONFIG_DIR".into(),
@@ -740,26 +656,6 @@ pub fn plan_vault_launch_env_and_args_in(
             env.insert(
                 "CODEX_SQLITE_HOME".into(),
                 paths.codex_sqlite_home.to_string_lossy().to_string(),
-            );
-        }
-        VaultAppTarget::GeminiCli => {
-            env.insert(
-                "GEMINI_CLI_HOME".into(),
-                paths.gemini_home.to_string_lossy().to_string(),
-            );
-            env.insert(
-                "GEMINI_CONFIG_DIR".into(),
-                paths.gemini_config_dir.to_string_lossy().to_string(),
-            );
-        }
-        VaultAppTarget::AiderCli => {
-            env.insert(
-                "AIDER_HOME".into(),
-                paths.aider_home.to_string_lossy().to_string(),
-            );
-            env.insert(
-                "XDG_CONFIG_HOME".into(),
-                paths.aider_home.to_string_lossy().to_string(),
             );
         }
     }
@@ -964,9 +860,6 @@ pub fn generate_vault_shortcuts_in(
          $env:CLAUDE_CONFIG_DIR = '{claude_dir}'\r\n\
          $env:CODEX_HOME = '{codex_dir}'\r\n\
          $env:CODEX_SQLITE_HOME = '{codex_sql}'\r\n\
-         $env:GEMINI_CLI_HOME = '{gemini_dir}'\r\n\
-         $env:GEMINI_CONFIG_DIR = '{gemini_cfg}'\r\n\
-         $env:AIDER_HOME = '{aider_dir}'\r\n\
          {proxy_line}\
          Write-Host \"[ClaudeGuard Vault] 已切换至主权隔离仓: {name_esc} ({id_esc})\" -ForegroundColor Cyan\r\n",
         id = vault.id,
@@ -976,9 +869,6 @@ pub fn generate_vault_shortcuts_in(
         claude_dir = escape_ps_single_quoted(&paths.claude_code_home.to_string_lossy()),
         codex_dir = escape_ps_single_quoted(&paths.codex_home.to_string_lossy()),
         codex_sql = escape_ps_single_quoted(&paths.codex_sqlite_home.to_string_lossy()),
-        gemini_dir = escape_ps_single_quoted(&paths.gemini_home.to_string_lossy()),
-        gemini_cfg = escape_ps_single_quoted(&paths.gemini_config_dir.to_string_lossy()),
-        aider_dir = escape_ps_single_quoted(&paths.aider_home.to_string_lossy()),
         proxy_line = proxy_line,
     );
     let mut ps1_bytes = vec![0xEF, 0xBB, 0xBF];
@@ -1239,13 +1129,10 @@ mod tests {
             &p1.claude_desktop,
             &p1.chatgpt_desktop,
             &p1.antigravity_ide,
-            &p1.cursor_ide,
-            &p1.windsurf_ide,
+            &p1.antigravity_extensions,
             &p1.claude_code_home,
             &p1.codex_home,
             &p1.codex_sqlite_home,
-            &p1.gemini_home,
-            &p1.gemini_config_dir,
         ] {
             assert!(dir.is_dir(), "expected dir {}", dir.display());
         }
@@ -1260,8 +1147,8 @@ mod tests {
             serde_json::from_str(&raw).expect("parse storage.json")
         };
 
-        let s1 = read_storage(&p1.cursor_ide);
-        let s2 = read_storage(&p2.cursor_ide);
+        let s1 = read_storage(&p1.antigravity_ide);
+        let s2 = read_storage(&p2.antigravity_ide);
         assert_eq!(
             s1["telemetry.machineId"].as_str().unwrap().len(),
             64,
@@ -1275,7 +1162,7 @@ mod tests {
 
         // Re-running ensure_vault_layout_in must be idempotent and keep existing IDs stable.
         ensure_vault_layout_in(&root, &v1).expect("re-run layout");
-        let s1_again = read_storage(&p1.cursor_ide);
+        let s1_again = read_storage(&p1.antigravity_ide);
         assert_eq!(s1["telemetry.machineId"], s1_again["telemetry.machineId"]);
         assert_eq!(s1["telemetry.sqmId"], s1_again["telemetry.sqmId"]);
 
@@ -1380,19 +1267,6 @@ mod tests {
         .expect("plan codex");
         assert!(codex.env.contains_key("CODEX_HOME"));
         assert!(codex.env.contains_key("CODEX_SQLITE_HOME"));
-
-        let gemini = plan_vault_launch_env_and_args_in(
-            &root,
-            Some(&fake_home),
-            &v,
-            VaultAppTarget::GeminiCli,
-            "127.0.0.1",
-            7890,
-            &[],
-        )
-        .expect("plan gemini");
-        assert!(gemini.env.contains_key("GEMINI_CLI_HOME"));
-        assert!(gemini.env.contains_key("GEMINI_CONFIG_DIR"));
 
         // Reject NUL in extra args
         assert!(plan_vault_launch_env_and_args_in(

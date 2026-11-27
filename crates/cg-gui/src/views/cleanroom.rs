@@ -1,7 +1,7 @@
 //! Mode B — Frost Ceramic v5 `防连坐净室清理器` view (Module M5).
 //!
 //! 3-step lossless sanitization workflow:
-//! 1. Client scope checkboxes (`Claude` / `ChatGPT & Codex` / `Cursor` / `Antigravity` / `Windsurf`)
+//! 1. Client scope checkboxes (`Claude` / `ChatGPT & Codex` / `Antigravity`)
 //!    + 100% Read-Only Deep Scan (`PipeRequest::ScanCleanRoom`)
 //! 2. Pollution Score Gauge + 4-Vector Findings List (selectable) +「100% 保留资产绿盾清单」
 //!    (`CLAUDE.md`, `settings.json`, `mcpServers`, `skills/`)
@@ -92,22 +92,10 @@ pub fn render_cleanroom_page(
             toggle: |s| s.chatgpt_codex = !s.chatgpt_codex,
         },
         ScopeOption {
-            key: "cursor",
-            label: "Cursor 机器码指纹",
-            on: scope.cursor,
-            toggle: |s| s.cursor = !s.cursor,
-        },
-        ScopeOption {
             key: "antigravity",
             label: "Antigravity 会话态",
             on: scope.antigravity,
             toggle: |s| s.antigravity = !s.antigravity,
-        },
-        ScopeOption {
-            key: "windsurf",
-            label: "Windsurf 机器标识",
-            on: scope.windsurf,
-            toggle: |s| s.windsurf = !s.windsurf,
         },
     ];
 
@@ -164,8 +152,7 @@ pub fn render_cleanroom_page(
             )
     });
 
-    let any_scope_selected =
-        scope.claude || scope.chatgpt_codex || scope.cursor || scope.antigravity || scope.windsurf;
+    let any_scope_selected = scope.claude || scope.chatgpt_codex || scope.antigravity;
     let ctrl_scan = ctrl.clone();
     let step1_card = bento_card_bloom(p, 17.0, 14.0, choreo.tile(0, 0))
         .flex_1()

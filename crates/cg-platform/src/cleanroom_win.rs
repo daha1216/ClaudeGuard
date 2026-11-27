@@ -305,7 +305,7 @@ fn build_report(
     if scope.chatgpt_codex {
         preserved.push("保留 ~/.codex/config.toml 与用户工作区脚本".to_string());
     }
-    if scope.cursor || scope.antigravity || scope.windsurf {
+    if scope.antigravity {
         preserved.push("保留 IDE 插件目录、settings.json 与工作区代码".to_string());
     }
 
@@ -471,16 +471,6 @@ fn collect_cleanroom_plan(
             scan_chromium_root(&home, &msix_gpt, "chatgpt", "msix", note, &mut plan);
         }
     }
-    if scope.cursor {
-        scan_chromium_root(
-            &home,
-            &roaming.join("Cursor"),
-            "cursor",
-            "ide",
-            "保留 Cursor 插件、settings.json 与代码工程",
-            &mut plan,
-        );
-    }
     if scope.antigravity {
         scan_chromium_root(
             &home,
@@ -488,16 +478,6 @@ fn collect_cleanroom_plan(
             "antigravity",
             "ide",
             "保留 Antigravity 插件、settings.json 与代码工程",
-            &mut plan,
-        );
-    }
-    if scope.windsurf {
-        scan_chromium_root(
-            &home,
-            &roaming.join("Windsurf"),
-            "windsurf",
-            "ide",
-            "保留 Windsurf 插件、settings.json 与代码工程",
             &mut plan,
         );
     }
@@ -877,14 +857,8 @@ pub fn match_credential_target_client(
     {
         return Some("chatgpt");
     }
-    if scope.cursor && (lower.starts_with("cursor") || lower.contains("cursor.sh")) {
-        return Some("cursor");
-    }
     if scope.antigravity && lower.contains("antigravity") {
         return Some("antigravity");
-    }
-    if scope.windsurf && (lower.starts_with("windsurf") || lower.contains("codeium")) {
-        return Some("windsurf");
     }
     None
 }
@@ -1146,14 +1120,10 @@ pub fn scan_orphan_processes_from_list(
             )
         {
             Some("chatgpt")
-        } else if scope.cursor && lower == "cursor.exe" {
-            Some("cursor")
         } else if scope.antigravity
             && matches!(lower.as_str(), "antigravity.exe" | "antigravity ide.exe")
         {
             Some("antigravity")
-        } else if scope.windsurf && lower == "windsurf.exe" {
-            Some("windsurf")
         } else {
             None
         };
@@ -1719,9 +1689,7 @@ fn validate_allowed_cleanroom_rel_path(rel: &Path) -> Result<(), String> {
         || norm.starts_with(".claude/")
         || norm.starts_with("appdata/roaming/claude/")
         || norm.starts_with("appdata/roaming/chatgpt/")
-        || norm.starts_with("appdata/roaming/cursor/")
         || norm.starts_with("appdata/roaming/antigravity/")
-        || norm.starts_with("appdata/roaming/windsurf/")
         || (norm.starts_with("appdata/local/packages/")
             && (norm.contains("/localcache/roaming/claude/")
                 || norm.contains("/localcache/roaming/chatgpt/")));

@@ -132,10 +132,6 @@ fn component_toast(id: &str) -> &'static str {
         "codex_cli" => "已检测 Codex CLI 版本",
         "antigravity_ide" => "已检测 Antigravity IDE 版本",
         "antigravity_cn" => "已检测 Antigravity 汉化仓库",
-        "cursor_ide" => "已检测 Cursor IDE 版本",
-        "windsurf_ide" => "已检测 Windsurf IDE 版本",
-        "zed_ide" => "已检测 Zed IDE 版本",
-        "trae_ide" => "已检测 Trae IDE 版本",
         _ => "已完成版本检测",
     }
 }
@@ -611,54 +607,6 @@ pub fn render_updates_page(
                 || checking_plugins
                 || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("antigravity_cn".into())),
         },
-        GridCardSpec {
-            item: &updates.cursor_ide,
-            icon_key: "cursor",
-            title: "Cursor IDE",
-            subtitle: "Anysphere 桌面端",
-            source: "官方源",
-            is_repo_track: false,
-            repo_url: Some("https://www.cursor.com/downloads"),
-            has_plugins_btn: false,
-            is_checking: checking_all
-                || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("cursor_ide".into())),
-        },
-        GridCardSpec {
-            item: &updates.windsurf_ide,
-            icon_key: "windsurf",
-            title: "Windsurf IDE",
-            subtitle: "Codeium 桌面端",
-            source: "官方源",
-            is_repo_track: false,
-            repo_url: Some("https://windsurf.com/download"),
-            has_plugins_btn: false,
-            is_checking: checking_all
-                || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("windsurf_ide".into())),
-        },
-        GridCardSpec {
-            item: &updates.zed_ide,
-            icon_key: "zed",
-            title: "Zed IDE",
-            subtitle: "zed-industries/zed",
-            source: "GitHub",
-            is_repo_track: false,
-            repo_url: Some("https://github.com/zed-industries/zed/releases"),
-            has_plugins_btn: false,
-            is_checking: checking_all
-                || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("zed_ide".into())),
-        },
-        GridCardSpec {
-            item: &updates.trae_ide,
-            icon_key: "trae",
-            title: "Trae IDE",
-            subtitle: "Trae 官方桌面端",
-            source: "官方源",
-            is_repo_track: false,
-            repo_url: Some("https://www.trae.ai/"),
-            has_plugins_btn: false,
-            is_checking: checking_all
-                || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("trae_ide".into())),
-        },
     ];
     let grid_total = grid_items.len();
     let avail_grid = grid_items
@@ -892,7 +840,7 @@ pub fn render_updates_page(
                                 } else if checking_all {
                                     "巡检中…"
                                 } else {
-                                    "全部巡检 (14)"
+                                    "全部巡检 (10)"
                                 },
                                 ButtonKind::Primary,
                                 can_check_all,
@@ -908,7 +856,7 @@ pub fn render_updates_page(
                                         ctrl_check_all.update(cx, |c, cx| {
                                             c.send_request(
                                                 PipeRequest::CheckUpdates { component: None },
-                                                Some("已完成全部 14 项版本巡检"),
+                                                Some("已完成全部 10 项版本巡检"),
                                                 cx,
                                             );
                                         });

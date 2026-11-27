@@ -28,37 +28,7 @@ fn cleanup_toast_for_agent(agent_id: &str) -> &'static str {
         "chatgpt" => "已清理 ChatGPT / Codex 及孤儿进程",
         "codex" => "已清理 Codex CLI 及孤儿进程",
         "antigravity" => "已清理 Antigravity 及孤儿进程",
-        "cursor" => "已清理 Cursor IDE 及孤儿进程",
-        "windsurf" => "已清理 Windsurf IDE 及孤儿进程",
-        "zed" => "已清理 Zed IDE 及孤儿进程",
-        "trae" => "已清理 Trae IDE 及孤儿进程",
-        "gemini" => "已清理 Gemini CLI 及孤儿进程",
-        "aider" => "已清理 Aider CLI 及孤儿进程",
         _ => "已清理受管 AI 客户端进程",
-    }
-}
-
-fn overview_agent_label<'a>(id: &str, fallback: &'a str) -> &'a str {
-    match id.to_ascii_lowercase().as_str() {
-        "cursor" => "Cursor",
-        "windsurf" => "Windsurf",
-        "zed" => "Zed",
-        "trae" => "Trae",
-        "gemini" => "Gemini CLI",
-        "aider" => "Aider CLI",
-        _ => canonical_agent_label(id, fallback),
-    }
-}
-
-fn overview_agent_rank(id: &str) -> u8 {
-    match id.to_ascii_lowercase().as_str() {
-        "cursor" => 6,
-        "windsurf" => 7,
-        "zed" => 8,
-        "trae" => 9,
-        "gemini" => 11,
-        "aider" => 12,
-        _ => brand_family_rank(id),
     }
 }
 
@@ -68,13 +38,7 @@ fn short_launch_name(agent_id: &str, fallback: &str) -> String {
         "claude-code" => "Code CLI".into(),
         "chatgpt" => "ChatGPT".into(),
         "antigravity" => "Antigravity".into(),
-        "cursor" => "Cursor".into(),
-        "windsurf" => "Windsurf".into(),
-        "zed" => "Zed".into(),
-        "trae" => "Trae".into(),
         "codex" => "Codex CLI".into(),
-        "gemini" => "Gemini CLI".into(),
-        "aider" => "Aider CLI".into(),
         _ => fallback.to_string(),
     }
 }
@@ -700,9 +664,7 @@ pub fn render_overview(
     } else {
         BadgeTone::Muted
     };
-    let health_card_busy = ctrl_r.is_scope_busy(&ActionScope::BuildHealthCard);
     let configuring_hooks = ctrl_r.is_scope_busy(&ActionScope::ConfigureHooks);
-    let expand_launch_deck = ctrl_r.overview_expand_launch_deck;
     let hooks_unconfigured = snap
         .as_deref()
         .is_some_and(|s| !s.hooks.claude_code_hook_installed);
@@ -710,14 +672,13 @@ pub fn render_overview(
         .as_deref()
         .and_then(|s| s.risk_assessment.geo_velocity_alert.clone());
     let ctrl_to_radar = ctrl.clone();
-    let ctrl_health_card = ctrl.clone();
 
     let risk_ring_badge = div()
         .id("ov-risk-score-badge")
         .cursor_pointer()
         .flex()
         .items_center()
-        .gap(px(5.5))
+        .flex_shrink_0()
         .hover(|s| s.opacity(0.88))
         .child(tone_tag(
             if risk_evaluated {
@@ -738,32 +699,6 @@ pub fn render_overview(
             }),
         );
 
-    let export_card_btn = icon_action_button(
-        "ov-export-health-card",
-        "icons/ui/shield.svg",
-        if health_card_busy {
-            "生成中…"
-        } else {
-            "导出体检图（隐去IP）"
-        },
-        ButtonKind::Secondary,
-        can_act && !health_card_busy,
-        p,
-    )
-    .h(px(25.))
-    .px(px(8.5))
-    .text_size(px(10.5))
-    .when(can_act && !health_card_busy, |b| {
-        b.on_mouse_up(
-            MouseButton::Left,
-            cx.listener(move |_, _, _, cx| {
-                ctrl_health_card.update(cx, |c, cx| {
-                    c.build_and_export_health_card(true, cx);
-                });
-            }),
-        )
-    });
-
     let hero_pose = choreo.tile(0, 0);
     let hero_card = bento_card_bloom(p, 18.0, 16.0, hero_pose)
         .flex_1()
@@ -781,7 +716,7 @@ pub fn render_overview(
                         .flex()
                         .items_center()
                         .justify_between()
-                        .gap(px(6.))
+                        .gap(px(8.))
                         .child(
                             div()
                                 .flex()
@@ -804,15 +739,7 @@ pub fn render_overview(
                                         .child(status_kicker),
                                 ),
                         )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .flex_shrink_0()
-                                .gap(px(5.))
-                                .child(risk_ring_badge)
-                                .child(export_card_btn),
-                        ),
+                        .child(risk_ring_badge),
                 )
                 .child(
                     div()
@@ -1133,75 +1060,6 @@ pub fn render_overview(
         .children(pad_cards.drain(0..pad_cards.len().min(2)));
     let pads_row2 = div().flex().w_full().gap(px(8.)).children(pad_cards);
 
-    let extra_launch_apps: Vec<_> = proj.launch_apps.iter().skip(4).collect();
-    let extra_count = extra_launch_apps.len();
-    let ctrl_toggle_deck = ctrl.clone();
-    let extra_strip = (expand_launch_deck && !extra_launch_apps.is_empty()).then(|| {
-        let pills = extra_launch_apps.into_iter().map(|app| {
-            let aid = app.agent_id.clone();
-            let paths = app.install_paths.clone();
-            let ctrl_el = ctrl.clone();
-            let hard_locked = !connected
-                || really_tripped
-                || pre_trip_fail
-                || app.quarantined
-                || app.ag_proxy_blocked;
-            let can_click =
-                connected && !busy && app.installed && !hard_locked && proj.hero.can_launch;
-            let hover_bg = p.sidebar_hover_bg;
-            div()
-                .id(gpui::ElementId::Name(
-                    format!("ov-launch-extra-{}", app.agent_id).into(),
-                ))
-                .flex()
-                .items_center()
-                .gap(px(5.))
-                .px(px(8.5))
-                .py(px(4.5))
-                .rounded(px(8.))
-                .bg(rgb(p.inset_bg))
-                .border_1()
-                .border_color(rgb(p.card_border))
-                .when(can_click, |el| {
-                    el.cursor_pointer()
-                        .hover(move |s| s.bg(rgb(hover_bg)).border_color(rgb(p.line_strong)))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(move |_, _, _, cx| {
-                                ctrl_el.update(cx, |c, cx| {
-                                    c.launch_app_with_gate(aid.clone(), paths.clone(), cx);
-                                });
-                            }),
-                        )
-                })
-                .when(!app.installed || hard_locked, |el| el.opacity(0.52))
-                .child(brand_icon_scaled(&app.agent_id, 16.0, 4.5, p.is_dark, 1.0))
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(p.text_primary))
-                        .child(short_launch_name(&app.agent_id, &app.label)),
-                )
-                .child(
-                    div()
-                        .text_size(px(10.))
-                        .text_color(rgb(if app.installed {
-                            p.accent_soft_text
-                        } else {
-                            p.text_muted
-                        }))
-                        .child(if !app.installed { "未装" } else { "启动" }),
-                )
-        });
-        div()
-            .flex()
-            .flex_wrap()
-            .gap(px(6.))
-            .pt(px(2.))
-            .children(pills)
-    });
-
     let deck_pose = choreo.tile(0, 1);
     let launch_deck = bento_card_bloom(p, 16.0, 14.0, deck_pose)
         .flex_1()
@@ -1233,52 +1091,7 @@ pub fn render_overview(
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(p.text_primary))
                                 .child("安全启动台"),
-                        )
-                        .when(extra_count > 0, |row| {
-                            let hover_bg = p.sidebar_hover_bg;
-                            row.child(
-                                div()
-                                    .id("ov-toggle-more-clients")
-                                    .cursor_pointer()
-                                    .px(px(7.))
-                                    .py(px(2.))
-                                    .rounded(px(999.))
-                                    .bg(rgb(if expand_launch_deck {
-                                        p.accent_soft_bg
-                                    } else {
-                                        p.inset_bg
-                                    }))
-                                    .border_1()
-                                    .border_color(rgb(if expand_launch_deck {
-                                        p.accent_soft_border
-                                    } else {
-                                        p.card_border
-                                    }))
-                                    .hover(move |s| s.bg(rgb(hover_bg)))
-                                    .text_size(px(10.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(if expand_launch_deck {
-                                        p.accent_soft_text
-                                    } else {
-                                        p.text_secondary
-                                    }))
-                                    .child(if expand_launch_deck {
-                                        "收起更多客户端 ▴".to_string()
-                                    } else {
-                                        format!("更多已支持端 (+{extra_count}) ▾")
-                                    })
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |_, _, _, cx| {
-                                            ctrl_toggle_deck.update(cx, |c, cx| {
-                                                c.overview_expand_launch_deck =
-                                                    !c.overview_expand_launch_deck;
-                                                cx.notify();
-                                            });
-                                        }),
-                                    ),
-                            )
-                        }),
+                        ),
                 )
                 .child(
                     div()
@@ -1300,8 +1113,7 @@ pub fn render_overview(
                 ),
         )
         .child(pads_row1)
-        .child(pads_row2)
-        .when_some(extra_strip, |d, strip| d.child(strip));
+        .child(pads_row2);
     let deck_slot = div().flex_1().min_w(px(0.)).flex().child(launch_deck);
 
     // -------------------------------------------------------------------------
@@ -1312,14 +1124,13 @@ pub fn render_overview(
     let ctrl_kill_all = ctrl.clone();
     let ctrl_sweep = ctrl.clone();
 
-    // Group managed 7-GUI + 4-CLI matrix cleanly by brand family.
+    // Group managed core AI clients cleanly by brand family.
     let mut sorted_agents: Vec<_> = proj.agent_statuses.iter().collect();
-    sorted_agents.sort_by_key(|a| overview_agent_rank(&a.id));
+    sorted_agents.sort_by_key(|a| brand_family_rank(&a.id));
 
     let proc_rows = sorted_agents
         .iter()
-        .filter(|a| !a.kind.contains("CLI") || a.running_count > 0 || a.orphan_count > 0)
-        .take(7)
+        .take(5)
         .enumerate()
         .map(|(row_idx, a)| {
             let row_pose = choreo.inner_bloom(1, row_idx.min(4));
@@ -1341,7 +1152,7 @@ pub fn render_overview(
             };
             let hover_bg = p.sidebar_hover_bg;
             let icon_key = agent_icon_key(&a.id, &a.kind);
-            let display_name = overview_agent_label(&a.id, &a.name).to_string();
+            let display_name = canonical_agent_label(&a.id, &a.name).to_string();
 
             let row = div()
                 .flex()
@@ -1437,21 +1248,10 @@ pub fn render_overview(
                         .justify_between()
                         .child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.))
-                                .child(
-                                    div()
-                                        .text_size(px(13.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(p.text_primary))
-                                        .child("7 客户端矩阵治理"),
-                                )
-                                .child(
-                                    mono_tabular(format!("{} 端", proj.agent_statuses.len()))
-                                        .text_size(px(10.5))
-                                        .text_color(rgb(p.text_muted)),
-                                ),
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(p.text_primary))
+                                .child("受管进程治理"),
                         )
                         .child(
                             action_button(

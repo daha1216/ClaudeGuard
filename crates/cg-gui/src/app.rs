@@ -358,7 +358,6 @@ pub struct AppController {
     pub open_region_picker_for: Option<String>,
     pub show_add_target_drawer: bool,
     pub show_vault_drawer: bool,
-    pub overview_expand_launch_deck: bool,
     pub cleanroom_scope: CleanRoomScope,
     pub cleanroom_selected_ids: HashSet<String>,
     pub cleanroom_selection_initialized: bool,
@@ -804,7 +803,6 @@ impl AppController {
             open_region_picker_for: None,
             show_add_target_drawer: false,
             show_vault_drawer: false,
-            overview_expand_launch_deck: false,
             cleanroom_scope: CleanRoomScope::default(),
             cleanroom_selected_ids: HashSet::new(),
             cleanroom_selection_initialized: false,
@@ -4528,10 +4526,6 @@ fn render_ceramic_header(
             &s.updates.antigravity_cn,
             &s.updates.ag_usage_monitor,
             &s.updates.ag_capsule,
-            &s.updates.cursor_ide,
-            &s.updates.windsurf_ide,
-            &s.updates.zed_ide,
-            &s.updates.trae_ide,
         ]
         .iter()
         .any(|slot| slot.phase == UpdateCheckPhase::UpdateAvailable)

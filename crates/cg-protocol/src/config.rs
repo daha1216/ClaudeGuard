@@ -12,19 +12,11 @@ use serde::{Deserialize, Serialize};
 /// Current config schema version (v5).
 pub const CONFIG_VERSION: u32 = 5;
 
-/// Known GUI agent identifiers that may appear in `guarded_agents` (v5 7-client matrix).
-pub const KNOWN_GUI_AGENT_IDS: [&str; 7] = [
-    "claude",
-    "chatgpt",
-    "antigravity",
-    "cursor",
-    "windsurf",
-    "zed",
-    "trae",
-];
+/// Known GUI agent identifiers that may appear in `guarded_agents`.
+pub const KNOWN_GUI_AGENT_IDS: [&str; 3] = ["claude", "chatgpt", "antigravity"];
 
 /// Known CLI agent identifiers observed and protected by Pre-Prompt Hook gates.
-pub const KNOWN_CLI_AGENT_IDS: [&str; 4] = ["claude-code", "codex", "gemini", "aider"];
+pub const KNOWN_CLI_AGENT_IDS: [&str; 2] = ["claude-code", "codex"];
 
 fn default_global_min_score() -> u8 {
     60
@@ -714,6 +706,18 @@ mod tests {
         assert_eq!(cfg.guarded_agents, vec!["claude"]);
         assert!(cfg.kill_cli_on_fail);
         assert!(clean_guarded_agents(&[]).is_empty());
+        assert_eq!(
+            clean_guarded_agents(&[
+                "Claude".into(),
+                "legacy-ide".into(),
+                "antigravity".into(),
+                "chatgpt".into(),
+                "claude".into(),
+            ]),
+            vec!["claude", "antigravity", "chatgpt"]
+        );
+        assert_eq!(KNOWN_GUI_AGENT_IDS, ["claude", "chatgpt", "antigravity"]);
+        assert_eq!(KNOWN_CLI_AGENT_IDS, ["claude-code", "codex"]);
     }
 
     #[test]

@@ -64,7 +64,7 @@ const TUN_EXCLUDES: &[&str] = &[
 ];
 
 /// Service domain suffixes whose appearance in `ProxyOverride` implies direct leak risk.
-const SENSITIVE_SUFFIXES: [&str; 15] = [
+const SENSITIVE_SUFFIXES: [&str; 8] = [
     "anthropic.com",
     "claude.ai",
     "openai.com",
@@ -73,13 +73,6 @@ const SENSITIVE_SUFFIXES: [&str; 15] = [
     "oaiusercontent.com",
     "googleapis.com",
     "google.com",
-    "cursor.com",
-    "cursor.sh",
-    "cursorapi.com",
-    "codeium.com",
-    "windsurf.com",
-    "zed.dev",
-    "trae.ai",
 ];
 
 /// Raw registry evidence read from Windows Internet Settings.
@@ -1578,18 +1571,11 @@ mod tests {
             AccessPath::Unknown { .. }
         ));
 
-        for v5_override in [
-            "*.cursor.sh",
-            "*.cursor.com",
-            "*.windsurf.com",
-            "*.codeium.com",
-            "*.zed.dev",
-            "*.trae.ai",
-        ] {
-            e.overrides = Some(v5_override.into());
+        for core_override in ["*.openai.com", "*.chatgpt.com", "*.googleapis.com"] {
+            e.overrides = Some(core_override.into());
             assert!(
                 matches!(verdict(&e, None, &hosts()), AccessPath::Unknown { .. }),
-                "expected ProxyOverride {v5_override} to flag bypass risk"
+                "expected ProxyOverride {core_override} to flag bypass risk"
             );
         }
 

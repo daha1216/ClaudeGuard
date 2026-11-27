@@ -18,14 +18,8 @@ fn friendly_agent_name(id: &str) -> &str {
         "claude" | "claude_desktop" | "claude-desktop" => "Claude Desktop",
         "chatgpt" | "codex" | "codex_desktop" | "codex-desktop" => "ChatGPT",
         "antigravity" | "antigravity_ide" | "antigravity-ide" => "Antigravity",
-        "cursor" | "cursor_ide" | "cursor-ide" => "Cursor IDE",
-        "windsurf" | "windsurf_ide" | "windsurf-ide" => "Windsurf IDE",
-        "zed" | "zed_ide" | "zed-ide" => "Zed",
-        "trae" | "trae_ide" | "trae-ide" => "Trae IDE",
         "claude-code" | "claude_code" => "Claude Code CLI",
         "codex-cli" | "codex_cli" => "Codex CLI",
-        "gemini" | "gemini-cli" | "gemini_cli" => "Gemini CLI",
-        "aider" | "aider-cli" | "aider_cli" => "Aider CLI",
         _ => id,
     }
 }

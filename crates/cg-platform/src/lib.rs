@@ -266,22 +266,8 @@ impl PlatformDriver for WindowsPlatformDriver {
             ag_usage_monitor: process_win::installed_ag_usage_monitor_version(),
             ag_capsule: process_win::installed_ag_capsule_version(),
         };
-        let v5_local = update_check::V5LocalIdeVersions {
-            cursor_ide: process_win::installed_cursor_ide_version(),
-            windsurf_ide: process_win::installed_windsurf_ide_version(),
-            zed_ide: process_win::installed_zed_ide_version(),
-            trae_ide: process_win::installed_trae_ide_version(),
-        };
-        let mut seeded_prev = prev.clone();
-        update_check::hydrate_v5_ide_updates(&mut seeded_prev, &v5_local, now_secs);
         update_check::check_all_updates_full(
-            route,
-            cg_version,
-            ag_proxy,
-            &local,
-            component,
-            &seeded_prev,
-            now_secs,
+            route, cg_version, ag_proxy, &local, component, prev, now_secs,
         )
     }
 

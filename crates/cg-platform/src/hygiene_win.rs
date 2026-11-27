@@ -856,11 +856,15 @@ mod tests {
         let report_mixed = evaluate_electron_hygiene_from_cmdlines(
             &[
                 ("claude".into(), 1001, Some(full_cmd.to_string())),
-                ("cursor".into(), 2002, Some(r#""Cursor.exe""#.to_string())),
+                (
+                    "antigravity".into(),
+                    2002,
+                    Some(r#""Antigravity.exe""#.to_string()),
+                ),
             ],
             200,
         );
-        assert_eq!(report_mixed.unguarded_running_agents, vec!["cursor"]);
+        assert_eq!(report_mixed.unguarded_running_agents, vec!["antigravity"]);
         assert!(!report_mixed.webrtc_flag_enforced);
         assert!(!report_mixed.quic_disabled_flag);
     }
@@ -880,7 +884,7 @@ mod tests {
     #[test]
     fn shortcut_patch_and_sha256_byte_exact_restore_roundtrip() {
         let dir = unique_temp_dir("lnk-roundtrip");
-        let lnk = dir.join("Cursor.lnk");
+        let lnk = dir.join("Antigravity.lnk");
         let backup = dir.join("hygiene_lnk_backup.json");
         let orig_target = PathBuf::from(r"C:\Windows\System32\notepad.exe");
         let launcher = PathBuf::from(r"C:\Windows\System32\cmd.exe");
@@ -891,23 +895,23 @@ mod tests {
             "--original-arg",
             None,
             0,
-            "Cursor Test Shortcut",
+            "Antigravity Test Shortcut",
         )
         .expect("create test .lnk");
         let original_bytes = std::fs::read(&lnk).unwrap();
         let original_sha = compute_sha256_hex(&original_bytes);
 
-        let rec = patch_shortcut_for_safe_launch(&lnk, "cursor", &launcher, &backup, 5555)
+        let rec = patch_shortcut_for_safe_launch(&lnk, "antigravity", &launcher, &backup, 5555)
             .expect("patch shortcut");
         assert_eq!(rec.original_sha256, original_sha);
-        assert_eq!(rec.agent_id, "cursor");
+        assert_eq!(rec.agent_id, "antigravity");
 
         let patched_meta = read_lnk_metadata(&lnk).expect("read patched .lnk");
         assert!(patched_meta
             .target_path
             .to_ascii_lowercase()
             .ends_with("cmd.exe"));
-        assert_eq!(patched_meta.arguments, "--safe-launch cursor");
+        assert_eq!(patched_meta.arguments, "--safe-launch antigravity");
         assert!(patched_meta
             .icon_path
             .to_ascii_lowercase()

@@ -5,7 +5,7 @@
 //! - Collapsible Draft-Isolated Create/Edit Sovereign Vault drawer (backed by `DraftStore.vault_draft`,
 //!   100% immune to 1s background snapshot polling, with 1-click「采纳当前实时出口作为基线」)
 //! - 2-column Bento grid of Sovereign Account Vault cards showing pinned regions/IPs/ASN, live state
-//!   pill, 1-click safe-launch buttons (`Claude`, `Code CLI`, `Codex`, `Antigravity`, `Cursor`),
+//!   pill, 1-click safe-launch buttons (`Claude`, `Claude Code`, `ChatGPT`, `Codex CLI`, `Antigravity`),
 //!   `生成桌面快捷方式`, `停止此仓`, `编辑`, and `删除`.
 
 use crate::app::{ActionScope, AppController, ConsoleWindowView};
@@ -486,7 +486,7 @@ pub fn render_vaults_page(
                         switch_row_gated(
                             "vault-sw-share-ext",
                             "共享宿主机 IDE 扩展目录",
-                            "VS Code 系（Cursor / Windsurf / Antigravity）复用插件本体但物理隔离登录态与机器码",
+                            "Antigravity 等 IDE 复用插件本体但物理隔离登录态与机器码",
                             draft.share_ide_extensions,
                             true,
                             p,
@@ -632,16 +632,10 @@ pub fn render_vaults_page(
                     .is_some_and(|n| !n.trim().is_empty());
             let launch_targets = [
                 (VaultAppTarget::ClaudeDesktop, "Claude"),
-                (VaultAppTarget::ClaudeCodeCli, "Code CLI"),
-                (VaultAppTarget::CursorIde, "Cursor"),
-                (VaultAppTarget::AntigravityIde, "Antigravity"),
+                (VaultAppTarget::ClaudeCodeCli, "Claude Code"),
                 (VaultAppTarget::ChatgptDesktop, "ChatGPT"),
-                (VaultAppTarget::WindsurfIde, "Windsurf"),
-                (VaultAppTarget::ZedIde, "Zed"),
-                (VaultAppTarget::TraeIde, "Trae"),
                 (VaultAppTarget::CodexCli, "Codex CLI"),
-                (VaultAppTarget::GeminiCli, "Gemini CLI"),
-                (VaultAppTarget::AiderCli, "Aider CLI"),
+                (VaultAppTarget::AntigravityIde, "Antigravity"),
             ];
             let can_launch_vault = can_act
                 && v.enabled
@@ -1002,7 +996,7 @@ pub fn render_vaults_page(
                                     .child(rt.summary.clone()),
                             )
                         })
-                        // 1-click safe launch row (all 11 managed GUI & CLI clients)
+                        // 1-click safe launch row (core managed GUI & CLI clients)
                         .child(div().flex().flex_wrap().gap(px(5.5)).children(launch_btns)),
                 )
                 // Footer operations

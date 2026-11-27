@@ -375,7 +375,7 @@ pub trait PlatformDriver: Send + Sync {
     /// Discover covered executables for a guarded agent id (`claude`, `chatgpt`, `antigravity`).
     fn discover_agent_exes(&self, agent_id: &str) -> PlatformResult<Vec<PathBuf>>;
 
-    /// Discover standalone native CLI executables for `cli_id` (`claude-code`, `codex`, `gemini`).
+    /// Discover standalone native CLI executables for `cli_id` (`claude-code`, `codex`).
     fn discover_cli_exes(&self, cli_id: &str) -> PlatformResult<Vec<PathBuf>> {
         let _ = cli_id;
         Ok(Vec::new())
@@ -384,7 +384,7 @@ pub trait PlatformDriver: Send + Sync {
     /// Kill running GUI processes belonging to `agent_id` with PID-reuse identity re-verification.
     fn kill_gui_agent(&self, agent_id: &str) -> PlatformResult<Vec<ProcessIdentity>>;
 
-    /// Kill running CLI session processes belonging to `cli_id` (`claude-code`, `codex`, `gemini`)
+    /// Kill running CLI session processes belonging to `cli_id` (`claude-code`, `codex`)
     /// children-first with PID-reuse re-verification (never touches ancestor terminals).
     fn kill_cli_agent(&self, cli_id: &str) -> PlatformResult<Vec<ProcessIdentity>> {
         let _ = cli_id;

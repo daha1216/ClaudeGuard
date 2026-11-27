@@ -24,13 +24,7 @@ fn hud_short_app(agent_id: &str, fallback: &str) -> String {
         "claude-code" => "Code CLI".into(),
         "chatgpt" => "ChatGPT".into(),
         "antigravity" => "Antigravity".into(),
-        "cursor" => "Cursor".into(),
-        "windsurf" => "Windsurf".into(),
-        "zed" => "Zed".into(),
-        "trae" => "Trae".into(),
         "codex" => "Codex CLI".into(),
-        "gemini" => "Gemini CLI".into(),
-        "aider" => "Aider CLI".into(),
         _ => canonical_agent_label(agent_id, fallback).to_string(),
     }
 }

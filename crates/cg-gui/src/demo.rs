@@ -100,12 +100,12 @@ fn demo_config(first_run: bool) -> Config {
     let mut targets =
         default_builtin_targets(&["198.51.100.98".into()], &["US".into(), "SG".into()]);
     targets.push(Target {
-        id: "custom-gemini".into(),
-        name: "Gemini 地区出口".into(),
+        id: "custom-anthropic-api".into(),
+        name: "Anthropic API".into(),
         builtin: false,
         enabled: false,
-        anchor_url: "https://gemini.google.com/".into(),
-        anchor_kind: AnchorKind::GeminiRegion,
+        anchor_url: "https://api.anthropic.com/cdn-cgi/trace".into(),
+        anchor_kind: AnchorKind::Trace,
         expect_ips: vec!["198.51.100.0/24".into()],
         expect_regions: vec!["US".into()],
         timeout_secs: 12,
@@ -114,12 +114,7 @@ fn demo_config(first_run: bool) -> Config {
     Config {
         first_run,
         targets,
-        guarded_agents: vec![
-            "claude".into(),
-            "chatgpt".into(),
-            "antigravity".into(),
-            "cursor".into(),
-        ],
+        guarded_agents: vec!["claude".into(), "chatgpt".into(), "antigravity".into()],
         theme_mode: ThemeMode::Auto,
         firewall_backend: FirewallBackendPref::AutoWfpFirst,
         wfp_boot_guard: false,
@@ -251,56 +246,6 @@ fn demo_agents(tripped: bool) -> Vec<AgentRuntimeStatus> {
             install_paths: vec![r"D:\Program Files\Antigravity\Antigravity.exe".into()],
         },
         AgentRuntimeStatus {
-            id: "cursor".into(),
-            name: "Cursor IDE".into(),
-            kind: AgentKind::Gui,
-            installed: true,
-            guarded: true,
-            running_count: if tripped { 0 } else { 1 },
-            orphan_count: 0,
-            quarantined: tripped,
-            firewall_rules: 0,
-            install_paths: vec![r"C:\Users\demo\AppData\Local\Programs\cursor\Cursor.exe".into()],
-        },
-        AgentRuntimeStatus {
-            id: "windsurf".into(),
-            name: "Windsurf IDE".into(),
-            kind: AgentKind::Gui,
-            installed: true,
-            guarded: false,
-            running_count: 0,
-            orphan_count: 0,
-            quarantined: false,
-            firewall_rules: 0,
-            install_paths: vec![
-                r"C:\Users\demo\AppData\Local\Programs\Windsurf\Windsurf.exe".into(),
-            ],
-        },
-        AgentRuntimeStatus {
-            id: "zed".into(),
-            name: "Zed IDE".into(),
-            kind: AgentKind::Gui,
-            installed: true,
-            guarded: false,
-            running_count: 0,
-            orphan_count: 0,
-            quarantined: false,
-            firewall_rules: 0,
-            install_paths: vec![r"C:\Users\demo\AppData\Local\Programs\Zed\Zed.exe".into()],
-        },
-        AgentRuntimeStatus {
-            id: "trae".into(),
-            name: "Trae IDE".into(),
-            kind: AgentKind::Gui,
-            installed: false,
-            guarded: false,
-            running_count: 0,
-            orphan_count: 0,
-            quarantined: false,
-            firewall_rules: 0,
-            install_paths: Vec::new(),
-        },
-        AgentRuntimeStatus {
             id: "claude-code".into(),
             name: "Claude Code CLI".into(),
             kind: AgentKind::Cli,
@@ -323,30 +268,6 @@ fn demo_agents(tripped: bool) -> Vec<AgentRuntimeStatus> {
             quarantined: false,
             firewall_rules: 0,
             install_paths: vec![r"C:\Users\demo\AppData\Roaming\npm\codex.cmd".into()],
-        },
-        AgentRuntimeStatus {
-            id: "gemini".into(),
-            name: "Gemini CLI".into(),
-            kind: AgentKind::Cli,
-            installed: true,
-            guarded: true,
-            running_count: 0,
-            orphan_count: 0,
-            quarantined: false,
-            firewall_rules: 0,
-            install_paths: vec![r"C:\Users\demo\AppData\Roaming\npm\gemini.cmd".into()],
-        },
-        AgentRuntimeStatus {
-            id: "aider".into(),
-            name: "Aider CLI".into(),
-            kind: AgentKind::Cli,
-            installed: false,
-            guarded: false,
-            running_count: 0,
-            orphan_count: 0,
-            quarantined: false,
-            firewall_rules: 0,
-            install_paths: Vec::new(),
         },
     ]
 }
@@ -669,66 +590,6 @@ fn demo_updates(now: u64, scenario: DemoScenario) -> UpdateSummary {
         checked_at: Some(now.saturating_sub(18)),
         note: "当前 v1.1.2 已是最新官方版本".into(),
     };
-    let cursor_ide = ComponentUpdateStatus {
-        id: "cursor_ide".into(),
-        name: "Cursor IDE".into(),
-        repo: "Anysphere 官方渠道".into(),
-        phase: UpdateCheckPhase::UpToDate,
-        installed_version: Some("0.51.4".into()),
-        latest_version: Some("0.51.4".into()),
-        release_url: Some("https://www.cursor.com/downloads".into()),
-        asset_url: None,
-        checked_at: Some(now.saturating_sub(18)),
-        note: "当前 v0.51.4 已是最新官方版本".into(),
-    };
-    let windsurf_ide = ComponentUpdateStatus {
-        id: "windsurf_ide".into(),
-        name: "Windsurf IDE".into(),
-        repo: "Codeium 官方渠道".into(),
-        phase: if scenario == DemoScenario::Trip {
-            UpdateCheckPhase::UpdateAvailable
-        } else {
-            UpdateCheckPhase::UpToDate
-        },
-        installed_version: Some("1.9.2".into()),
-        latest_version: Some(if scenario == DemoScenario::Trip {
-            "1.10.0".into()
-        } else {
-            "1.9.2".into()
-        }),
-        release_url: Some("https://windsurf.com/download".into()),
-        asset_url: None,
-        checked_at: Some(now.saturating_sub(18)),
-        note: if scenario == DemoScenario::Trip {
-            "发现新版本：当前 v1.9.2 -> 最新 v1.10.0".into()
-        } else {
-            "当前 v1.9.2 已是最新官方版本".into()
-        },
-    };
-    let zed_ide = ComponentUpdateStatus {
-        id: "zed_ide".into(),
-        name: "Zed IDE".into(),
-        repo: "zed-industries/zed".into(),
-        phase: UpdateCheckPhase::UpToDate,
-        installed_version: Some("0.188.3".into()),
-        latest_version: Some("0.188.3".into()),
-        release_url: Some("https://github.com/zed-industries/zed/releases".into()),
-        asset_url: None,
-        checked_at: Some(now.saturating_sub(18)),
-        note: "当前 v0.188.3 已是最新官方版本".into(),
-    };
-    let trae_ide = ComponentUpdateStatus {
-        id: "trae_ide".into(),
-        name: "Trae IDE".into(),
-        repo: "Trae 官方渠道".into(),
-        phase: UpdateCheckPhase::NotInstalled,
-        installed_version: None,
-        latest_version: Some("1.4.2".into()),
-        release_url: Some("https://www.trae.ai/".into()),
-        asset_url: None,
-        checked_at: Some(now.saturating_sub(18)),
-        note: "本机未检测到 Trae IDE 安装路径".into(),
-    };
     UpdateSummary {
         claudeguard,
         antigravity_proxy,
@@ -740,10 +601,6 @@ fn demo_updates(now: u64, scenario: DemoScenario) -> UpdateSummary {
         antigravity_cn,
         ag_usage_monitor,
         ag_capsule,
-        cursor_ide,
-        windsurf_ide,
-        zed_ide,
-        trae_ide,
         claude_msix_version: Some("5.1231.2.0".into()),
         codex_msix_version: Some("26.1111.2228.0".into()),
     }
@@ -819,23 +676,6 @@ pub fn demo_cleanroom_report(now: u64, scope: &CleanRoomScope) -> CleanRoomRepor
             preservation_note: "保留用户自定义 config.toml 与项目指令".into(),
         });
     }
-    if scope.cursor {
-        findings.push(CleanRoomFinding {
-            id: "v2-cursor-storage".into(),
-            client_id: "cursor".into(),
-            vector: CleanRoomVector::DesktopChromiumAndCrashpad,
-            risk_weight: 20,
-            location_display: "%APPDATA%\\Cursor\\User\\globalStorage\\storage.json".into(),
-            correlation_keys: vec![
-                "telemetry.machineId".into(),
-                "telemetry.macMachineId".into(),
-                "telemetry.devDeviceId".into(),
-            ],
-            masked_preview: "需重置 3 项 Cursor 机器码遥测键".into(),
-            bytes_size: 24_576,
-            preservation_note: "100% 保留已装扩展、主题与快捷键".into(),
-        });
-    }
     if scope.antigravity {
         findings.push(CleanRoomFinding {
             id: "v2-ag-session".into(),
@@ -847,19 +687,6 @@ pub fn demo_cleanroom_report(now: u64, scope: &CleanRoomScope) -> CleanRoomRepor
             masked_preview: "浏览器内核会话缓存与旧账号状态".into(),
             bytes_size: 312_000,
             preservation_note: "100% 保留 version.dll 代理注入配置与 MCP 技能".into(),
-        });
-    }
-    if scope.windsurf {
-        findings.push(CleanRoomFinding {
-            id: "v2-windsurf-storage".into(),
-            client_id: "windsurf".into(),
-            vector: CleanRoomVector::DesktopChromiumAndCrashpad,
-            risk_weight: 15,
-            location_display: "%APPDATA%\\Windsurf\\User\\globalStorage\\storage.json".into(),
-            correlation_keys: vec!["telemetry.machineId".into(), "Cookies".into()],
-            masked_preview: "Windsurf 机器标识与会话缓存".into(),
-            bytes_size: 18_432,
-            preservation_note: "100% 保留扩展与工作区配置".into(),
         });
     }
 
@@ -908,7 +735,7 @@ pub fn demo_cleanroom_backups(now: u64) -> Vec<CleanRoomBackupMeta> {
             archive_bytes: 214_528,
             item_count: 6,
             sha256_hex: "9f3b8c2a11d4e7054f90aa21cc0178d5a9e33b102f8c74a1".into(),
-            clients_included: vec!["claude".into(), "cursor".into()],
+            clients_included: vec!["claude".into(), "antigravity".into()],
         },
         CleanRoomBackupMeta {
             backup_id: "cgbak-20261120-0945".into(),
@@ -941,8 +768,8 @@ fn demo_wfp_status(now: u64, scenario: DemoScenario) -> WfpStatus {
             seq: 303,
             timestamp_ms: now_ms.saturating_sub(58_000),
             pid: Some(22910),
-            agent_id: "cursor".into(),
-            app_path: "Cursor.exe".into(),
+            agent_id: "chatgpt".into(),
+            app_path: "ChatGPT.exe".into(),
             remote_ip: "203.0.113.45".into(),
             remote_port: 443,
             protocol: "tcp".into(),

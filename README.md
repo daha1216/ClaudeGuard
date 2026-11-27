@@ -21,7 +21,7 @@
   <img src="https://img.shields.io/badge/License-MIT%20%2F%20Apache--2.0-green" alt="License" />
 </p>
 
-> **Architecture note**: Built on the privilege-separated **Windows Service daemon + native GPUI client** (`claudeguard-daemon.exe` + `claudeguard-gui.exe` + `claudeguard-cli.exe`, zero WebView2 dependency, zero daily UAC prompts, crash-safe WAL rollback), **v5.0.0** expands ClaudeGuard into a full **Anti-Ban Fortress (M1–M7)** with dynamic Win32 WFP kernel filtering, a 10D ban-risk radar, Sovereign Multi-Account Vaults, encrypted 4-vector Clean-Room sanitization, `<2ms` O(1) CLI/WSL2 hook gating, and a 7-GUI + 4-CLI guarded matrix. The legacy v3 codebase remains preserved on the [`v3`](https://github.com/daha1216/ClaudeGuard/tree/v3) branch and tag [`v3.12.5`](https://github.com/daha1216/ClaudeGuard/releases/tag/v3.12.5).
+> **Architecture note**: Built on the privilege-separated **Windows Service daemon + native GPUI client** (`claudeguard-daemon.exe` + `claudeguard-gui.exe` + `claudeguard-cli.exe`, zero WebView2 dependency, zero daily UAC prompts, crash-safe WAL rollback), **v5.0.0** expands ClaudeGuard into a full **Anti-Ban Fortress (M1–M7)** with dynamic Win32 WFP kernel filtering, a 10D ban-risk radar, Sovereign Multi-Account Vaults, encrypted 4-vector Clean-Room sanitization, `<2ms` O(1) CLI/WSL2 hook gating, and focused protection for the core AI suite (`Claude`, `Claude Code`, `ChatGPT`, `Codex CLI`, `Antigravity`). The legacy v3 codebase remains preserved on the [`v3`](https://github.com/daha1216/ClaudeGuard/tree/v3) branch and tag [`v3.12.5`](https://github.com/daha1216/ClaudeGuard/releases/tag/v3.12.5).
 
 ---
 
@@ -153,9 +153,9 @@ All screenshots below are real HiDPI renders captured directly from `claudeguard
 4. **M4 & M5 · Sovereign Multi-Account Vaults & 4-Vector Clean-Room Sanitizer (`CGBAK005`)**:
    - Per-account isolated profile directories (`--user-data-dir` / `CLAUDE_CONFIG_DIR`), per-vault egress baselines, desktop `.lnk` launchers, and read-only fail-closed launch enforcement (`auto_align_mihomo_on_vault_launch: false` by default).
    - 4-vector local residue scanner that preserves 100% of user code/configs and mandates `CGBAK005` Windows CNG AES-256-GCM + DPAPI encrypted `.cgbak` Time-Machine backups before any purge.
-5. **M6 & M7 · `<2ms` O(1) CLI Hooks, WSL2 Loopback HMAC Bridge, `BurstGuard` & 7-GUI + 4-CLI Matrix**:
+5. **M6 & M7 · `<2ms` O(1) CLI Hooks, WSL2 Loopback HMAC Bridge, `BurstGuard` & Core AI Suite Matrix**:
    - Idempotent Claude Code `settings.json` hook merge and PowerShell `$PROFILE` wrapper installer, loopback-only (`127.0.0.1:0`) WSL2 HMAC-SHA256 anti-replay bridge (`.claudeguard-wsl-token`), and `BurstGuard` rate/cadence anomaly defense.
-   - Expanded coverage across **7 GUI apps** (`Claude Desktop`, `ChatGPT / Codex`, `Antigravity IDE`, `Cursor`, `Windsurf`, `Zed`, `Trae`) and **4 CLIs** (`Claude Code`, `Codex CLI`, `Gemini CLI`, `Aider CLI`), alongside the 10-component read-only update radar.
+   - Focused, deep coverage across the core **3 GUI apps** (`Claude Desktop`, `ChatGPT / Codex`, `Antigravity IDE`) and **2 CLIs** (`Claude Code`, `Codex CLI`), alongside the 10-component read-only update radar.
 
 ---
 
@@ -229,11 +229,11 @@ claudeguard-gui.exe --demo pass                    # Standalone UI demo (pass | 
 Requires Rust (`1.98+`, verified on `rustc 1.99.0`), Windows 10/11 SDK, and [Inno Setup 6](https://jrsoftware.org/isinfo.php) (for `.exe` installer packaging):
 
 ```powershell
-# 1. Core workspace (protocol, core, platform, daemon, cli) — 330 tests
+# 1. Core workspace (protocol, core, platform, daemon, cli) — 333 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 
-# 2. v3->v5 upgrade bridge (cg-v3-bridge) — 4 tests
+# 2. v3->v5 upgrade bridge (cg-v3-bridge) — 5 tests
 cargo clippy --locked --manifest-path crates/cg-v3-bridge/Cargo.toml --all-targets -- -D warnings
 cargo test --locked --manifest-path crates/cg-v3-bridge/Cargo.toml
 

@@ -343,7 +343,7 @@ pub fn sync_claude_code_settings(
     atomic_write_bytes(settings_path, &final_bytes)
 }
 
-/// Renders the marked PowerShell `$PROFILE` wrapper block for `claude`, `codex`, `gemini`, and `aider`.
+/// Renders the marked PowerShell `$PROFILE` wrapper block for `claude` and `codex`.
 pub fn render_pwsh_profile_block(cli_exe: &Path) -> String {
     let exe_esc = cli_exe.to_string_lossy().replace('\'', "''");
     format!(
@@ -369,8 +369,6 @@ function Invoke-ClaudeGuardCliWrap {{\r\n\
 }}\r\n\
 function claude {{ Invoke-ClaudeGuardCliWrap -AgentId 'claude-code' -ExeName 'claude' -ForwardArgs $args }}\r\n\
 function codex  {{ Invoke-ClaudeGuardCliWrap -AgentId 'codex'       -ExeName 'codex'  -ForwardArgs $args }}\r\n\
-function gemini {{ Invoke-ClaudeGuardCliWrap -AgentId 'gemini'      -ExeName 'gemini' -ForwardArgs $args }}\r\n\
-function aider  {{ Invoke-ClaudeGuardCliWrap -AgentId 'aider'       -ExeName 'aider'  -ForwardArgs $args }}\r\n\
 {end}",
         start = PWSH_BLOCK_START,
         end = PWSH_BLOCK_END,
@@ -867,7 +865,6 @@ mod tests {
         assert!(prof_text.contains(PWSH_BLOCK_START));
         assert!(prof_text.contains("function claude"));
         assert!(prof_text.contains("function codex"));
-        assert!(prof_text.contains("function gemini"));
 
         // Verify vault settings carries `--vault work-us`.
         let v_settings = vroot
