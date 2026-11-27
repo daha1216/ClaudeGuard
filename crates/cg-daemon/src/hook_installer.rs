@@ -55,10 +55,88 @@ pub fn resolve_interactive_user_home() -> Option<PathBuf> {
         })
 }
 
-/// Returns the default PowerShell 7 `$PROFILE.CurrentUserAllHosts` path under `user_home`.
+/// Resolves a `User Shell Folders\Personal` registry value (supporting OneDrive Known Folder Move
+/// such as `%USERPROFILE%\OneDrive\Documents` or an explicit path under `user_home`), falling back
+/// cleanly to `user_home\Documents` when absent, outside `user_home`, or containing `..`.
+pub fn resolve_documents_dir_from_personal(
+    user_home: &Path,
+    personal_raw: Option<&str>,
+) -> PathBuf {
+    let fallback = user_home.join("Documents");
+    let Some(raw) = personal_raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return fallback;
+    };
+    if raw.contains("..") {
+        return fallback;
+    }
+
+    let norm_raw = raw.replace('/', "\\");
+    let home_norm = user_home
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_string();
+
+    let rel_opt = if norm_raw.len() > "%USERPROFILE%\\".len()
+        && norm_raw[.."%USERPROFILE%\\".len()].eq_ignore_ascii_case("%USERPROFILE%\\")
+    {
+        Some(&norm_raw["%USERPROFILE%\\".len()..])
+    } else if norm_raw.len() > home_norm.len() + 1
+        && norm_raw[..home_norm.len()].eq_ignore_ascii_case(&home_norm)
+        && norm_raw.as_bytes()[home_norm.len()] == b'\\'
+    {
+        Some(&norm_raw[home_norm.len() + 1..])
+    } else {
+        None
+    };
+
+    if let Some(rel) = rel_opt
+        .map(|r| r.trim_matches('\\'))
+        .filter(|r| !r.is_empty())
+    {
+        let first_seg = rel.split('\\').next().unwrap_or("");
+        if first_seg.eq_ignore_ascii_case("Documents") || user_home.join(first_seg).is_dir() {
+            let candidate = user_home.join(rel);
+            if vault_win::ensure_no_reparse_points_chain(&candidate).is_ok() {
+                return candidate;
+            }
+        }
+    }
+    fallback
+}
+
+#[cfg(windows)]
+fn read_interactive_personal_folder_raw(user_home: &Path) -> Option<String> {
+    let active_home = resolve_interactive_user_home()?;
+    let a = active_home
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    let b = user_home
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    if a != b {
+        return None;
+    }
+    let key = cg_platform::access_win::open_interactive_user_subkey(
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+    )?;
+    key.get_value::<String, _>("Personal").ok()
+}
+
+#[cfg(not(windows))]
+fn read_interactive_personal_folder_raw(_user_home: &Path) -> Option<String> {
+    None
+}
+
+/// Returns the default PowerShell 7 `$PROFILE.CurrentUserAllHosts` path under `user_home`
+/// (honoring Windows OneDrive Known Folder Redirection when active).
 pub fn default_pwsh_profile_path(user_home: &Path) -> PathBuf {
-    user_home
-        .join("Documents")
+    let raw_personal = read_interactive_personal_folder_raw(user_home);
+    resolve_documents_dir_from_personal(user_home, raw_personal.as_deref())
         .join("PowerShell")
         .join("profile.ps1")
 }
@@ -278,12 +356,16 @@ function Invoke-ClaudeGuardCliWrap {{\r\n\
         if (-not [string]::IsNullOrWhiteSpace($env:CG_VAULT_ID)) {{\r\n\
             $gateArgs += @('--vault', $env:CG_VAULT_ID)\r\n\
         }}\r\n\
-        & $cgCli @gateArgs\r\n\
+        $null | & $cgCli @gateArgs\r\n\
         if ($LASTEXITCODE -ne 0) {{ return }}\r\n\
     }}\r\n\
-    $realCmd = Get-Command -Name $ExeName -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1\r\n\
+    $realCmd = Get-Command -Name $ExeName -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Where-Object {{ $_.Source -ne $PSCommandPath }} | Select-Object -First 1\r\n\
     if ($null -eq $realCmd) {{ Write-Error \"ClaudeGuard: executable not found: $ExeName\"; return }}\r\n\
-    & $realCmd.Source @ForwardArgs\r\n\
+    if ($MyInvocation.ExpectingInput) {{\r\n\
+        $input | & $realCmd.Source @ForwardArgs\r\n\
+    }} else {{\r\n\
+        & $realCmd.Source @ForwardArgs\r\n\
+    }}\r\n\
 }}\r\n\
 function claude {{ Invoke-ClaudeGuardCliWrap -AgentId 'claude-code' -ExeName 'claude' -ForwardArgs $args }}\r\n\
 function codex  {{ Invoke-ClaudeGuardCliWrap -AgentId 'codex'       -ExeName 'codex'  -ForwardArgs $args }}\r\n\
@@ -464,7 +546,17 @@ pub fn configure_cli_hooks_in(
     ))
 }
 
-/// Production hook configurator targeting the active interactive user home & default vaults root.
+/// Derives the Sovereign Vaults root directory (`<user_home>\AppData\Local\ClaudeGuard\Vaults`)
+/// for an interactive user profile so Session-0 `LocalSystem` never writes into `systemprofile`.
+pub fn vaults_root_for_user(user_home: &Path) -> PathBuf {
+    user_home
+        .join("AppData")
+        .join("Local")
+        .join("ClaudeGuard")
+        .join("Vaults")
+}
+
+/// Production hook configurator targeting the active interactive user home & user vaults root.
 pub fn configure_cli_hooks(
     vaults: &[AccountVault],
     install_claude_code: bool,
@@ -473,11 +565,11 @@ pub fn configure_cli_hooks(
 ) -> Result<HookIntegrationStatus, String> {
     let user_home = resolve_interactive_user_home()
         .ok_or_else(|| "无法定位当前交互用户主目录，无法配置 CLI Hook".to_string())?;
-    let vaults_root = vault_win::default_vaults_root().ok();
+    let vaults_root = vaults_root_for_user(&user_home);
     let cli_exe = resolve_cli_exe_path();
     configure_cli_hooks_in(
         &user_home,
-        vaults_root.as_deref(),
+        Some(&vaults_root),
         &cli_exe,
         vaults,
         install_claude_code,
@@ -494,7 +586,10 @@ pub fn inspect_hook_status(
     last_gate_latency_us: u64,
 ) -> HookIntegrationStatus {
     let user_home = resolve_interactive_user_home();
-    let vaults_root = vault_win::default_vaults_root().ok();
+    let vaults_root = user_home
+        .as_deref()
+        .map(vaults_root_for_user)
+        .or_else(|| vault_win::default_vaults_root().ok());
     inspect_hook_status_in(
         user_home.as_deref(),
         vaults_root.as_deref(),
@@ -529,6 +624,87 @@ fn backup_path_for(path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+#[cfg(windows)]
+fn ensure_interactive_user_modify_dacl_if_service(target: &Path) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, BOOL, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    if !cg_platform::access_win::is_session_zero() {
+        return;
+    }
+    let Some(sid) = crate::wsl_bridge::resolve_user_sid_for_path(target) else {
+        return;
+    };
+    if !cg_platform::access_win::is_interactive_user_sid(&sid) {
+        return;
+    }
+    let sddl = format!("D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{sid})");
+    let sddl_w: Vec<u16> = OsStr::new(&sddl)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl_w.as_ptr()),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+    }
+    .is_err()
+    {
+        return;
+    }
+    struct SdGuard(PSECURITY_DESCRIPTOR);
+    impl Drop for SdGuard {
+        fn drop(&mut self) {
+            if !self.0 .0.is_null() {
+                unsafe {
+                    let _ = LocalFree(HLOCAL(self.0 .0));
+                }
+            }
+        }
+    }
+    let _sd_guard = SdGuard(sd);
+
+    let mut present = BOOL(0);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut defaulted = BOOL(0);
+    if unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) }.is_err()
+        || !present.as_bool()
+        || dacl.is_null()
+    {
+        return;
+    }
+    let path_w: Vec<u16> = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let _ = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            PSID::default(),
+            PSID::default(),
+            Some(dacl.cast_const()),
+            None,
+        )
+    };
+}
+
 fn atomic_write_bytes(target: &Path, bytes: &[u8]) -> Result<(), String> {
     vault_win::ensure_no_reparse_points_chain(target)?;
     let parent = target
@@ -543,6 +719,8 @@ fn atomic_write_bytes(target: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("同步临时文件失败：{e}"))?;
     tmp.persist(target)
         .map_err(|e| format!("原子替换 {} 失败：{}", target.display(), e.error))?;
+    #[cfg(windows)]
+    ensure_interactive_user_modify_dacl_if_service(target);
     Ok(())
 }
 
@@ -698,6 +876,18 @@ mod tests {
             .join("settings.json");
         let v_text = std::fs::read_to_string(&v_settings).unwrap();
         assert!(v_text.contains("--vault work-us"));
+
+        // Verify OneDrive `User Shell Folders\Personal` redirection & stdin-safe wrapper script.
+        assert!(prof_text.contains("$null | & $cgCli @gateArgs"));
+        assert!(prof_text.contains("Application,ExternalScript"));
+        assert!(prof_text.contains("$MyInvocation.ExpectingInput"));
+
+        let onedrive_docs = home.join("OneDrive").join("Documents");
+        std::fs::create_dir_all(&onedrive_docs).unwrap();
+        assert_eq!(
+            resolve_documents_dir_from_personal(&home, Some(r"%USERPROFILE%\OneDrive\Documents")),
+            onedrive_docs
+        );
 
         // Re-running uninstall strips wrapper block while keeping oh-my-posh line intact.
         let st_off = configure_cli_hooks_in(&home, Some(&vroot), cli, &vaults, false, false, true)

@@ -1072,31 +1072,42 @@ where
         }
     }
 
-    // Tier 3: Cloudflare cdn-cgi/trace
+    // Tier 3: Cloudflare cdn-cgi/trace (reject if split-routing returned a different IP than `norm_ip`!)
     if let Ok((200, body)) = http_get("https://1.1.1.1/cdn-cgi/trace") {
-        if let Ok(report) =
-            parse_cdn_cgi_trace(&body, norm_ip.as_deref(), observed_country, now_secs)
-        {
-            if let Some(ref key) = report.ip {
-                cache.put(key, report.clone(), now_secs);
+        if let Ok(trace_raw) = parse_cdn_cgi_trace(&body, None, observed_country, now_secs) {
+            let ip_matches = match norm_ip.as_deref() {
+                Some(exp_ip) => {
+                    trace_raw
+                        .ip
+                        .as_deref()
+                        .and_then(normalize_ip_key)
+                        .as_deref()
+                        == Some(exp_ip)
+                }
+                None => true,
+            };
+            if ip_matches {
+                if let Ok(report) =
+                    parse_cdn_cgi_trace(&body, norm_ip.as_deref(), observed_country, now_secs)
+                {
+                    if let Some(ref key) = report.ip {
+                        cache.put(key, report.clone(), now_secs);
+                    }
+                    return report;
+                }
             }
-            return report;
         }
     }
 
-    // Tier 4: Pure offline fallback
-    let offline = build_offline_purity_report(
+    // Tier 4: Pure offline fallback (do NOT poison the 30-minute cache on transient network errors!)
+    build_offline_purity_report(
         norm_ip.as_deref(),
         observed_country,
         None,
         None,
         "offline_fallback",
         now_secs,
-    );
-    if let Some(ref key) = offline.ip {
-        cache.put(key, offline.clone(), now_secs);
-    }
-    offline
+    )
 }
 
 /// 4-tier rate-limit-proof IP intelligence fetcher strictly routed via `ProbeRoute` (ZERO direct fallback).
@@ -1141,11 +1152,13 @@ pub fn fetch_ip_purity_via_route(
         },
     );
 
-    if let Some(ref key) = report.ip {
-        let mut guard = global_ip_intel_cache()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.put(key, report.clone(), now_secs);
+    if report.source_tag != "offline_fallback" && report.source_tag != "offline_fail_closed" {
+        if let Some(ref key) = report.ip {
+            let mut guard = global_ip_intel_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.put(key, report.clone(), now_secs);
+        }
     }
     report
 }
@@ -1259,12 +1272,14 @@ pub fn detect_local_fake_ip_dns() -> bool {
         .any(|sa| crate::netwatch_win::is_fake_ip_addr(sa.ip()))
 }
 
-/// Pure evaluator folding observed DNS resolver countries, expected proxy country, and Fake-IP state
-/// into a protocol `DnsCoherenceReport`.
-pub fn evaluate_dns_coherence(
+/// Pure evaluator folding observed DNS resolver countries, expected proxy country, Fake-IP state,
+/// and runtime access posture into a protocol `DnsCoherenceReport`.
+pub fn evaluate_dns_coherence_with_posture(
     resolver_countries: Vec<String>,
     expected_country: Option<&str>,
     fake_ip_active: bool,
+    access_level: cg_protocol::AccessLevel,
+    electron_hygiene_enforced: bool,
     now_secs: u64,
 ) -> DnsCoherenceReport {
     let expected = normalize_country_code(expected_country);
@@ -1277,13 +1292,24 @@ pub fn evaluate_dns_coherence(
         }
     }
 
-    let domestic_resolver_detected = !fake_ip_active
+    let raw_domestic = !fake_ip_active
         && expected.as_deref() != Some("CN")
         && normalized.iter().any(|c| c == "CN");
 
+    // In SystemProxy mode with Electron `--host-resolver-rules=MAP * ~NOTFOUND` enforced and an
+    // overseas proxy egress (`!CN`), rule-based proxies (Clash GFWList) commonly route unknown
+    // `*.edns.ip-api.com` test domains DIRECT (`CN`) while proxying all AI domains (`claude.ai` etc.)
+    // remotely. Do NOT trigger a false Grade-D domestic DNS veto in that protected posture!
+    let system_proxy_remote_dns_shielded = raw_domestic
+        && access_level == cg_protocol::AccessLevel::SystemProxy
+        && electron_hygiene_enforced
+        && expected.as_deref().is_some_and(|c| c != "CN");
+
+    let domestic_resolver_detected = raw_domestic && !system_proxy_remote_dns_shielded;
+
     let coherent = if domestic_resolver_detected {
         false
-    } else if fake_ip_active {
+    } else if fake_ip_active || system_proxy_remote_dns_shielded {
         true
     } else {
         match expected.as_deref() {
@@ -1294,6 +1320,9 @@ pub fn evaluate_dns_coherence(
 
     let summary = if domestic_resolver_detected {
         "检测到国内 DNS 解析器回源（CN），存在本地 DNS 地理位置泄漏风险".to_string()
+    } else if system_proxy_remote_dns_shielded {
+        "系统代理分流规则将通用测速域名解析至国内，但安全启动台已强制客户端远端代理解析（MAP * ~NOTFOUND），AI 域名无本地 DNS 泄漏"
+            .to_string()
     } else if fake_ip_active {
         "已检测到代理 Fake-IP DNS 接管（198.18.0.0/15），域名解析已由远端代理节点统一承接"
             .to_string()
@@ -1322,32 +1351,61 @@ pub fn evaluate_dns_coherence(
     }
 }
 
-/// Probe DNS geographic coherence strictly honoring `ProbeRoute` (ZERO direct fallback on `Skip`).
-pub fn probe_dns_coherence(
-    route: &ProbeRoute,
+/// Pure evaluator folding observed DNS resolver countries, expected proxy country, and Fake-IP state
+/// into a protocol `DnsCoherenceReport`.
+pub fn evaluate_dns_coherence(
+    resolver_countries: Vec<String>,
     expected_country: Option<&str>,
+    fake_ip_active: bool,
     now_secs: u64,
 ) -> DnsCoherenceReport {
-    let fake_ip_active = detect_local_fake_ip_dns();
+    evaluate_dns_coherence_with_posture(
+        resolver_countries,
+        expected_country,
+        fake_ip_active,
+        cg_protocol::AccessLevel::Tun,
+        false,
+        now_secs,
+    )
+}
 
+fn probe_dns_coherence_impl(
+    route: &ProbeRoute,
+    expected_country: Option<&str>,
+    timeout: Duration,
+    access_level: cg_protocol::AccessLevel,
+    electron_hygiene_enforced: bool,
+    now_secs: u64,
+) -> DnsCoherenceReport {
+    // 1. Check `ProbeRoute::Skip` FIRST — never call OS DNS (`claude.ai`) when uncovered/skipped!
     if let ProbeRoute::Skip(reason) = route {
         return DnsCoherenceReport {
             checked_at: now_secs,
-            coherent: fake_ip_active,
+            coherent: false,
             domestic_resolver_detected: false,
-            fake_ip_active,
+            fake_ip_active: false,
             resolver_countries: Vec::new(),
             summary: format!("未执行外网 DNS 地理探测（{reason}）"),
         };
     }
 
+    // 2. Only check local Fake-IP DNS (`claude.ai`) when a verified TUN adapter is active,
+    //    preventing plaintext ISP DNS queries for `claude.ai` under SystemProxy!
+    let fake_ip_active = if access_level == cg_protocol::AccessLevel::Tun {
+        detect_local_fake_ip_dns()
+    } else {
+        false
+    };
+
+    // 3. Query randomized `<rand32>.edns.ip-api.com/json` (official ip-api EDNS protocol) so
+    //    upstream DNS caches never mask real recursive resolver geography; do NOT fall back to
+    //    `1.1.1.1/cdn-cgi/trace` (which measures HTTP TCP egress, not DNS resolver location!).
+    let rand_sub = crate::crypto_win::random_hex(16)
+        .unwrap_or_else(|_| format!("{now_secs:016x}{:016x}", std::process::id()));
+    let edns_url = format!("https://{rand_sub}.edns.ip-api.com/json");
+
     let mut countries = Vec::new();
-    if let Ok(resp) = probe_url(
-        route,
-        "https://edns.ip-api.com/json",
-        DEFAULT_IP_INTEL_TIMEOUT,
-        64 * 1024,
-    ) {
+    if let Ok(resp) = probe_url(route, &edns_url, timeout, 64 * 1024) {
         if resp.status == 200 {
             if let Some(cc) = parse_edns_resolver_country(&resp.body) {
                 countries.push(cc);
@@ -1355,24 +1413,58 @@ pub fn probe_dns_coherence(
         }
     }
 
-    if countries.is_empty() {
-        if let Ok(resp) = probe_url(
-            route,
-            "https://1.1.1.1/cdn-cgi/trace",
-            DEFAULT_IP_INTEL_TIMEOUT,
-            64 * 1024,
-        ) {
-            if resp.status == 200 {
-                if let Ok(trace) = parse_cdn_cgi_trace(&resp.body, None, None, now_secs) {
-                    if let Some(cc) = trace.country {
-                        countries.push(cc);
-                    }
-                }
-            }
-        }
-    }
+    evaluate_dns_coherence_with_posture(
+        countries,
+        expected_country,
+        fake_ip_active,
+        access_level,
+        electron_hygiene_enforced,
+        now_secs,
+    )
+}
 
-    evaluate_dns_coherence(countries, expected_country, fake_ip_active, now_secs)
+/// Posture-aware DNS geographic coherence probe for `cg-daemon` risk scoring.
+pub fn probe_dns_coherence_for_posture(
+    route: &ProbeRoute,
+    expected_egress_country: Option<&str>,
+    timeout_ms: u64,
+    access_level: cg_protocol::AccessLevel,
+    electron_hygiene_enforced: bool,
+) -> DnsCoherenceReport {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let timeout = Duration::from_millis(timeout_ms.clamp(500, 10_000));
+    probe_dns_coherence_impl(
+        route,
+        expected_egress_country,
+        timeout,
+        access_level,
+        electron_hygiene_enforced,
+        now_secs,
+    )
+}
+
+/// Probe DNS geographic coherence strictly honoring `ProbeRoute` (ZERO direct fallback on `Skip`).
+pub fn probe_dns_coherence(
+    route: &ProbeRoute,
+    expected_country: Option<&str>,
+    now_secs: u64,
+) -> DnsCoherenceReport {
+    let inferred_level = match route {
+        ProbeRoute::Proxy(_) => cg_protocol::AccessLevel::SystemProxy,
+        ProbeRoute::Direct => cg_protocol::AccessLevel::Tun,
+        ProbeRoute::Skip(_) => cg_protocol::AccessLevel::Uncovered,
+    };
+    probe_dns_coherence_impl(
+        route,
+        expected_country,
+        DEFAULT_IP_INTEL_TIMEOUT,
+        inferred_level,
+        false,
+        now_secs,
+    )
 }
 
 #[cfg(test)]
@@ -1515,6 +1607,52 @@ mod tests {
         );
         assert_eq!(calls, 0);
         assert_eq!(skipped.source_tag, "offline_fail_closed");
+
+        // 1b. Tier 3 (`1.1.1.1/cdn-cgi/trace`) split-route IP mismatch MUST be rejected, and Tier 4
+        //     `offline_fallback` MUST NOT poison the 30-minute cache!
+        let mut split_cache = IpIntelCache::new(1800, 4);
+        let fallback_rep = fetch_ip_purity_with_fetcher(
+            &ProbeRoute::Proxy("http://127.0.0.1:7890".into()),
+            Some("68.105.28.44"),
+            Some("US"),
+            1000,
+            &mut split_cache,
+            |url| {
+                if url.contains("1.1.1.1/cdn-cgi/trace") {
+                    Ok((200, "ip=114.114.114.114\nloc=CN\n".into()))
+                } else {
+                    Ok((429, "rate limited".into()))
+                }
+            },
+        );
+        assert_eq!(fallback_rep.source_tag, "offline_fallback");
+        assert_eq!(fallback_rep.ip.as_deref(), Some("68.105.28.44"));
+        assert_eq!(fallback_rep.country.as_deref(), Some("US"));
+        assert!(split_cache.get("68.105.28.44", 1001).is_none());
+
+        // 1c. SystemProxy + Electron hygiene `MAP * ~NOTFOUND` exempts GFWList domestic EDNS split
+        let sys_proxy_dns = evaluate_dns_coherence_with_posture(
+            vec!["CN".into()],
+            Some("US"),
+            false,
+            cg_protocol::AccessLevel::SystemProxy,
+            true,
+            1000,
+        );
+        assert!(sys_proxy_dns.coherent);
+        assert!(!sys_proxy_dns.domestic_resolver_detected);
+
+        // Without Electron hygiene in SystemProxy or in Tun mode without Fake-IP, CN resolver IS flagged!
+        let tun_leak_dns = evaluate_dns_coherence_with_posture(
+            vec!["CN".into()],
+            Some("US"),
+            false,
+            cg_protocol::AccessLevel::Tun,
+            true,
+            1000,
+        );
+        assert!(!tun_leak_dns.coherent);
+        assert!(tun_leak_dns.domestic_resolver_detected);
 
         // 2. Tier 1 returns 429 -> falls back to Tier 2 (ipinfo.io) and caches for 30 min
         let route = ProbeRoute::Proxy("http://127.0.0.1:7890".into());

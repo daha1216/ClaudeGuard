@@ -211,13 +211,13 @@ fn grade_title_zh(grade: SafetyGrade) -> &'static str {
 
 fn ascii_asn_label(class: AsnClassification) -> &'static str {
     match class {
-        AsnClassification::IspResidential => "NATIVE ISP RESIDENTIAL",
-        AsnClassification::BusinessIsp => "BUSINESS ISP LINE",
+        AsnClassification::IspResidential => "ISP RESIDENTIAL",
+        AsnClassification::BusinessIsp => "BUSINESS ISP",
         AsnClassification::MobileCellular => "MOBILE CARRIER",
-        AsnClassification::EducationGov => "EDU / GOV NETWORK",
-        AsnClassification::DatacenterHosting => "DATACENTER / VPS",
-        AsnClassification::PublicProxyVpnTor => "SHARED VPN / TOR",
-        AsnClassification::Unknown => "UNCLASSIFIED ASN",
+        AsnClassification::EducationGov => "EDU / GOV NET",
+        AsnClassification::DatacenterHosting => "DATACENTER ASN",
+        AsnClassification::PublicProxyVpnTor => "VPN / TOR EXIT",
+        AsnClassification::Unknown => "UNKNOWN ASN",
     }
 }
 
@@ -526,13 +526,13 @@ pub fn render_health_card_png(
         accent,
     );
 
-    // Right 2x3 metrics Bento grid (pure ASCII desensitized telemetry).
+    // Right 2x3 metrics Bento grid (pure ASCII desensitized telemetry, <= 24 chars per tile).
     let asn_line = snap
         .map(|s| {
+            let risk = s.risk_assessment.ip_purity.abuse_risk_score.min(100);
             format!(
-                "{} (ABUSE {}%)",
-                ascii_asn_label(s.risk_assessment.ip_purity.classification),
-                s.risk_assessment.ip_purity.abuse_risk_score.min(100)
+                "{} ({risk}%)",
+                ascii_asn_label(s.risk_assessment.ip_purity.classification)
             )
         })
         .unwrap_or_else(|| "ISP PURITY VERIFIED".into());
@@ -601,18 +601,34 @@ pub fn render_health_card_png(
         canvas.fill_rounded_rect(tx + 20, ty + 24, 8, 22, 4, accent, None);
         canvas.draw_text(tx + 38, ty + 28, 2, kicker, ink_muted);
         let safe_val = sanitize_ascii_only(&redact_sensitive_tokens(value));
-        let clipped: String = safe_val.chars().take(24).collect();
+        let clipped = clip_card_tile_value(&safe_val, 24);
         canvas.draw_text(tx + 22, ty + 74, 2, &clipped, ink_primary);
     }
 
-    // Bottom footer bar.
+    // Bottom footer bar (strictly <= 86 chars so `68 + width <= 1100` stays well inside `1172` border).
     let safe_ver = sanitize_ascii_only(&card.cg_version);
-    let footer = format!(
-        "GENERATED LOCALLY BY CLAUDEGUARD V{safe_ver}  |  STRICT ALLOWLIST REDACTION  |  NO RAW IP OR USERNAME"
-    );
+    let footer: String = format!(
+        "CLAUDEGUARD V{safe_ver}  |  LOCAL ALLOWLIST REDACTION  |  ZERO RAW IP OR ACCOUNT DATA"
+    )
+    .chars()
+    .take(86)
+    .collect();
     canvas.draw_text(68, 608, 2, &footer, ink_muted);
 
     encode_png_rgb_lossless(CARD_WIDTH, CARD_HEIGHT, &canvas.rgb)
+}
+
+fn clip_card_tile_value(raw: &str, max_chars: usize) -> String {
+    let mut clipped: String = raw.chars().take(max_chars).collect();
+    if clipped.contains('(')
+        && !clipped.contains(')')
+        && let Some(pos) = clipped.rfind('(')
+    {
+        clipped.truncate(pos);
+    }
+    clipped
+        .trim_end_matches([' ', '(', '/', '-', '|'])
+        .to_string()
 }
 
 /// Exports the desensitized PNG health card to `dir` (or Desktop / temp directory) and updates `card.saved_png_path`.
@@ -1057,5 +1073,24 @@ mod tests {
             assert!(!png_lossy.contains("203.0.113.45"));
             assert!(!png_lossy.contains("alice_secret"));
         }
+
+        // Verify tile clipper never leaves an unmatched opening '(' and footer fits inside 1172px border.
+        assert_eq!(
+            clip_card_tile_value("NATIVE ISP RESIDENTIAL (ABUSE 2%)", 24),
+            "NATIVE ISP RESIDENTIAL"
+        );
+        assert_eq!(
+            clip_card_tile_value("ISP RESIDENTIAL (2%)", 24),
+            "ISP RESIDENTIAL (2%)"
+        );
+        let footer_px = 68
+            + measure_text_px(
+                "CLAUDEGUARD V5.0.0  |  LOCAL ALLOWLIST REDACTION  |  ZERO RAW IP OR ACCOUNT DATA",
+                2,
+            );
+        assert!(
+            footer_px <= 1140,
+            "footer must fit inside card right border, got {footer_px}px"
+        );
     }
 }

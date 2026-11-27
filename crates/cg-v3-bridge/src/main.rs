@@ -29,6 +29,34 @@ const EMBEDDED_SETUP: &[u8] = &[];
 const WAITER_FLAG: &str = "--cg-wait";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_JSON_DEPTH: usize = 64;
+const DATA_DIR_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+fn is_reparse_point_metadata(meta: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return true;
+        }
+    }
+    meta.file_type().is_symlink()
+}
+
+/// Returns `true` if `path` or any existing ancestor directory is a symlink, junction, or mount point.
+fn has_reparse_point_in_chain(path: &Path) -> bool {
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        if let Ok(meta) = fs::symlink_metadata(ancestor) {
+            if is_reparse_point_metadata(&meta) {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WaiterArgs {
@@ -193,9 +221,16 @@ fn sha256_file(file: &mut File) -> Result<[u8; 32], String> {
     Ok(hasher.finalize())
 }
 
-/// Opens `setup_exe` with `FILE_SHARE_READ` (`1`) only, preventing external processes from
-/// writing, truncating, deleting, or renaming the staged binary while allowing OS image execution.
+/// Opens `setup_exe` with `FILE_SHARE_READ` (`1`) only, rejecting symlinks/reparse points and
+/// preventing external processes from writing, truncating, deleting, or renaming the staged binary
+/// while allowing OS image execution.
 fn open_setup_read_locked(setup_exe: &Path) -> Result<File, String> {
+    if has_reparse_point_in_chain(setup_exe) {
+        return Err(format!(
+            "检测到升级安装包路径存在符号链接或重解析点，拒绝执行：{}",
+            setup_exe.display()
+        ));
+    }
     let mut opts = OpenOptions::new();
     opts.read(true);
     #[cfg(windows)]
@@ -204,8 +239,19 @@ fn open_setup_read_locked(setup_exe: &Path) -> Result<File, String> {
         const FILE_SHARE_READ_ONLY: u32 = 1;
         opts.share_mode(FILE_SHARE_READ_ONLY);
     }
-    opts.open(setup_exe)
-        .map_err(|e| format!("锁定升级安装包失败（{}）：{e}", setup_exe.display()))
+    let file = opts
+        .open(setup_exe)
+        .map_err(|e| format!("锁定升级安装包失败（{}）：{e}", setup_exe.display()))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("读取升级安装包元数据失败（{}）：{e}", setup_exe.display()))?;
+    if is_reparse_point_metadata(&meta) || !meta.is_file() {
+        return Err(format!(
+            "升级安装包不是常规文件或包含重解析点，拒绝执行：{}",
+            setup_exe.display()
+        ));
+    }
+    Ok(file)
 }
 
 fn verify_locked_setup_sha256(file: &mut File, expected_bytes: &[u8]) -> Result<(), String> {
@@ -443,24 +489,49 @@ fn non_empty_env_dir(var_name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Picks a staging directory (`%ProgramData%\ClaudeGuard\staging` first, else `%TEMP%\ClaudeGuard-upgrade`).
-fn pick_staging_dir(program_data: Option<PathBuf>, temp_dir: PathBuf) -> PathBuf {
-    if let Some(pd) = program_data {
-        return pd.join("ClaudeGuard").join("staging");
+/// Resolves and hardens `%ProgramData%\ClaudeGuard\staging` with reparse-point rejection and
+/// protected DACL (`DATA_DIR_SDDL`). Never falls back to world/user-writable `%TEMP%`.
+fn ensure_staging_dir_in(program_data: Option<PathBuf>) -> Result<PathBuf, String> {
+    let pd = program_data
+        .ok_or_else(|| "无法读取系统 ProgramData 目录，拒绝回退至临时目录执行升级".to_string())?;
+    if has_reparse_point_in_chain(&pd) {
+        return Err(format!(
+            "检测到 ProgramData 目录存在符号链接或目录联接，已中止升级：{}",
+            pd.display()
+        ));
     }
-    temp_dir.join("ClaudeGuard-upgrade")
+    let cg_root = pd.join("ClaudeGuard");
+    let staging = cg_root.join("staging");
+    if has_reparse_point_in_chain(&staging) {
+        return Err(format!(
+            "检测到升级暂存目录存在符号链接或目录联接，已中止升级：{}",
+            staging.display()
+        ));
+    }
+    let root_existed = cg_root.exists();
+    fs::create_dir_all(&staging)
+        .map_err(|e| format!("无法创建受保护升级暂存目录（{}）：{e}", staging.display()))?;
+    if has_reparse_point_in_chain(&staging) {
+        return Err(format!(
+            "创建后检测到升级暂存目录存在符号链接或目录联接，已中止升级：{}",
+            staging.display()
+        ));
+    }
+    if !root_existed {
+        let _ = win_api::apply_secure_staging_dacl(&cg_root);
+    }
+    win_api::apply_secure_staging_dacl(&staging)?;
+    if has_reparse_point_in_chain(&staging) {
+        return Err(format!(
+            "加固权限后检测到升级暂存目录存在重解析点，已中止升级：{}",
+            staging.display()
+        ));
+    }
+    Ok(staging)
 }
 
-/// Resolves and ensures a writable staging directory.
 fn ensure_staging_dir() -> Result<PathBuf, String> {
-    let primary = pick_staging_dir(non_empty_env_dir("ProgramData"), std::env::temp_dir());
-    if fs::create_dir_all(&primary).is_ok() {
-        return Ok(primary);
-    }
-    let fallback = std::env::temp_dir().join("ClaudeGuard-upgrade");
-    fs::create_dir_all(&fallback)
-        .map_err(|e| format!("无法创建升级暂存目录（{}）：{e}", fallback.display()))?;
-    Ok(fallback)
+    ensure_staging_dir_in(non_empty_env_dir("ProgramData"))
 }
 
 /// Copies legacy v3 `%APPDATA%\ClaudeGuard\config.json` into `%ProgramData%\ClaudeGuard\config.json`
@@ -473,6 +544,9 @@ fn migrate_config_if_absent(appdata_dir: Option<&Path>, programdata_dir: Option<
     let dst_dir = dst_base.join("ClaudeGuard");
     let dst = dst_dir.join("config.json");
 
+    if has_reparse_point_in_chain(&src) || has_reparse_point_in_chain(&dst) {
+        return false;
+    }
     if !src.is_file() || dst.exists() {
         return false;
     }
@@ -636,6 +710,19 @@ mod win_api {
     const SW_SHOWNORMAL: i32 = 1;
     const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
     const INFINITE: u32 = 0xFFFF_FFFF;
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER_CLASS: u32 = 1;
+    const TOKEN_ELEVATION_CLASS: u32 = 20;
+    const SDDL_REVISION_1: u32 = 1;
+    const SE_FILE_OBJECT: u32 = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+
+    #[repr(C)]
+    struct SidAndAttributes {
+        sid: *mut c_void,
+        attributes: u32,
+    }
 
     #[repr(C)]
     pub(super) struct ShellExecuteInfoW {
@@ -668,6 +755,46 @@ mod win_api {
         fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
         fn GetExitCodeProcess(handle: *mut c_void, exit_code: *mut u32) -> i32;
         fn CloseHandle(handle: *mut c_void) -> i32;
+        fn GetCurrentProcess() -> *mut c_void;
+        fn LocalFree(hmem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(
+            process_handle: *mut c_void,
+            desired_access: u32,
+            token_handle: *mut *mut c_void,
+        ) -> i32;
+        fn GetTokenInformation(
+            token_handle: *mut c_void,
+            token_information_class: u32,
+            token_information: *mut c_void,
+            token_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+        fn ConvertSidToStringSidW(sid: *mut c_void, string_sid: *mut *mut u16) -> i32;
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string_security_descriptor: *const u16,
+            string_sd_revision: u32,
+            security_descriptor: *mut *mut c_void,
+            security_descriptor_size: *mut u32,
+        ) -> i32;
+        fn GetSecurityDescriptorDacl(
+            psecurity_descriptor: *mut c_void,
+            lpb_dacl_present: *mut i32,
+            p_dacl: *mut *mut c_void,
+            lpb_dacl_defaulted: *mut i32,
+        ) -> i32;
+        fn SetNamedSecurityInfoW(
+            p_object_name: *const u16,
+            object_type: u32,
+            security_info: u32,
+            psid_owner: *mut c_void,
+            psid_group: *mut c_void,
+            p_dacl: *mut c_void,
+            p_sacl: *mut c_void,
+        ) -> u32;
     }
 
     #[link(name = "shell32")]
@@ -702,6 +829,158 @@ mod win_api {
                 MB_OK | MB_ICONERROR,
             );
         }
+    }
+
+    struct LocalMemGuard(*mut c_void);
+
+    impl Drop for LocalMemGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let _ = LocalFree(self.0);
+                }
+            }
+        }
+    }
+
+    fn is_current_process_elevated() -> bool {
+        let mut tok: *mut c_void = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok) } == 0
+            || tok.is_null()
+        {
+            return false;
+        }
+        let _guard = ProcessHandleGuard(tok);
+        let mut elevated: u32 = 0;
+        let mut ret_len: u32 = 0;
+        let ok = unsafe {
+            GetTokenInformation(
+                tok,
+                TOKEN_ELEVATION_CLASS,
+                (&mut elevated as *mut u32).cast::<c_void>(),
+                std::mem::size_of::<u32>() as u32,
+                &mut ret_len,
+            )
+        };
+        ok != 0 && elevated != 0
+    }
+
+    fn current_user_sid_string() -> Option<String> {
+        let mut tok: *mut c_void = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok) } == 0
+            || tok.is_null()
+        {
+            return None;
+        }
+        let _guard = ProcessHandleGuard(tok);
+        let mut needed: u32 = 0;
+        unsafe {
+            let _ =
+                GetTokenInformation(tok, TOKEN_USER_CLASS, std::ptr::null_mut(), 0, &mut needed);
+        }
+        if needed == 0 || needed > 4096 {
+            return None;
+        }
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+        let ok = unsafe {
+            GetTokenInformation(
+                tok,
+                TOKEN_USER_CLASS,
+                buf.as_mut_ptr().cast::<c_void>(),
+                needed,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let user = unsafe { &*(buf.as_ptr().cast::<SidAndAttributes>()) };
+        if user.sid.is_null() {
+            return None;
+        }
+        let mut sid_w: *mut u16 = std::ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(user.sid, &mut sid_w) } == 0 || sid_w.is_null() {
+            return None;
+        }
+        let _mem = LocalMemGuard(sid_w.cast::<c_void>());
+        let mut len = 0usize;
+        unsafe {
+            while len < 256 && *sid_w.add(len) != 0 {
+                len += 1;
+            }
+        }
+        let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_w, len) });
+        if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    /// Applies protected `DATA_DIR_SDDL` (`SY+BA` when elevated; `SY+BA+<current_user_sid>` when
+    /// unelevated so unprivileged callers strip `Users`/`Everyone` inheritance without locking
+    /// themselves out before UAC elevation).
+    pub fn apply_secure_staging_dacl(dir: &Path) -> Result<(), String> {
+        let sddl = if is_current_process_elevated() {
+            super::DATA_DIR_SDDL.to_string()
+        } else if let Some(sid) = current_user_sid_string() {
+            format!("{}(A;OICI;FA;;;{sid})", super::DATA_DIR_SDDL)
+        } else {
+            super::DATA_DIR_SDDL.to_string()
+        };
+        let sddl_w = wide_null(OsStr::new(&sddl));
+        let mut sd_ptr: *mut c_void = std::ptr::null_mut();
+        let mut sd_size: u32 = 0;
+        let conv_ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl_w.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd_ptr,
+                &mut sd_size,
+            )
+        };
+        if conv_ok == 0 || sd_ptr.is_null() {
+            return Err(format!(
+                "解析暂存目录 SDDL 安全描述符失败：{}",
+                dir.display()
+            ));
+        }
+        let _sd_guard = LocalMemGuard(sd_ptr);
+
+        let mut dacl_present: i32 = 0;
+        let mut dacl_ptr: *mut c_void = std::ptr::null_mut();
+        let mut dacl_defaulted: i32 = 0;
+        let dacl_ok = unsafe {
+            GetSecurityDescriptorDacl(
+                sd_ptr,
+                &mut dacl_present,
+                &mut dacl_ptr,
+                &mut dacl_defaulted,
+            )
+        };
+        if dacl_ok == 0 || dacl_present == 0 || dacl_ptr.is_null() {
+            return Err(format!("提取暂存目录 DACL 失败：{}", dir.display()));
+        }
+
+        let path_w = wide_null(dir.as_os_str());
+        let rc = unsafe {
+            SetNamedSecurityInfoW(
+                path_w.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl_ptr,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "加固升级暂存目录权限失败（win32={rc}）：{}",
+                dir.display()
+            ));
+        }
+        Ok(())
     }
 
     pub fn schedule_delete_on_reboot(path: &Path) {
@@ -758,6 +1037,9 @@ mod win_api {
     use std::path::Path;
     pub fn show_error(title: &str, msg: &str) {
         eprintln!("{title}: {msg}");
+    }
+    pub fn apply_secure_staging_dacl(_dir: &Path) -> Result<(), String> {
+        Ok(())
     }
     pub fn schedule_delete_on_reboot(_path: &Path) {}
     pub fn run_elevated_setup_and_wait(_setup_exe: &Path) -> Result<bool, String> {
@@ -862,23 +1144,8 @@ fn run_primary() -> Result<(), String> {
         EMBEDDED_SETUP,
     )?;
 
-    // Copy this bridge binary out of `{app}\ClaudeGuard.exe` into staging so `{app}` stays unlocked
-    // and Inno Setup's `taskkill /IM ClaudeGuard.exe` never hits the waiter.
-    let waiter_path = staging.join(format!("cg-v3-waiter-{}.exe", unique_tag()));
-    if fs::copy(&cur_exe, &waiter_path).is_ok() {
-        let mut cmd = Command::new(&waiter_path);
-        cmd.arg(WAITER_FLAG)
-            .arg(&cur_exe)
-            .arg(&old_exe)
-            .arg(&setup_path);
-        if spawn_detached(&mut cmd).is_ok() {
-            win_api::schedule_delete_on_reboot(&waiter_path);
-            return Ok(());
-        }
-        let _ = fs::remove_file(&waiter_path);
-    }
-
-    // Direct fallback if waiter copy could not be spawned: lock & verify SHA-256 before execution.
+    // Acquire a FILE_SHARE_READ-only lock handle on setup_path immediately and verify SHA-256
+    // before spawning either the waiter or the direct installer fallback.
     let mut setup_lock = match open_setup_read_locked(&setup_path) {
         Ok(f) => f,
         Err(e) => {
@@ -891,6 +1158,35 @@ fn run_primary() -> Result<(), String> {
         remove_file_with_retry(&setup_path);
         return Err(err);
     }
+
+    // Copy this bridge binary out of `{app}\ClaudeGuard.exe` into staging via `create_new` + read-lock
+    // verification so `{app}` stays unlocked and Inno Setup's `taskkill /IM ClaudeGuard.exe` never hits the waiter.
+    if let Ok(cur_bytes) = fs::read(&cur_exe) {
+        if !cur_bytes.is_empty() {
+            if let Ok(waiter_path) = write_unique_file(&staging, "cg-v3-waiter", "exe", &cur_bytes)
+            {
+                if let Ok(mut waiter_lock) = open_setup_read_locked(&waiter_path) {
+                    if verify_locked_setup_sha256(&mut waiter_lock, &cur_bytes).is_ok() {
+                        let mut cmd = Command::new(&waiter_path);
+                        cmd.arg(WAITER_FLAG)
+                            .arg(&cur_exe)
+                            .arg(&old_exe)
+                            .arg(&setup_path);
+                        if spawn_detached(&mut cmd).is_ok() {
+                            drop(waiter_lock);
+                            drop(setup_lock);
+                            win_api::schedule_delete_on_reboot(&waiter_path);
+                            return Ok(());
+                        }
+                    }
+                    drop(waiter_lock);
+                }
+                let _ = fs::remove_file(&waiter_path);
+            }
+        }
+    }
+
+    // Direct fallback if waiter copy could not be spawned: `setup_lock` is already verified & held.
 
     match spawn_detached(Command::new(&setup_path).arg("/SP-")) {
         Ok(_) => {
@@ -1118,5 +1414,49 @@ mod tests {
         assert_eq!(std::mem::size_of::<win_api::ShellExecuteInfoW>(), 112);
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn staging_dir_rejects_missing_programdata_and_hardens_dacl_without_temp_fallback() {
+        assert!(
+            ensure_staging_dir_in(None).is_err(),
+            "missing ProgramData must fail closed instead of falling back to %TEMP%"
+        );
+
+        let fake_pd = std::env::temp_dir().join(format!("cg-v3-pd-{}", unique_tag()));
+        fs::create_dir_all(&fake_pd).unwrap();
+        let staging = ensure_staging_dir_in(Some(fake_pd.clone())).expect("hardened staging dir");
+        assert_eq!(staging, fake_pd.join("ClaudeGuard").join("staging"));
+        assert!(staging.is_dir());
+        assert!(!has_reparse_point_in_chain(&staging));
+
+        #[cfg(windows)]
+        {
+            // Verify junction / directory symlink in chain is strictly rejected.
+            let target_dir = fake_pd.join("real_target");
+            let junc_pd = fake_pd.join("junction_pd");
+            fs::create_dir_all(&target_dir).unwrap();
+            let mklink = Command::new("cmd.exe")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &junc_pd.to_string_lossy(),
+                    &target_dir.to_string_lossy(),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if mklink.is_ok_and(|s| s.success()) {
+                assert!(has_reparse_point_in_chain(&junc_pd));
+                assert!(
+                    ensure_staging_dir_in(Some(junc_pd.clone())).is_err(),
+                    "reparse-point junction in ProgramData chain must be rejected"
+                );
+                let _ = fs::remove_dir(&junc_pd);
+            }
+        }
+
+        let _ = fs::remove_dir_all(&fake_pd);
     }
 }

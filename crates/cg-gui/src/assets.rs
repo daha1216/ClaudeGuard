@@ -206,6 +206,44 @@ const fn brand_tile_surface(is_dark: bool) -> (u32, u32) {
     }
 }
 
+/// Distinct Frost Ceramic monogram badge `(glyph, bg_hex, border_hex, text_hex)` for clients
+/// without embedded raster PNGs so all 11 managed tools are instantly recognizable at a glance.
+pub fn brand_monogram_spec(key: &str, is_dark: bool) -> Option<(&'static str, u32, u32, u32)> {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "cursor" | "cursor_ide" | "cursor-ide" => Some(if is_dark {
+            ("CU", 0x1E2436, 0x364366, 0x9BB5FF)
+        } else {
+            ("CU", 0xEEF2FF, 0xD5DDFB, 0x3B4FA8)
+        }),
+        "windsurf" | "windsurf_ide" | "windsurf-ide" => Some(if is_dark {
+            ("WS", 0x182B2F, 0x2A4E55, 0x7CE2EC)
+        } else {
+            ("WS", 0xECFAFC, 0xCBECEF, 0x166B75)
+        }),
+        "zed" | "zed_ide" | "zed-ide" => Some(if is_dark {
+            ("Z", 0x2B241A, 0x4E3F2B, 0xF4C57A)
+        } else {
+            ("Z", 0xFDF6EC, 0xF0DFC2, 0x8F5B14)
+        }),
+        "trae" | "trae_ide" | "trae-ide" => Some(if is_dark {
+            ("TR", 0x192B24, 0x2C4E40, 0x7FE3B4)
+        } else {
+            ("TR", 0xECFBF3, 0xCBEFDB, 0x1B6E4A)
+        }),
+        "gemini" | "gemini_cli" | "gemini-cli" => Some(if is_dark {
+            ("GM", 0x241F36, 0x413663, 0xC2A8FF)
+        } else {
+            ("GM", 0xF3EFFD, 0xDDD2FA, 0x5A3EA6)
+        }),
+        "aider" | "aider_cli" | "aider-cli" => Some(if is_dark {
+            ("AD", 0x2E2022, 0x54383C, 0xF59FA8)
+        } else {
+            ("AD", 0xFDF0F2, 0xF3D2D7, 0x993342)
+        }),
+        _ => None,
+    }
+}
+
 /// Renders a unified Ceramic Squircle brand icon (`size_px × size_px`) at fixed crisp dimensions
 /// (avoiding layout-time pixel stepping during card unfolds).
 pub fn brand_icon_scaled(
@@ -270,6 +308,21 @@ pub fn brand_icon_scaled(
         }
 
         container
+    } else if let Some((glyph, mono_bg, mono_border, mono_fg)) =
+        brand_monogram_spec(normalized.as_str(), is_dark)
+    {
+        let font_px = if glyph.len() == 1 {
+            (size_px * 0.48).max(10.0)
+        } else {
+            (size_px * 0.40).max(9.0)
+        };
+        container
+            .bg(rgb(mono_bg))
+            .border_color(rgb(mono_border))
+            .text_size(px(font_px))
+            .font_weight(gpui::FontWeight::BOLD)
+            .text_color(rgb(mono_fg))
+            .child(glyph)
     } else if normalized == "local" {
         let icon_px = (size_px * 0.58).max(8.0);
         let globe_tint = if is_dark { 0x9BB0C7 } else { 0x5A7088 };
@@ -391,6 +444,28 @@ mod tests {
             let _ = brand_icon_scaled(key, 24.0, 6.0, false, 0.80);
             let _ = brand_icon_scaled(key, 24.0, 6.0, true, 1.05);
             let _ = brand_icon_scaled(key, 24.0, 6.0, true, 0.10);
+        }
+    }
+
+    #[test]
+    fn v5_brand_monograms_are_distinct_across_six_new_clients() {
+        let keys = ["cursor", "windsurf", "zed", "trae", "gemini", "aider"];
+        for is_dark in [false, true] {
+            let mut seen_glyphs = std::collections::HashSet::new();
+            let mut seen_bgs = std::collections::HashSet::new();
+            for key in keys {
+                let (glyph, bg, border, fg) =
+                    brand_monogram_spec(key, is_dark).expect("v5 client monogram");
+                assert_ne!(glyph, "AI");
+                assert!(
+                    seen_glyphs.insert(glyph),
+                    "duplicate monogram glyph {glyph}"
+                );
+                assert!(seen_bgs.insert(bg), "duplicate monogram bg {bg:#x}");
+                assert_ne!(bg, border);
+                assert_ne!(bg, fg);
+                let _ = brand_icon(key, 24.0, 6.0, is_dark);
+            }
         }
     }
 }

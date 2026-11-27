@@ -52,7 +52,7 @@ const TUN_EXCLUDES: &[&str] = &[
     "6to4",
 ];
 
-const SENSITIVE_SUFFIXES: [&str; 8] = [
+const SENSITIVE_SUFFIXES: &[&str] = &[
     "anthropic.com",
     "claude.ai",
     "openai.com",
@@ -61,6 +61,12 @@ const SENSITIVE_SUFFIXES: [&str; 8] = [
     "oaiusercontent.com",
     "googleapis.com",
     "google.com",
+    "cursor.com",
+    "cursor.sh",
+    "codeium.com",
+    "windsurf.com",
+    "zed.dev",
+    "trae.ai",
 ];
 
 /// Windows registry proxy configuration snapshot.
@@ -657,6 +663,19 @@ mod tests {
             bypass_risk(Some("<local>;*.anthropic.com"), &hosts).as_deref(),
             Some("*.anthropic.com")
         );
+        for v5_override in [
+            "*.cursor.com",
+            "*.cursor.sh",
+            "*.codeium.com",
+            "*.windsurf.com",
+            "*.zed.dev",
+            "*.trae.ai",
+        ] {
+            assert_eq!(
+                bypass_risk(Some(&format!("<local>;{v5_override}")), &hosts).as_deref(),
+                Some(v5_override)
+            );
+        }
         assert!(matches!(
             parse_proxy_server(Some("socks=127.0.0.1:1080")),
             ProxyParse::Unsupported(_)

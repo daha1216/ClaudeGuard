@@ -31,6 +31,13 @@ pub const MAX_PIPE_INSTANCES: u32 = 16;
 /// Maximum incoming request frame payload accepted by `PipeServer` (`256 KiB`).
 pub const MAX_REQUEST_FRAME_BYTES: usize = 256 * 1024;
 
+/// Maximum requests served on a single persistent client pipe handle before recycling the slot.
+const MAX_REQUESTS_PER_CONNECTION: usize = 256;
+
+/// Maximum wall-clock lifetime for a single persistent client pipe connection (`60s`), preventing
+/// slow-pinging clients from pinning all `MAX_PIPE_INSTANCES` slots indefinitely.
+const MAX_CONNECTION_LIFETIME_SECS: u64 = 60;
+
 /// Returns true for read-only / non-mutating [`PipeRequest`] variants permitted across sessions
 /// (plus `NotifySystemShutdown` so shutdown/logoff session transitions never drop OS power hints).
 pub fn is_readonly_pipe_request(req: &PipeRequest) -> bool {
@@ -616,9 +623,14 @@ mod win_impl {
             return;
         };
         let in_session_zero = cg_platform::access_win::is_session_zero();
+        let conn_started = std::time::Instant::now();
+        let mut served_requests = 0usize;
 
         loop {
-            if shutdown_event.raw().is_invalid() {
+            if shutdown_event.raw().is_invalid()
+                || served_requests >= MAX_REQUESTS_PER_CONNECTION
+                || conn_started.elapsed().as_secs() >= MAX_CONNECTION_LIFETIME_SECS
+            {
                 break;
             }
             let payload = match read_pipe_frame_overlapped(
@@ -629,6 +641,7 @@ mod win_impl {
                 Ok(bytes) => bytes,
                 Err(_) => break,
             };
+            served_requests += 1;
 
             let response = match serde_json::from_slice::<PipeRequest>(&payload) {
                 Ok(req) => {

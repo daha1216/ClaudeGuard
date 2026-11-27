@@ -618,12 +618,109 @@ pub fn export_redacted_diagnostics_zip(
     }
 
     for item in &mut masked.self_check.items {
-        item.detail = scrub_user_profile_paths(&scrub_credentials_in_text(&item.detail));
+        item.detail =
+            scrub_user_profile_paths(&scrub_credentials_in_text(&redact(&item.detail, false)));
     }
     for toast in &mut masked.recent_toasts {
         toast.body =
             scrub_user_profile_paths(&scrub_credentials_in_text(&redact(&toast.body, false)));
     }
+    masked.last_error = scrub_user_profile_paths(&scrub_credentials_in_text(&redact(
+        &masked.last_error,
+        false,
+    )));
+    masked.launch_error = scrub_user_profile_paths(&scrub_credentials_in_text(&redact(
+        &masked.launch_error,
+        false,
+    )));
+    if let Some(tr) = &mut masked.tripped {
+        tr.reason =
+            scrub_user_profile_paths(&scrub_credentials_in_text(&redact(&tr.reason, false)));
+    }
+
+    // 5. Scrub v5 M1–M7 fields (10D risk assessment, STUN, WFP ring buffer, Sovereign Vaults, Clean-Room).
+    if let Some(ip) = masked.risk_assessment.ip_purity.ip.as_deref() {
+        masked.risk_assessment.ip_purity.ip = Some(redact(ip, false));
+    }
+    masked.risk_assessment.ip_purity.city = None;
+    masked.risk_assessment.ip_purity.lat_tenths = None;
+    masked.risk_assessment.ip_purity.lon_tenths = None;
+    if let Some(rip) = masked.risk_assessment.stun_leak.reflexive_ip.as_deref() {
+        masked.risk_assessment.stun_leak.reflexive_ip = Some(redact(rip, false));
+    }
+    masked.risk_assessment.stun_leak.summary = scrub_user_profile_paths(
+        &scrub_credentials_in_text(&redact(&masked.risk_assessment.stun_leak.summary, false)),
+    );
+    masked.risk_assessment.dns_coherence.summary =
+        scrub_user_profile_paths(&scrub_credentials_in_text(&redact(
+            &masked.risk_assessment.dns_coherence.summary,
+            false,
+        )));
+    masked.risk_assessment.electron_hygiene.summary =
+        scrub_user_profile_paths(&scrub_credentials_in_text(&redact(
+            &masked.risk_assessment.electron_hygiene.summary,
+            false,
+        )));
+    masked.risk_assessment.headline = scrub_user_profile_paths(&scrub_credentials_in_text(
+        &redact(&masked.risk_assessment.headline, false),
+    ));
+    for dim in &mut masked.risk_assessment.dimensions {
+        dim.detail =
+            scrub_user_profile_paths(&scrub_credentials_in_text(&redact(&dim.detail, false)));
+    }
+    for rec in &mut masked.risk_assessment.recommendations {
+        *rec = scrub_user_profile_paths(&scrub_credentials_in_text(&redact(rec, false)));
+    }
+    if let Some(alert) = &mut masked.risk_assessment.geo_velocity_alert {
+        alert.from_city.clear();
+        alert.to_city.clear();
+    }
+
+    masked.wfp.last_error = scrub_user_profile_paths(&scrub_credentials_in_text(&redact(
+        &masked.wfp.last_error,
+        false,
+    )));
+    for ev in &mut masked.wfp.recent_blocked {
+        if !ev.remote_ip.is_empty() {
+            ev.remote_ip = redact(&ev.remote_ip, false);
+        }
+        ev.app_path = scrub_user_profile_paths(&ev.app_path);
+    }
+
+    for v in &mut masked.config.vaults {
+        v.pinned_ips = v.pinned_ips.iter().map(|ip| redact(ip, false)).collect();
+    }
+    for v in &mut masked.vaults {
+        if let Some(ip) = v.last_ip_masked.as_deref() {
+            v.last_ip_masked = Some(redact(ip, false));
+        }
+        v.vault_dir = scrub_user_profile_paths(&v.vault_dir);
+        v.summary =
+            scrub_user_profile_paths(&scrub_credentials_in_text(&redact(&v.summary, false)));
+    }
+
+    if let Some(cr) = &mut masked.last_cleanroom_report {
+        cr.summary =
+            scrub_user_profile_paths(&scrub_credentials_in_text(&redact(&cr.summary, false)));
+        for f in &mut cr.findings {
+            f.location_display = scrub_user_profile_paths(&scrub_credentials_in_text(&redact(
+                &f.location_display,
+                false,
+            )));
+            f.masked_preview = scrub_user_profile_paths(&scrub_credentials_in_text(&redact(
+                &f.masked_preview,
+                false,
+            )));
+        }
+    }
+    masked.hooks.summary = scrub_user_profile_paths(&scrub_credentials_in_text(&redact(
+        &masked.hooks.summary,
+        false,
+    )));
+    masked.wsl_bridge.summary = scrub_user_profile_paths(&scrub_credentials_in_text(&redact(
+        &masked.wsl_bridge.summary,
+        false,
+    )));
 
     let mut logs_txt = String::new();
     for entry in &mut masked.recent_logs {
@@ -787,7 +884,10 @@ pub fn build_sanitized_health_card(
             snap.wfp.total_blocked_packets
         )
     } else if !snap.wfp.active_backend.is_empty() {
-        scrub_health_card_text(&format!("防火墙引擎 {}", snap.wfp.active_backend))
+        scrub_health_card_text(&format!(
+            "防火墙引擎：{}",
+            friendly_wfp_backend_label(&snap.wfp.active_backend)
+        ))
     } else {
         "系统防火墙守卫就绪".to_string()
     };
@@ -867,13 +967,54 @@ pub fn build_sanitized_health_card(
     }
 }
 
+pub fn friendly_wfp_backend_label(raw: &str) -> &str {
+    match raw.trim() {
+        "wfp_dynamic" => "WFP 内核动态引擎",
+        "com_legacy" => "Windows 防火墙兼容引擎",
+        "wfp_unavailable" => "内核引擎未就绪",
+        "unsupported" => "当前平台不支持",
+        other => other,
+    }
+}
+
+fn prune_health_card_pngs(dir: &Path, keep: usize) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut cards: Vec<(SystemTime, String, PathBuf)> = rd
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("ClaudeGuard-HealthCard-") || !name.ends_with(".png") {
+                return None;
+            }
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path).ok()?;
+            if crate::journal::is_reparse_point_metadata(&meta) || !meta.is_file() {
+                return None;
+            }
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((mtime, name, path))
+        })
+        .collect();
+
+    if cards.len() <= keep {
+        return;
+    }
+    cards.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let remove_count = cards.len() - keep;
+    for (_, _, old_path) in cards.into_iter().take(remove_count) {
+        let _ = fs::remove_file(old_path);
+    }
+}
+
 fn export_health_card_png(
     data_dir: &Path,
     safety_score: u8,
     grade: SafetyGrade,
     now_secs: u64,
 ) -> Result<PathBuf, String> {
-    let out_dir = data_dir.join("health_cards");
+    let out_dir = resolve_diagnostics_dir(data_dir);
     if has_reparse_point_in_chain(&out_dir) {
         return Err("refusing to export health card PNG through reparse point".into());
     }
@@ -907,6 +1048,13 @@ fn export_health_card_png(
     f.write_all(&bytes)
         .and_then(|()| f.sync_all())
         .map_err(|e| format!("写入健康卡 PNG 失败：{e}"))?;
+
+    let is_desktop = out_dir
+        .file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case("Desktop"));
+    if !is_desktop {
+        prune_health_card_pngs(&out_dir, MAX_DIAGNOSTIC_ARCHIVES);
+    }
     Ok(chosen)
 }
 
@@ -1080,6 +1228,43 @@ mod tests {
             level: LogLevel::Info,
             category: "probe".into(),
             message: r"检测到真实出口 203.0.113.45 路径 C:\Users\alice_secret\claude.exe 代理 http://u:p@127.0.0.1:7890".into(),
+        });
+        snap.last_error = r"直连异常 203.0.113.45 C:\Users\alice_secret\claude.exe".into();
+        snap.risk_assessment.ip_purity.ip = Some("198.51.100.98".into());
+        snap.risk_assessment.ip_purity.city = Some("Los Angeles".into());
+        snap.risk_assessment.ip_purity.lat_tenths = Some(340);
+        snap.risk_assessment.ip_purity.lon_tenths = Some(-1182);
+        snap.risk_assessment.stun_leak.reflexive_ip = Some("203.0.113.45".into());
+        snap.risk_assessment.stun_leak.summary = "STUN 暴露 203.0.113.45".into();
+        snap.wfp.recent_blocked.push(cg_protocol::WfpBlockedEvent {
+            seq: 1,
+            timestamp_ms: 1000,
+            pid: Some(42),
+            agent_id: "claude".into(),
+            app_path: r"C:\Users\alice_secret\AppData\Local\AnthropicClaude\claude.exe".into(),
+            remote_ip: "203.0.113.45".into(),
+            remote_port: 443,
+            protocol: "udp".into(),
+            layer: "ale_auth_connect_v4".into(),
+            filter_reason: "quic_shield".into(),
+        });
+        snap.vaults.push(cg_protocol::VaultRuntimeStatus {
+            id: "work-us".into(),
+            name: "Work US".into(),
+            vault_dir: r"C:\Users\alice_secret\AppData\Local\ClaudeGuard\Vaults\work-us".into(),
+            last_ip_masked: Some("198.51.100.98".into()),
+            summary: r"出口 198.51.100.98 位于 C:\Users\alice_secret".into(),
+            ..Default::default()
+        });
+        snap.last_cleanroom_report = Some(cg_protocol::CleanRoomReport {
+            summary: r"扫描 C:\Users\alice_secret 发现 203.0.113.45".into(),
+            findings: vec![cg_protocol::CleanRoomFinding {
+                id: "f1".into(),
+                location_display: r"C:\Users\alice_secret\.claude.json".into(),
+                masked_preview: "ip=203.0.113.45".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
         });
 
         let out = export_redacted_diagnostics_zip(dir.path(), &snap, 1700000000, Some(dir.path()))

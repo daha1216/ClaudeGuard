@@ -5,29 +5,43 @@ use crate::widgets::controls::{guide_card, inset_box, mono_tabular, toggle_switc
 use gpui::{Div, Entity, FontWeight, MouseButton, div, prelude::*, px, rgb};
 
 /// Stable brand-family sort key so siblings with matching brand icons/colors
-/// (Anthropic: Claude + Claude Code; OpenAI: ChatGPT + Codex CLI; Google: Antigravity)
-/// always stay visually grouped together instead of interleaved across lists.
+/// (Anthropic: Claude + Claude Code; OpenAI: ChatGPT + Codex CLI; Google: Antigravity + Gemini CLI;
+/// AI IDEs: Cursor, Windsurf, Zed, Trae, Aider) always stay visually grouped together.
 pub fn brand_family_rank(id: &str) -> u8 {
-    match id.to_ascii_lowercase().as_str() {
+    match id.trim().to_ascii_lowercase().as_str() {
         "claude" | "claude_desktop" | "claude-desktop" => 0,
         "claude-code" | "claude_code" => 1,
         "chatgpt" | "codex_desktop" | "codex-desktop" => 2,
         "codex" | "codex-cli" | "codex_cli" => 3,
         "antigravity" | "antigravity_ide" | "antigravity-ide" => 4,
         "antigravity_cn" | "antigravity-cn" => 5,
-        "local" => 6,
-        _ => 10,
+        "cursor" | "cursor_ide" | "cursor-ide" => 6,
+        "windsurf" | "windsurf_ide" | "windsurf-ide" => 7,
+        "zed" | "zed_ide" | "zed-ide" => 8,
+        "trae" | "trae_ide" | "trae-ide" => 9,
+        "gemini" | "gemini-cli" | "gemini_cli" => 10,
+        "aider" | "aider-cli" | "aider_cli" => 11,
+        "local" => 12,
+        _ => 20,
     }
 }
 
-/// Harmonized display label across Launch Deck, Process Governance, and Breaker views.
+/// Harmonized display label across Launch Deck, Process Governance, Vaults, and Breaker views.
 pub fn canonical_agent_label<'a>(id: &str, fallback: &'a str) -> &'a str {
-    match id.to_ascii_lowercase().as_str() {
-        "claude" => "Claude",
+    match id.trim().to_ascii_lowercase().as_str() {
+        "all" => "全部受管端",
+        "claude" | "claude_desktop" | "claude-desktop" => "Claude",
         "claude-code" | "claude_code" => "Claude Code",
-        "chatgpt" => "ChatGPT",
+        "chatgpt" | "codex_desktop" | "codex-desktop" => "ChatGPT",
         "codex" | "codex-cli" | "codex_cli" => "Codex CLI",
-        "antigravity" => "Antigravity",
+        "antigravity" | "antigravity_ide" | "antigravity-ide" => "Antigravity",
+        "antigravity_cn" | "antigravity-cn" => "Antigravity 汉化包",
+        "cursor" | "cursor_ide" | "cursor-ide" => "Cursor",
+        "windsurf" | "windsurf_ide" | "windsurf-ide" => "Windsurf",
+        "zed" | "zed_ide" | "zed-ide" => "Zed",
+        "trae" | "trae_ide" | "trae-ide" => "Trae",
+        "gemini" | "gemini-cli" | "gemini_cli" => "Gemini CLI",
+        "aider" | "aider-cli" | "aider_cli" => "Aider CLI",
         _ => fallback,
     }
 }

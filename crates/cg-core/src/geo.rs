@@ -62,12 +62,44 @@ pub const PLACES: &[Place] = &[
         lon: -84.3880,
     },
     Place {
+        colo: "AUS",
+        city: "奥斯汀",
+        country: "US",
+        tz: "Central Standard Time",
+        lat: 30.2672,
+        lon: -97.7431,
+    },
+    Place {
+        colo: "BCN",
+        city: "巴塞罗那",
+        country: "ES",
+        tz: "Romance Standard Time",
+        lat: 41.3874,
+        lon: 2.1686,
+    },
+    Place {
+        colo: "BER",
+        city: "柏林",
+        country: "DE",
+        tz: "W. Europe Standard Time",
+        lat: 52.5200,
+        lon: 13.4050,
+    },
+    Place {
         colo: "BKK",
         city: "曼谷",
         country: "TH",
         tz: "SE Asia Standard Time",
         lat: 13.7563,
         lon: 100.5018,
+    },
+    Place {
+        colo: "BNA",
+        city: "纳什维尔",
+        country: "US",
+        tz: "Central Standard Time",
+        lat: 36.1627,
+        lon: -86.7816,
     },
     Place {
         colo: "BNE",
@@ -84,6 +116,22 @@ pub const PLACES: &[Place] = &[
         tz: "India Standard Time",
         lat: 19.0760,
         lon: 72.8777,
+    },
+    Place {
+        colo: "BOS",
+        city: "波士顿",
+        country: "US",
+        tz: "Eastern Standard Time",
+        lat: 42.3601,
+        lon: -71.0589,
+    },
+    Place {
+        colo: "BRU",
+        city: "布鲁塞尔",
+        country: "BE",
+        tz: "Romance Standard Time",
+        lat: 50.8503,
+        lon: 4.3517,
     },
     Place {
         colo: "BUD",
@@ -110,6 +158,14 @@ pub const PLACES: &[Place] = &[
         lon: 106.8456,
     },
     Place {
+        colo: "CLT",
+        city: "夏洛特",
+        country: "US",
+        tz: "Eastern Standard Time",
+        lat: 35.2271,
+        lon: -80.8431,
+    },
+    Place {
         colo: "CPH",
         city: "哥本哈根",
         country: "DK",
@@ -126,12 +182,28 @@ pub const PLACES: &[Place] = &[
         lon: 77.2090,
     },
     Place {
+        colo: "DEN",
+        city: "丹佛",
+        country: "US",
+        tz: "Mountain Standard Time",
+        lat: 39.7392,
+        lon: -104.9903,
+    },
+    Place {
         colo: "DFW",
         city: "达拉斯",
         country: "US",
         tz: "Central Standard Time",
         lat: 32.7767,
         lon: -96.7970,
+    },
+    Place {
+        colo: "DTW",
+        city: "底特律",
+        country: "US",
+        tz: "Eastern Standard Time",
+        lat: 42.3314,
+        lon: -83.0458,
     },
     Place {
         colo: "DUB",
@@ -190,12 +262,28 @@ pub const PLACES: &[Place] = &[
         lon: 114.1694,
     },
     Place {
+        colo: "HND",
+        city: "东京",
+        country: "JP",
+        tz: "Tokyo Standard Time",
+        lat: 35.5494,
+        lon: 139.7798,
+    },
+    Place {
         colo: "IAD",
         city: "阿什本",
         country: "US",
         tz: "Eastern Standard Time",
         lat: 39.0438,
         lon: -77.4874,
+    },
+    Place {
+        colo: "IAH",
+        city: "休斯敦",
+        country: "US",
+        tz: "Central Standard Time",
+        lat: 29.7604,
+        lon: -95.3698,
     },
     Place {
         colo: "ICN",
@@ -212,6 +300,14 @@ pub const PLACES: &[Place] = &[
         tz: "Turkey Standard Time",
         lat: 41.0082,
         lon: 28.9784,
+    },
+    Place {
+        colo: "JFK",
+        city: "纽约",
+        country: "US",
+        tz: "Eastern Standard Time",
+        lat: 40.6413,
+        lon: -73.7781,
     },
     Place {
         colo: "JNB",
@@ -236,6 +332,14 @@ pub const PLACES: &[Place] = &[
         tz: "Singapore Standard Time",
         lat: 3.1390,
         lon: 101.6869,
+    },
+    Place {
+        colo: "LAS",
+        city: "拉斯维加斯",
+        country: "US",
+        tz: "Pacific Standard Time",
+        lat: 36.1699,
+        lon: -115.1398,
     },
     Place {
         colo: "LAX",
@@ -270,6 +374,30 @@ pub const PLACES: &[Place] = &[
         lon: -3.7038,
     },
     Place {
+        colo: "MAN",
+        city: "曼彻斯特",
+        country: "GB",
+        tz: "GMT Standard Time",
+        lat: 53.4808,
+        lon: -2.2426,
+    },
+    Place {
+        colo: "MCI",
+        city: "堪萨斯城",
+        country: "US",
+        tz: "Central Standard Time",
+        lat: 39.0997,
+        lon: -94.5786,
+    },
+    Place {
+        colo: "MCO",
+        city: "奥兰多",
+        country: "US",
+        tz: "Eastern Standard Time",
+        lat: 28.5383,
+        lon: -81.3792,
+    },
+    Place {
         colo: "MEL",
         city: "墨尔本",
         country: "AU",
@@ -300,6 +428,22 @@ pub const PLACES: &[Place] = &[
         tz: "Russian Standard Time",
         lat: 55.7558,
         lon: 37.6173,
+    },
+    Place {
+        colo: "MSP",
+        city: "明尼阿波利斯",
+        country: "US",
+        tz: "Central Standard Time",
+        lat: 44.9778,
+        lon: -93.2650,
+    },
+    Place {
+        colo: "MUC",
+        city: "慕尼黑",
+        country: "DE",
+        tz: "W. Europe Standard Time",
+        lat: 48.1351,
+        lon: 11.5820,
     },
     Place {
         colo: "MXP",
@@ -334,6 +478,14 @@ pub const PLACES: &[Place] = &[
         lon: 10.7522,
     },
     Place {
+        colo: "PDX",
+        city: "波特兰",
+        country: "US",
+        tz: "Pacific Standard Time",
+        lat: 45.5152,
+        lon: -122.6784,
+    },
+    Place {
         colo: "PER",
         city: "珀斯",
         country: "AU",
@@ -342,12 +494,44 @@ pub const PLACES: &[Place] = &[
         lon: 115.8605,
     },
     Place {
+        colo: "PHL",
+        city: "费城",
+        country: "US",
+        tz: "Eastern Standard Time",
+        lat: 39.9526,
+        lon: -75.1652,
+    },
+    Place {
+        colo: "PHX",
+        city: "凤凰城",
+        country: "US",
+        tz: "US Mountain Standard Time",
+        lat: 33.4484,
+        lon: -112.0740,
+    },
+    Place {
         colo: "PRG",
         city: "布拉格",
         country: "CZ",
         tz: "Central Europe Standard Time",
         lat: 50.0755,
         lon: 14.4378,
+    },
+    Place {
+        colo: "RDU",
+        city: "罗利",
+        country: "US",
+        tz: "Eastern Standard Time",
+        lat: 35.7796,
+        lon: -78.6382,
+    },
+    Place {
+        colo: "SAN",
+        city: "圣迭戈",
+        country: "US",
+        tz: "Pacific Standard Time",
+        lat: 32.7157,
+        lon: -117.1611,
     },
     Place {
         colo: "SEA",
@@ -382,6 +566,22 @@ pub const PLACES: &[Place] = &[
         lon: -121.8863,
     },
     Place {
+        colo: "SLC",
+        city: "盐湖城",
+        country: "US",
+        tz: "Mountain Standard Time",
+        lat: 40.7608,
+        lon: -111.8910,
+    },
+    Place {
+        colo: "SMF",
+        city: "萨克拉门托",
+        country: "US",
+        tz: "Pacific Standard Time",
+        lat: 38.5816,
+        lon: -121.4944,
+    },
+    Place {
         colo: "SYD",
         city: "悉尼",
         country: "AU",
@@ -396,6 +596,14 @@ pub const PLACES: &[Place] = &[
         tz: "Israel Standard Time",
         lat: 32.0853,
         lon: 34.7818,
+    },
+    Place {
+        colo: "TPA",
+        city: "坦帕",
+        country: "US",
+        tz: "Eastern Standard Time",
+        lat: 27.9506,
+        lon: -82.4572,
     },
     Place {
         colo: "TPE",
@@ -422,12 +630,44 @@ pub const PLACES: &[Place] = &[
         lon: 21.0122,
     },
     Place {
+        colo: "YEG",
+        city: "埃德蒙顿",
+        country: "CA",
+        tz: "Mountain Standard Time",
+        lat: 53.5461,
+        lon: -113.4938,
+    },
+    Place {
+        colo: "YOW",
+        city: "渥太华",
+        country: "CA",
+        tz: "Eastern Standard Time",
+        lat: 45.4215,
+        lon: -75.6972,
+    },
+    Place {
+        colo: "YUL",
+        city: "蒙特利尔",
+        country: "CA",
+        tz: "Eastern Standard Time",
+        lat: 45.5017,
+        lon: -73.5673,
+    },
+    Place {
         colo: "YVR",
         city: "温哥华",
         country: "CA",
         tz: "Pacific Standard Time",
         lat: 49.2827,
         lon: -123.1207,
+    },
+    Place {
+        colo: "YYC",
+        city: "卡尔加里",
+        country: "CA",
+        tz: "Mountain Standard Time",
+        lat: 51.0447,
+        lon: -114.0719,
     },
     Place {
         colo: "YYZ",
@@ -645,9 +885,118 @@ pub fn by_country(country: &str) -> Option<&'static Place> {
     COUNTRY_FALLBACK.iter().find(|p| p.country == key)
 }
 
-/// Resolves geographic metadata preferring `colo` over single-timezone country fallback.
+/// Looks up a [`Place`] by English or localized city name (case-insensitive), optionally
+/// validating `country` when provided.
+pub fn by_city(city_name: &str, country: Option<&str>) -> Option<&'static Place> {
+    let trimmed = city_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let country_norm = country.map(str::trim).filter(|c| !c.is_empty());
+
+    // Direct match against localized city labels in PLACES.
+    if let Some(found) = PLACES.iter().find(|p| {
+        p.city == trimmed && country_norm.is_none_or(|cc| p.country.eq_ignore_ascii_case(cc))
+    }) {
+        return Some(found);
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let mapped_colo = match lower.as_str() {
+        "san jose" | "santa clara" | "sunnyvale" | "mountain view" => "SJC",
+        "san francisco" | "palo alto" | "fremont" => "SFO",
+        "sacramento" => "SMF",
+        "los angeles" | "el segundo" | "irvine" => "LAX",
+        "san diego" => "SAN",
+        "seattle" | "bellevue" | "redmond" => "SEA",
+        "portland" | "hillsboro" => "PDX",
+        "las vegas" => "LAS",
+        "phoenix" | "tempe" => "PHX",
+        "denver" => "DEN",
+        "salt lake city" => "SLC",
+        "dallas" | "richardson" | "fort worth" => "DFW",
+        "houston" => "IAH",
+        "austin" => "AUS",
+        "chicago" => "ORD",
+        "minneapolis" => "MSP",
+        "kansas city" => "MCI",
+        "nashville" => "BNA",
+        "detroit" => "DTW",
+        "atlanta" => "ATL",
+        "miami" => "MIA",
+        "tampa" => "TPA",
+        "orlando" => "MCO",
+        "charlotte" => "CLT",
+        "raleigh" => "RDU",
+        "ashburn" | "reston" | "washington" | "washington, d.c." => "IAD",
+        "new york" | "new york city" | "manhattan" => "JFK",
+        "newark" | "secaucus" | "clifton" => "EWR",
+        "boston" => "BOS",
+        "philadelphia" => "PHL",
+        "toronto" => "YYZ",
+        "vancouver" => "YVR",
+        "montreal" => "YUL",
+        "ottawa" => "YOW",
+        "calgary" => "YYC",
+        "edmonton" => "YEG",
+        "tokyo" | "chiyoda" | "shinjuku" | "shinagawa" => "NRT",
+        "osaka" => "KIX",
+        "singapore" => "SIN",
+        "seoul" | "incheon" => "ICN",
+        "taipei" => "TPE",
+        "hong kong" => "HKG",
+        "bangkok" => "BKK",
+        "jakarta" => "CGK",
+        "kuala lumpur" => "KUL",
+        "mumbai" => "BOM",
+        "new delhi" | "delhi" => "DEL",
+        "dubai" => "DXB",
+        "sydney" => "SYD",
+        "melbourne" => "MEL",
+        "brisbane" => "BNE",
+        "perth" => "PER",
+        "adelaide" => "ADL",
+        "auckland" => "AKL",
+        "frankfurt" | "frankfurt am main" => "FRA",
+        "berlin" => "BER",
+        "munich" => "MUC",
+        "london" => "LHR",
+        "manchester" => "MAN",
+        "amsterdam" => "AMS",
+        "paris" => "CDG",
+        "zurich" => "ZRH",
+        "vienna" => "VIE",
+        "copenhagen" => "CPH",
+        "stockholm" => "ARN",
+        "oslo" => "OSL",
+        "helsinki" => "HEL",
+        "dublin" => "DUB",
+        "lisbon" => "LIS",
+        "madrid" => "MAD",
+        "barcelona" => "BCN",
+        "milan" => "MXP",
+        "brussels" => "BRU",
+        "prague" => "PRG",
+        "warsaw" => "WAW",
+        "budapest" => "BUD",
+        "athens" => "ATH",
+        "istanbul" => "IST",
+        "tel aviv" => "TLV",
+        "johannesburg" => "JNB",
+        "sao paulo" => "GRU",
+        "mexico city" => "MEX",
+        "moscow" => "MOW",
+        _ => return None,
+    };
+
+    by_colo(mapped_colo)
+        .filter(|p| country_norm.is_none_or(|cc| p.country.eq_ignore_ascii_case(cc)))
+}
+
+/// Resolves geographic metadata preferring `colo` IATA code, then city name, then single-timezone country fallback.
 pub fn resolve(colo: Option<&str>, country: Option<&str>) -> Option<&'static Place> {
     colo.and_then(by_colo)
+        .or_else(|| colo.and_then(|c| by_city(c, country)))
         .or_else(|| country.and_then(by_country))
 }
 
@@ -682,12 +1031,25 @@ mod tests {
         assert!(by_country("CA").is_none());
         assert!(by_country("AU").is_none());
         assert_eq!(resolve(Some("LAX"), Some("US")).unwrap().city, "洛杉矶");
+        assert_eq!(resolve(Some("DEN"), Some("US")).unwrap().city, "丹佛");
+        assert_eq!(resolve(Some("BOS"), Some("US")).unwrap().city, "波士顿");
+        assert_eq!(resolve(Some("San Jose"), Some("US")).unwrap().colo, "SJC");
+        assert_eq!(resolve(Some("Ashburn"), Some("US")).unwrap().colo, "IAD");
+        assert_eq!(resolve(Some("Frankfurt"), Some("DE")).unwrap().colo, "FRA");
         assert_eq!(resolve(Some("XXX"), Some("JP")).unwrap().city, "东京");
         assert!(resolve(None, Some("AU")).is_none());
     }
 
     #[test]
     fn all_places_have_valid_coordinates_and_timezones() {
+        for pair in PLACES.windows(2) {
+            assert!(
+                pair[0].colo < pair[1].colo,
+                "PLACES must stay sorted alphabetically: {} >= {}",
+                pair[0].colo,
+                pair[1].colo
+            );
+        }
         for place in PLACES {
             assert_eq!(place.colo.len(), 3);
             assert_eq!(place.country.len(), 2);

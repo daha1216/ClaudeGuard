@@ -27,7 +27,7 @@ const PUBLIC_DOH_REMOTES: &str = concat!(
     "2606:4700:4700::1111,2606:4700:4700::1001,",
     "2001:4860:4860::8888,2001:4860:4860::8844,2620:fe::fe"
 );
-const GLOBAL_IPV6_RANGE: &str = "2000::/3,64:ff9b::/96,fc00::/7";
+const GLOBAL_IPV6_RANGE: &str = "2000::/3,64:ff9b::/96";
 
 #[derive(Clone, Debug)]
 struct ShieldRuleSpec {
@@ -359,7 +359,7 @@ mod tests {
                 && s.remote_ports == Some("443,853")
         }));
         assert!(specs.iter().any(|s| {
-            s.name.contains("IPv6-") && s.remote_addresses == Some("2000::/3,64:ff9b::/96,fc00::/7")
+            s.name.contains("IPv6-") && s.remote_addresses == Some("2000::/3,64:ff9b::/96")
         }));
 
         let quic_only = build_shield_specs(&exes, true, false, false);

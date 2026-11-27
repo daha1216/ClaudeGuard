@@ -9,7 +9,7 @@ use crate::demo::{
 };
 use crate::health_card::build_sanitized_health_card;
 use crate::protocol::{
-    AgentKind, CleanRoomBackupMeta, CleanRoomRiskLevel, DEFAULT_PIPE_NAME, ErrorCode,
+    AccessLevel, AgentKind, CleanRoomBackupMeta, CleanRoomRiskLevel, DEFAULT_PIPE_NAME, ErrorCode,
     GuardSnapshot, HookDecision, Lifecycle, OperationItemReceipt, OperationReceipt,
     OperationStatus, PipeRequest, PipeResponse, PolicyPreset, ProtectionState, SafetyGrade,
     TargetState, UiLabelExt, UpdateCheckPhase, VaultRuntimeState, VaultRuntimeStatus,
@@ -844,6 +844,13 @@ impl DaemonClient {
                 scope,
                 selected_finding_ids,
             } => {
+                if selected_finding_ids.is_empty() {
+                    return PipeResponse::Error {
+                        code: ErrorCode::ValidationFailed,
+                        message: "请至少勾选 1 项待清理的关联残留项".into(),
+                        receipt: None,
+                    };
+                }
                 let current = snap
                     .last_cleanroom_report
                     .clone()
@@ -866,15 +873,11 @@ impl DaemonClient {
                 if scope.windsurf {
                     clients.push("windsurf".into());
                 }
-                let removed_count = if selected_finding_ids.is_empty() {
-                    current.findings.len()
-                } else {
-                    current
-                        .findings
-                        .iter()
-                        .filter(|f| selected_finding_ids.contains(&f.id))
-                        .count()
-                };
+                let removed_count = current
+                    .findings
+                    .iter()
+                    .filter(|f| selected_finding_ids.contains(&f.id))
+                    .count();
                 backups.insert(
                     0,
                     CleanRoomBackupMeta {
@@ -890,15 +893,11 @@ impl DaemonClient {
                 snap.cleanroom_backup_count = backups.len();
                 drop(backups);
 
-                let remaining_findings: Vec<_> = if selected_finding_ids.is_empty() {
-                    Vec::new()
-                } else {
-                    current
-                        .findings
-                        .into_iter()
-                        .filter(|f| !selected_finding_ids.contains(&f.id))
-                        .collect()
-                };
+                let remaining_findings: Vec<_> = current
+                    .findings
+                    .into_iter()
+                    .filter(|f| !selected_finding_ids.contains(&f.id))
+                    .collect();
                 let new_score: u8 = remaining_findings
                     .iter()
                     .map(|f| u16::from(f.risk_weight))
@@ -1565,50 +1564,185 @@ fn exchange_named_pipe(
     ))
 }
 
+/// Mode-aware launch context mirroring `cg_core::hygiene_plan::HygienePlanInput` so `cg-gui`
+/// injects full M3 Chromium anti-leak flags without mutating `Cargo.toml` / `Cargo.lock`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchHygieneContext {
+    pub enforce_electron_hygiene_flags: bool,
+    pub access_level: AccessLevel,
+    pub proxy_host: String,
+    pub proxy_port: u16,
+    pub antigravity_version_dll_active: bool,
+    pub privacy_mask: bool,
+}
+
+impl Default for LaunchHygieneContext {
+    fn default() -> Self {
+        Self {
+            enforce_electron_hygiene_flags: true,
+            access_level: AccessLevel::SystemProxy,
+            proxy_host: "127.0.0.1".into(),
+            proxy_port: 7890,
+            antigravity_version_dll_active: false,
+            privacy_mask: false,
+        }
+    }
+}
+
+/// Returns `true` ONLY for Chromium / Electron GUI clients (NEVER native Rust `zed` or CLIs).
+pub fn is_electron_gui_agent(agent_id: &str) -> bool {
+    matches!(
+        agent_id.trim().to_ascii_lowercase().as_str(),
+        "claude" | "chatgpt" | "antigravity" | "cursor" | "windsurf" | "trae"
+    )
+}
+
+/// Returns `true` for interactive terminal CLI AI tools.
+pub fn is_cli_launch_agent(agent_id: &str) -> bool {
+    matches!(
+        agent_id.trim().to_ascii_lowercase().as_str(),
+        "claude-code" | "codex" | "codex-cli" | "gemini" | "aider"
+    )
+}
+
+/// Human-friendly display label for Safe Launch toasts and errors.
+pub fn friendly_launch_name(agent_id: &str) -> &str {
+    match agent_id.trim().to_ascii_lowercase().as_str() {
+        "claude" => "Claude Desktop",
+        "chatgpt" => "ChatGPT",
+        "antigravity" => "Antigravity",
+        "cursor" => "Cursor",
+        "windsurf" => "Windsurf",
+        "zed" => "Zed",
+        "trae" => "Trae",
+        "claude-code" => "Claude Code",
+        "codex" | "codex-cli" => "Codex CLI",
+        "gemini" => "Gemini CLI",
+        "aider" => "Aider CLI",
+        _ => agent_id,
+    }
+}
+
+/// Masks `C:\Users\<username>` or `C:/Users/<username>` in user-visible toast paths.
+pub fn mask_user_path_for_toast(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    for prefix in [r"c:\users\", "c:/users/"] {
+        if let Some(idx) = lower.find(prefix) {
+            let after = idx + prefix.len();
+            let rest = &raw[after..];
+            let sep_offset = rest.find(['\\', '/']).unwrap_or(rest.len());
+            if sep_offset > 0 {
+                let sep = &rest[sep_offset..];
+                return format!("{}***{}", &raw[..after], sep);
+            }
+        }
+    }
+    raw.to_string()
+}
+
+/// Computes exact M3 Chromium/Electron anti-leak flags (`--disable-quic`, WebRTC non-proxied UDP
+/// lock, and mode-aware `SystemProxy` `--proxy-server` + `--host-resolver-rules`).
+pub fn plan_electron_hygiene_args(agent_id: &str, ctx: &LaunchHygieneContext) -> Vec<String> {
+    if !ctx.enforce_electron_hygiene_flags || !is_electron_gui_agent(agent_id) {
+        return Vec::new();
+    }
+
+    let mut args = vec![
+        "--disable-quic".to_string(),
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string(),
+        "--enforce-webrtc-ip-permission-check".to_string(),
+    ];
+
+    let is_ag_dll =
+        agent_id.trim().eq_ignore_ascii_case("antigravity") && ctx.antigravity_version_dll_active;
+    if ctx.access_level == AccessLevel::SystemProxy && !is_ag_dll {
+        let host = ctx.proxy_host.trim();
+        let valid_host = !host.is_empty()
+            && ctx.proxy_port > 0
+            && !host
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | ';'));
+        if valid_host {
+            let proxy_url = if host.contains("://") {
+                format!("{host}:{}", ctx.proxy_port)
+            } else {
+                format!("http://{host}:{}", ctx.proxy_port)
+            };
+            args.push(format!("--proxy-server={proxy_url}"));
+            args.push(
+                "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1, EXCLUDE ::1, EXCLUDE localhost"
+                    .to_string(),
+            );
+        }
+    }
+
+    args
+}
+
 #[cfg(any(windows, test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AgentLaunchPlan {
-    disable_quic: bool,
+    hygiene_args: Vec<String>,
+    is_cli: bool,
     working_dir: Option<std::path::PathBuf>,
     toast_message: String,
 }
 
 #[cfg(any(windows, test))]
-fn plan_agent_launch(agent_id: &str, user_profile: Option<&std::path::Path>) -> AgentLaunchPlan {
-    if matches!(
-        agent_id,
-        "claude" | "chatgpt" | "antigravity" | "cursor" | "windsurf" | "zed" | "trae"
-    ) {
+fn plan_agent_launch(
+    agent_id: &str,
+    user_profile: Option<&std::path::Path>,
+    ctx: &LaunchHygieneContext,
+) -> AgentLaunchPlan {
+    let display = friendly_launch_name(agent_id);
+    if is_electron_gui_agent(agent_id) {
+        let hygiene_args = plan_electron_hygiene_args(agent_id, ctx);
+        let toast_message = if hygiene_args.is_empty() {
+            format!("已安全启动 {display}")
+        } else {
+            format!("已安全启动 {display}（已自动加固 QUIC / WebRTC 防泄露）")
+        };
         AgentLaunchPlan {
-            disable_quic: true,
+            hygiene_args,
+            is_cli: false,
             working_dir: None,
-            toast_message: format!("已安全启动 {agent_id}（普通用户权限 · 已禁用 QUIC 泄露）"),
+            toast_message,
         }
-    } else if matches!(
-        agent_id,
-        "claude-code" | "codex" | "codex-cli" | "gemini" | "aider"
-    ) {
+    } else if agent_id.trim().eq_ignore_ascii_case("zed") {
+        // Native Rust GPUI editor (`clap` CLI) — NEVER pass Chromium `--disable-quic` flags!
+        AgentLaunchPlan {
+            hygiene_args: Vec::new(),
+            is_cli: false,
+            working_dir: None,
+            toast_message: format!("已安全启动 {display}"),
+        }
+    } else if is_cli_launch_agent(agent_id) {
         let working_dir = user_profile
             .filter(|p| !p.as_os_str().is_empty() && p.is_dir())
             .map(std::path::Path::to_path_buf);
         let toast_message = if let Some(dir) = &working_dir {
-            format!(
-                "已安全启动 CLI {agent_id}（普通用户权限 · 工作目录 {}）",
-                dir.display()
-            )
+            let raw_dir = dir.display().to_string();
+            let shown_dir = if ctx.privacy_mask {
+                mask_user_path_for_toast(&raw_dir)
+            } else {
+                raw_dir
+            };
+            format!("已在新终端安全启动 {display}（工作目录 {shown_dir}）")
         } else {
-            format!("已安全启动 CLI {agent_id}（普通用户权限）")
+            format!("已在新终端安全启动 {display}")
         };
         AgentLaunchPlan {
-            disable_quic: false,
+            hygiene_args: Vec::new(),
+            is_cli: true,
             working_dir,
             toast_message,
         }
     } else {
         AgentLaunchPlan {
-            disable_quic: false,
+            hygiene_args: Vec::new(),
+            is_cli: false,
             working_dir: None,
-            toast_message: format!("已安全启动 {agent_id}（普通用户权限）"),
+            toast_message: format!("已安全启动 {display}"),
         }
     }
 }
@@ -1619,24 +1753,70 @@ fn plan_agent_launch(agent_id: &str, user_profile: Option<&std::path::Path>) -> 
 pub fn launch_agent_normal_user(
     agent_id: &str,
     install_paths: &[String],
+    ctx: &LaunchHygieneContext,
 ) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+    let display = friendly_launch_name(agent_id);
+
     if let Some(exe) = install_paths.iter().find(|p| Path::new(p).is_file()) {
         let user_profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
-        let plan = plan_agent_launch(agent_id, user_profile.as_deref());
-        let mut cmd = Command::new(exe);
-        // Vector 4 of the 4-Vector Leak Shield: disable UDP QUIC on Electron/Chromium AI apps
-        // so traffic never bypasses HTTP proxies via HTTP/3 UDP:443.
-        if plan.disable_quic {
-            cmd.arg("--disable-quic");
+        let plan = plan_agent_launch(agent_id, user_profile.as_deref(), ctx);
+        let exe_lower = exe.to_ascii_lowercase();
+        let is_script_shim = exe_lower.ends_with(".cmd")
+            || exe_lower.ends_with(".bat")
+            || exe_lower.ends_with(".ps1");
+
+        if plan.is_cli || is_script_shim {
+            let wt_candidate = std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .map(|p| p.join("Microsoft").join("WindowsApps").join("wt.exe"))
+                .filter(|p| p.is_file());
+
+            if let Some(wt_exe) = wt_candidate {
+                let mut cmd = Command::new(wt_exe);
+                if let Some(cwd) = &plan.working_dir {
+                    cmd.arg("-d").arg(cwd);
+                }
+                if exe_lower.ends_with(".ps1") {
+                    cmd.args(["pwsh.exe", "-NoExit", "-File", exe]);
+                } else {
+                    cmd.args(["cmd.exe", "/k", exe]);
+                }
+                if cmd.spawn().is_ok() {
+                    return Ok(plan.toast_message);
+                }
+            }
+
+            let mut fallback = if exe_lower.ends_with(".ps1") {
+                let mut c = Command::new("powershell.exe");
+                c.args(["-NoExit", "-ExecutionPolicy", "Bypass", "-File", exe]);
+                c
+            } else {
+                let mut c = Command::new("cmd.exe");
+                c.args(["/k", exe]);
+                c
+            };
+            fallback.creation_flags(CREATE_NEW_CONSOLE);
+            if let Some(cwd) = &plan.working_dir {
+                fallback.current_dir(cwd);
+            }
+            fallback
+                .spawn()
+                .map_err(|e| format!("启动 {display} 终端失败：{e}"))?;
+            return Ok(plan.toast_message);
         }
+
+        let mut cmd = Command::new(exe);
+        cmd.args(&plan.hygiene_args);
         if let Some(cwd) = &plan.working_dir {
             cmd.current_dir(cwd);
         }
         cmd.spawn()
-            .map_err(|e| format!("启动 {agent_id} 失败：{e}"))?;
+            .map_err(|e| format!("启动 {display} 失败：{e}"))?;
         return Ok(plan.toast_message);
     }
 
@@ -1650,19 +1830,23 @@ pub fn launch_agent_normal_user(
         Command::new("explorer.exe")
             .arg(target)
             .spawn()
-            .map_err(|e| format!("通过 explorer 启动 {agent_id} 失败：{e}"))?;
-        return Ok(format!("已通过系统壳层安全启动 {agent_id}"));
+            .map_err(|e| format!("通过系统启动 {display} 失败：{e}"))?;
+        return Ok(format!("已安全启动 {display}"));
     }
 
-    Err(format!("未找到 {agent_id} 的安装路径，请确认客户端已安装"))
+    Err(format!("未找到 {display} 的安装路径，请确认客户端已安装"))
 }
 
 #[cfg(not(windows))]
 pub fn launch_agent_normal_user(
     agent_id: &str,
     _install_paths: &[String],
+    _ctx: &LaunchHygieneContext,
 ) -> Result<String, String> {
-    Ok(format!("[demo] 已模拟安全启动 {agent_id}"))
+    Ok(format!(
+        "[demo] 已模拟安全启动 {}",
+        friendly_launch_name(agent_id)
+    ))
 }
 
 /// Safely opens an `https://` URL in the user's default browser without invoking a shell.
@@ -1984,36 +2168,123 @@ mod tests {
     }
 
     #[test]
-    fn agent_launch_plan_distinguishes_gui_quic_and_cli_working_dir() {
+    fn agent_launch_plan_distinguishes_electron_hygiene_native_zed_and_cli_privacy() {
         let existing_dir = std::env::temp_dir();
         assert!(existing_dir.is_dir());
 
-        for gui_id in ["claude", "chatgpt", "antigravity"] {
-            let plan = plan_agent_launch(gui_id, Some(&existing_dir));
-            assert!(plan.disable_quic, "{gui_id} must pass --disable-quic");
+        let sys_ctx = LaunchHygieneContext {
+            enforce_electron_hygiene_flags: true,
+            access_level: AccessLevel::SystemProxy,
+            proxy_host: "127.0.0.1".into(),
+            proxy_port: 7890,
+            antigravity_version_dll_active: false,
+            privacy_mask: false,
+        };
+
+        for gui_id in [
+            "claude",
+            "chatgpt",
+            "antigravity",
+            "cursor",
+            "windsurf",
+            "trae",
+        ] {
+            let plan = plan_agent_launch(gui_id, Some(&existing_dir), &sys_ctx);
+            assert!(
+                plan.hygiene_args.contains(&"--disable-quic".to_string()),
+                "{gui_id} must inject --disable-quic"
+            );
+            assert!(
+                plan.hygiene_args.contains(
+                    &"--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string()
+                ),
+                "{gui_id} must lock WebRTC UDP"
+            );
+            assert!(
+                plan.hygiene_args
+                    .contains(&"--enforce-webrtc-ip-permission-check".to_string()),
+                "{gui_id} must enforce WebRTC permission check"
+            );
+            assert!(
+                plan.hygiene_args
+                    .iter()
+                    .any(|a| a == "--proxy-server=http://127.0.0.1:7890"),
+                "{gui_id} in SystemProxy must inject --proxy-server"
+            );
+            assert!(
+                plan.hygiene_args
+                    .iter()
+                    .any(|a| a.starts_with("--host-resolver-rules=MAP * ~NOTFOUND")),
+                "{gui_id} in SystemProxy must lock host resolver"
+            );
+            assert!(!plan.is_cli);
             assert!(plan.working_dir.is_none());
-            assert!(plan.toast_message.contains("已禁用 QUIC 泄露"));
         }
 
-        for cli_id in ["claude-code", "codex", "codex-cli", "gemini"] {
-            let plan = plan_agent_launch(cli_id, Some(&existing_dir));
-            assert!(!plan.disable_quic, "{cli_id} must NOT pass --disable-quic");
-            assert_eq!(plan.working_dir.as_deref(), Some(existing_dir.as_path()));
+        // Antigravity with active version.dll skips --proxy-server & --host-resolver-rules to avoid double-proxying.
+        let mut ag_dll_ctx = sys_ctx.clone();
+        ag_dll_ctx.antigravity_version_dll_active = true;
+        let ag_plan = plan_agent_launch("antigravity", None, &ag_dll_ctx);
+        assert_eq!(ag_plan.hygiene_args.len(), 3);
+        assert!(
+            !ag_plan
+                .hygiene_args
+                .iter()
+                .any(|a| a.starts_with("--proxy-server="))
+        );
+
+        // TUN mode injects QUIC + WebRTC locks ONLY (never --host-resolver-rules).
+        let mut tun_ctx = sys_ctx.clone();
+        tun_ctx.access_level = AccessLevel::Tun;
+        let tun_plan = plan_agent_launch("cursor", None, &tun_ctx);
+        assert_eq!(tun_plan.hygiene_args.len(), 3);
+        assert!(
+            !tun_plan
+                .hygiene_args
+                .iter()
+                .any(|a| a.starts_with("--host-resolver-rules="))
+        );
+
+        // Master toggle OFF injects ZERO flags even on Electron apps.
+        let mut off_ctx = sys_ctx.clone();
+        off_ctx.enforce_electron_hygiene_flags = false;
+        assert!(
+            plan_agent_launch("claude", None, &off_ctx)
+                .hygiene_args
+                .is_empty()
+        );
+
+        // Native Rust Zed MUST NEVER receive Chromium --disable-quic flags!
+        let zed_plan = plan_agent_launch("zed", Some(&existing_dir), &sys_ctx);
+        assert!(
+            zed_plan.hygiene_args.is_empty(),
+            "Zed is native GPUI, must receive 0 Chromium flags"
+        );
+        assert!(!zed_plan.is_cli);
+
+        for cli_id in ["claude-code", "codex", "codex-cli", "gemini", "aider"] {
+            let plan = plan_agent_launch(cli_id, Some(&existing_dir), &sys_ctx);
             assert!(
-                !plan.toast_message.contains("QUIC"),
-                "{cli_id} toast must not falsely claim QUIC disabled: {}",
-                plan.toast_message
+                plan.hygiene_args.is_empty(),
+                "{cli_id} must NOT pass Chromium flags"
             );
-            assert!(plan.toast_message.contains("CLI"));
+            assert!(plan.is_cli);
+            assert_eq!(plan.working_dir.as_deref(), Some(existing_dir.as_path()));
+            assert!(!plan.toast_message.contains("QUIC"));
             assert!(plan.toast_message.contains("工作目录"));
         }
 
+        // Privacy mask scrubs C:\Users\<username> in toast paths.
+        assert_eq!(
+            mask_user_path_for_toast(r"C:\Users\mjq\Projects\demo"),
+            r"C:\Users\***\Projects\demo"
+        );
+
         // Non-existent USERPROFILE falls back cleanly without failing.
         let missing_dir = existing_dir.join("cg_nonexistent_profile_dir_9f8e7d");
-        let fallback = plan_agent_launch("claude-code", Some(&missing_dir));
-        assert!(!fallback.disable_quic);
+        let fallback = plan_agent_launch("claude-code", Some(&missing_dir), &sys_ctx);
+        assert!(fallback.hygiene_args.is_empty());
         assert!(fallback.working_dir.is_none());
-        assert!(!fallback.toast_message.contains("QUIC"));
         assert!(!fallback.toast_message.contains("工作目录"));
     }
 
@@ -2275,12 +2546,32 @@ mod tests {
                 scope: scope.clone(),
             })
             .expect("scan cleanroom");
-        assert!(matches!(scan_resp, PipeResponse::CleanRoomScan { .. }));
+        let scanned_ids: Vec<String> = match scan_resp {
+            PipeResponse::CleanRoomScan { report } => {
+                assert!(!report.findings.is_empty());
+                report.findings.iter().map(|f| f.id.clone()).collect()
+            }
+            other => panic!("unexpected ScanCleanRoom: {other:?}"),
+        };
+
+        // Empty `selected_finding_ids` must be rejected explicitly rather than silently purging all!
+        assert!(matches!(
+            client
+                .exchange(PipeRequest::ExecuteCleanRoom {
+                    scope: scope.clone(),
+                    selected_finding_ids: Vec::new(),
+                })
+                .expect("empty selection guard"),
+            PipeResponse::Error {
+                code: ErrorCode::ValidationFailed,
+                ..
+            }
+        ));
 
         let exec_resp = client
             .exchange(PipeRequest::ExecuteCleanRoom {
                 scope,
-                selected_finding_ids: Vec::new(),
+                selected_finding_ids: scanned_ids,
             })
             .expect("exec cleanroom");
         match exec_resp {

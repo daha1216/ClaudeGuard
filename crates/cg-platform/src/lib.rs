@@ -51,6 +51,8 @@ pub use traits::{
     FW_PROFILE_ALL,
 };
 
+pub use access_win::{resolve_user_sid_string_for_home, ImpersonateInteractiveUserGuard};
+
 #[cfg(windows)]
 use access_win::{AccessEvidenceRaw, AccessInfo, AccessPath};
 #[cfg(windows)]
@@ -168,6 +170,17 @@ impl WindowsPlatformDriver {
     /// Idempotently purge any persistent / boot-time ClaudeGuard WFP filters.
     pub fn clear_persistent_boot_guard(&self) -> PlatformResult<RemoveReport> {
         self.firewall.clear_persistent_boot_guard()
+    }
+
+    /// Read-only inspection of the active 4-Vector Leak Shield (WFP dynamic state or COM fallback).
+    pub fn inspect_leak_shield(&self) -> cg_protocol::LeakShieldStatus {
+        self.firewall.inspect_leak_shield()
+    }
+
+    /// Idempotently purge ALL ClaudeGuard firewall state (WFP dynamic rules/posture/shield,
+    /// persistent boot-time filters, and COM firewall/shield rules).
+    pub fn clear_all_claudeguard_state(&self) -> Result<usize, String> {
+        self.firewall.clear_all_claudeguard_state()
     }
 }
 
@@ -296,7 +309,9 @@ impl PlatformDriver for WindowsPlatformDriver {
     }
 
     fn protect_secret(&self, plaintext: &[u8]) -> PlatformResult<Vec<u8>> {
-        crypto_win::protect_bytes(plaintext, crypto_win::DpapiScope::CurrentUser)
+        // Bind to LocalMachine so Session-0 LocalSystem service and elevated CLI tools interoperate
+        // seamlessly (`unprotect_bytes` still auto-decrypts legacy `CurrentUser` blobs).
+        crypto_win::protect_bytes(plaintext, crypto_win::DpapiScope::LocalMachine)
     }
 
     fn unprotect_secret(&self, ciphertext: &[u8]) -> PlatformResult<Vec<u8>> {

@@ -80,12 +80,27 @@ pub fn is_agent_scm_service_exe(exe_name_l: &str) -> bool {
     )
 }
 
-fn is_claude_cli_path_l(exe_path_l: &str) -> bool {
-    exe_path_l.contains(r"\claude\claude-code\")
-        || exe_path_l.contains(r"\.local\bin\claude")
-        || exe_path_l.contains(r"@anthropic-ai\claude-code")
-        || exe_path_l.contains("@anthropic-ai/claude-code")
-        || exe_path_l.contains("claude-code-win32")
+/// Returns true if `exe_path_l` (lowercased) belongs to a standalone Claude Code CLI installation
+/// rather than the Claude Desktop GUI application.
+pub fn is_claude_cli_path_l(exe_path_l: &str) -> bool {
+    let norm = if exe_path_l.contains('/') {
+        std::borrow::Cow::Owned(exe_path_l.replace('/', "\\"))
+    } else {
+        std::borrow::Cow::Borrowed(exe_path_l)
+    };
+    let p = norm.as_ref();
+    p.contains(r"\claude\claude-code\")
+        || p.contains(r"\.local\bin\claude")
+        || p.contains(r"\.local\share\claude\")
+        || p.contains(r"\.claude\bin\")
+        || p.contains(r"\.claude\local\")
+        || p.contains(r"\volta\bin\claude")
+        || p.contains(r"\pnpm\claude")
+        || p.contains(r"\scoop\apps\claude-code\")
+        || p.contains(r"\.bun\bin\claude")
+        || (p.contains(r"\winget\") && p.contains("claude"))
+        || p.contains(r"@anthropic-ai\claude-code")
+        || p.contains("claude-code-win32")
 }
 
 fn path_under_dir_l(exe_path_l: &str, dir_raw: &str) -> bool {
@@ -233,11 +248,7 @@ pub fn cli_agent_matches(id: &str, exe_name_l: &str, exe_path_l: &str, cmd_l: &s
         "claude-code" => {
             cmd_l.contains(r"@anthropic-ai\claude-code")
                 || cmd_l.contains("@anthropic-ai/claude-code")
-                || exe_path_l.contains(r"\.local\bin\claude")
-                || exe_path_l.contains(r"\claude\claude-code\")
-                || exe_path_l.contains(r"@anthropic-ai\claude-code")
-                || exe_path_l.contains("@anthropic-ai/claude-code")
-                || exe_path_l.contains("claude-code-win32")
+                || is_claude_cli_path_l(exe_path_l)
         }
         "codex" => {
             if exe_path_l.contains(r"\windowsapps\openai.")
@@ -678,6 +689,38 @@ mod tests {
             r"c:\users\dev\.local\bin\aider.exe",
             ""
         ));
+
+        // Expanded Claude Code CLI paths must NEVER misclassify as Claude Desktop GUI
+        for cli_p in [
+            r"c:\users\dev\.local\share\claude\versions\2.1.88\claude.exe",
+            r"c:\users\dev\.claude\bin\claude.exe",
+            r"c:\users\dev\.claude\local\claude.exe",
+            r"c:\users\dev\appdata\local\volta\bin\claude.exe",
+            r"c:\users\dev\appdata\local\pnpm\claude.exe",
+            r"c:\users\dev\scoop\apps\claude-code\current\claude.exe",
+            r"c:\users\dev\.bun\bin\claude.exe",
+            r"c:\users\dev\appdata\local\microsoft\winget\links\claude.exe",
+            r"c:\users\dev\appdata\local\microsoft\winget\packages\anthropic.claudecode_1.0\claude.exe",
+        ] {
+            assert!(is_claude_cli_path_l(cli_p), "must detect CLI path: {cli_p}");
+            assert!(
+                !gui_agent_matches("claude", "claude.exe", cli_p, None),
+                "CLI binary must not match GUI claude: {cli_p}"
+            );
+            assert!(
+                cli_agent_matches("claude-code", "claude.exe", cli_p, ""),
+                "CLI binary must match claude-code: {cli_p}"
+            );
+        }
+        assert!(
+            !cli_agent_matches(
+                "claude-code",
+                "rg.exe",
+                r"c:\users\dev\appdata\local\microsoft\winget\links\rg.exe",
+                ""
+            ),
+            "unrelated WinGet binaries must never match claude-code"
+        );
         assert!(cli_agent_matches(
             "aider",
             "python.exe",

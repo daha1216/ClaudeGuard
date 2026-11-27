@@ -81,6 +81,38 @@ pub fn safety_grade_tone(grade: SafetyGrade) -> BadgeTone {
     }
 }
 
+/// Human-friendly Chinese label for raw firewall backend codes (`wfp_dynamic`, `com_legacy`, etc.).
+pub fn friendly_firewall_backend(raw: &str) -> &str {
+    match raw.trim() {
+        "" => "防火墙待同步",
+        "wfp_dynamic" => "WFP 内核动态引擎",
+        "wfp_persistent" | "wfp_boottime" => "WFP 开机抢先引擎",
+        "com_legacy" => "系统防火墙兼容引擎",
+        "wfp_unavailable" => "内核引擎未就绪",
+        "unsupported" => "当前平台不支持",
+        other => other,
+    }
+}
+
+/// Human-friendly display name for any managed AI desktop or CLI client identifier.
+pub fn friendly_agent_display_name(id: &str) -> &str {
+    match id.trim().to_ascii_lowercase().as_str() {
+        "all" => "全部客户端",
+        "claude" | "claude_desktop" | "claude-desktop" => "Claude",
+        "claude-code" | "claude_code" => "Claude Code",
+        "chatgpt" | "codex_desktop" | "codex-desktop" => "ChatGPT",
+        "codex" | "codex-cli" | "codex_cli" => "Codex CLI",
+        "antigravity" | "antigravity_ide" | "antigravity-ide" => "Antigravity",
+        "cursor" | "cursor_ide" | "cursor-ide" => "Cursor",
+        "windsurf" | "windsurf_ide" | "windsurf-ide" => "Windsurf",
+        "zed" | "zed_ide" | "zed-ide" => "Zed",
+        "trae" | "trae_ide" | "trae-ide" => "Trae",
+        "gemini" | "gemini-cli" | "gemini_cli" => "Gemini CLI",
+        "aider" | "aider-cli" | "aider_cli" => "Aider CLI",
+        _ => id,
+    }
+}
+
 /// Formats a WFP blocked packet's remote IP respecting `privacy_mask_ip`.
 pub fn mask_wfp_event_ip(ev: &WfpBlockedEvent, privacy_mask: bool) -> String {
     if ev.remote_ip.trim().is_empty() {
@@ -166,7 +198,8 @@ impl VaultDraft {
         }
     }
 
-    /// One-click helper adopting the live probed egress country, IP, ASN, and active Mihomo node.
+    /// Recommended 1-click baseline: adopts live country, ASN, and active Mihomo node
+    /// WITHOUT locking ephemeral `/32` single IP or hardcoding the global proxy port.
     pub fn adopt_current_egress(&mut self, snap: &GuardSnapshot) {
         let primary_target = snap
             .targets
@@ -184,6 +217,27 @@ impl VaultDraft {
         {
             self.pinned_regions_text = cc.trim().to_ascii_uppercase();
         }
+        self.pinned_ips_text.clear();
+        self.dedicated_proxy_port_text.clear();
+        if let Some(asn) = snap.risk_assessment.ip_purity.asn {
+            self.pinned_asn_text = asn.to_string();
+        }
+        if !snap.mihomo.active_group.trim().is_empty() {
+            self.preferred_mihomo_group = snap.mihomo.active_group.trim().to_string();
+        }
+        if !snap.mihomo.active_node.trim().is_empty() {
+            self.preferred_mihomo_node = snap.mihomo.active_node.trim().to_string();
+        }
+    }
+
+    /// Strict static-IP baseline: adopts live country, ASN, Mihomo node, AND exact static IP.
+    pub fn adopt_current_egress_strict_ip(&mut self, snap: &GuardSnapshot) {
+        self.adopt_current_egress(snap);
+        let primary_target = snap
+            .targets
+            .iter()
+            .find(|t| t.id == "claude" && t.ip.is_some())
+            .or_else(|| snap.targets.iter().find(|t| t.ip.is_some()));
         if let Some(ip) = snap
             .risk_assessment
             .ip_purity
@@ -193,18 +247,6 @@ impl VaultDraft {
             .filter(|ip| !ip.trim().is_empty())
         {
             self.pinned_ips_text = ip.trim().to_string();
-        }
-        if let Some(asn) = snap.risk_assessment.ip_purity.asn {
-            self.pinned_asn_text = asn.to_string();
-        }
-        if snap.config.proxy_port > 0 {
-            self.dedicated_proxy_port_text = snap.config.proxy_port.to_string();
-        }
-        if !snap.mihomo.active_group.trim().is_empty() {
-            self.preferred_mihomo_group = snap.mihomo.active_group.trim().to_string();
-        }
-        if !snap.mihomo.active_node.trim().is_empty() {
-            self.preferred_mihomo_node = snap.mihomo.active_node.trim().to_string();
         }
     }
 
@@ -664,7 +706,17 @@ pub struct HudCleanupChipViewModel {
     pub quarantined: bool,
 }
 
-/// Projected Mode A Tray Quick HUD (`424 x 590`).
+/// Compact Sovereign Account Vault quick-launch chip for Mode A Tray Quick HUD.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HudVaultChipViewModel {
+    pub vault_id: String,
+    pub name: String,
+    pub region_tag: String,
+    pub state: VaultRuntimeState,
+    pub can_launch: bool,
+}
+
+/// Projected Mode A Tray Quick HUD (`398 x 472`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HudProjection {
     pub connected: bool,
@@ -684,6 +736,7 @@ pub struct HudProjection {
     pub safety_evaluated: bool,
     pub wfp_blocked_total: u64,
     pub active_vault_name: Option<String>,
+    pub vaults: Vec<HudVaultChipViewModel>,
 }
 
 /// Projected runtime status row for one AI client on the Breaker page.
@@ -848,16 +901,16 @@ pub fn project_hero(
     let Some(snap) = snap else {
         return HeroViewModel {
             tone: HeroTone::DisarmedOrPaused,
-            pill_label: "等待守护服务".into(),
-            title: "尚未连接 Guardian 服务".into(),
-            subtitle: "正在尝试连接 \\\\.\\pipe\\ClaudeGuardV4，或使用 --demo 预览状态".into(),
+            pill_label: "等待防封服务".into(),
+            title: "后台防封服务尚未运行".into(),
+            subtitle: "点击下方「一键启动守护服务」即可立即恢复防封保护".into(),
             access_badge: "未连接".into(),
             pass_count: 0,
             fail_count: 0,
             unverified_count: 0,
             is_paused: false,
             paused_remaining_text: None,
-            checked_age_text: "等待快照".into(),
+            checked_age_text: "等待就绪".into(),
             can_launch: false,
         };
     };
@@ -898,9 +951,9 @@ pub fn project_hero(
     let (tone, pill_label, title, subtitle) = if !connected {
         (
             HeroTone::DisarmedOrPaused,
-            "连接中断 · 安全闭锁".into(),
-            "守护服务未连接（安全闭锁中）".into(),
-            "命名管道不可用，无法验证出口合规；严格禁止假报通过或启动 AI 应用".into(),
+            "服务离线 · 安全保护锁".into(),
+            "后台防封服务未运行（已暂停启动）".into(),
+            "后台防封服务尚未就绪，点击「一键启动守护服务」即可恢复节点核验与客户端启动".into(),
         )
     } else if snap.lifecycle == Lifecycle::Unconfigured {
         (
@@ -1152,13 +1205,21 @@ pub fn project_launch_apps(snap: Option<&GuardSnapshot>) -> Vec<SafeLaunchAppVie
     let canonical = [
         ("claude", "Claude Desktop", "桌面端"),
         ("claude-code", "Claude Code", "CLI"),
+        ("cursor", "Cursor", "IDE"),
+        ("antigravity", "Antigravity", "IDE"),
         ("chatgpt", "ChatGPT", "Codex"),
-        ("antigravity", "反重力", "IDE"),
+        ("windsurf", "Windsurf", "IDE"),
+        ("zed", "Zed", "IDE"),
+        ("trae", "Trae", "IDE"),
+        ("codex", "Codex CLI", "CLI"),
+        ("gemini", "Gemini CLI", "CLI"),
+        ("aider", "Aider CLI", "CLI"),
     ];
 
-    canonical
+    let mut ranked: Vec<(u8, usize, SafeLaunchAppViewModel)> = canonical
         .into_iter()
-        .map(|(id, label, badge)| {
+        .enumerate()
+        .map(|(canon_idx, (id, label, badge))| {
             let ag_proxy_blocked = id == "antigravity"
                 && snap.is_some_and(|s| {
                     s.config.require_antigravity_proxy
@@ -1169,8 +1230,14 @@ pub fn project_launch_apps(snap: Option<&GuardSnapshot>) -> Vec<SafeLaunchAppVie
                 && snap.is_some_and(|s| {
                     s.antigravity_proxy.installed && s.antigravity_proxy.is_ready_for_launch()
                 });
+            let guarded = snap.is_some_and(|s| {
+                s.config
+                    .guarded_agents
+                    .iter()
+                    .any(|g| g.eq_ignore_ascii_case(id))
+            });
             let found = snap.and_then(|s| s.agents.iter().find(|a| a.id == id));
-            match found {
+            let vm = match found {
                 Some(agent) => SafeLaunchAppViewModel {
                     agent_id: id.into(),
                     label: label.into(),
@@ -1187,7 +1254,7 @@ pub fn project_launch_apps(snap: Option<&GuardSnapshot>) -> Vec<SafeLaunchAppVie
                     agent_id: id.into(),
                     label: label.into(),
                     badge: badge.into(),
-                    installed: true,
+                    installed: false,
                     quarantined: snap.is_some_and(GuardSnapshot::is_tripped),
                     ag_proxy_blocked,
                     ag_proxy_ready,
@@ -1195,9 +1262,20 @@ pub fn project_launch_apps(snap: Option<&GuardSnapshot>) -> Vec<SafeLaunchAppVie
                     orphan_count: 0,
                     install_paths: Vec::new(),
                 },
-            }
+            };
+            let tier = if vm.installed && guarded {
+                0
+            } else if vm.installed {
+                1
+            } else {
+                2
+            };
+            (tier, canon_idx, vm)
         })
-        .collect()
+        .collect();
+
+    ranked.sort_by_key(|(tier, canon_idx, _)| (*tier, *canon_idx));
+    ranked.into_iter().map(|(_, _, vm)| vm).collect()
 }
 
 pub fn project_hud(
@@ -1312,6 +1390,46 @@ pub fn project_hud(
             .find(|v| v.state == VaultRuntimeState::ActiveRunning)
             .map(|v| v.name.clone())
     });
+    let vaults = snap
+        .map(|s| {
+            s.config
+                .vaults
+                .iter()
+                .map(|cfg_v| {
+                    let rt = s.vaults.iter().find(|r| r.id == cfg_v.id);
+                    let state = rt.map(|r| r.state).unwrap_or(if cfg_v.enabled {
+                        VaultRuntimeState::Ready
+                    } else {
+                        VaultRuntimeState::Disabled
+                    });
+                    let mihomo_can_align = cfg_v.auto_align_mihomo_on_vault_launch
+                        && cfg_v
+                            .preferred_mihomo_node
+                            .as_deref()
+                            .is_some_and(|n| !n.trim().is_empty());
+                    let can_launch = cfg_v.enabled
+                        && state != VaultRuntimeState::CoolingDown
+                        && (state != VaultRuntimeState::EgressMismatch || mihomo_can_align);
+                    let region_tag = cfg_v
+                        .pinned_regions
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "GLOBAL".into());
+                    HudVaultChipViewModel {
+                        vault_id: cfg_v.id.clone(),
+                        name: if cfg_v.name.trim().is_empty() {
+                            cfg_v.id.clone()
+                        } else {
+                            cfg_v.name.clone()
+                        },
+                        region_tag,
+                        state,
+                        can_launch,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     HudProjection {
         connected,
@@ -1331,6 +1449,7 @@ pub fn project_hud(
         safety_evaluated,
         wfp_blocked_total,
         active_vault_name,
+        vaults,
     }
 }
 
@@ -1392,12 +1511,12 @@ pub fn project_console_from_input(input: ConsoleProjectionInput<'_>) -> ConsoleP
                         .trim_start_matches("守护服务未连接：")
                         .trim();
                     if clean.is_empty() {
-                        "无法连接后台守护服务".into()
+                        "后台防封服务尚未运行".into()
                     } else {
                         clean.to_string()
                     }
                 })
-                .unwrap_or_else(|| "正在连接守护服务 \\\\.\\pipe\\ClaudeGuardV4…".into()),
+                .unwrap_or_else(|| "后台防封服务尚未运行，点击一键启动即可恢复保护".into()),
         )
     } else {
         None
@@ -2590,8 +2709,20 @@ mod tests {
         drafts.vault_dirty = true;
 
         assert_eq!(drafts.vault_draft.pinned_regions_text, "US");
-        assert_eq!(drafts.vault_draft.pinned_ips_text, "198.51.100.98");
+        assert_eq!(
+            drafts.vault_draft.pinned_ips_text, "",
+            "recommended adopt must not lock ephemeral /32 IP"
+        );
+        assert_eq!(
+            drafts.vault_draft.dedicated_proxy_port_text, "",
+            "adopt must leave dedicated_proxy_port empty so vault follows global port"
+        );
         assert_eq!(drafts.vault_draft.pinned_asn_text, "7922");
+
+        // Explicit strict static-IP adoption populates exact IP while keeping dedicated port empty.
+        drafts.vault_draft.adopt_current_egress_strict_ip(&snap1);
+        assert_eq!(drafts.vault_draft.pinned_ips_text, "198.51.100.98");
+        assert_eq!(drafts.vault_draft.dedicated_proxy_port_text, "");
 
         // 1s background snapshot poll arrives with higher cfg_rev — must NEVER overwrite vault_draft!
         let mut snap2 = snap1.clone();
@@ -2606,6 +2737,7 @@ mod tests {
         let vault = drafts.vault_draft.to_account_vault().expect("valid vault");
         assert_eq!(vault.id, "team-us-01");
         assert_eq!(vault.pinned_asn, Some(7922));
+        assert_eq!(vault.dedicated_proxy_port, None);
         assert!(!vault.auto_align_mihomo_on_vault_launch);
 
         drafts.vault_draft.id = "../escape".into();
@@ -2621,6 +2753,22 @@ mod tests {
         assert_eq!(hud.safety_grade, SafetyGrade::S);
         assert_eq!(hud.wfp_blocked_total, 12);
         assert!(hud.active_vault_name.is_some());
+        assert!(!hud.vaults.is_empty());
+        assert_eq!(hud.launch_apps.len(), 11);
+
+        // When snapshot is None, launch apps default to installed=false and offline hero has zero pipe jargon.
+        let offline_apps = project_launch_apps(None);
+        assert_eq!(offline_apps.len(), 11);
+        assert!(offline_apps.iter().all(|a| !a.installed));
+        let offline_hero = project_hero(None, false, false, 0);
+        assert!(!offline_hero.subtitle.contains(r"\\.\pipe"));
+        assert!(!offline_hero.subtitle.contains("--demo"));
+
+        assert_eq!(friendly_firewall_backend("wfp_dynamic"), "WFP 内核动态引擎");
+        assert_eq!(
+            friendly_firewall_backend("com_legacy"),
+            "系统防火墙兼容引擎"
+        );
 
         assert_eq!(safety_grade_tone(SafetyGrade::S), BadgeTone::Pass);
         assert_eq!(safety_grade_tone(SafetyGrade::A), BadgeTone::Pass);

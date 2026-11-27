@@ -786,6 +786,20 @@ impl GuardEngine {
                 requires_recheck: false,
             };
         }
+        if state.lockdown_manual || state.lockdown_applied == Some(true) {
+            return LaunchDecision {
+                allowed: false,
+                reason: "当前处于断网封锁状态，禁止启动应用".into(),
+                requires_recheck: false,
+            };
+        }
+        if state.protection == ProtectionState::Pending && state.tripped.is_none() {
+            return LaunchDecision {
+                allowed: false,
+                reason: "尚未完成首轮出口检查，需先完成探测".into(),
+                requires_recheck: true,
+            };
+        }
         if state.protection != ProtectionState::Monitoring || state.tripped.is_some() {
             return LaunchDecision {
                 allowed: false,
@@ -1339,11 +1353,12 @@ fn handle_wal_healed(state: &mut EngineState, now_secs: u64, cmds: &mut Vec<Effe
         state.wal_pending = false;
         state.last_error.clear();
         if state.protection == ProtectionState::Degraded {
-            state.protection = if state.lifecycle == Lifecycle::Disarmed {
-                ProtectionState::Monitoring
+            if state.lifecycle == Lifecycle::Disarmed {
+                state.protection = ProtectionState::Monitoring;
             } else {
-                ProtectionState::Pending
-            };
+                state.protection = ProtectionState::Pending;
+                state.checked_at = None;
+            }
         }
         log_both(
             state,
@@ -2680,6 +2695,7 @@ fn handle_rearm_persisted(
     }
     state.lifecycle = Lifecycle::Armed;
     state.protection = ProtectionState::Pending;
+    state.checked_at = None;
     state.disarmed_reason.clear();
     state.last_error.clear();
     clear_compliant_ip_baseline(state);
@@ -2835,6 +2851,7 @@ fn handle_config_persisted(
         state.runtime_epoch = state.runtime_epoch.saturating_add(1);
     }
     state.target_statuses = initial_target_statuses(&state.config);
+    state.checked_at = None;
     state.access_streak = 0;
     clear_compliant_ip_baseline(state);
     state.checking = false;
@@ -2994,6 +3011,7 @@ fn handle_exit_maintenance(
     if ok {
         if !state.protection.is_isolated() {
             state.protection = ProtectionState::Pending;
+            state.checked_at = None;
         }
         clear_compliant_ip_baseline(state);
         state.last_error.clear();
@@ -3140,7 +3158,6 @@ fn handle_antigravity_proxy_updated(
             && status.antigravity_version != state.config.last_seen_antigravity_version);
 
     if version_changed && !in_tx {
-        state.config.last_seen_antigravity_version = status.antigravity_version.clone();
         let audit_msg = if let Some(prev) = status.version_changed_from.as_deref() {
             format!(
                 "检测到反重力客户端版本更新：{} -> {}（{}）",
@@ -3164,16 +3181,27 @@ fn handle_antigravity_proxy_updated(
         );
 
         if status.version_changed_from.is_some() {
-            state.cfg_rev = state.cfg_rev.saturating_add(1);
-            cmds.push(EffectCommand::PersistConfig {
-                config: state.config.clone(),
-                target_cfg_rev: state.cfg_rev,
-            });
+            if !state.config.first_run && state.lifecycle != Lifecycle::Unconfigured {
+                // CONTRACT §3.6 & R11: stage updated version via PersistConfig without mutating
+                // state.config or state.cfg_rev until ConfigPersisted succeeds!
+                let mut next_cfg = state.config.clone();
+                next_cfg.last_seen_antigravity_version = status.antigravity_version.clone();
+                cmds.push(EffectCommand::PersistConfig {
+                    config: next_cfg,
+                    target_cfg_rev: state.cfg_rev.saturating_add(1),
+                });
+            } else {
+                // Before onboarding completes (first_run == true), cache in memory only so empty
+                // built-in target allowlists never fail ConfigStore::save_verified.
+                state.config.last_seen_antigravity_version = status.antigravity_version.clone();
+            }
             cmds.push(EffectCommand::Notify {
                 class: "client_update".into(),
                 title: "检测到反重力客户端更新".into(),
                 body: status.summary.clone(),
             });
+        } else {
+            state.config.last_seen_antigravity_version = status.antigravity_version.clone();
         }
     }
 
@@ -4773,14 +4801,15 @@ mod tests {
         let (after, cmds) = GuardEngine::step(
             state,
             EngineEvent::AntigravityProxyUpdated {
-                status: upgraded_missing,
+                status: upgraded_missing.clone(),
             },
             120,
         );
-        assert_eq!(after.cfg_rev, 1);
+        // Two-phase PersistConfig discipline: memory cfg_rev & config commit only upon ConfigPersisted.
+        assert_eq!(after.cfg_rev, 0);
         assert_eq!(
             after.config.last_seen_antigravity_version.as_deref(),
-            Some("45.0.0")
+            Some("44.9.1")
         );
         assert!(after.logs.iter().any(|l| {
             l.level == LogLevel::Audit
@@ -4788,13 +4817,34 @@ mod tests {
                 && l.message.contains("44.9.1")
                 && l.message.contains("45.0.0")
         }));
-        assert!(cmds.iter().any(|c| matches!(
-            c,
-            EffectCommand::PersistConfig {
-                config,
-                target_cfg_rev: 1,
-            } if config.last_seen_antigravity_version.as_deref() == Some("45.0.0")
-        )));
+        let staged_cfg = cmds
+            .iter()
+            .find_map(|c| match c {
+                EffectCommand::PersistConfig {
+                    config,
+                    target_cfg_rev: 1,
+                } => Some(config.clone()),
+                _ => None,
+            })
+            .expect("PersistConfig must be emitted with target_cfg_rev=1");
+        assert_eq!(
+            staged_cfg.last_seen_antigravity_version.as_deref(),
+            Some("45.0.0")
+        );
+        let (committed, _) = GuardEngine::step(
+            after,
+            EngineEvent::ConfigPersisted {
+                ok: true,
+                config: Some(staged_cfg),
+                error: None,
+            },
+            121,
+        );
+        assert_eq!(committed.cfg_rev, 1);
+        assert_eq!(
+            committed.config.last_seen_antigravity_version.as_deref(),
+            Some("45.0.0")
+        );
         assert!(cmds.iter().any(|c| matches!(
             c,
             EffectCommand::Notify { class, title, body }
@@ -4807,6 +4857,32 @@ mod tests {
             EffectCommand::Notify { class, title, .. }
                 if class == "warning" && title == "反重力透明代理异常：注入丢失 (version.dll)"
         )));
+
+        // When first_run == true (Unconfigured), version_changed_from must NOT emit PersistConfig.
+        let first_run_cfg = Config {
+            first_run: true,
+            last_seen_antigravity_version: Some("44.9.1".into()),
+            ..Config::default()
+        };
+        let uncfg_state = EngineState::new(first_run_cfg, true, true, 100);
+        let (uncfg_after, uncfg_cmds) = GuardEngine::step(
+            uncfg_state,
+            EngineEvent::AntigravityProxyUpdated {
+                status: upgraded_missing,
+            },
+            125,
+        );
+        assert_eq!(uncfg_after.cfg_rev, 0);
+        assert_eq!(
+            uncfg_after.config.last_seen_antigravity_version.as_deref(),
+            Some("45.0.0")
+        );
+        assert!(
+            !uncfg_cmds
+                .iter()
+                .any(|c| matches!(c, EffectCommand::PersistConfig { .. })),
+            "Unconfigured first_run state must not emit PersistConfig"
+        );
     }
 
     #[test]
@@ -5674,21 +5750,85 @@ mod tests {
         assert_eq!(quarantined.protection, ProtectionState::Quarantined);
         assert!(quarantined.pending_tx.is_none());
 
-        // Next clean telemetry tick persists last_seen_antigravity_version as expected.
-        let (persisted_ag, cmds_ag2) = GuardEngine::step(
+        // Next clean telemetry tick stages PersistConfig with last_seen_antigravity_version = "45.0.0".
+        let (staged_ag, cmds_ag2) = GuardEngine::step(
             quarantined,
             EngineEvent::AntigravityProxyUpdated { status: upgraded },
             110,
+        );
+        let next_cfg = cmds_ag2
+            .iter()
+            .find_map(|c| match c {
+                EffectCommand::PersistConfig { config, .. } => Some(config.clone()),
+                _ => None,
+            })
+            .expect("PersistConfig must be emitted once IsolationCompleted clears tx");
+        assert_eq!(
+            next_cfg.last_seen_antigravity_version.as_deref(),
+            Some("45.0.0")
+        );
+        let (persisted_ag, _) = GuardEngine::step(
+            staged_ag,
+            EngineEvent::ConfigPersisted {
+                ok: true,
+                config: Some(next_cfg),
+                error: None,
+            },
+            111,
         );
         assert_eq!(
             persisted_ag.config.last_seen_antigravity_version.as_deref(),
             Some("45.0.0")
         );
+    }
+
+    #[test]
+    fn launch_gate_pending_requests_recheck_blocks_manual_lockdown_and_clears_checked_at_on_reset()
+    {
+        let cfg = armed_config();
+        let pending_state = EngineState::new(cfg.clone(), true, true, 100);
+        let pending_gate = GuardEngine::evaluate_launch_gate(&pending_state, 101);
+        assert!(!pending_gate.allowed);
         assert!(
-            cmds_ag2
-                .iter()
-                .any(|c| matches!(c, EffectCommand::PersistConfig { .. }))
+            pending_gate.requires_recheck,
+            "cold-boot Armed+Pending must request on-demand Launch probe"
         );
+
+        let (mut monitoring, _) = GuardEngine::step(
+            pending_state,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: pass_probes(),
+            },
+            105,
+        );
+        assert!(monitoring.checked_at.is_some());
+        assert!(GuardEngine::evaluate_launch_gate(&monitoring, 106).allowed);
+
+        // Manual lockdown must block evaluate_launch_gate immediately without recheck.
+        monitoring.lockdown_manual = true;
+        let lock_gate = GuardEngine::evaluate_launch_gate(&monitoring, 107);
+        assert!(!lock_gate.allowed);
+        assert!(!lock_gate.requires_recheck);
+        monitoring.lockdown_manual = false;
+
+        // ConfigPersisted resets target_statuses to Pending AND clears checked_at to None.
+        let (after_cfg, _) = GuardEngine::step(
+            monitoring,
+            EngineEvent::ConfigPersisted {
+                ok: true,
+                config: Some(cfg),
+                error: None,
+            },
+            110,
+        );
+        assert!(after_cfg.checked_at.is_none());
+        let after_cfg_gate = GuardEngine::evaluate_launch_gate(&after_cfg, 111);
+        assert!(!after_cfg_gate.allowed);
+        assert!(after_cfg_gate.requires_recheck);
     }
 
     #[test]

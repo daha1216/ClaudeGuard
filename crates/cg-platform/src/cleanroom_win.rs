@@ -898,6 +898,11 @@ pub fn enumerate_matching_credentials(scope: &CleanRoomScope) -> Vec<CredentialS
         CredEnumerateW, CredFree, CREDENTIALW, CRED_ENUMERATE_FLAGS,
     };
 
+    let _imp = match crate::access_win::ImpersonateInteractiveUserGuard::enter() {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+
     struct CredListGuard(*mut *mut CREDENTIALW);
     impl Drop for CredListGuard {
         fn drop(&mut self) {
@@ -957,11 +962,16 @@ pub fn enumerate_matching_credentials(_scope: &CleanRoomScope) -> Vec<Credential
 }
 
 #[cfg(windows)]
-fn read_credential_for_backup(target_name: &str, cred_type: u32) -> Option<BackupCredentialEntry> {
+fn read_credential_for_backup(
+    target_name: &str,
+    cred_type: u32,
+) -> Result<Option<BackupCredentialEntry>, String> {
     use windows::core::PCWSTR;
     use windows::Win32::Security::Credentials::{
         CredEnumerateW, CredFree, CREDENTIALW, CRED_ENUMERATE_FLAGS,
     };
+
+    let _imp = crate::access_win::ImpersonateInteractiveUserGuard::enter()?;
 
     struct CredListGuard(*mut *mut CREDENTIALW);
     impl Drop for CredListGuard {
@@ -987,7 +997,7 @@ fn read_credential_for_backup(target_name: &str, cred_type: u32) -> Option<Backu
             || creds_ptr.is_null()
             || count == 0
         {
-            return None;
+            return Ok(None);
         }
         let _guard = CredListGuard(creds_ptr);
         let slice = core::slice::from_raw_parts(creds_ptr, count as usize);
@@ -1010,7 +1020,7 @@ fn read_credential_for_backup(target_name: &str, cred_type: u32) -> Option<Backu
                     )
                     .to_vec()
                 };
-                return Some(BackupCredentialEntry {
+                return Ok(Some(BackupCredentialEntry {
                     target_name: name,
                     cred_type,
                     user_name: (!cred.UserName.is_null())
@@ -1024,19 +1034,19 @@ fn read_credential_for_backup(target_name: &str, cred_type: u32) -> Option<Backu
                         .flatten(),
                     persist: cred.Persist.0,
                     blob_b64: STANDARD.encode(blob),
-                });
+                }));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 #[cfg(not(windows))]
 fn read_credential_for_backup(
     _target_name: &str,
     _cred_type: u32,
-) -> Option<BackupCredentialEntry> {
-    None
+) -> Result<Option<BackupCredentialEntry>, String> {
+    Ok(None)
 }
 
 #[cfg(windows)]
@@ -1044,6 +1054,8 @@ fn delete_windows_credential(target_name: &str, cred_type: u32) -> Result<(), St
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::Security::Credentials::{CredDeleteW, CRED_TYPE};
+
+    let _imp = crate::access_win::ImpersonateInteractiveUserGuard::enter()?;
 
     let wide: Vec<u16> = std::ffi::OsStr::new(target_name)
         .encode_wide()
@@ -1067,6 +1079,8 @@ fn restore_windows_credential(entry: &BackupCredentialEntry) -> Result<(), Strin
     use windows::Win32::Security::Credentials::{
         CredWriteW, CREDENTIALW, CRED_FLAGS, CRED_PERSIST, CRED_TYPE,
     };
+
+    let _imp = crate::access_win::ImpersonateInteractiveUserGuard::enter()?;
 
     let mut blob = STANDARD
         .decode(&entry.blob_b64)
@@ -1270,7 +1284,7 @@ pub fn execute_cleanroom_with_backup(
                 target_name,
                 cred_type,
             } => {
-                if let Some(entry) = read_credential_for_backup(target_name, *cred_type) {
+                if let Some(entry) = read_credential_for_backup(target_name, *cred_type)? {
                     manifest_creds.push(entry);
                 }
             }
@@ -1549,17 +1563,25 @@ pub fn restore_cleanroom_backup(data_dir: &Path, backup_id: &str) -> Result<usiz
     let manifest: BackupArchiveManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| format!("解析备份包 manifest.json 失败：{e}"))?;
 
+    let allowed_roots = build_allowed_restore_roots(data_dir);
     let mut restored_count = 0usize;
     let mut restored_anchors: BTreeMap<String, PathBuf> = BTreeMap::new();
 
     for entry in &manifest.files {
-        let anchor = restored_anchors
-            .entry(entry.anchor_root.clone())
-            .or_insert_with(|| PathBuf::from(&entry.anchor_root))
-            .clone();
-        ensure_no_reparse_points_chain(&anchor)?;
+        let anchor = if let Some(cached) = restored_anchors.get(&entry.anchor_root) {
+            cached.clone()
+        } else {
+            let validated = validate_allowed_restore_anchor(
+                Path::new(&entry.anchor_root),
+                data_dir,
+                &allowed_roots,
+            )?;
+            restored_anchors.insert(entry.anchor_root.clone(), validated.clone());
+            validated
+        };
 
         let rel = validate_safe_rel_path(&entry.rel_path)?;
+        validate_allowed_cleanroom_rel_path(&rel)?;
         let target = anchor.join(&rel);
         ensure_no_reparse_points_chain(&target)?;
 
@@ -1574,6 +1596,142 @@ pub fn restore_cleanroom_backup(data_dir: &Path, backup_id: &str) -> Result<usiz
     }
 
     Ok(restored_count)
+}
+
+fn normalize_canonical_key(path: &Path) -> String {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let raw = resolved.to_string_lossy();
+    let stripped = crate::process_win::strip_verbatim_win32_str(&raw);
+    stripped
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn build_allowed_restore_roots(data_dir: &Path) -> Vec<String> {
+    let mut roots = Vec::new();
+    let mut push_root = |p: &Path| {
+        let k = normalize_canonical_key(p);
+        if !k.is_empty() && !roots.contains(&k) {
+            roots.push(k);
+        }
+    };
+
+    for home in crate::process_win::user_home_dirs() {
+        push_root(&home);
+    }
+    if !crate::access_win::is_session_zero() {
+        if let Some(up) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+            push_root(&up);
+        }
+        push_root(&std::env::temp_dir());
+    }
+
+    // Support isolated unit-test sandboxes (`<sandbox>/cg_data` + `<sandbox>/user_home`) when
+    // `data_dir` itself is outside `%ProgramData%` and system roots.
+    let pd_key = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    let pd_norm = normalize_canonical_key(&pd_key);
+    let data_norm = normalize_canonical_key(data_dir);
+    if !pd_norm.is_empty()
+        && data_norm != pd_norm
+        && !data_norm.starts_with(&format!(r"{pd_norm}\"))
+    {
+        if let Some(sandbox_parent) = data_dir.parent() {
+            if sandbox_parent.parent().is_some() {
+                push_root(sandbox_parent);
+            }
+        }
+    }
+    roots
+}
+
+fn validate_allowed_restore_anchor(
+    raw_anchor: &Path,
+    data_dir: &Path,
+    allowed_roots: &[String],
+) -> Result<PathBuf, String> {
+    ensure_no_reparse_points_chain(raw_anchor)?;
+    if !raw_anchor.is_dir() {
+        return Err(format!(
+            "安全拦截：还原锚点目录不存在或无效（{}）",
+            raw_anchor.display()
+        ));
+    }
+    let anchor_norm = normalize_canonical_key(raw_anchor);
+    if anchor_norm.is_empty() {
+        return Err("安全拦截：还原锚点路径为空".into());
+    }
+
+    // Explicitly forbid system/service directories regardless of environment variables.
+    let mut forbidden = vec![
+        normalize_canonical_key(data_dir),
+        r"c:\windows".to_string(),
+        r"c:\program files".to_string(),
+        r"c:\program files (x86)".to_string(),
+        r"c:\programdata".to_string(),
+    ];
+    for env_k in [
+        "SystemRoot",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramData",
+    ] {
+        if let Some(val) = std::env::var_os(env_k) {
+            let k = normalize_canonical_key(Path::new(&val));
+            if !k.is_empty() && !forbidden.contains(&k) {
+                forbidden.push(k);
+            }
+        }
+    }
+    for bad in &forbidden {
+        if !bad.is_empty() && (anchor_norm == *bad || anchor_norm.starts_with(&format!(r"{bad}\")))
+        {
+            return Err(format!(
+                "安全拦截：拒绝向受保护系统或服务目录还原文件（{}）",
+                raw_anchor.display()
+            ));
+        }
+    }
+
+    let is_allowed = allowed_roots
+        .iter()
+        .any(|root| anchor_norm == *root || anchor_norm.starts_with(&format!(r"{root}\")));
+    if !is_allowed {
+        return Err(format!(
+            "安全拦截：备份清单锚点超出允许的用户主目录范围（{}）",
+            raw_anchor.display()
+        ));
+    }
+
+    Ok(raw_anchor.to_path_buf())
+}
+
+fn validate_allowed_cleanroom_rel_path(rel: &Path) -> Result<(), String> {
+    let norm = rel
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let allowed = norm == ".claude.json"
+        || norm.starts_with(".claude.json.backup")
+        || norm.starts_with(".claude.json.tmp")
+        || norm.starts_with(".claude/")
+        || norm.starts_with("appdata/roaming/claude/")
+        || norm.starts_with("appdata/roaming/chatgpt/")
+        || norm.starts_with("appdata/roaming/cursor/")
+        || norm.starts_with("appdata/roaming/antigravity/")
+        || norm.starts_with("appdata/roaming/windsurf/")
+        || (norm.starts_with("appdata/local/packages/")
+            && (norm.contains("/localcache/roaming/claude/")
+                || norm.contains("/localcache/roaming/chatgpt/")));
+    if !allowed {
+        return Err(format!(
+            "安全拦截：备份条目超出净室客户端状态白名单路径（{}）",
+            rel.display()
+        ));
+    }
+    Ok(())
 }
 
 fn is_valid_backup_id(id: &str) -> bool {
@@ -1720,7 +1878,7 @@ fn apply_backup_dir_strict_acl_if_service(dir: &Path) {
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
     };
 
-    if !crate::access_win::is_session_zero() {
+    if !crate::access_win::is_session_zero() && !crate::access_win::is_elevated().unwrap_or(false) {
         return;
     }
 
@@ -2091,6 +2249,21 @@ mod tests {
         }
         std::fs::write(&backup_meta.file_path, &tampered).unwrap();
         assert!(restore_cleanroom_backup(&data_dir, &backup_meta.backup_id).is_err());
+
+        // System/service anchor_root and non-cleanroom relative paths (e.g. Startup) must be rejected.
+        let allowed_roots = build_allowed_restore_roots(&data_dir);
+        assert!(validate_allowed_restore_anchor(
+            Path::new(r"C:\Windows\System32"),
+            &data_dir,
+            &allowed_roots
+        )
+        .is_err());
+        assert!(validate_allowed_restore_anchor(&data_dir, &data_dir, &allowed_roots).is_err());
+        assert!(validate_allowed_cleanroom_rel_path(Path::new(
+            "AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/evil.exe"
+        ))
+        .is_err());
+        assert!(validate_allowed_cleanroom_rel_path(Path::new(".ssh/authorized_keys")).is_err());
 
         // Read-only credential enumeration must succeed safely without exposing raw secrets.
         let _creds = enumerate_matching_credentials(&scope);

@@ -25,6 +25,48 @@ pub struct ConfigStore {
     dir: PathBuf,
 }
 
+/// Validates `targets` against `cg_core::targets::validate`, allowing empty IP/region allowlists
+/// ONLY while `first_run == true` (pre-onboarding `Lifecycle::Unconfigured`), while still enforcing
+/// all built-in target presence, URL/SSRF checks, ID uniqueness, and syntax validation.
+pub fn validate_targets_for_config(
+    targets: Vec<cg_protocol::Target>,
+    first_run: bool,
+) -> Result<Vec<cg_protocol::Target>, String> {
+    if !first_run {
+        return targets::validate(targets);
+    }
+
+    for id in targets::BUILTIN_IDS {
+        if !targets.iter().any(|t| t.id.trim().eq_ignore_ascii_case(id)) {
+            return Err(format!("缺少内置目标 {id}，请点“恢复默认”"));
+        }
+    }
+
+    let mut empty_allowlist_ids: Vec<String> = Vec::new();
+    let mut staged = targets;
+    for t in &mut staged {
+        let id_norm = t.id.trim().to_ascii_lowercase();
+        let has_ip = t.expect_ips.iter().any(|s| !s.trim().is_empty());
+        let has_region = t.expect_regions.iter().any(|s| !s.trim().is_empty());
+        if t.enabled
+            && t.anchor_kind != cg_protocol::AnchorKind::Reachability
+            && !has_ip
+            && !has_region
+        {
+            empty_allowlist_ids.push(id_norm);
+            t.expect_regions = vec!["US".to_string()];
+        }
+    }
+
+    let mut validated = targets::validate_with_options(staged, false)?;
+    for t in &mut validated {
+        if empty_allowlist_ids.iter().any(|id| id == &t.id) {
+            t.expect_regions.clear();
+        }
+    }
+    Ok(validated)
+}
+
 impl ConfigStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
@@ -100,9 +142,18 @@ impl ConfigStore {
     /// Any validation, serialization, write, rename, or read-back verification error returns `Err`
     /// without altering the existing `config.json` on disk.
     pub fn save_verified(&self, cfg: &Config) -> Result<Config, String> {
+        for id in targets::BUILTIN_IDS {
+            if !cfg
+                .targets
+                .iter()
+                .any(|t| t.id.trim().eq_ignore_ascii_case(id))
+            {
+                return Err(format!("缺少内置目标 {id}，请点“恢复默认”"));
+            }
+        }
         let mut normalized = cfg.clone();
         normalized.migrate();
-        normalized.targets = targets::validate(normalized.targets)?;
+        normalized.targets = validate_targets_for_config(normalized.targets, normalized.first_run)?;
 
         crate::journal::ensure_secure_data_dir(&self.dir)?;
 
@@ -173,5 +224,14 @@ mod tests {
         let mut bad = Config::default();
         bad.targets.clear();
         assert!(store.save_verified(&bad).is_err());
+
+        // First-run pre-onboarding config with empty region/IP allowlists saves & loads cleanly!
+        let first_run_cfg = Config::default();
+        assert!(first_run_cfg.first_run);
+        let saved_first = store
+            .save_verified(&first_run_cfg)
+            .expect("first_run config must persist before onboarding");
+        assert!(saved_first.first_run);
+        assert!(saved_first.targets[1].expect_regions.is_empty());
     }
 }

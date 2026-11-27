@@ -1228,7 +1228,7 @@ pub fn render_environment_page(
                                                 .text_size(px(13.5))
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .text_color(rgb(p.text_primary))
-                                                .child("10D 风险与出口纯净度雷达"),
+                                                .child("当前网络防封体检分"),
                                         )
                                         .child(tone_tag(
                                             if risk.evaluated_at > 0 {
@@ -1269,7 +1269,7 @@ pub fn render_environment_page(
                                         if is_building_card {
                                             "生成中…"
                                         } else {
-                                            "导出防封体检卡"
+                                            "导出防封体检图（已隐去 IP 与账号）"
                                         },
                                         ButtonKind::Secondary,
                                         can_act && !is_building_card,
@@ -1366,19 +1366,20 @@ pub fn render_environment_page(
                                             .text_size(px(12.5))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(rgb(p.badge_fail.text))
-                                            .child("7 日时空轨迹预警 · 检测到超音速跨洲瞬移"),
+                                            .child(format!(
+                                                "跨国秒切保护（防异地登录风控） · 距上次节点约 {} km，建议冷却后再用",
+                                                alert.distance_km
+                                            )),
                                     ),
                             )
                             .child(
                                 mono_tabular(format!(
-                                    "{} ({}) → {} ({}) · 位移 {} km / 间隔 {}s · 等效时速 {} km/h · 冷却剩余 {}",
+                                    "{} ({}) → {} ({}) · 间隔 {}s · 剩余冷却 {}",
                                     alert.from_country,
                                     alert.from_city,
                                     alert.to_country,
                                     alert.to_city,
-                                    alert.distance_km,
                                     alert.elapsed_secs,
-                                    alert.implied_speed_kmh,
                                     rem_txt
                                 ))
                                 .truncate()
@@ -1389,7 +1390,7 @@ pub fn render_environment_page(
                     .child(
                         action_button(
                             "env-clear-geo-cooldown",
-                            "解除瞬移冷却",
+                            "确认本人切换节点 · 立即放行",
                             ButtonKind::DangerSoft,
                             can_act,
                             p,
@@ -1442,7 +1443,7 @@ pub fn render_environment_page(
                                 .text_size(px(12.5))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(p.text_primary))
-                                .child("IP 纯净度 & ASN 威胁情报"),
+                                .child("当前节点宽带纯净度 & 运营商类型"),
                         )
                         .child(tone_tag(
                             purity.classification.label(),
@@ -1556,7 +1557,7 @@ pub fn render_environment_page(
                                 .text_size(px(12.5))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(p.text_primary))
-                                .child("STUN / DNS 一致性与 Electron 启动卫生"),
+                                .child("客户端启动防泄露加固 & DNS/UDP 检测"),
                         )
                         .child(tone_tag(
                             if stun.leaked || dns.domestic_resolver_detected {
@@ -1648,8 +1649,8 @@ pub fn render_environment_page(
                         )
                         .child(switch_row_gated(
                             "env-electron-hyg",
-                            "启动 Electron 应用自动注入防漏卫生参数",
-                            "注入 --disable-quic 与 WebRTC 策略（系统代理模式附加主机解析防泄露）",
+                            "客户端启动防泄露加固",
+                            "自动关闭 QUIC 与 WebRTC 真实网卡暴露（系统代理模式同步锁定远端 DNS 解析）",
                             electron_hyg_on,
                             can_act,
                             p,
@@ -1685,6 +1686,29 @@ pub fn render_environment_page(
                     } else {
                         d.detail.clone()
                     };
+                    let dim_id = d.id.clone();
+                    let needs_fix = d.score < d.max_score || !d.healthy;
+                    let fix_label: Option<&'static str> = if !needs_fix {
+                        None
+                    } else {
+                        match dim_id.as_str() {
+                            "wfp_shield" | "dual_stack" | "webrtc_stun" | "dns_coherence" => {
+                                Some("一键开启四重防漏")
+                            }
+                            "electron_hygiene" => Some("一键开启启动防漏"),
+                            "tz_locale" => Some("一键对齐时区"),
+                            "geo_velocity" => Some("确认换线·放行"),
+                            "burst_guard" | "cli_wsl_coverage" | "cli_hooks" => {
+                                Some("一键保护终端")
+                            }
+                            "clean_room_hygiene" | "cleanroom" => Some("立即扫描残留"),
+                            "asn_purity" | "abuse_score" => Some("配专属空间 →"),
+                            _ => None,
+                        }
+                    };
+                    let ctrl_dim_fix = ctrl.clone();
+                    let hov_fix = p.sidebar_hover_bg;
+
                     inset_box(p)
                         .flex_1()
                         .flex_basis(px(0.))
@@ -1702,6 +1726,7 @@ pub fn render_environment_page(
                                     div()
                                         .flex()
                                         .items_center()
+                                        .min_w(px(0.))
                                         .gap(px(5.5))
                                         .child(status_dot(
                                             if d.healthy {
@@ -1713,6 +1738,7 @@ pub fn render_environment_page(
                                         ))
                                         .child(
                                             div()
+                                                .truncate()
                                                 .text_size(px(11.5))
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .text_color(rgb(p.text_primary))
@@ -1720,14 +1746,152 @@ pub fn render_environment_page(
                                         ),
                                 )
                                 .child(
-                                    mono_tabular(format!("{}/{}", d.score, d.max_score))
-                                        .text_size(px(11.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(if d.healthy {
-                                            p.badge_pass.text
-                                        } else {
-                                            p.badge_fail.text
-                                        })),
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .flex_shrink_0()
+                                        .gap(px(6.))
+                                        .when_some(fix_label, |row, lbl| {
+                                            let id_for_click = dim_id.clone();
+                                            row.child(
+                                                div()
+                                                    .id(gpui::ElementId::Name(
+                                                        format!("dim-fix-{}", dim_id).into(),
+                                                    ))
+                                                    .px(px(6.5))
+                                                    .py(px(1.5))
+                                                    .rounded(px(6.))
+                                                    .bg(rgb(p.accent_soft_bg))
+                                                    .border_1()
+                                                    .border_color(rgb(p.accent_soft_border))
+                                                    .text_size(px(10.))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(p.accent_soft_text))
+                                                    .when(can_act, |pill| {
+                                                        pill.cursor_pointer()
+                                                            .hover(move |s| s.bg(rgb(hov_fix)))
+                                                            .on_mouse_up(
+                                                                MouseButton::Left,
+                                                                cx.listener(
+                                                                    move |_, _, _, cx| {
+                                                                        let did =
+                                                                            id_for_click.clone();
+                                                                        ctrl_dim_fix.update(
+                                                                            cx,
+                                                                            |c, cx| match did
+                                                                                .as_str()
+                                                                            {
+                                                                                "wfp_shield"
+                                                                                | "dual_stack"
+                                                                                | "webrtc_stun"
+                                                                                | "dns_coherence" => {
+                                                                                    c.save_config_patch(
+                                                                                        |cfg| {
+                                                                                            cfg.leak_shield_quic =
+                                                                                                true;
+                                                                                            cfg.leak_shield_dns_doh =
+                                                                                                true;
+                                                                                            cfg.leak_shield_ipv6 =
+                                                                                                true;
+                                                                                        },
+                                                                                        "已开启四重防漏保护",
+                                                                                        cx,
+                                                                                    );
+                                                                                    c.send_request(
+                                                                                        PipeRequest::SyncLeakShield,
+                                                                                        Some(
+                                                                                            "四重防漏规则已同步生效",
+                                                                                        ),
+                                                                                        cx,
+                                                                                    );
+                                                                                }
+                                                                                "electron_hygiene" => {
+                                                                                    c.save_config_patch(
+                                                                                        |cfg| {
+                                                                                            cfg.enforce_electron_hygiene_flags =
+                                                                                                true;
+                                                                                        },
+                                                                                        "已开启客户端启动防漏加固",
+                                                                                        cx,
+                                                                                    );
+                                                                                }
+                                                                                "tz_locale" => {
+                                                                                    c.send_request(
+                                                                                        PipeRequest::ApplyEnvAlignment {
+                                                                                            align_tz:
+                                                                                                true,
+                                                                                            align_location:
+                                                                                                false,
+                                                                                        },
+                                                                                        Some(
+                                                                                            "已一键对齐本机时区与节点地区",
+                                                                                        ),
+                                                                                        cx,
+                                                                                    );
+                                                                                }
+                                                                                "geo_velocity" => {
+                                                                                    c.send_request(
+                                                                                        PipeRequest::ClearGeoVelocityCooldown,
+                                                                                        Some(
+                                                                                            "已确认本人换线并解除冷却",
+                                                                                        ),
+                                                                                        cx,
+                                                                                    );
+                                                                                }
+                                                                                "burst_guard"
+                                                                                | "cli_wsl_coverage"
+                                                                                | "cli_hooks" => {
+                                                                                    c.send_request(
+                                                                                        PipeRequest::ConfigureCliHooks {
+                                                                                            install_claude_code:
+                                                                                                true,
+                                                                                            install_pwsh_profile:
+                                                                                                true,
+                                                                                            sync_all_vaults:
+                                                                                                true,
+                                                                                        },
+                                                                                        Some(
+                                                                                            "已完成终端防封保护一键接入",
+                                                                                        ),
+                                                                                        cx,
+                                                                                    );
+                                                                                }
+                                                                                "clean_room_hygiene"
+                                                                                | "cleanroom" => {
+                                                                                    c.set_nav(
+                                                                                        NavSection::CleanRoom,
+                                                                                        cx,
+                                                                                    );
+                                                                                    c.run_cleanroom_scan(
+                                                                                        cx,
+                                                                                    );
+                                                                                }
+                                                                                _ => {
+                                                                                    c.set_nav(
+                                                                                        NavSection::Vaults,
+                                                                                        cx,
+                                                                                    );
+                                                                                }
+                                                                            },
+                                                                        );
+                                                                    },
+                                                                ),
+                                                            )
+                                                    })
+                                                    .when(!can_act, |pill| pill.opacity(0.5))
+                                                    .child(lbl),
+                                            )
+                                        })
+                                        .child(
+                                            mono_tabular(format!("{}/{}", d.score, d.max_score))
+                                                .text_size(px(11.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(if d.healthy {
+                                                    p.badge_pass.text
+                                                } else {
+                                                    p.badge_fail.text
+                                                })),
+                                        ),
                                 ),
                         )
                         .child(
@@ -1904,7 +2068,7 @@ pub fn render_environment_page(
                                         .text_size(px(12.5))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(rgb(p.text_primary))
-                                        .child("亚毫秒级 CLI Pre-Prompt 门禁钩子"),
+                                        .child("终端命令行防封保护（Claude Code / PowerShell）"),
                                 )
                                 .child(tone_tag(
                                     if hooks.claude_code_hook_installed {
@@ -2032,7 +2196,7 @@ pub fn render_environment_page(
                                 if is_configuring_hooks {
                                     "接入中…"
                                 } else {
-                                    "一键接入 CLI 门禁 & 同步主权仓"
+                                    "一键保护终端 & 同步全部账号空间"
                                 },
                                 ButtonKind::Primary,
                                 can_act && !is_configuring_hooks,
@@ -2080,15 +2244,15 @@ pub fn render_environment_page(
                                         .text_size(px(12.5))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(rgb(p.text_primary))
-                                        .child("WSL2 跨子系统 HMAC 门禁桥接"),
+                                        .child("WSL2 子系统联动保护"),
                                 )
                                 .child(tone_tag(
                                     if wsl.proxy_desync_detected {
-                                        "代理失步预警"
+                                        "代理不一致预警"
                                     } else if wsl.listening {
-                                        "回环桥接运行中"
+                                        "联动运行中"
                                     } else {
-                                        "未监听"
+                                        "未开启"
                                     },
                                     if wsl.proxy_desync_detected {
                                         BadgeTone::Fail
@@ -2102,8 +2266,8 @@ pub fn render_environment_page(
                         )
                         .child(switch_row_gated(
                             "env-wsl-enabled",
-                            "启用 WSL2 本地回环 HMAC 门禁桥",
-                            "允许 WSL2 内 Claude Code / Codex CLI 共享宿主机亚 5ms 门禁与代理同步检查",
+                            "开启 WSL2 子系统防封联动",
+                            "让 Linux 子系统内的 AI 工具共享主机的防封门禁与代理核验",
                             wsl_enabled_on,
                             can_act,
                             p,
@@ -2197,20 +2361,23 @@ pub fn render_environment_page(
                                 p,
                             )
                             .h(px(28.))
-                            .when(can_act && wsl_enabled_on && !is_syncing_wsl, |b| {
-                                b.on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |_, _, _, cx| {
-                                        ctrl_wsl_sync.update(cx, |c, cx| {
-                                            c.send_request(
-                                                PipeRequest::SyncWslBridge,
-                                                Some("已完成 WSL2 跨子系统门禁同步"),
-                                                cx,
-                                            );
-                                        });
-                                    }),
-                                )
-                            }),
+                            .when(
+                                can_act && wsl_enabled_on && !is_syncing_wsl,
+                                |b| {
+                                    b.on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            ctrl_wsl_sync.update(cx, |c, cx| {
+                                                c.send_request(
+                                                    PipeRequest::SyncWslBridge,
+                                                    Some("已完成 WSL2 跨子系统门禁同步"),
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                    )
+                                },
+                            ),
                         ),
                 );
 
@@ -2222,6 +2389,8 @@ pub fn render_environment_page(
                 hotkeys_snap.conflict_note.clone()
             };
 
+            let ctrl_hk_preset = ctrl.clone();
+            let cur_panic_chord = cfg.hotkey_panic_lockdown.clone();
             let burst_and_hotkey_card = bento_card_bloom(p, 16.0, 14.0, choreo.tile(1, 0))
                 .flex_1()
                 .gap(px(10.))
@@ -2248,11 +2417,11 @@ pub fn render_environment_page(
                                                 .text_size(px(12.5))
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .text_color(rgb(p.text_primary))
-                                                .child("BurstGuard 速率防风控护栏"),
+                                                .child("高频提问防风控保护"),
                                         )
                                         .child(tone_tag(
                                             if burst.robotic_cadence_detected {
-                                                "疑似机械节律"
+                                                "疑似脚本高频"
                                             } else {
                                                 burst.mode.label()
                                             },
@@ -2269,7 +2438,7 @@ pub fn render_environment_page(
                                 .child(segmented_capsule_track(p).children(burst_items))
                                 .child(
                                     mono_tabular(format!(
-                                        "近 1 分钟 {} 次 · 近 15 分钟 {} 次（告警阈值 {} RPM / 限速 {} RPM）",
+                                        "近 1 分钟 {} 次 · 近 15 分钟 {} 次（提醒阈值 {} 次/分 · 限速 {} 次/分）",
                                         burst.prompts_last_1m,
                                         burst.prompts_last_15m,
                                         cfg.burst_warn_rpm,
@@ -2289,8 +2458,8 @@ pub fn render_environment_page(
                                 .gap(px(6.))
                                 .child(switch_row_gated(
                                     "env-hotkeys-enabled",
-                                    "全局原生紧急热键 (Win32 RegisterHotKey)",
-                                    "零键盘钩子无反作弊误报 · 50ms 触发紧急锁死或呼出迷你 HUD",
+                                    "全局快捷热键（随时锁网 / 呼出迷你窗）",
+                                    "系统级原生热键，不挂键盘钩子、不触发游戏反作弊",
                                     hotkeys_enabled_on,
                                     can_act,
                                     p,
@@ -2311,6 +2480,7 @@ pub fn render_environment_page(
                                     div()
                                         .flex()
                                         .flex_wrap()
+                                        .items_center()
                                         .gap(px(6.))
                                         .child(tone_tag(
                                             format!(
@@ -2337,7 +2507,51 @@ pub fn render_environment_page(
                                                 BadgeTone::Warn
                                             },
                                             p,
-                                        )),
+                                        ))
+                                        .child(
+                                            action_button(
+                                                "env-cycle-hotkey-preset",
+                                                "切换防冲突组合键",
+                                                ButtonKind::Ghost,
+                                                can_act && hotkeys_enabled_on,
+                                                p,
+                                            )
+                                            .h(px(23.))
+                                            .px(px(7.5))
+                                            .text_size(px(10.))
+                                            .when(can_act && hotkeys_enabled_on, |b| {
+                                                b.on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |_, _, _, cx| {
+                                                        let (next_p, next_h) = if cur_panic_chord
+                                                            .eq_ignore_ascii_case("Ctrl+Alt+Shift+L")
+                                                        {
+                                                            ("Win+Shift+F9", "Win+Shift+F10")
+                                                        } else if cur_panic_chord
+                                                            .eq_ignore_ascii_case("Win+Shift+F9")
+                                                        {
+                                                            ("Ctrl+Alt+F11", "Ctrl+Alt+F12")
+                                                        } else {
+                                                            ("Ctrl+Alt+Shift+L", "Ctrl+Alt+Shift+H")
+                                                        };
+                                                        ctrl_hk_preset.update(cx, |c, cx| {
+                                                            c.save_config_patch_msg(
+                                                                move |x| {
+                                                                    x.hotkey_panic_lockdown =
+                                                                        next_p.into();
+                                                                    x.hotkey_quick_hud =
+                                                                        next_h.into();
+                                                                },
+                                                                format!(
+                                                                    "已切换热键为 {next_p} / {next_h}"
+                                                                ),
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
+                                                )
+                                            }),
+                                        ),
                                 )
                                 .when(!hk_conflict.is_empty(), |col| {
                                     col.child(

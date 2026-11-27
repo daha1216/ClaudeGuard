@@ -109,8 +109,37 @@ pub fn decode_binding_response(buf: &[u8], expected_tx_id: &[u8; 12]) -> Option<
     fallback_mapped
 }
 
-/// Execute a single non-intrusive UDP STUN reflection probe with an explicit per-endpoint timeout.
+fn resolve_endpoint_ipv4_bounded(
+    endpoint: &str,
+    timeout: Duration,
+) -> Option<std::net::SocketAddr> {
+    if let Ok(sa) = endpoint.parse::<std::net::SocketAddr>() {
+        return sa.is_ipv4().then_some(sa);
+    }
+    if timeout.is_zero() {
+        return None;
+    }
+    let owned = endpoint.to_string();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let found = owned
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.find(|a| a.is_ipv4()));
+        let _ = tx.send(found);
+    });
+    rx.recv_timeout(timeout).ok().flatten()
+}
+
+/// Execute a single non-intrusive UDP STUN reflection probe within a strict overall `timeout`
+/// wall-clock budget (including bounded DNS resolution across all fallback endpoints).
 pub fn probe_stun_reflexive_ip_with_timeout(tx_seed: u64, timeout: Duration) -> StunProbeOutcome {
+    let bounded_total = timeout.clamp(
+        Duration::from_millis(MIN_STUN_TIMEOUT_MS),
+        Duration::from_millis(MAX_STUN_TIMEOUT_MS),
+    );
+    let deadline = std::time::Instant::now() + bounded_total;
+
     let mut tx_id = [0u8; 12];
     tx_id[0..8].copy_from_slice(&tx_seed.to_le_bytes());
     tx_id[8..12].copy_from_slice(&0xC6_05_53_89u32.to_be_bytes());
@@ -119,16 +148,33 @@ pub fn probe_stun_reflexive_ip_with_timeout(tx_seed: u64, timeout: Duration) -> 
     let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
         return StunProbeOutcome::BlockedOrUnreachable;
     };
-    let _ = sock.set_read_timeout(Some(timeout));
-    let _ = sock.set_write_timeout(Some(timeout));
 
-    for endpoint in STUN_ENDPOINTS {
-        let Ok(mut addrs) = endpoint.to_socket_addrs() else {
+    let total_eps = STUN_ENDPOINTS.len().max(1);
+    for (idx, endpoint) in STUN_ENDPOINTS.iter().enumerate() {
+        let now = std::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            break;
+        }
+        let eps_left = (total_eps - idx).max(1) as u32;
+        let step_budget = (remaining / eps_left)
+            .max(Duration::from_millis(100))
+            .min(remaining);
+
+        let Some(target) = resolve_endpoint_ipv4_bounded(endpoint, step_budget) else {
             continue;
         };
-        let Some(target) = addrs.find(|a| a.is_ipv4()) else {
-            continue;
-        };
+
+        let after_dns = deadline.saturating_duration_since(std::time::Instant::now());
+        if after_dns.is_zero() {
+            break;
+        }
+        let io_budget = (after_dns / eps_left)
+            .max(Duration::from_millis(80))
+            .min(after_dns);
+        let _ = sock.set_read_timeout(Some(io_budget));
+        let _ = sock.set_write_timeout(Some(io_budget));
+
         if sock.send_to(&req, target).is_err() {
             continue;
         }

@@ -161,7 +161,7 @@ fn apply_protected_system_admin_dacl(dir: &Path) -> Result<(), String> {
 }
 
 /// Ensures `dir` exists, is NOT a symlink/junction reparse point, and when running as `SYSTEM`
-/// or elevated on the default `%ProgramData%\ClaudeGuard` path, applies `DATA_DIR_SDDL`.
+/// or elevated (outside `#[cfg(test)]` temporary directories), applies `DATA_DIR_SDDL`.
 pub fn ensure_secure_data_dir(dir: &Path) -> Result<(), String> {
     if let Ok(meta) = std::fs::symlink_metadata(dir) {
         if is_reparse_point_metadata(&meta) {
@@ -172,9 +172,9 @@ pub fn ensure_secure_data_dir(dir: &Path) -> Result<(), String> {
         }
     }
     let is_default_pd = is_default_programdata_claudeguard_dir(dir);
-    if is_default_pd && has_reparse_point_in_chain(dir) {
+    if (is_default_pd || !cfg!(test)) && has_reparse_point_in_chain(dir) {
         return Err(format!(
-            "refusing to use ProgramData path containing a reparse point: {}",
+            "refusing to use data directory path containing a reparse point: {}",
             dir.display()
         ));
     }
@@ -192,7 +192,7 @@ pub fn ensure_secure_data_dir(dir: &Path) -> Result<(), String> {
     }
 
     #[cfg(windows)]
-    if is_default_pd
+    if (is_default_pd || !cfg!(test))
         && (cg_platform::access_win::is_session_zero()
             || cg_platform::access_win::is_elevated().unwrap_or(false))
     {
@@ -438,6 +438,15 @@ pub fn is_lockdown_step(step: &PlannedStep) -> bool {
     )
 }
 
+/// Returns true if `step` represents a persistent boot-time WFP filter or shortcut hygiene patch
+/// that must survive transient round-recovery WAL clears until explicitly disarmed/restored.
+pub fn is_persistent_guard_step(step: &PlannedStep) -> bool {
+    matches!(
+        step.action,
+        WalAction::WfpPersistentSync { .. } | WalAction::PatchShortcutHygiene { .. }
+    )
+}
+
 fn merge_baselines(existing: &BaselineState, incoming: &BaselineState) -> BaselineState {
     let mut rules = existing.firewall_rules_present.clone();
     for r in &incoming.firewall_rules_present {
@@ -622,7 +631,10 @@ impl JournalStore {
             let b = merge_baselines(&prev.baseline, &fallback_baseline);
             for step in prev.planned_steps {
                 let is_ld = is_lockdown_step(&step);
-                let keep = (is_ld && preserve_lockdown) || (!is_ld && preserve_non_lockdown);
+                let is_pers = is_persistent_guard_step(&step);
+                let keep = is_pers
+                    || (is_ld && preserve_lockdown)
+                    || (!is_ld && !is_pers && preserve_non_lockdown);
                 if keep && !merged_steps.iter().any(|s| s.action == step.action) {
                     merged_steps.push(step);
                 }
@@ -649,17 +661,28 @@ impl JournalStore {
         self.begin_tx(epoch, effective_kind, merged_steps, baseline)
     }
 
-    /// Retains only still-active coexisting steps (`Lockdown` vs `Isolation`) on disk,
-    /// clearing `journal.json` ONLY when neither layer remains active (`H-04`).
+    /// Retains only still-active coexisting steps (`Lockdown`, `Isolation`, and persistent
+    /// `WfpPersistentSync` / `PatchShortcutHygiene`) on disk, clearing `journal.json` ONLY
+    /// when no active layer or persistent step remains (`H-04` + `#44 [HIGH-06]`).
     pub fn retain_coexisting_committed(
         &self,
         epoch: u64,
         keep_lockdown: bool,
         keep_non_lockdown: bool,
     ) -> Result<(), String> {
-        if !keep_lockdown && !keep_non_lockdown {
-            return self.clear();
-        }
+        self.retain_active_layers(epoch, keep_lockdown, keep_non_lockdown, true)
+    }
+
+    /// Retains active `Lockdown`, `Isolation`, and (when `keep_wfp_boot_guard` is true)
+    /// `WfpPersistentSync` + `PatchShortcutHygiene` steps on disk, clearing `journal.json`
+    /// only when zero active steps remain.
+    pub fn retain_active_layers(
+        &self,
+        epoch: u64,
+        keep_lockdown: bool,
+        keep_non_lockdown: bool,
+        keep_wfp_boot_guard: bool,
+    ) -> Result<(), String> {
         let existing = match self.load() {
             LoadedJournal::Uncommitted(j) | LoadedJournal::Committed(j) => j,
             LoadedJournal::NotFound => return Ok(()),
@@ -668,11 +691,28 @@ impl JournalStore {
         let mut kept: Vec<PlannedStep> = existing
             .planned_steps
             .into_iter()
-            .filter(|s| {
-                let is_ld = is_lockdown_step(s);
-                (is_ld && keep_lockdown) || (!is_ld && keep_non_lockdown)
+            .filter(|s| match &s.action {
+                WalAction::WfpPersistentSync { .. } => keep_wfp_boot_guard,
+                WalAction::PatchShortcutHygiene { .. } => true,
+                _ => {
+                    let is_ld = is_lockdown_step(s);
+                    (is_ld && keep_lockdown) || (!is_ld && keep_non_lockdown)
+                }
             })
             .collect();
+
+        if !keep_lockdown && !keep_non_lockdown {
+            if kept.is_empty() {
+                return self.clear();
+            }
+            for (idx, step) in kept.iter_mut().enumerate() {
+                step.step_id = (idx as u32).saturating_add(1);
+            }
+            let mut updated =
+                RecoveryJournal::new(epoch, TxKind::Composite, kept, BaselineState::default());
+            return self.commit_tx(&mut updated);
+        }
+
         for (idx, step) in kept.iter_mut().enumerate() {
             step.step_id = (idx as u32).saturating_add(1);
         }
@@ -683,8 +723,10 @@ impl JournalStore {
         if kept.is_empty() && !baseline_has_data {
             return self.clear();
         }
-        let kind = if keep_lockdown && !keep_non_lockdown {
+        let kind = if keep_lockdown && !keep_non_lockdown && kept.iter().all(is_lockdown_step) {
             TxKind::Lockdown
+        } else if kept.len() > 1 {
+            TxKind::Composite
         } else {
             existing.kind
         };
@@ -919,12 +961,22 @@ impl RecoveryExecutor for PlatformRecoveryExecutor {
     }
 
     fn clear_wfp_persistent_filters(&self) -> Result<usize, String> {
-        if !self.driver.capabilities().app_quarantine {
+        if !self.driver.capabilities().app_quarantine
+            || self.driver.firewall().engine_name() == "in-memory-mock"
+        {
             return Ok(0);
         }
         match cg_platform::wfp_win::clear_persistent_filters() {
             Ok(report) => Ok(report.removed),
             Err(PlatformError::Unsupported { .. }) => Ok(0),
+            // A non-elevated foreground/dev process can neither create nor enumerate persistent
+            // BFE filters; only the elevated service/LocalSystem can, so there is nothing this
+            // process could have orphaned. Do not fail closed into `Degraded` on every boot.
+            Err(PlatformError::AccessDenied(_))
+                if !cg_platform::access_win::is_elevated().unwrap_or(false) =>
+            {
+                Ok(0)
+            }
             Err(err) => Err(err.to_string()),
         }
     }
@@ -1043,6 +1095,13 @@ fn heal_orphans_only(executor: &dyn RecoveryExecutor) -> HealReport {
         .into_iter()
         .filter(|r| is_managed_firewall_rule(r))
         .collect();
+
+    if let Err(err) = executor.clear_wfp_persistent_filters() {
+        report.push("clear_wfp_persistent_filters", false, err.clone());
+        report.status = HealStatus::Failed;
+        report.summary = format!("failed to clear orphaned WFP persistent filters: {err}");
+        return report;
+    }
 
     if managed_orphans.is_empty() {
         report.verified = true;
@@ -1283,7 +1342,8 @@ fn handle_corrupt_journal(executor: &dyn RecoveryExecutor, parse_err: &str) -> H
         summary: String::new(),
     };
 
-    // Safely remove any ClaudeGuard-prefixed firewall rules, while keeping the corrupt journal file on disk.
+    // Safely remove any ClaudeGuard-prefixed firewall rules and persistent WFP boot filters,
+    // while keeping the corrupt journal file on disk.
     match executor.clear_all_managed_firewall_rules() {
         Ok(count) => report.items.push(HealItem {
             action: "clear_managed_firewall_rules".to_string(),
@@ -1292,6 +1352,18 @@ fn handle_corrupt_journal(executor: &dyn RecoveryExecutor, parse_err: &str) -> H
         }),
         Err(err) => report.items.push(HealItem {
             action: "clear_managed_firewall_rules".to_string(),
+            ok: false,
+            detail: err,
+        }),
+    }
+    match executor.clear_wfp_persistent_filters() {
+        Ok(count) => report.items.push(HealItem {
+            action: "clear_wfp_persistent_filters".to_string(),
+            ok: true,
+            detail: format!("removed {count} persistent WFP filter(s)"),
+        }),
+        Err(err) => report.items.push(HealItem {
+            action: "clear_wfp_persistent_filters".to_string(),
             ok: false,
             detail: err,
         }),

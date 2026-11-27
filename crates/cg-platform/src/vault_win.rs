@@ -353,18 +353,58 @@ pub fn validate_vault_id(vault_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolves the default `%LOCALAPPDATA%\ClaudeGuard\Vaults` root directory.
+/// Computes `<home>\AppData\Local\ClaudeGuard\Vaults` for a resolved interactive user home.
+pub fn vaults_root_for_user_home(home: &Path) -> PathBuf {
+    home.join("AppData")
+        .join("Local")
+        .join("ClaudeGuard")
+        .join("Vaults")
+}
+
+fn is_service_profile_path(path: &Path) -> bool {
+    let low = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    low.contains(r"\windows\system32\config\systemprofile")
+        || low.contains(r"\windows\syswow64\config\systemprofile")
+        || low.contains(r"\windows\serviceprofiles\")
+}
+
+/// Resolves the default `%LOCALAPPDATA%\ClaudeGuard\Vaults` root directory, routing to the
+/// interactive user's profile when invoked from Session 0 (`LocalSystem`) or a service profile.
 pub fn default_vaults_root() -> Result<PathBuf, String> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("USERPROFILE")
-                .filter(|v| !v.is_empty())
-                .map(|h| PathBuf::from(h).join("AppData").join("Local"))
-        })
-        .ok_or_else(|| "无法解析 LOCALAPPDATA 或 USERPROFILE 环境变量".to_string())?;
-    let root = base.join("ClaudeGuard").join("Vaults");
+    let root = if crate::access_win::is_session_zero() {
+        let home = crate::process_win::user_home_dirs()
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                "服务会话未检测到交互式用户主目录，无法定位主权隔离仓目录".to_string()
+            })?;
+        vaults_root_for_user_home(&home)
+    } else {
+        let env_local = std::env::var_os("LOCALAPPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| !is_service_profile_path(p))
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+                    .filter(|h| !is_service_profile_path(h))
+                    .map(|h| h.join("AppData").join("Local"))
+            });
+        match env_local {
+            Some(base) => base.join("ClaudeGuard").join("Vaults"),
+            None => {
+                let home = crate::process_win::user_home_dirs()
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "无法解析 LOCALAPPDATA 或 USERPROFILE 环境变量".to_string())?;
+                vaults_root_for_user_home(&home)
+            }
+        }
+    };
     ensure_no_reparse_points_chain(&root)?;
     Ok(root)
 }
@@ -531,9 +571,15 @@ pub fn plan_vault_launch_env_and_args(
     extra_args: &[String],
 ) -> Result<VaultLaunchSpec, String> {
     let base = default_vaults_root()?;
-    let home = std::env::var_os("USERPROFILE")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
+    let home = if crate::access_win::is_session_zero() {
+        crate::process_win::user_home_dirs().into_iter().next()
+    } else {
+        std::env::var_os("USERPROFILE")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .filter(|h| !is_service_profile_path(h))
+            .or_else(|| crate::process_win::user_home_dirs().into_iter().next())
+    };
     plan_vault_launch_env_and_args_in(
         &base,
         home.as_deref(),
@@ -920,6 +966,7 @@ pub fn generate_vault_shortcuts_in(
          $env:CODEX_SQLITE_HOME = '{codex_sql}'\r\n\
          $env:GEMINI_CLI_HOME = '{gemini_dir}'\r\n\
          $env:GEMINI_CONFIG_DIR = '{gemini_cfg}'\r\n\
+         $env:AIDER_HOME = '{aider_dir}'\r\n\
          {proxy_line}\
          Write-Host \"[ClaudeGuard Vault] 已切换至主权隔离仓: {name_esc} ({id_esc})\" -ForegroundColor Cyan\r\n",
         id = vault.id,
@@ -931,6 +978,7 @@ pub fn generate_vault_shortcuts_in(
         codex_sql = escape_ps_single_quoted(&paths.codex_sqlite_home.to_string_lossy()),
         gemini_dir = escape_ps_single_quoted(&paths.gemini_home.to_string_lossy()),
         gemini_cfg = escape_ps_single_quoted(&paths.gemini_config_dir.to_string_lossy()),
+        aider_dir = escape_ps_single_quoted(&paths.aider_home.to_string_lossy()),
         proxy_line = proxy_line,
     );
     let mut ps1_bytes = vec![0xEF, 0xBB, 0xBF];

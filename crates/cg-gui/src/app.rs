@@ -4,8 +4,8 @@
 use crate::assets::{EmbeddedAssets, brand_mark, ui_icon};
 use crate::demo::DemoScenario;
 use crate::ipc::{
-    DaemonClient, TransportEndpoint, TransportError, launch_agent_normal_user, open_external_url,
-    start_daemon_service_elevated,
+    DaemonClient, LaunchHygieneContext, TransportEndpoint, TransportError, friendly_launch_name,
+    launch_agent_normal_user, open_external_url, start_daemon_service_elevated,
 };
 use crate::motion::{
     DirectionalTransition, PresenceSpring, SlidingIndicatorState, rgba_with_alpha_scale,
@@ -15,7 +15,7 @@ use crate::protocol::{
     ANCHOR_KINDS, AnchorKind, CleanRoomBackupMeta, CleanRoomReport, CleanRoomScope, Config,
     DEFAULT_PIPE_NAME, GuardSnapshot, Lifecycle, LogEntry, LogLevel, OnboardingProbeResult,
     OperationStatus, POLICY_PRESETS, PipeRequest, PipeResponse, PolicyPreset, SanitizedHealthCard,
-    Target, UpdateCheckPhase, normalize_ip_or_cidr,
+    Target, UpdateCheckPhase, VaultAppTarget, VaultRuntimeState, normalize_ip_or_cidr,
 };
 use crate::state::{
     ConsoleProjection, ConsoleProjectionInput, DraftStore, HudProjection, NavSection, TargetDraft,
@@ -28,8 +28,8 @@ use crate::theme::{
 };
 use crate::tray_win::{
     HotkeyRegistrationReport, LogicalRect, SingleInstanceOutcome, TrayChannel, TrayEvent,
-    TrayHandle, TrayTone, acquire_single_instance, apply_win11_round_corners, compute_hud_bounds,
-    ensure_window_on_screen, minimize_window_smooth, primary_work_area_logical,
+    TrayHandle, TrayTone, TrayVaultMenuItem, acquire_single_instance, apply_win11_round_corners,
+    compute_hud_bounds, ensure_window_on_screen, minimize_window_smooth, primary_work_area_logical,
     restore_window_if_minimized, signal_existing_tray_instance, toggle_maximize_window_smooth,
 };
 use crate::views;
@@ -108,7 +108,7 @@ pub enum ActionScope {
     VaultOp(String),
     CleanRoomScan,
     CleanRoomExecute,
-    CleanRoomRestore,
+    CleanRoomRestore(String),
     DeepRiskAudit,
     ConfigureHooks,
     SyncWslBridge,
@@ -358,8 +358,10 @@ pub struct AppController {
     pub open_region_picker_for: Option<String>,
     pub show_add_target_drawer: bool,
     pub show_vault_drawer: bool,
+    pub overview_expand_launch_deck: bool,
     pub cleanroom_scope: CleanRoomScope,
     pub cleanroom_selected_ids: HashSet<String>,
+    pub cleanroom_selection_initialized: bool,
     pub cleanroom_report: Option<CleanRoomReport>,
     pub cleanroom_backups: Vec<CleanRoomBackupMeta>,
     pub wfp_agent_filter: Option<String>,
@@ -628,10 +630,11 @@ impl AppController {
                 false,
                 true,
                 |ctrl, text| {
-                    ctrl.drafts.vault_draft.id = text.to_string();
-                    ctrl.drafts.vault_dirty = true;
-                    ctrl.drafts.vault_validation_error = None;
-                    false
+                    if !ctrl.drafts.vault_draft.editing_existing {
+                        ctrl.drafts.vault_draft.id = text.to_string();
+                        ctrl.drafts.vault_dirty = true;
+                    }
+                    ctrl.drafts.vault_validation_error.take().is_some()
                 },
                 Some(AppController::save_vault_draft),
                 cx,
@@ -644,7 +647,7 @@ impl AppController {
                 |ctrl, text| {
                     ctrl.drafts.vault_draft.name = text.to_string();
                     ctrl.drafts.vault_dirty = true;
-                    false
+                    ctrl.drafts.vault_validation_error.take().is_some()
                 },
                 Some(AppController::save_vault_draft),
                 cx,
@@ -657,7 +660,7 @@ impl AppController {
                 |ctrl, text| {
                     ctrl.drafts.vault_draft.pinned_regions_text = text.to_string();
                     ctrl.drafts.vault_dirty = true;
-                    false
+                    ctrl.drafts.vault_validation_error.take().is_some()
                 },
                 Some(AppController::save_vault_draft),
                 cx,
@@ -670,7 +673,7 @@ impl AppController {
                 |ctrl, text| {
                     ctrl.drafts.vault_draft.pinned_ips_text = text.to_string();
                     ctrl.drafts.vault_dirty = true;
-                    false
+                    ctrl.drafts.vault_validation_error.take().is_some()
                 },
                 Some(AppController::save_vault_draft),
                 cx,
@@ -683,7 +686,7 @@ impl AppController {
                 |ctrl, text| {
                     ctrl.drafts.vault_draft.pinned_asn_text = text.to_string();
                     ctrl.drafts.vault_dirty = true;
-                    false
+                    ctrl.drafts.vault_validation_error.take().is_some()
                 },
                 Some(AppController::save_vault_draft),
                 cx,
@@ -696,7 +699,7 @@ impl AppController {
                 |ctrl, text| {
                     ctrl.drafts.vault_draft.dedicated_proxy_port_text = text.to_string();
                     ctrl.drafts.vault_dirty = true;
-                    false
+                    ctrl.drafts.vault_validation_error.take().is_some()
                 },
                 Some(AppController::save_vault_draft),
                 cx,
@@ -709,7 +712,7 @@ impl AppController {
                 |ctrl, text| {
                     ctrl.drafts.vault_draft.preferred_mihomo_group = text.to_string();
                     ctrl.drafts.vault_dirty = true;
-                    false
+                    ctrl.drafts.vault_validation_error.take().is_some()
                 },
                 Some(AppController::save_vault_draft),
                 cx,
@@ -722,7 +725,7 @@ impl AppController {
                 |ctrl, text| {
                     ctrl.drafts.vault_draft.preferred_mihomo_node = text.to_string();
                     ctrl.drafts.vault_dirty = true;
-                    false
+                    ctrl.drafts.vault_validation_error.take().is_some()
                 },
                 Some(AppController::save_vault_draft),
                 cx,
@@ -735,7 +738,7 @@ impl AppController {
                 |ctrl, text| {
                     ctrl.drafts.vault_draft.min_safety_score_text = text.to_string();
                     ctrl.drafts.vault_dirty = true;
-                    false
+                    ctrl.drafts.vault_validation_error.take().is_some()
                 },
                 Some(AppController::save_vault_draft),
                 cx,
@@ -748,7 +751,7 @@ impl AppController {
                 |ctrl, text| {
                     ctrl.drafts.vault_draft.cooldown_secs_text = text.to_string();
                     ctrl.drafts.vault_dirty = true;
-                    false
+                    ctrl.drafts.vault_validation_error.take().is_some()
                 },
                 Some(AppController::save_vault_draft),
                 cx,
@@ -801,8 +804,10 @@ impl AppController {
             open_region_picker_for: None,
             show_add_target_drawer: false,
             show_vault_drawer: false,
+            overview_expand_launch_deck: false,
             cleanroom_scope: CleanRoomScope::default(),
             cleanroom_selected_ids: HashSet::new(),
+            cleanroom_selection_initialized: false,
             cleanroom_report: None,
             cleanroom_backups: Vec::new(),
             wfp_agent_filter: None,
@@ -959,7 +964,7 @@ impl AppController {
                 apply_win11_round_corners("ClaudeGuard Quick HUD", border_rgb);
             }
             if self.console_window.is_some() {
-                apply_win11_round_corners("ClaudeGuard v4", border_rgb);
+                apply_win11_round_corners("ClaudeGuard", border_rgb);
             }
         }
     }
@@ -1491,12 +1496,27 @@ impl AppController {
         }
         if let Some(report) = snapshot.last_cleanroom_report.clone() {
             self.cleanroom_report = Some(report);
+            self.reconcile_cleanroom_selection();
         }
         self.snapshot = Some(Arc::new(snapshot));
         self.snapshot_seq = self.snapshot_seq.wrapping_add(1);
         self.invalidate_console_cache();
         self.invalidate_hud_cache();
         self.sync_tray_status();
+    }
+
+    pub fn reconcile_cleanroom_selection(&mut self) {
+        let Some(report) = self.cleanroom_report.as_ref() else {
+            return;
+        };
+        let valid_ids: HashSet<String> = report.findings.iter().map(|f| f.id.clone()).collect();
+        if !self.cleanroom_selection_initialized {
+            self.cleanroom_selected_ids = valid_ids;
+            self.cleanroom_selection_initialized = true;
+        } else {
+            self.cleanroom_selected_ids
+                .retain(|id| valid_ids.contains(id));
+        }
     }
 
     fn sync_input_entities_from_drafts(&mut self, cx: &mut Context<Self>) {
@@ -1619,6 +1639,27 @@ impl AppController {
             format!("ClaudeGuard v5 · {}", proj.hero.title)
         };
         let next_state = (tone, paused, tip.clone());
+        let vault_menu: Vec<TrayVaultMenuItem> = proj
+            .vaults
+            .iter()
+            .map(|v| {
+                let st_icon = match v.state {
+                    VaultRuntimeState::ActiveRunning => "[运行中] ",
+                    VaultRuntimeState::EgressMismatch => "[节点不符] ",
+                    VaultRuntimeState::CoolingDown => "[冷却中] ",
+                    VaultRuntimeState::Disabled => "[已停用] ",
+                    VaultRuntimeState::Ready => "",
+                };
+                TrayVaultMenuItem {
+                    vault_id: v.vault_id.clone(),
+                    label: format!("{st_icon}{} ({}) · 启动 Claude", v.name, v.region_tag),
+                    enabled: self.connected && v.can_launch,
+                }
+            })
+            .collect();
+        if let Some(tray) = self.tray.as_ref() {
+            tray.sync_vault_menu(vault_menu);
+        }
         if self.last_tray_state.as_ref() == Some(&next_state) {
             return;
         }
@@ -1707,7 +1748,9 @@ impl AppController {
             }
             PipeRequest::ScanCleanRoom { .. } => Some(ActionScope::CleanRoomScan),
             PipeRequest::ExecuteCleanRoom { .. } => Some(ActionScope::CleanRoomExecute),
-            PipeRequest::RestoreCleanRoomBackup { .. } => Some(ActionScope::CleanRoomRestore),
+            PipeRequest::RestoreCleanRoomBackup { backup_id } => {
+                Some(ActionScope::CleanRoomRestore(backup_id.clone()))
+            }
             PipeRequest::RunDeepRiskAudit => Some(ActionScope::DeepRiskAudit),
             PipeRequest::ConfigureCliHooks { .. } => Some(ActionScope::ConfigureHooks),
             PipeRequest::SyncWslBridge => Some(ActionScope::SyncWslBridge),
@@ -1870,7 +1913,8 @@ impl AppController {
                     }
                     Ok(PipeResponse::CleanRoomScan { report }) => {
                         ctrl.cleanroom_report = Some(*report);
-                        ctrl.cleanroom_selected_ids.clear();
+                        ctrl.cleanroom_selection_initialized = false;
+                        ctrl.reconcile_cleanroom_selection();
                         if let Some(msg) = ok_msg {
                             ctrl.set_toast(msg, true, cx);
                         }
@@ -2515,11 +2559,12 @@ impl AppController {
                             ctrl.apply_snapshot(*snap, cx);
                         }
                         if allowed {
+                            let disp_name = friendly_launch_name(&agent_id);
                             if ctrl.client.is_demo() {
                                 ctrl.in_flight.remove(&scope);
                                 ctrl.busy_action = !ctrl.in_flight.is_empty();
                                 ctrl.set_toast(
-                                    format!("[演示] 门禁放行：将以普通用户权限启动 {agent_id}"),
+                                    format!("[演示] 门禁放行：已安全启动 {disp_name}"),
                                     true,
                                     cx,
                                 );
@@ -2527,11 +2572,28 @@ impl AppController {
                                 let aid_bg = agent_id.clone();
                                 let paths_bg = install_paths.clone();
                                 let scope_bg = scope.clone();
+                                let hyg_ctx = ctrl
+                                    .snapshot
+                                    .as_ref()
+                                    .map(|s| LaunchHygieneContext {
+                                        enforce_electron_hygiene_flags: s
+                                            .config
+                                            .enforce_electron_hygiene_flags,
+                                        access_level: s.access.level,
+                                        proxy_host: s.config.proxy_host.clone(),
+                                        proxy_port: s.config.proxy_port,
+                                        antigravity_version_dll_active: s
+                                            .antigravity_proxy
+                                            .installed
+                                            && s.antigravity_proxy.is_ready_for_launch(),
+                                        privacy_mask: ctrl.privacy_mask,
+                                    })
+                                    .unwrap_or_default();
                                 cx.spawn(async move |this_l, cx| {
                                     let launch_res = cx
                                         .background_executor()
                                         .spawn(async move {
-                                            launch_agent_normal_user(&aid_bg, &paths_bg)
+                                            launch_agent_normal_user(&aid_bg, &paths_bg, &hyg_ctx)
                                         })
                                         .await;
                                     let _ = this_l.update(cx, |c, cx| {
@@ -2924,8 +2986,25 @@ impl AppController {
         if let Some(snap) = self.snapshot.clone() {
             self.drafts.vault_draft.adopt_current_egress(&snap);
             self.drafts.vault_dirty = true;
+            self.drafts.vault_validation_error = None;
             self.sync_vault_input_entities(cx);
-            self.set_toast("已采纳当前实时出口基线至隔离仓表单", true, cx);
+            self.set_toast(
+                "已绑定当前节点地区与运营商（未锁死动态单 IP，换节点同区不误拦）",
+                true,
+                cx,
+            );
+        }
+    }
+
+    pub fn adopt_egress_strict_ip_into_vault_draft(&mut self, cx: &mut Context<Self>) {
+        if let Some(snap) = self.snapshot.clone() {
+            self.drafts
+                .vault_draft
+                .adopt_current_egress_strict_ip(&snap);
+            self.drafts.vault_dirty = true;
+            self.drafts.vault_validation_error = None;
+            self.sync_vault_input_entities(cx);
+            self.set_toast("已严格绑定当前静态 IP、地区与运营商", true, cx);
         }
     }
 
@@ -2992,15 +3071,37 @@ impl AppController {
         let scope = self.cleanroom_scope.clone();
         let selected_finding_ids: Vec<String> =
             self.cleanroom_selected_ids.iter().cloned().collect();
+        if selected_finding_ids.is_empty() {
+            self.set_toast("请至少勾选 1 项需要清理的残留项", false, cx);
+            return;
+        }
         self.send_request(
             PipeRequest::ExecuteCleanRoom {
                 scope,
                 selected_finding_ids,
             },
-            Some("已完成加密备份并执行防连坐洗白（后置复核通过）"),
+            Some("已完成本机加密备份并清理所选残留项"),
             cx,
         );
         self.refresh_cleanroom_backups(cx);
+    }
+
+    pub fn open_cleanroom_backup_dir(&mut self, cx: &mut Context<Self>) {
+        let candidate = self
+            .cleanroom_backups
+            .first()
+            .and_then(|b| {
+                std::path::Path::new(&b.file_path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
+            .filter(|s| !s.is_empty() && !s.starts_with('%'))
+            .unwrap_or_else(|| {
+                std::env::var("ProgramData")
+                    .map(|pd| format!(r"{pd}\ClaudeGuard\cleanroom_backups"))
+                    .unwrap_or_else(|_| r"C:\ProgramData\ClaudeGuard\cleanroom_backups".into())
+            });
+        self.open_path_in_explorer_async(candidate, cx);
     }
 
     pub fn refresh_cleanroom_backups(&mut self, cx: &mut Context<Self>) {
@@ -3113,14 +3214,14 @@ pub fn toggle_hud_window(ctrl: Entity<AppController>, cx: &mut App) {
     open_hud_window(ctrl, cx);
 }
 
-/// Opens or focuses Mode B Wide Bento Main Console (`1020x720`, auto-clamped to DPI work area).
+/// Opens or focuses Mode B Wide Bento Main Console (`1020x700`, auto-clamped to DPI work area).
 pub fn open_console_window(ctrl: Entity<AppController>, cx: &mut App) {
     let existing = ctrl.read(cx).console_window;
     if let Some(handle) = existing
         && handle
             .update(cx, |_, window, _| {
-                let _ = restore_window_if_minimized("ClaudeGuard v4");
-                let _ = ensure_window_on_screen("ClaudeGuard v4");
+                let _ = restore_window_if_minimized("ClaudeGuard");
+                let _ = ensure_window_on_screen("ClaudeGuard");
                 window.activate_window();
             })
             .is_ok()
@@ -3165,7 +3266,7 @@ pub fn open_console_window(ctrl: Entity<AppController>, cx: &mut App) {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             display_id,
             titlebar: Some(TitlebarOptions {
-                title: Some("ClaudeGuard v4".into()),
+                title: Some("ClaudeGuard".into()),
                 appears_transparent: true,
                 ..Default::default()
             }),
@@ -3180,8 +3281,8 @@ pub fn open_console_window(ctrl: Entity<AppController>, cx: &mut App) {
         },
         move |window, cx| cx.new(|cx| ConsoleWindowView::new(ctrl_clone, window, cx)),
     ) {
-        apply_win11_round_corners("ClaudeGuard v4", border_rgb);
-        let _ = ensure_window_on_screen("ClaudeGuard v4");
+        apply_win11_round_corners("ClaudeGuard", border_rgb);
+        let _ = ensure_window_on_screen("ClaudeGuard");
         ctrl.update(cx, |c, _| c.console_window = Some(handle));
     }
 }
@@ -3700,6 +3801,8 @@ impl ConsoleWindowView {
             } else if c.open_region_picker_for.is_some() {
                 c.open_region_picker_for = None;
                 cx.notify();
+            } else if c.show_vault_drawer {
+                c.close_vault_drawer(cx);
             } else if c.show_add_target_drawer {
                 c.show_add_target_drawer = false;
                 cx.notify();
@@ -3724,6 +3827,9 @@ impl ConsoleWindowView {
             return;
         }
         self.ctrl.update(cx, |c, cx| match c.nav_section {
+            NavSection::Vaults if c.show_vault_drawer => {
+                c.save_vault_draft(cx);
+            }
             NavSection::Targets => {
                 if c.drafts.dirty {
                     c.save_target_drafts(cx);
@@ -3752,6 +3858,11 @@ impl ConsoleWindowView {
             }
             match c.nav_section {
                 NavSection::Audit => c.refresh_audit_logs(cx),
+                NavSection::CleanRoom => {
+                    if !c.is_scope_busy(&ActionScope::CleanRoomScan) {
+                        c.run_cleanroom_scan(cx);
+                    }
+                }
                 NavSection::Updates => {
                     let tripped = c.snapshot.as_ref().is_some_and(|s| s.is_tripped());
                     if tripped {
@@ -3866,7 +3977,9 @@ impl Render for ConsoleWindowView {
         let prev_active_nav = self.page_transition.active();
         let nav_changed = prev_active_nav != nav;
         if nav_changed {
-            self.dock_indicator.select(active_nav_idx, reduce_motion);
+            if active_nav_idx < 7 {
+                self.dock_indicator.select(active_nav_idx, reduce_motion);
+            }
             let old_idx = NavSection::ALL
                 .iter()
                 .position(|s| *s == prev_active_nav)
@@ -3941,26 +4054,6 @@ impl Render for ConsoleWindowView {
                 && s.antigravity_proxy.installed
                 && !s.antigravity_proxy.is_ready_for_launch()
         });
-        let has_any_update = snapshot_opt.as_ref().is_some_and(|s| {
-            [
-                &s.updates.claudeguard,
-                &s.updates.antigravity_proxy,
-                &s.updates.claude_desktop,
-                &s.updates.claude_code,
-                &s.updates.codex_desktop,
-                &s.updates.codex_cli,
-                &s.updates.antigravity_ide,
-                &s.updates.antigravity_cn,
-                &s.updates.ag_usage_monitor,
-                &s.updates.ag_capsule,
-                &s.updates.cursor_ide,
-                &s.updates.windsurf_ide,
-                &s.updates.zed_ide,
-                &s.updates.trae_ide,
-            ]
-            .iter()
-            .any(|slot| slot.phase == UpdateCheckPhase::UpdateAvailable)
-        });
         let cleanroom_alert = snapshot_opt.as_ref().is_some_and(|s| {
             s.last_cleanroom_report
                 .as_ref()
@@ -3993,7 +4086,6 @@ impl Render for ConsoleWindowView {
                 targets_alert: tripped,
                 targets_dirty,
                 env_alert: tripped || ag_issue,
-                has_update: has_any_update,
             },
             p,
             cx,
@@ -4423,6 +4515,27 @@ fn render_ceramic_header(
     let theme_menu_open = ctrl_r.theme_menu_open;
     let privacy_mask = ctrl_r.privacy_mask;
     let hud_open = ctrl_r.hud_window.is_some();
+    let active_nav = ctrl_r.nav_section;
+    let has_any_update = ctrl_r.snapshot.as_ref().is_some_and(|s| {
+        [
+            &s.updates.claudeguard,
+            &s.updates.antigravity_proxy,
+            &s.updates.claude_desktop,
+            &s.updates.claude_code,
+            &s.updates.codex_desktop,
+            &s.updates.codex_cli,
+            &s.updates.antigravity_ide,
+            &s.updates.antigravity_cn,
+            &s.updates.ag_usage_monitor,
+            &s.updates.ag_capsule,
+            &s.updates.cursor_ide,
+            &s.updates.windsurf_ide,
+            &s.updates.zed_ide,
+            &s.updates.trae_ide,
+        ]
+        .iter()
+        .any(|slot| slot.phase == UpdateCheckPhase::UpdateAvailable)
+    });
     let theme_style = ctrl_r.theme_style;
     let is_dark = p.is_dark;
     let busy = ctrl_r.busy_action;
@@ -4432,6 +4545,8 @@ fn render_ceramic_header(
     let ctrl_reconn = ctrl.clone();
     let ctrl_priv = ctrl.clone();
     let ctrl_hud = ctrl.clone();
+    let ctrl_upd = ctrl.clone();
+    let ctrl_ntf = ctrl.clone();
     let ctrl_theme = ctrl.clone();
     let ctrl_close = ctrl;
 
@@ -4731,6 +4846,108 @@ fn render_ceramic_header(
                 )
                 .child(
                     div()
+                        .id("header-nav-updates")
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.5))
+                        .h(px(28.))
+                        .px(px(9.5))
+                        .rounded(px(999.))
+                        .bg(rgb(if active_nav == NavSection::Updates {
+                            p.accent_soft_bg
+                        } else {
+                            p.card_bg
+                        }))
+                        .border_1()
+                        .border_color(rgb(if active_nav == NavSection::Updates {
+                            p.accent_soft_border
+                        } else {
+                            p.card_border
+                        }))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(rgb(hover_tile)))
+                        .text_size(px(11.5))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(if active_nav == NavSection::Updates {
+                            p.accent_soft_text
+                        } else {
+                            p.text_secondary
+                        }))
+                        .child(ui_icon(
+                            "icons/ui/download.svg",
+                            12.0,
+                            if active_nav == NavSection::Updates {
+                                p.accent_soft_text
+                            } else {
+                                p.text_secondary
+                            },
+                        ))
+                        .child("更新")
+                        .when(has_any_update, |pill| {
+                            pill.child(
+                                div()
+                                    .w(px(5.5))
+                                    .h(px(5.5))
+                                    .rounded(px(999.))
+                                    .bg(rgb(p.badge_warn.dot)),
+                            )
+                        })
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                ctrl_upd.update(cx, |c, cx| c.set_nav(NavSection::Updates, cx));
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("header-nav-notify")
+                        .flex()
+                        .items_center()
+                        .gap(px(4.5))
+                        .h(px(28.))
+                        .px(px(9.5))
+                        .rounded(px(999.))
+                        .bg(rgb(if active_nav == NavSection::Notify {
+                            p.accent_soft_bg
+                        } else {
+                            p.card_bg
+                        }))
+                        .border_1()
+                        .border_color(rgb(if active_nav == NavSection::Notify {
+                            p.accent_soft_border
+                        } else {
+                            p.card_border
+                        }))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(rgb(hover_tile)))
+                        .text_size(px(11.5))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(if active_nav == NavSection::Notify {
+                            p.accent_soft_text
+                        } else {
+                            p.text_secondary
+                        }))
+                        .child(ui_icon(
+                            "icons/ui/bell.svg",
+                            12.0,
+                            if active_nav == NavSection::Notify {
+                                p.accent_soft_text
+                            } else {
+                                p.text_secondary
+                            },
+                        ))
+                        .child("通知")
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                ctrl_ntf.update(cx, |c, cx| c.set_nav(NavSection::Notify, cx));
+                            }),
+                        ),
+                )
+                .child(
+                    div()
                         .id("header-theme-toggle")
                         .flex()
                         .items_center()
@@ -4800,7 +5017,7 @@ fn render_ceramic_header(
                             MouseButton::Left,
                             cx.listener(|_, _, window, cx| {
                                 cx.stop_propagation();
-                                if !minimize_window_smooth("ClaudeGuard v4") {
+                                if !minimize_window_smooth("ClaudeGuard") {
                                     window.minimize_window();
                                 }
                             }),
@@ -4823,7 +5040,7 @@ fn render_ceramic_header(
                         MouseButton::Left,
                         cx.listener(|_, _, window, cx| {
                             cx.stop_propagation();
-                            if !toggle_maximize_window_smooth("ClaudeGuard v4") {
+                            if !toggle_maximize_window_smooth("ClaudeGuard") {
                                 window.zoom_window();
                             }
                         }),
@@ -5246,7 +5463,6 @@ struct DockRenderState {
     targets_alert: bool,
     targets_dirty: bool,
     env_alert: bool,
-    has_update: bool,
 }
 
 fn render_ceramic_dock(
@@ -5266,7 +5482,6 @@ fn render_ceramic_dock(
         targets_alert,
         targets_dirty,
         env_alert,
-        has_update,
     } = st;
     let target_dot = if targets_alert {
         Some(p.badge_fail.dot)
@@ -5276,11 +5491,13 @@ fn render_ceramic_dock(
         None
     };
 
-    let items: [(NavSection, &'static str, &'static str, Option<u32>); 9] = [
+    // Streamlined 7-item daily-driver protection Dock (low-frequency `更新` & `通知` live in the top utility bar,
+    // while `Ctrl+1..9` and all `NavSection` deep-links remain 100% preserved).
+    let items: [(NavSection, &'static str, &'static str, Option<u32>); 7] = [
         (NavSection::Overview, "总览", "icons/ui/home.svg", None),
         (
             NavSection::Vaults,
-            "多账号仓",
+            "账号仓",
             "icons/ui/lock.svg",
             vault_active.then_some(p.badge_pass.dot),
         ),
@@ -5292,25 +5509,18 @@ fn render_ceramic_dock(
         ),
         (
             NavSection::Targets,
-            "目标",
+            "白名单",
             "icons/ui/globe.svg",
             target_dot,
         ),
         (NavSection::Breaker, "熔断", "icons/ui/flame.svg", None),
         (
             NavSection::Environment,
-            "防漏",
+            "防泄露",
             "icons/ui/radar.svg",
             env_alert.then_some(p.badge_fail.dot),
         ),
         (NavSection::Audit, "审计", "icons/ui/clock.svg", None),
-        (
-            NavSection::Updates,
-            "更新",
-            "icons/ui/download.svg",
-            has_update.then_some(p.badge_warn.dot),
-        ),
-        (NavSection::Notify, "通知", "icons/ui/bell.svg", None),
     ];
 
     let dock_btns =
@@ -5406,12 +5616,13 @@ fn render_ceramic_dock(
             if let Some(first) = bounds.first() {
                 let origin_x = first.left().as_f32();
                 let reduce_motion = cx.reduce_motion();
+                let clamped_idx = active_nav_idx.min(bounds.len().saturating_sub(1));
                 let _ = view_weak.update(cx, |view, _| {
                     let was_init = view.dock_indicator.geometry().is_some();
                     view.dock_indicator.record_bounds(
                         origin_x,
                         &bounds,
-                        active_nav_idx,
+                        clamped_idx,
                         reduce_motion,
                     );
                     if !was_init || view.dock_indicator.is_active() {
@@ -5423,7 +5634,9 @@ fn render_ceramic_dock(
         .children(dock_btns);
 
     let mut inner_track = div().relative().flex().items_center();
-    if let Some((pill_x, pill_w)) = pill_geom {
+    if active_nav_idx < 7
+        && let Some((pill_x, pill_w)) = pill_geom
+    {
         inner_track = inner_track.child(liquid_glass_pill(pill_x, pill_w, 10.5, p));
     }
     inner_track = inner_track.child(buttons_row);
@@ -5600,6 +5813,31 @@ fn handle_tray_event(ctrl: Entity<AppController>, event: TrayEvent, cx: &mut App
         TrayEvent::SweepOrphans => {
             ctrl.update(cx, |c, cx| {
                 c.send_request(PipeRequest::SweepOrphans, Some("已清理孤儿进程"), cx);
+            });
+        }
+        TrayEvent::LaunchVault(vault_id) => {
+            ctrl.update(cx, |c, cx| {
+                let vname = c
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| s.config.vaults.iter().find(|v| v.id == vault_id))
+                    .map(|v| {
+                        if v.name.trim().is_empty() {
+                            v.id.clone()
+                        } else {
+                            v.name.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| vault_id.clone());
+                c.send_request_msg(
+                    PipeRequest::LaunchVault {
+                        vault_id,
+                        app: VaultAppTarget::ClaudeDesktop,
+                        extra_args: Vec::new(),
+                    },
+                    Some(format!("已在账号仓「{vname}」启动 Claude")),
+                    cx,
+                );
             });
         }
         TrayEvent::PanicLockdown => {

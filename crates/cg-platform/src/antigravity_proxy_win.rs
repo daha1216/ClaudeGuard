@@ -537,8 +537,20 @@ fn next_temp_nonce() -> u64 {
     x ^ (x >> 31)
 }
 
+fn compute_sha256_hex_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    hex
+}
+
+/// Restricts `<data_dir>\antigravity-proxy` cache directory ACL to `SYSTEM` + `Administrators`
+/// (`D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`) when running elevated or as Session-0 service.
 #[cfg(windows)]
-fn apply_user_writable_acl_if_service(path: &Path) {
+fn apply_cache_dir_strict_acl_if_privileged(dir: &Path) {
     use core::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     use windows::core::{w, PWSTR};
@@ -548,11 +560,11 @@ fn apply_user_writable_acl_if_service(path: &Path) {
         SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows::Win32::Security::{
-        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        UNPROTECTED_DACL_SECURITY_INFORMATION,
+        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
     };
 
-    if !crate::access_win::is_session_zero() {
+    if !crate::access_win::is_session_zero() && !crate::access_win::is_elevated().unwrap_or(false) {
         return;
     }
 
@@ -570,7 +582,7 @@ fn apply_user_writable_acl_if_service(path: &Path) {
     unsafe {
         let mut sd = PSECURITY_DESCRIPTOR::default();
         if ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            w!("D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)"),
+            w!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
             SDDL_REVISION_1,
             &mut sd,
             None,
@@ -591,11 +603,11 @@ fn apply_user_writable_acl_if_service(path: &Path) {
             return;
         }
 
-        let mut wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut wide_path: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
         let _ = SetNamedSecurityInfoW(
             PWSTR(wide_path.as_mut_ptr()),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             None,
             None,
             Some(dacl_ptr.cast_const()),
@@ -605,7 +617,7 @@ fn apply_user_writable_acl_if_service(path: &Path) {
 }
 
 #[cfg(not(windows))]
-fn apply_user_writable_acl_if_service(_path: &Path) {}
+fn apply_cache_dir_strict_acl_if_privileged(_dir: &Path) {}
 
 fn atomic_write_verified_file(
     dir: &Path,
@@ -654,7 +666,8 @@ fn atomic_write_verified_file(
         let _ = std::fs::remove_file(&tmp_path);
         return Err(format!("替换 {file_name} 失败：{rename_err}"));
     }
-    apply_user_writable_acl_if_service(&target_path);
+    // Note: Do NOT stamp `(A;;FA;;;AU)` onto executable DLLs — creating `tmp_path` inside `dir`
+    // with default security attributes already inherits `dir`'s exact `(OI)(CI)` DACL safely.
     Ok(target_path)
 }
 
@@ -982,8 +995,40 @@ pub fn proxy_dll_cache_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join("version.dll")
 }
 
-/// Repairs the injection preferring a previously verified DLL from `cache_dir`, so an Antigravity
-/// self-update does not force another release download; refreshes the cache after a download.
+/// Companion SHA-256 sidecar file for the cached `version.dll`.
+pub fn proxy_dll_cache_sha256_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("version.dll.sha256")
+}
+
+fn read_verified_cached_proxy_dll(cache_dir: &Path) -> Option<Vec<u8>> {
+    ensure_no_reparse_points(cache_dir).ok()?;
+    let cache_file = proxy_dll_cache_path(cache_dir);
+    let sha_file = proxy_dll_cache_sha256_path(cache_dir);
+    ensure_no_reparse_points(&cache_file).ok()?;
+    ensure_no_reparse_points(&sha_file).ok()?;
+
+    let expected_sha = std::fs::read_to_string(&sha_file)
+        .ok()
+        .and_then(|raw| raw.split_whitespace().next().map(str::to_string))
+        .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))?;
+    let meta = std::fs::metadata(&cache_file).ok()?;
+    if !meta.is_file() || meta.len() > MAX_PROXY_DLL_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&cache_file).ok()?;
+    if !validate_antigravity_proxy_dll_bytes(&bytes) {
+        return None;
+    }
+    let actual_sha = compute_sha256_hex_bytes(&bytes);
+    if !actual_sha.eq_ignore_ascii_case(&expected_sha) {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Repairs the injection preferring a previously verified DLL from `cache_dir` (whose SHA-256
+/// matches `version.dll.sha256`), so an Antigravity self-update does not force another release
+/// download; refreshes the protected cache after a verified download.
 pub fn repair_antigravity_proxy_cached(
     route: &crate::probe_http::ProbeRoute,
     proxy_port: u16,
@@ -991,18 +1036,15 @@ pub fn repair_antigravity_proxy_cached(
     cache_dir: &Path,
 ) -> Result<AntigravityRepairReport, String> {
     let dir = resolve_antigravity_dir(explicit_dir)?;
-    let cache_file = proxy_dll_cache_path(cache_dir);
-    if let Ok(bytes) = std::fs::read(&cache_file) {
-        if validate_antigravity_proxy_dll_bytes(&bytes) {
-            let tag = std::fs::read_to_string(cache_dir.join("release_tag.txt"))
-                .map(|s| s.trim().to_string())
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "cache".to_string());
-            // A validated cache entry is byte-identical to what a download would yield, so a
-            // failed install means the target is locked; retrying over the network cannot help.
-            return install_verified_proxy_bytes_into_dir(&dir, &bytes, false, proxy_port, &tag);
-        }
+    if let Some(bytes) = read_verified_cached_proxy_dll(cache_dir) {
+        let tag = std::fs::read_to_string(cache_dir.join("release_tag.txt"))
+            .map(|s| s.trim().to_string())
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "cache".to_string());
+        // A validated cache entry is byte-identical to what a download would yield, so a
+        // failed install means the target is locked; retrying over the network cannot help.
+        return install_verified_proxy_bytes_into_dir(&dir, &bytes, false, proxy_port, &tag);
     }
 
     let report = repair_antigravity_proxy(route, proxy_port, Some(&dir))?;
@@ -1010,22 +1052,32 @@ pub fn repair_antigravity_proxy_cached(
     Ok(report)
 }
 
-/// Copies the installed (already verified) `version.dll` into `cache_dir` so a later injection can
-/// be repaired without network access. Returns whether the cache now holds a verified DLL.
+/// Copies the installed (already verified) `version.dll` into `cache_dir` (enforcing `SY+BA`
+/// ACLs when elevated/service and recording `version.dll.sha256`) so a later injection can be
+/// repaired without network access. Returns whether the cache now holds a verified DLL.
 pub fn cache_proxy_dll_from_dir(install_dir: &Path, cache_dir: &Path, release_tag: &str) -> bool {
-    let Ok(bytes) = std::fs::read(install_dir.join("version.dll")) else {
+    let dll_src = install_dir.join("version.dll");
+    if ensure_no_reparse_points(&dll_src).is_err() || ensure_no_reparse_points(cache_dir).is_err() {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(&dll_src) else {
         return false;
     };
     if !validate_antigravity_proxy_dll_bytes(&bytes) || std::fs::create_dir_all(cache_dir).is_err()
     {
         return false;
     }
+    apply_cache_dir_strict_acl_if_privileged(cache_dir);
+    let sha_hex = compute_sha256_hex_bytes(&bytes);
     if atomic_write_verified_file(cache_dir, "version.dll", &bytes).is_err() {
+        return false;
+    }
+    if atomic_write_verified_file(cache_dir, "version.dll.sha256", sha_hex.as_bytes()).is_err() {
         return false;
     }
     let tag = release_tag.trim();
     if !tag.is_empty() {
-        let _ = std::fs::write(cache_dir.join("release_tag.txt"), tag.as_bytes());
+        let _ = atomic_write_verified_file(cache_dir, "release_tag.txt", tag.as_bytes());
     }
     true
 }
@@ -1425,13 +1477,15 @@ mod tests {
 
     #[test]
     fn cached_dll_reinstalls_without_release_download() {
+        let seed_dir = unique_temp_dir("cache-seed");
         let install_dir = unique_temp_dir("cache-install");
         let cache_dir = unique_temp_dir("cache-store");
         let bytes = synthetic_proxy_dll_bytes();
-        std::fs::write(cache_dir.join("version.dll"), &bytes).unwrap();
-        std::fs::write(cache_dir.join("release_tag.txt"), b"v2.6.6").unwrap();
+        std::fs::write(seed_dir.join("version.dll"), &bytes).unwrap();
+        assert!(cache_proxy_dll_from_dir(&seed_dir, &cache_dir, "v2.6.6"));
+        assert!(proxy_dll_cache_sha256_path(&cache_dir).is_file());
 
-        // Skip route would refuse a download, so a successful repair proves the cache was used.
+        // Skip route would refuse a download, so a successful repair proves the SHA-256 verified cache was used.
         let report = repair_antigravity_proxy_cached(
             &crate::probe_http::ProbeRoute::Skip("未开启系统代理且未检测到 TUN 网卡".into()),
             7891,
@@ -1452,7 +1506,24 @@ mod tests {
         assert_eq!(cfg["child_injection"], serde_json::json!(true));
         assert_eq!(cfg["proxy"]["port"], serde_json::json!(7891));
         assert_eq!(cfg["_version"], serde_json::json!("2.6.6"));
+
+        // Tampering with cached `version.dll` without matching SHA-256 sidecar MUST reject cache!
+        let mut tampered = bytes.clone();
+        tampered[2048] ^= 0xFF;
+        std::fs::write(proxy_dll_cache_path(&cache_dir), &tampered).unwrap();
+        let tampered_dir = unique_temp_dir("cache-tampered");
+        assert!(repair_antigravity_proxy_cached(
+            &crate::probe_http::ProbeRoute::Skip("offline".into()),
+            7891,
+            Some(&tampered_dir),
+            &cache_dir,
+        )
+        .is_err());
+        assert!(!tampered_dir.join("version.dll").exists());
+
+        std::fs::remove_dir_all(&seed_dir).unwrap();
         std::fs::remove_dir_all(&install_dir).unwrap();
+        std::fs::remove_dir_all(&tampered_dir).unwrap();
         std::fs::remove_dir_all(&cache_dir).unwrap();
     }
 

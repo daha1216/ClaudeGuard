@@ -185,8 +185,16 @@ fn parse_virtual_key(key_lower: &str) -> Option<u32> {
     }
 }
 
+/// Sovereign Account Vault quick-launch entry displayed in the Win32 tray popup menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrayVaultMenuItem {
+    pub vault_id: String,
+    pub label: String,
+    pub enabled: bool,
+}
+
 /// Tray events emitted from the Win32 tray thread to the GPUI app controller.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TrayEvent {
     ToggleHud,
     OpenConsole,
@@ -194,6 +202,7 @@ pub enum TrayEvent {
     TogglePause,
     SweepOrphans,
     PanicLockdown,
+    LaunchVault(String),
     SafeExit,
     QuitGuiOnly,
     SystemShuttingDown,
@@ -320,14 +329,15 @@ mod win_impl {
         CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
         DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW,
         GetWindowRect, HICON, ICON_BIG, ICON_SMALL, ICONINFO, IMAGE_ICON, LR_SHARED, LoadImageW,
-        MF_SEPARATOR, MF_STRING, MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage, RegisterClassW,
-        RegisterWindowMessageW, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON,
-        SPI_GETCLIENTAREAANIMATION, SPI_GETWORKAREA, SW_RESTORE, SWP_NOACTIVATE, SWP_NOSIZE,
-        SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetForegroundWindow,
-        SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, TPM_BOTTOMALIGN,
-        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, UnregisterClassW,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
-        WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETICON, WM_USER, WNDCLASSW,
+        MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MSGFLT_ALLOW, PostMessageW,
+        PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXICON, SM_CXSMICON, SM_CYICON,
+        SM_CYSMICON, SPI_GETCLIENTAREAANIMATION, SPI_GETWORKAREA, SW_RESTORE, SWP_NOACTIVATE,
+        SWP_NOSIZE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW,
+        SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW,
+        TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
+        UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CONTEXTMENU,
+        WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETICON, WM_USER,
+        WNDCLASSW,
     };
     use windows::core::{PCWSTR, w};
 
@@ -398,6 +408,8 @@ mod win_impl {
     const CMD_SAFE_EXIT: u32 = 1006;
     const CMD_QUIT_GUI: u32 = 1007;
     const CMD_PANIC_LOCKDOWN: u32 = 1008;
+    const CMD_LAUNCH_VAULT_BASE: u32 = 1100;
+    const MAX_TRAY_VAULT_ITEMS: usize = 16;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct HotkeyDesiredConfig {
@@ -414,6 +426,7 @@ mod win_impl {
         pending_balloons: Mutex<VecDeque<(String, String, bool)>>,
         hotkeys: Mutex<HotkeyDesiredConfig>,
         hotkey_report: Mutex<HotkeyRegistrationReport>,
+        vault_items: Mutex<Vec<TrayVaultMenuItem>>,
         taskbar_created_msg: u32,
         hwnd: Mutex<Option<isize>>,
     }
@@ -437,6 +450,7 @@ mod win_impl {
                     hud_chord: "Ctrl+Alt+Shift+H".to_string(),
                 }),
                 hotkey_report: Mutex::new(HotkeyRegistrationReport::default()),
+                vault_items: Mutex::new(Vec::new()),
                 taskbar_created_msg: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
                 hwnd: Mutex::new(None),
             });
@@ -523,6 +537,13 @@ mod win_impl {
                 .lock()
                 .map(|r| r.clone())
                 .unwrap_or_default()
+        }
+
+        /// Updates Sovereign Account Vault quick-launch entries shown in the tray popup menu.
+        pub fn sync_vault_menu(&self, items: Vec<TrayVaultMenuItem>) {
+            if let Ok(mut guard) = self.shared.vault_items.lock() {
+                *guard = items;
+            }
         }
 
         pub fn shutdown(&mut self) {
@@ -866,6 +887,31 @@ mod win_impl {
             w!("暂停保护 30 分钟")
         };
 
+        let vault_snapshot: Vec<TrayVaultMenuItem> = ctx
+            .shared
+            .vault_items
+            .lock()
+            .map(|v| v.iter().take(MAX_TRAY_VAULT_ITEMS).cloned().collect())
+            .unwrap_or_default();
+
+        let panic_label = ctx
+            .shared
+            .hotkeys
+            .lock()
+            .ok()
+            .map(|hk| {
+                if hk.enabled && !hk.panic_chord.trim().is_empty() {
+                    format!("紧急防封锁死 ({})", hk.panic_chord.trim())
+                } else {
+                    "紧急防封锁死".to_string()
+                }
+            })
+            .unwrap_or_else(|| "紧急防封锁死".to_string());
+        let panic_wide: Vec<u16> = panic_label
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
         unsafe {
             let _ = AppendMenuW(
                 menu,
@@ -879,6 +925,34 @@ mod win_impl {
                 CMD_TOGGLE_HUD as usize,
                 w!("显示 / 隐藏快捷 HUD"),
             );
+            if !vault_snapshot.is_empty()
+                && let Ok(vault_sub) = CreatePopupMenu()
+            {
+                for (idx, item) in vault_snapshot.iter().enumerate() {
+                    let wide: Vec<u16> = item
+                        .label
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect();
+                    let flags = if item.enabled {
+                        MF_STRING
+                    } else {
+                        MF_STRING | MF_GRAYED
+                    };
+                    let _ = AppendMenuW(
+                        vault_sub,
+                        flags,
+                        (CMD_LAUNCH_VAULT_BASE + idx as u32) as usize,
+                        PCWSTR(wide.as_ptr()),
+                    );
+                }
+                let _ = AppendMenuW(
+                    menu,
+                    MF_POPUP,
+                    vault_sub.0 as usize,
+                    w!("多账号隔离仓 · 一键启动"),
+                );
+            }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, CMD_RECHECK as usize, w!("立即重检出口"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE_PAUSE as usize, pause_text);
@@ -892,7 +966,7 @@ mod win_impl {
                 menu,
                 MF_STRING,
                 CMD_PANIC_LOCKDOWN as usize,
-                w!("紧急防封锁死 (Ctrl+Alt+Shift+L)"),
+                PCWSTR(panic_wide.as_ptr()),
             );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT_GUI as usize, w!("仅退出托盘界面"));
@@ -918,7 +992,19 @@ mod win_impl {
             let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
             let _ = DestroyMenu(menu);
             if selected.0 > 0 {
-                dispatch_menu_cmd(selected.0 as u32, &ctx.shared.channel);
+                let sel = selected.0 as u32;
+                if sel >= CMD_LAUNCH_VAULT_BASE
+                    && (sel - CMD_LAUNCH_VAULT_BASE) < vault_snapshot.len() as u32
+                {
+                    let idx = (sel - CMD_LAUNCH_VAULT_BASE) as usize;
+                    if vault_snapshot[idx].enabled {
+                        ctx.shared
+                            .channel
+                            .send(TrayEvent::LaunchVault(vault_snapshot[idx].vault_id.clone()));
+                    }
+                } else {
+                    dispatch_menu_cmd(sel, &ctx.shared.channel);
+                }
             }
         }
     }
@@ -939,7 +1025,7 @@ mod win_impl {
             .tooltip
             .lock()
             .map(|s| s.clone())
-            .unwrap_or_else(|_| "ClaudeGuard v4".to_string());
+            .unwrap_or_else(|_| "ClaudeGuard v5".to_string());
         super::copy_utf16_truncated(&tip_text, &mut nid.szTip);
 
         let cmd = if add { NIM_ADD } else { NIM_MODIFY };
@@ -1444,6 +1530,8 @@ mod win_impl {
         pub fn hotkey_report(&self) -> HotkeyRegistrationReport {
             HotkeyRegistrationReport::default()
         }
+
+        pub fn sync_vault_menu(&self, _items: Vec<TrayVaultMenuItem>) {}
 
         pub fn shutdown(&mut self) {}
     }

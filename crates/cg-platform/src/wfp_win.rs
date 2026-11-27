@@ -454,6 +454,19 @@ fn protocol_label(ip_proto: u8) -> &'static str {
     }
 }
 
+/// Pure classifier identifying Hyper-V / WSL2 virtual adapters (`vEthernet (WSL)`, etc.)
+/// so WFP `strict_tunnel_only` permits localhost-equivalent IDE/LSP/MCP traffic into WSL2.
+pub fn is_wsl_virtual_adapter_name(desc: &str, friendly: &str) -> bool {
+    let dl = desc.trim().to_ascii_lowercase();
+    let fl = friendly.trim().to_ascii_lowercase();
+    fl.contains("vethernet (wsl")
+        || dl.contains("vethernet (wsl")
+        || fl == "wsl"
+        || fl.starts_with("wsl ")
+        || fl.ends_with(" (wsl)")
+        || (dl.contains("hyper-v virtual ethernet") && fl.contains("wsl"))
+}
+
 // ==================== Windows Native WFP Implementation ====================
 
 #[cfg(windows)]
@@ -709,6 +722,68 @@ pub mod win_impl {
         }
     }
 
+    type FwpmNetEventSubscribe4Fn = unsafe extern "system" fn(
+        engine_handle: HANDLE,
+        subscription: *const FWPM_NET_EVENT_SUBSCRIPTION0,
+        callback: FWPM_NET_EVENT_CALLBACK4,
+        context: *mut c_void,
+        events_handle: *mut HANDLE,
+    ) -> u32;
+
+    /// Dynamically resolves `FwpmNetEventSubscribe4` from `System32\fwpuclnt.dll` so Windows 10
+    /// 1809 LTSC / Server 2019 hosts (which only export `Subscribe0..3`) degrade gracefully
+    /// instead of aborting process startup with `STATUS_ENTRYPOINT_NOT_FOUND` (`0xC0000139`).
+    fn resolve_fwpm_net_event_subscribe4() -> Option<FwpmNetEventSubscribe4Fn> {
+        use std::sync::OnceLock;
+
+        const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn LoadLibraryExW(
+                lp_lib_file_name: *const u16,
+                h_file: *mut c_void,
+                dw_flags: u32,
+            ) -> *mut c_void;
+            fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const u8) -> *const c_void;
+        }
+
+        static FN_PTR: OnceLock<Option<FwpmNetEventSubscribe4Fn>> = OnceLock::new();
+        *FN_PTR.get_or_init(|| unsafe {
+            let dll_w: [u16; 13] = [
+                b'f' as u16,
+                b'w' as u16,
+                b'p' as u16,
+                b'u' as u16,
+                b'c' as u16,
+                b'l' as u16,
+                b'n' as u16,
+                b't' as u16,
+                b'.' as u16,
+                b'd' as u16,
+                b'l' as u16,
+                b'l' as u16,
+                0,
+            ];
+            let hmod = LoadLibraryExW(
+                dll_w.as_ptr(),
+                core::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            );
+            if hmod.is_null() {
+                return None;
+            }
+            let proc = GetProcAddress(hmod, c"FwpmNetEventSubscribe4".as_ptr().cast::<u8>());
+            if proc.is_null() {
+                return None;
+            }
+            Some(core::mem::transmute::<
+                *const c_void,
+                FwpmNetEventSubscribe4Fn,
+            >(proc))
+        })
+    }
+
     /// RAII wrapper for `FwpmNetEventSubscribe4` guaranteeing `FwpmNetEventUnsubscribe0`
     /// completes BEFORE the shared `Arc<WfpEventStore>` context pointer is reclaimed.
     pub struct WfpNetEventSubscription {
@@ -724,6 +799,12 @@ pub mod win_impl {
 
     impl WfpNetEventSubscription {
         pub fn subscribe(engine: HANDLE, store: Arc<WfpEventStore>) -> PlatformResult<Self> {
+            let Some(subscribe_fn) = resolve_fwpm_net_event_subscribe4() else {
+                return Err(PlatformError::unsupported(
+                    "wfp_net_events",
+                    "FwpmNetEventSubscribe4 is not exported by fwpuclnt.dll on this Windows version",
+                ));
+            };
             let mut template = FWPM_NET_EVENT_ENUM_TEMPLATE0::default();
             let subscription = FWPM_NET_EVENT_SUBSCRIPTION0 {
                 enumTemplate: &mut template,
@@ -733,11 +814,11 @@ pub mod win_impl {
             let ctx_ptr = Arc::into_raw(store);
             let mut sub_handle = HANDLE::default();
             let rc = unsafe {
-                FwpmNetEventSubscribe4(
+                subscribe_fn(
                     engine,
                     &subscription,
                     Some(wfp_net_event_callback_v4),
-                    Some(ctx_ptr.cast::<c_void>()),
+                    ctx_ptr.cast::<c_void>() as *mut c_void,
                     &mut sub_handle,
                 )
             };
@@ -900,31 +981,57 @@ pub mod win_impl {
             let filter_id = unsafe { (*drop_ptr).filterId };
             let store = unsafe { &*(context as *const WfpEventStore) };
 
-            if store.lookup_try(filter_id).is_none() {
+            let Some(attr_snapshot) = store.lookup_try(filter_id) else {
                 return;
-            }
+            };
 
             let hdr = &ev.header;
-            let (remote_ip, fallback_layer): (IpAddr, &'static str) =
+            let flags = hdr.flags;
+            let has_ip_ver = (flags & FWPM_NET_EVENT_FLAG_IP_VERSION_SET) != 0;
+            let has_remote_addr = (flags & FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET) != 0;
+            let has_remote_port = (flags & FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET) != 0;
+            let has_ip_proto = (flags & FWPM_NET_EVENT_FLAG_IP_PROTOCOL_SET) != 0;
+            let has_app_id = (flags & FWPM_NET_EVENT_FLAG_APP_ID_SET) != 0;
+
+            let (remote_ip_str, fallback_layer): (String, &str) = if has_ip_ver {
                 if hdr.ipVersion == FWP_IP_VERSION_V4 {
-                    (
+                    let ip_s = if has_remote_addr {
                         IpAddr::V4(ipv4_from_wfp_host_u32(unsafe {
                             hdr.Anonymous2.remoteAddrV4
-                        })),
-                        "ale_auth_connect_v4",
-                    )
+                        }))
+                        .to_string()
+                    } else {
+                        String::new()
+                    };
+                    (ip_s, "ale_auth_connect_v4")
                 } else if hdr.ipVersion == FWP_IP_VERSION_V6 {
-                    (
+                    let ip_s = if has_remote_addr {
                         IpAddr::V6(Ipv6Addr::from(unsafe {
                             hdr.Anonymous2.remoteAddrV6.byteArray16
-                        })),
-                        "ale_auth_connect_v6",
-                    )
+                        }))
+                        .to_string()
+                    } else {
+                        String::new()
+                    };
+                    (ip_s, "ale_auth_connect_v6")
                 } else {
                     return;
-                };
+                }
+            } else {
+                (String::new(), attr_snapshot.layer.as_str())
+            };
 
-            let app_path = decode_utf16_le_blob(&hdr.appId);
+            let app_path = if has_app_id {
+                decode_utf16_le_blob(&hdr.appId)
+            } else {
+                String::new()
+            };
+            let remote_port = if has_remote_port { hdr.remotePort } else { 0 };
+            let proto = if has_ip_proto {
+                protocol_label(hdr.ipProtocol)
+            } else {
+                "other"
+            };
             let timestamp_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -935,9 +1042,9 @@ pub mod win_impl {
                 timestamp_ms,
                 None,
                 app_path,
-                remote_ip.to_string(),
-                hdr.remotePort,
-                protocol_label(hdr.ipProtocol),
+                remote_ip_str,
+                remote_port,
+                proto,
                 fallback_layer,
             );
         }));
@@ -1241,6 +1348,12 @@ pub mod win_impl {
     }
 
     /// Add Weight 13 4-Vector Leak Shield filters for one resolved executable.
+    ///
+    /// - Vector 1 (`UDP:443`): excludes loopback (`!IS_LOOPBACK`) so localhost HTTP/3 dev servers work.
+    /// - Vector 2 (`DNS/DoT/DoH`): when `active_tun_luid` is present, adds `IP_LOCAL_INTERFACE != tun_luid`
+    ///   so DNS/DoH routed *through* the verified TUN adapter succeeds while physical NIC leaks are blocked.
+    /// - Vector 3 (`IPv6`): when `active_tun_luid` is present, excludes `fc00::/7` ULA (preserving Mihomo /
+    ///   sing-box IPv6 Fake-IP) and adds `IP_LOCAL_INTERFACE != tun_luid`.
     #[allow(clippy::too_many_arguments)]
     fn add_app_leak_shield_filters(
         engine: HANDLE,
@@ -1250,15 +1363,18 @@ pub mod win_impl {
         block_quic: bool,
         block_dns_doh: bool,
         block_ipv6: bool,
+        active_tun_luid: Option<u64>,
         attributions: &mut HashMap<u64, WfpFilterAttribution>,
     ) -> PlatformResult<Vec<u64>> {
         let mut created = Vec::new();
+        let mut tun_luid_cell = active_tun_luid;
 
-        // Vector 1: QUIC UDP:443 (V4 + V6)
+        // Vector 1: Non-loopback QUIC UDP:443 (V4 + V6)
         if block_quic {
             for (layer, layer_name) in ALE_CONNECT_LAYERS {
                 let mut conds = [
                     cond_app_id(app_blob, FWP_MATCH_EQUAL),
+                    cond_loopback(false),
                     cond_ip_protocol(17),
                     cond_remote_port(443, FWP_MATCH_EQUAL),
                 ];
@@ -1285,16 +1401,25 @@ pub mod win_impl {
             }
         }
 
-        // Vector 2: Direct DNS (53), DoT (853), and Public DoH (443)
+        // Vector 2: Direct DNS (53), DoT (853), and Public DoH (443) outside verified TUN
         if block_dns_doh {
-            // (2a) Non-loopback port 53 or 853 on V4 & V6
+            // (2a) Non-loopback port 53 or 853 on V4 & V6 (exempting verified active_tun_luid)
             for (layer, layer_name) in ALE_CONNECT_LAYERS {
-                let mut conds = [
-                    cond_app_id(app_blob, FWP_MATCH_EQUAL),
-                    cond_loopback(false),
-                    cond_remote_port(53, FWP_MATCH_EQUAL),
-                    cond_remote_port(853, FWP_MATCH_EQUAL),
-                ];
+                let mut conds = Vec::with_capacity(5);
+                conds.push(cond_app_id(app_blob, FWP_MATCH_EQUAL));
+                conds.push(cond_loopback(false));
+                if let Some(ref mut luid_val) = tun_luid_cell {
+                    conds.push(FWPM_FILTER_CONDITION0 {
+                        fieldKey: FWPM_CONDITION_IP_LOCAL_INTERFACE,
+                        matchType: FWP_MATCH_NOT_EQUAL,
+                        conditionValue: FWP_CONDITION_VALUE0 {
+                            r#type: FWP_UINT64,
+                            Anonymous: FWP_CONDITION_VALUE0_0 { uint64: luid_val },
+                        },
+                    });
+                }
+                conds.push(cond_remote_port(53, FWP_MATCH_EQUAL));
+                conds.push(cond_remote_port(853, FWP_MATCH_EQUAL));
                 let fid = add_filter_raw(
                     engine,
                     CLAUDEGUARD_WFP_PROVIDER_GUID,
@@ -1322,8 +1447,19 @@ pub mod win_impl {
                 .iter()
                 .map(|ip| v4_addr_mask(*ip, 32))
                 .collect();
-            let mut conds_v4 = Vec::with_capacity(2 + v4_masks.len());
+            let mut conds_v4 = Vec::with_capacity(4 + v4_masks.len());
             conds_v4.push(cond_app_id(app_blob, FWP_MATCH_EQUAL));
+            conds_v4.push(cond_loopback(false));
+            if let Some(ref mut luid_val) = tun_luid_cell {
+                conds_v4.push(FWPM_FILTER_CONDITION0 {
+                    fieldKey: FWPM_CONDITION_IP_LOCAL_INTERFACE,
+                    matchType: FWP_MATCH_NOT_EQUAL,
+                    conditionValue: FWP_CONDITION_VALUE0 {
+                        r#type: FWP_UINT64,
+                        Anonymous: FWP_CONDITION_VALUE0_0 { uint64: luid_val },
+                    },
+                });
+            }
             conds_v4.push(cond_remote_port(443, FWP_MATCH_EQUAL));
             for m in &mut v4_masks {
                 conds_v4.push(FWPM_FILTER_CONDITION0 {
@@ -1361,8 +1497,19 @@ pub mod win_impl {
                 .iter()
                 .map(|ip| v6_addr_mask(*ip, 128))
                 .collect();
-            let mut conds_v6 = Vec::with_capacity(2 + v6_masks.len());
+            let mut conds_v6 = Vec::with_capacity(4 + v6_masks.len());
             conds_v6.push(cond_app_id(app_blob, FWP_MATCH_EQUAL));
+            conds_v6.push(cond_loopback(false));
+            if let Some(ref mut luid_val) = tun_luid_cell {
+                conds_v6.push(FWPM_FILTER_CONDITION0 {
+                    fieldKey: FWPM_CONDITION_IP_LOCAL_INTERFACE,
+                    matchType: FWP_MATCH_NOT_EQUAL,
+                    conditionValue: FWP_CONDITION_VALUE0 {
+                        r#type: FWP_UINT64,
+                        Anonymous: FWP_CONDITION_VALUE0_0 { uint64: luid_val },
+                    },
+                });
+            }
             conds_v6.push(cond_remote_port(443, FWP_MATCH_EQUAL));
             for m in &mut v6_masks {
                 conds_v6.push(FWPM_FILTER_CONDITION0 {
@@ -1396,15 +1543,29 @@ pub mod win_impl {
             created.push(fid_doh_v6);
         }
 
-        // Vector 3: Direct Public IPv6 Leak Shield (`2000::/3`, `64:ff9b::/96`, `fc00::/7`)
+        // Vector 3: Direct Public IPv6 Leak Shield (`2000::/3`, `64:ff9b::/96`; skip `fc00::/7` ULA
+        // when TUN is active so Mihomo/sing-box Fake-IP v6 is never blocked).
         if block_ipv6 {
             let mut v6_ranges: Vec<FWP_V6_ADDR_AND_MASK> = GLOBAL_IPV6_CIDRS
                 .iter()
+                .filter(|(ip, plen)| {
+                    !(tun_luid_cell.is_some() && ip.segments()[0] == 0xfc00 && *plen == 7)
+                })
                 .map(|(ip, plen)| v6_addr_mask(*ip, *plen))
                 .collect();
-            let mut conds_v6 = Vec::with_capacity(2 + v6_ranges.len());
+            let mut conds_v6 = Vec::with_capacity(3 + v6_ranges.len());
             conds_v6.push(cond_app_id(app_blob, FWP_MATCH_EQUAL));
             conds_v6.push(cond_loopback(false));
+            if let Some(ref mut luid_val) = tun_luid_cell {
+                conds_v6.push(FWPM_FILTER_CONDITION0 {
+                    fieldKey: FWPM_CONDITION_IP_LOCAL_INTERFACE,
+                    matchType: FWP_MATCH_NOT_EQUAL,
+                    conditionValue: FWP_CONDITION_VALUE0 {
+                        r#type: FWP_UINT64,
+                        Anonymous: FWP_CONDITION_VALUE0_0 { uint64: luid_val },
+                    },
+                });
+            }
             for m in &mut v6_ranges {
                 conds_v6.push(FWPM_FILTER_CONDITION0 {
                     fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
@@ -1442,7 +1603,7 @@ pub mod win_impl {
 
     /// Add the Per-App Split-Permit Sandwich (`ALE_AUTH_CONNECT_V4/V6`):
     /// - Weight `11`: PERMIT Loopback (`FWP_CONDITION_FLAG_IS_LOOPBACK`)
-    /// - Weight `10`: PERMIT Verified Active TUN `NET_LUID` (`FWPM_CONDITION_IP_LOCAL_INTERFACE`)
+    /// - Weight `10`: PERMIT Verified Active TUN `NET_LUID` + WSL2 `vEthernet (WSL)` (`!= 53`)
     /// - Weight `9`:  Optional PERMIT RFC1918 LAN (`REMOTE_PORT != 53`)
     /// - Weight `2`:  BLOCK Catch-All Physical NIC Direct Egress (`direct_nic_bypass`)
     #[allow(clippy::too_many_arguments)]
@@ -1451,11 +1612,12 @@ pub mod win_impl {
         sublayer_guid: GUID,
         app_blob: &WfpAppIdBlob,
         active_tun_luid: Option<u64>,
+        wsl_luids: &[u64],
         allow_lan_dev_servers: bool,
         agent_id: &str,
         attributions: &mut HashMap<u64, WfpFilterAttribution>,
     ) -> PlatformResult<Vec<u64>> {
-        let mut created = Vec::with_capacity(7);
+        let mut created = Vec::with_capacity(7 + wsl_luids.len() * 2);
 
         for (layer, layer_name) in ALE_CONNECT_LAYERS {
             // (A) Weight 11: Permit Loopback (127.0.0.1 proxy, Antigravity LSP, local MCP)
@@ -1500,6 +1662,40 @@ pub mod win_impl {
                     &mut conds_tun,
                 )?;
                 created.push(fid_tun);
+            }
+
+            // (B2) Weight 10: Permit WSL2 `vEthernet (WSL)` local virtual bridge (excluding DNS :53)
+            for &wsl_raw in wsl_luids {
+                if Some(wsl_raw) == active_tun_luid || wsl_raw == 0 {
+                    continue;
+                }
+                let mut wsl_luid_val = wsl_raw;
+                let mut conds_wsl = [
+                    cond_app_id(app_blob, FWP_MATCH_EQUAL),
+                    FWPM_FILTER_CONDITION0 {
+                        fieldKey: FWPM_CONDITION_IP_LOCAL_INTERFACE,
+                        matchType: FWP_MATCH_EQUAL,
+                        conditionValue: FWP_CONDITION_VALUE0 {
+                            r#type: FWP_UINT64,
+                            Anonymous: FWP_CONDITION_VALUE0_0 {
+                                uint64: &mut wsl_luid_val,
+                            },
+                        },
+                    },
+                    cond_remote_port(53, FWP_MATCH_NOT_EQUAL),
+                ];
+                let fid_wsl = add_filter_raw(
+                    engine,
+                    CLAUDEGUARD_WFP_PROVIDER_GUID,
+                    sublayer_guid,
+                    layer,
+                    WFP_WEIGHT_ACTIVE_TUN_PERMIT,
+                    FWP_ACTION_PERMIT,
+                    FWPM_FILTER_FLAG_NONE,
+                    "ClaudeGuard WSL2 Virtual Bridge Permit (Non-DNS)",
+                    &mut conds_wsl,
+                )?;
+                created.push(fid_wsl);
             }
 
             // (C) Weight 2: Catch-All Physical NIC Hard-Block
@@ -1712,8 +1908,15 @@ pub mod win_impl {
         rule_entries: Vec<TrackedRuleEntry>,
         posture_filter_ids: Vec<u64>,
         posture_attributions: HashMap<u64, WfpFilterAttribution>,
+        posture_shield_filter_count: usize,
+        posture_quic_blocked: bool,
+        posture_dns_doh_blocked: bool,
+        posture_ipv6_blocked: bool,
         shield_filter_ids: Vec<u64>,
         shield_attributions: HashMap<u64, WfpFilterAttribution>,
+        shield_quic_blocked: bool,
+        shield_dns_doh_blocked: bool,
+        shield_ipv6_blocked: bool,
         boot_time_filters_armed: bool,
         last_error: String,
     }
@@ -1819,8 +2022,15 @@ pub mod win_impl {
                     rule_entries: Vec::new(),
                     posture_filter_ids: Vec::new(),
                     posture_attributions: HashMap::new(),
+                    posture_shield_filter_count: 0,
+                    posture_quic_blocked: false,
+                    posture_dns_doh_blocked: false,
+                    posture_ipv6_blocked: false,
                     shield_filter_ids: Vec::new(),
                     shield_attributions: HashMap::new(),
+                    shield_quic_blocked: false,
+                    shield_dns_doh_blocked: false,
+                    shield_ipv6_blocked: false,
                     boot_time_filters_armed,
                     last_error,
                 }),
@@ -1835,6 +2045,15 @@ pub mod win_impl {
             &self,
             spec: &WfpRuntimePostureSpec,
         ) -> PlatformResult<WfpStatus> {
+            let effective_tun_luid = spec
+                .active_tun_luid
+                .or_else(|| detect_active_tun_luid_native().map(|(_, luid)| luid));
+            let wsl_luids = if spec.strict_tunnel_only {
+                detect_wsl_adapter_luids_native()
+            } else {
+                Vec::new()
+            };
+
             let mut guard = self
                 .state
                 .lock()
@@ -1843,6 +2062,7 @@ pub mod win_impl {
 
             let mut new_ids = Vec::new();
             let mut new_attrs = HashMap::new();
+            let mut posture_shield_count = 0usize;
 
             let txn_result: PlatformResult<()> = (|| {
                 let txn = WfpTransactionGuard::begin(engine)?;
@@ -1921,8 +2141,10 @@ pub mod win_impl {
                                 spec.block_quic_udp443,
                                 spec.block_direct_dns_doh,
                                 spec.block_global_ipv6,
+                                effective_tun_luid,
                                 &mut new_attrs,
                             )?;
+                            posture_shield_count += shield_ids.len();
                             new_ids.extend(shield_ids);
                         }
 
@@ -1931,7 +2153,8 @@ pub mod win_impl {
                                 engine,
                                 CLAUDEGUARD_WFP_SUBLAYER_DYNAMIC_GUID,
                                 &blob,
-                                spec.active_tun_luid,
+                                effective_tun_luid,
+                                &wsl_luids,
                                 spec.allow_lan_dev_servers,
                                 agent_id,
                                 &mut new_attrs,
@@ -1951,6 +2174,10 @@ pub mod win_impl {
 
             guard.posture_filter_ids = new_ids;
             guard.posture_attributions = new_attrs;
+            guard.posture_shield_filter_count = posture_shield_count;
+            guard.posture_quic_blocked = spec.block_quic_udp443 && posture_shield_count > 0;
+            guard.posture_dns_doh_blocked = spec.block_direct_dns_doh && posture_shield_count > 0;
+            guard.posture_ipv6_blocked = spec.block_global_ipv6 && posture_shield_count > 0;
             guard.last_error.clear();
             let full_map = guard.rebuild_attribution_map();
             drop(guard);
@@ -1967,6 +2194,7 @@ pub mod win_impl {
             block_dns_doh: bool,
             block_ipv6: bool,
         ) -> PlatformResult<LeakShieldStatus> {
+            let active_tun_luid = detect_active_tun_luid_native().map(|(_, luid)| luid);
             let mut guard = self
                 .state
                 .lock()
@@ -2006,6 +2234,7 @@ pub mod win_impl {
                             block_quic,
                             block_dns_doh,
                             block_ipv6,
+                            active_tun_luid,
                             &mut new_attrs,
                         )?;
                         new_ids.extend(ids);
@@ -2022,19 +2251,100 @@ pub mod win_impl {
             let count = new_ids.len();
             guard.shield_filter_ids = new_ids;
             guard.shield_attributions = new_attrs;
+            guard.shield_quic_blocked = block_quic && count > 0;
+            guard.shield_dns_doh_blocked = block_dns_doh && count > 0;
+            guard.shield_ipv6_blocked = block_ipv6 && count > 0;
             let full_map = guard.rebuild_attribution_map();
             drop(guard);
 
             self.events.replace_filter_map(full_map);
 
-            Ok(LeakShieldStatus {
-                enabled: count > 0,
-                quic_blocked: block_quic && count > 0,
-                dns_doh_blocked: block_dns_doh && count > 0,
-                ipv6_blocked: block_ipv6 && count > 0,
-                active_rules: count,
-                summary: summarize_wfp_shield(block_quic, block_dns_doh, block_ipv6, count),
-            })
+            Ok(self.inspect_leak_shield())
+        }
+
+        /// Read-only inspection of active WFP 4-Vector Leak Shield filters (standalone + posture).
+        pub fn inspect_leak_shield(&self) -> LeakShieldStatus {
+            let Ok(guard) = self.state.lock() else {
+                return LeakShieldStatus {
+                    summary: "无法读取 WFP 护盾状态".into(),
+                    ..LeakShieldStatus::default()
+                };
+            };
+            let standalone_count = guard.shield_filter_ids.len();
+            let posture_count = guard.posture_shield_filter_count;
+            let active_rules = standalone_count + posture_count;
+            let quic_blocked = (guard.shield_quic_blocked && standalone_count > 0)
+                || (guard.posture_quic_blocked && posture_count > 0);
+            let dns_doh_blocked = (guard.shield_dns_doh_blocked && standalone_count > 0)
+                || (guard.posture_dns_doh_blocked && posture_count > 0);
+            let ipv6_blocked = (guard.shield_ipv6_blocked && standalone_count > 0)
+                || (guard.posture_ipv6_blocked && posture_count > 0);
+            LeakShieldStatus {
+                enabled: active_rules > 0,
+                quic_blocked,
+                dns_doh_blocked,
+                ipv6_blocked,
+                active_rules,
+                summary: summarize_wfp_shield(
+                    quic_blocked,
+                    dns_doh_blocked,
+                    ipv6_blocked,
+                    active_rules,
+                ),
+            }
+        }
+
+        /// Atomically purge ALL dynamic WFP filters (`rule_entries`, `posture_filter_ids`,
+        /// `shield_filter_ids`, and any orphaned dynamic sublayer filters) in a single transaction.
+        pub fn clear_all_dynamic_filters(&self) -> PlatformResult<usize> {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| PlatformError::Io("WFP state mutex poisoned".into()))?;
+            let engine = self.session.raw();
+            let live_ids = enumerate_sublayer_filter_ids(
+                engine,
+                CLAUDEGUARD_WFP_PROVIDER_GUID,
+                CLAUDEGUARD_WFP_SUBLAYER_DYNAMIC_GUID,
+                false,
+            )
+            .unwrap_or_default();
+
+            let mut to_delete: HashSet<u64> = live_ids.into_iter().collect();
+            for entry in &guard.rule_entries {
+                to_delete.extend(entry.filter_ids.iter().copied());
+            }
+            to_delete.extend(guard.posture_filter_ids.iter().copied());
+            to_delete.extend(guard.shield_filter_ids.iter().copied());
+
+            let mut removed = 0usize;
+            if !to_delete.is_empty() {
+                let txn = WfpTransactionGuard::begin(engine)?;
+                for fid in to_delete {
+                    if delete_filter_id_idempotent(engine, fid)? {
+                        removed += 1;
+                    }
+                }
+                txn.commit()?;
+            }
+
+            guard.rule_entries.clear();
+            guard.posture_filter_ids.clear();
+            guard.posture_attributions.clear();
+            guard.posture_shield_filter_count = 0;
+            guard.posture_quic_blocked = false;
+            guard.posture_dns_doh_blocked = false;
+            guard.posture_ipv6_blocked = false;
+            guard.shield_filter_ids.clear();
+            guard.shield_attributions.clear();
+            guard.shield_quic_blocked = false;
+            guard.shield_dns_doh_blocked = false;
+            guard.shield_ipv6_blocked = false;
+            guard.last_error.clear();
+            drop(guard);
+
+            self.events.replace_filter_map(HashMap::new());
+            Ok(removed)
         }
 
         /// Synchronize opt-in persistent `FWPM_FILTER_FLAG_BOOTTIME` filters.
@@ -2572,6 +2882,58 @@ pub mod win_impl {
         }
         None
     }
+
+    /// Detect active (`IfOperStatusUp`) WSL2 / Hyper-V WSL virtual bridge `NET_LUID`s.
+    pub fn detect_wsl_adapter_luids_native() -> Vec<u64> {
+        use windows::Win32::NetworkManagement::IpHelper::{
+            GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+            GAA_FLAG_SKIP_MULTICAST, GET_ADAPTERS_ADDRESSES_FLAGS, IP_ADAPTER_ADDRESSES_LH,
+        };
+        use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+
+        const FAMILY_UNSPEC: u32 = 0;
+        const ERROR_BUFFER_OVERFLOW: u32 = 111;
+
+        let flags = GET_ADAPTERS_ADDRESSES_FLAGS(
+            GAA_FLAG_SKIP_ANYCAST.0 | GAA_FLAG_SKIP_MULTICAST.0 | GAA_FLAG_SKIP_DNS_SERVER.0,
+        );
+        let mut size: u32 = 32 * 1024;
+        for _ in 0..4 {
+            let mut buffer: Vec<u64> = vec![0; (size as usize).div_ceil(8)];
+            let rc = unsafe {
+                GetAdaptersAddresses(
+                    FAMILY_UNSPEC,
+                    flags,
+                    None,
+                    Some(buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>()),
+                    &mut size,
+                )
+            };
+            if rc == 0 {
+                let mut luids = Vec::new();
+                let mut current = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+                while !current.is_null() {
+                    let adapter = unsafe { &*current };
+                    if adapter.OperStatus == IfOperStatusUp {
+                        let desc = unsafe { pwstr_to_string(adapter.Description) };
+                        let friendly = unsafe { pwstr_to_string(adapter.FriendlyName) };
+                        if is_wsl_virtual_adapter_name(&desc, &friendly) {
+                            let luid = unsafe { adapter.Luid.Value };
+                            if luid != 0 && !luids.contains(&luid) {
+                                luids.push(luid);
+                            }
+                        }
+                    }
+                    current = adapter.Next;
+                }
+                return luids;
+            }
+            if rc != ERROR_BUFFER_OVERFLOW {
+                return Vec::new();
+            }
+        }
+        Vec::new()
+    }
 }
 
 #[cfg(windows)]
@@ -2645,6 +3007,17 @@ impl WfpFirewallEngine {
     }
 
     pub fn clear_blocked_events(&self) {}
+
+    pub fn inspect_leak_shield(&self) -> LeakShieldStatus {
+        LeakShieldStatus::default()
+    }
+
+    pub fn clear_all_dynamic_filters(&self) -> PlatformResult<usize> {
+        Err(PlatformError::unsupported(
+            "wfp",
+            "Windows Filtering Platform is only supported on Windows",
+        ))
+    }
 }
 
 #[cfg(not(windows))]
@@ -3038,6 +3411,78 @@ impl HybridFirewallEngine {
         } else {
             clear_persistent_filters()
         }
+    }
+
+    /// Read-only inspection of the active 4-Vector Leak Shield:
+    /// queries tracked dynamic WFP shield/posture filters when WFP is active, or falls back to
+    /// `leak_shield_win::inspect_leak_shield()` under `ComLegacy` / non-elevated `AutoWfpFirst`.
+    pub fn inspect_leak_shield(&self) -> LeakShieldStatus {
+        let Ok(guard) = self.inner.read() else {
+            return LeakShieldStatus {
+                summary: "HybridFirewallEngine lock poisoned".into(),
+                ..LeakShieldStatus::default()
+            };
+        };
+        if let Some(ref wfp) = guard.wfp {
+            wfp.inspect_leak_shield()
+        } else if guard.pref == FirewallBackendPref::WfpOnly {
+            LeakShieldStatus {
+                summary: "仅 WFP 模式下内核会话不可用，防泄露护盾未生效".into(),
+                ..LeakShieldStatus::default()
+            }
+        } else {
+            crate::leak_shield_win::inspect_leak_shield()
+        }
+    }
+
+    /// Purges ALL ClaudeGuard firewall state across both WFP and COM backends:
+    /// 1. Dynamic WFP `rule_entries`, `shield_filter_ids`, and `posture_filter_ids`
+    /// 2. Persistent / Boot-Time WFP sublayer (`0xFF10`) filters
+    /// 3. Windows Firewall COM `ClaudeGuard*` and `ClaudeGuard-Shield-*` rules
+    pub fn clear_all_claudeguard_state(&self) -> Result<usize, String> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| "HybridFirewallEngine lock poisoned".to_string())?;
+
+        let mut total_removed = 0usize;
+
+        if let Some(ref wfp) = guard.wfp {
+            let dyn_removed = wfp.clear_all_dynamic_filters().map_err(|e| e.to_string())?;
+            total_removed = total_removed.saturating_add(dyn_removed);
+            match wfp.clear_persistent_filters() {
+                Ok(rep) => total_removed = total_removed.saturating_add(rep.removed),
+                Err(PlatformError::AccessDenied(_))
+                    if guard.pref != FirewallBackendPref::WfpOnly => {}
+                Err(err) => return Err(err.to_string()),
+            }
+        } else {
+            match clear_persistent_filters() {
+                Ok(rep) => total_removed = total_removed.saturating_add(rep.removed),
+                Err(PlatformError::Unsupported { .. }) => {}
+                Err(PlatformError::AccessDenied(_))
+                    if guard.pref != FirewallBackendPref::WfpOnly => {}
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+
+        // Also sweep any residual COM firewall / shield rules (e.g. after backend switch or upgrade).
+        match guard.com.remove_rules_with_prefix("ClaudeGuard") {
+            Ok(rep) => total_removed = total_removed.saturating_add(rep.removed),
+            Err(PlatformError::Unsupported { .. }) => {}
+            Err(PlatformError::AccessDenied(_))
+                if guard.wfp.is_none() && guard.pref != FirewallBackendPref::ComLegacy => {}
+            Err(err) if guard.wfp.is_some() => {
+                // WFP primary clear already succeeded; do not fail if MpsSvc COM is stopped.
+                let _ = err;
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+        if let Ok(shield_removed) = crate::leak_shield_win::clear_leak_shield() {
+            total_removed = total_removed.saturating_add(shield_removed);
+        }
+
+        Ok(total_removed)
     }
 
     fn wfp_only_err(last_error: &str) -> PlatformError {
@@ -3555,6 +4000,11 @@ mod tests {
             ..Default::default()
         };
         ev_v4.Anonymous.classifyDrop = &mut drop_v4;
+        ev_v4.header.flags = FWPM_NET_EVENT_FLAG_IP_VERSION_SET
+            | FWPM_NET_EVENT_FLAG_IP_PROTOCOL_SET
+            | FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET
+            | FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET
+            | FWPM_NET_EVENT_FLAG_APP_ID_SET;
         ev_v4.header.ipVersion = FWP_IP_VERSION_V4;
         ev_v4.header.ipProtocol = 17;
         ev_v4.header.remotePort = 53;
@@ -3574,6 +4024,10 @@ mod tests {
             ..Default::default()
         };
         ev_v6.Anonymous.classifyDrop = &mut drop_v6;
+        ev_v6.header.flags = FWPM_NET_EVENT_FLAG_IP_VERSION_SET
+            | FWPM_NET_EVENT_FLAG_IP_PROTOCOL_SET
+            | FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET
+            | FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET;
         ev_v6.header.ipVersion = FWP_IP_VERSION_V6;
         ev_v6.header.ipProtocol = 6;
         ev_v6.header.remotePort = 443;
@@ -3594,15 +4048,43 @@ mod tests {
         ev_other.header.ipVersion = FWP_IP_VERSION_V4;
         ev_other.header.Anonymous2.remoteAddrV4 = ipv4_to_wfp_host_u32(Ipv4Addr::new(8, 8, 8, 8));
 
+        // (4) Owned drop with `flags = 0` and bogus dangling `appId.data` -> must NOT dereference `appId`!
+        let mut drop_unflagged = FWPM_NET_EVENT_CLASSIFY_DROP2 {
+            filterId: 701,
+            ..Default::default()
+        };
+        let mut ev_unflagged = FWPM_NET_EVENT5 {
+            r#type: FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+            ..Default::default()
+        };
+        ev_unflagged.Anonymous.classifyDrop = &mut drop_unflagged;
+        ev_unflagged.header.flags = 0;
+        ev_unflagged.header.appId = FWP_BYTE_BLOB {
+            size: 64,
+            data: core::ptr::dangling_mut::<u8>(),
+        };
+
         unsafe {
             win_impl::wfp_net_event_callback_v4(ctx_ptr, &ev_v4);
             win_impl::wfp_net_event_callback_v4(ctx_ptr, &ev_v6);
             win_impl::wfp_net_event_callback_v4(ctx_ptr, &ev_other);
+            win_impl::wfp_net_event_callback_v4(ctx_ptr, &ev_unflagged);
         }
 
+        assert!(is_wsl_virtual_adapter_name(
+            "Hyper-V Virtual Ethernet Adapter",
+            "vEthernet (WSL (Hyper-V firewall))"
+        ));
+        assert!(!is_wsl_virtual_adapter_name(
+            "Realtek PCIe GbE Family Controller",
+            "Ethernet"
+        ));
+
         let (total, events) = store.snapshot_events();
-        assert_eq!(total, 2);
-        assert_eq!(events.len(), 2);
+        assert_eq!(total, 3);
+        assert_eq!(events.len(), 3);
+        assert!(events[2].app_path.is_empty());
+        assert_eq!(events[2].remote_port, 0);
 
         assert_eq!(events[0].seq, 1);
         assert_eq!(events[0].agent_id, "claude");

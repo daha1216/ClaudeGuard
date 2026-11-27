@@ -52,9 +52,14 @@ pub fn protect_bytes(plaintext: &[u8], scope: DpapiScope) -> PlatformResult<Vec<
             plaintext.len()
         )));
     }
+    let mut empty_sentinel: u8 = 0;
     let input = CRYPT_INTEGER_BLOB {
         cbData: plaintext.len() as u32,
-        pbData: plaintext.as_ptr().cast_mut(),
+        pbData: if plaintext.is_empty() {
+            &mut empty_sentinel
+        } else {
+            plaintext.as_ptr().cast_mut()
+        },
     };
     let mut output = CRYPT_INTEGER_BLOB::default();
     let flags = CRYPTPROTECT_UI_FORBIDDEN
@@ -668,6 +673,13 @@ mod tests {
             .expect("DPAPI CurrentUser encryption should succeed");
         let dec = unprotect_str_base64(&enc).expect("DPAPI decryption should succeed");
         assert_eq!(dec, secret);
+
+        // Empty slice must use null pbData cleanly without dangling pointer UB.
+        for scope in [DpapiScope::CurrentUser, DpapiScope::LocalMachine] {
+            let empty_enc = protect_bytes(&[], scope).expect("DPAPI empty slice protect");
+            let empty_dec = unprotect_bytes(&empty_enc).expect("DPAPI empty slice unprotect");
+            assert!(empty_dec.is_empty());
+        }
 
         // Oversized input must fail cleanly.
         let huge = vec![b'a'; MAX_SECRET_BYTES + 1];

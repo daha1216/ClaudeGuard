@@ -255,8 +255,12 @@ pub fn evaluate_wsl_request(
     }
 
     let snap = coordinator.snapshot();
-    // Detect WSL2 proxy desync: host uses SystemProxy (non-TUN) while WSL2 reports empty proxy env.
-    if snap.access.level == AccessLevel::SystemProxy
+    // Detect WSL2 proxy desync ONLY when Armed and not paused: host uses SystemProxy (non-TUN)
+    // while WSL2 reports empty proxy env. Honors `monitor_only` (`Warn` instead of hard `Block`).
+    let armed_and_active =
+        snap.lifecycle == cg_protocol::Lifecycle::Armed && !snap.is_paused_at(now_secs);
+    if armed_and_active
+        && snap.access.level == AccessLevel::SystemProxy
         && req
             .wsl_proxy_env
             .as_deref()
@@ -264,20 +268,31 @@ pub fn evaluate_wsl_request(
     {
         coordinator.set_wsl_proxy_desync(true);
         let port = snap.config.proxy_port;
+        let msg = format!(
+            "🛡️ [ClaudeGuard v5 WSL2 防裸连提醒] 宿主机处于系统代理模式（非全局 TUN），但 WSL2 终端内未配置 HTTPS_PROXY！请先执行 `export HTTPS_PROXY=http://127.0.0.1:{port}`（Mirrored 模式）或指向宿主机网卡 IP `http://<HostIP>:{port}` 后重试。"
+        );
+        if snap.config.monitor_only {
+            return WslGateResponse {
+                allowed: true,
+                decision: HookDecision::Allow,
+                safety_score: snap.risk_assessment.score,
+                reason: msg,
+                latency_path: "wsl_proxy_desync_warn".into(),
+            };
+        }
         return WslGateResponse {
             allowed: false,
             decision: HookDecision::Block,
             safety_score: snap.risk_assessment.score,
-            reason: format!(
-                "🛡️ [ClaudeGuard v5 WSL2 防裸连拦截] 宿主机处于系统代理模式（非全局 TUN），但 WSL2 终端内未配置 HTTPS_PROXY！请先执行 `export HTTPS_PROXY=http://127.0.0.1:{port}` 后重试。"
-            ),
+            reason: msg,
             latency_path: "wsl_proxy_desync".into(),
         };
     }
-    if req
-        .wsl_proxy_env
-        .as_deref()
-        .is_some_and(|v| !v.trim().is_empty())
+    if !armed_and_active
+        || req
+            .wsl_proxy_env
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
         || snap.access.level == AccessLevel::Tun
     {
         coordinator.set_wsl_proxy_desync(false);
@@ -362,11 +377,14 @@ impl WslBridgeServer {
 
         let stop = Arc::new(AtomicBool::new(false));
         let replay_cache = Arc::new(Mutex::new(NonceReplayCache::new(NONCE_CACHE_CAPACITY)));
+        let active_workers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        const MAX_WSL_BRIDGE_WORKERS: usize = 8;
 
         let t_stop = stop.clone();
-        let t_secret = secret_hex.clone();
+        let t_secret = Arc::<str>::from(secret_hex.as_str());
         let t_cache = replay_cache.clone();
         let t_coord = coordinator;
+        let t_workers = active_workers;
 
         let handle = std::thread::Builder::new()
             .name("cg-wsl-bridge".to_string())
@@ -378,7 +396,36 @@ impl WslBridgeServer {
                                 let _ = stream.shutdown(std::net::Shutdown::Both);
                                 continue;
                             }
-                            handle_client_stream(stream, &t_secret, &t_cache, &t_coord);
+                            // Winsock `accept()` inherits non-blocking (`FIONBIO`) from `listener`;
+                            // restore blocking mode before bounded-timeout reads/writes!
+                            let _ = stream.set_nonblocking(false);
+
+                            let prev = t_workers.fetch_add(1, Ordering::AcqRel);
+                            if prev >= MAX_WSL_BRIDGE_WORKERS {
+                                t_workers.fetch_sub(1, Ordering::AcqRel);
+                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                                continue;
+                            }
+                            let w_secret = t_secret.clone();
+                            let w_cache = t_cache.clone();
+                            let w_coord = t_coord.clone();
+                            let w_counter = t_workers.clone();
+                            if std::thread::Builder::new()
+                                .name("cg-wsl-gate-conn".to_string())
+                                .spawn(move || {
+                                    struct WorkerSlotGuard(Arc<std::sync::atomic::AtomicUsize>);
+                                    impl Drop for WorkerSlotGuard {
+                                        fn drop(&mut self) {
+                                            self.0.fetch_sub(1, Ordering::AcqRel);
+                                        }
+                                    }
+                                    let _slot = WorkerSlotGuard(w_counter);
+                                    handle_client_stream(stream, &w_secret, &w_cache, &w_coord);
+                                })
+                                .is_err()
+                            {
+                                t_workers.fetch_sub(1, Ordering::AcqRel);
+                            }
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(15));
@@ -475,8 +522,9 @@ fn handle_client_stream(
     replay_cache: &Mutex<NonceReplayCache>,
     coordinator: &CoordinatorHandle,
 ) {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(1500)));
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
 
     let mut line = String::new();
     let read_res = {
@@ -542,6 +590,112 @@ pub fn write_wsl_token_file(path: &Path, token: &WslTokenFile) -> Result<(), Str
     Ok(())
 }
 
+/// Resolves the interactive user SID (`S-1-5-21-*` or Entra ID `S-1-12-1-*`) owning `target_path`
+/// even at OS boot in Session 0 before any user has logged into a desktop session (`ProfileList` +
+/// NTFS owner SID fallback + `active_interactive_user_sid`).
+#[cfg(windows)]
+pub(crate) fn resolve_user_sid_for_path(target_path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::{LocalFree, HLOCAL, NO_ERROR};
+    use windows::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    let norm_target = target_path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+
+    // 1. Deterministic `ProfileList` lookup matching `<ProfileImagePath>` prefix (works pre-logon at boot!).
+    if let Ok(profile_list) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList",
+        KEY_READ,
+    ) {
+        for sid in profile_list.enum_keys().flatten() {
+            if !cg_platform::access_win::is_interactive_user_sid(&sid) {
+                continue;
+            }
+            let Ok(sub) = profile_list.open_subkey_with_flags(&sid, KEY_READ) else {
+                continue;
+            };
+            let Ok(raw_img) = sub.get_value::<String, _>("ProfileImagePath") else {
+                continue;
+            };
+            let clean_img = raw_img
+                .trim()
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_ascii_lowercase();
+            if !clean_img.is_empty()
+                && (norm_target == clean_img
+                    || norm_target
+                        .strip_prefix(&clean_img)
+                        .is_some_and(|rest| rest.starts_with('\\')))
+            {
+                return Some(sid.trim().to_string());
+            }
+        }
+    }
+
+    // 2. Inspect NTFS owner SID on parent directory if owned by an interactive user.
+    if let Some(parent) = target_path.parent() {
+        let p_w: Vec<u16> = parent
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut owner_sid = PSID::default();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(p_w.as_ptr()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(&mut owner_sid),
+                None,
+                None,
+                None,
+                &mut sd,
+            )
+        };
+        if rc == NO_ERROR && !sd.0.is_null() {
+            struct SdFreeGuard(PSECURITY_DESCRIPTOR);
+            impl Drop for SdFreeGuard {
+                fn drop(&mut self) {
+                    if !self.0 .0.is_null() {
+                        unsafe {
+                            let _ = LocalFree(HLOCAL(self.0 .0));
+                        }
+                    }
+                }
+            }
+            let _sd_guard = SdFreeGuard(sd);
+            if !owner_sid.is_invalid() {
+                let mut pw = PWSTR::null();
+                if unsafe { ConvertSidToStringSidW(owner_sid, &mut pw) }.is_ok() && !pw.is_null() {
+                    let s = unsafe { pw.to_string().ok() };
+                    unsafe {
+                        let _ = LocalFree(HLOCAL(pw.0.cast()));
+                    }
+                    if let Some(sid) = s {
+                        if cg_platform::access_win::is_interactive_user_sid(&sid) {
+                            return Some(sid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Fallback to currently active WTS interactive console/RDP user SID.
+    cg_platform::access_win::active_interactive_user_sid()
+        .filter(|sid| cg_platform::access_win::is_interactive_user_sid(sid))
+}
+
 #[cfg(windows)]
 fn apply_user_only_token_dacl(path: &Path) -> Result<(), String> {
     use std::ffi::OsStr;
@@ -568,8 +722,8 @@ fn apply_user_only_token_dacl(path: &Path) -> Result<(), String> {
         }
     }
 
-    let sddl = match cg_platform::access_win::active_interactive_user_sid() {
-        Some(sid) if sid.starts_with("S-1-5-21-") => {
+    let sddl = match resolve_user_sid_for_path(path) {
+        Some(sid) if cg_platform::access_win::is_interactive_user_sid(&sid) => {
             format!("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;{sid})")
         }
         _ => "D:P(A;;FA;;;SY)(A;;FA;;;BA)".to_string(),
@@ -698,12 +852,43 @@ if __name__ == '__main__':\n\
     )
 }
 
+/// Validates a WSL2 distribution identifier (`1..=64` ASCII `[A-Za-z0-9._-]`, no `.` / `..` / path separators),
+/// blocking UNC/SMB path-traversal injection via `HKCU\...\Lxss\*\DistributionName`.
+pub fn is_valid_wsl_distro_name(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64 {
+        return false;
+    }
+    if raw == "." || raw == ".." || raw.contains("..") {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'.' | b'_' | b'-'))
+}
+
+fn atomic_write_wsl_file(parent_dir: &Path, target: &Path, bytes: &[u8]) -> Result<(), String> {
+    vault_win::ensure_no_reparse_points_chain(target)?;
+    let mut tmp = NamedTempFile::new_in(parent_dir)
+        .map_err(|e| format!("创建 WSL2 临时文件失败（{}）：{e}", parent_dir.display()))?;
+    tmp.write_all(bytes)
+        .map_err(|e| format!("写入 WSL2 临时文件失败：{e}"))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("同步 WSL2 临时文件失败：{e}"))?;
+    // `rename` replaces any 9p Linux symlink inode at `target` rather than following it!
+    tmp.persist(target)
+        .map_err(|e| format!("原子替换 WSL2 文件 {} 失败：{}", target.display(), e.error))?;
+    Ok(())
+}
+
 /// Deploys `~/.local/bin/claudeguard-wsl-gate` (LF newlines) and safely updates `.claude/settings.json`
 /// inside an explicit Linux home directory (testable without live WSL).
 ///
 /// Uses explicit `python3 "$HOME/.local/bin/claudeguard-wsl-gate"` invocation so the hook executes
 /// reliably over `\\wsl.localhost` Plan9 (`9p`) mounts where Windows-created files lack `+x` bits,
-/// checks reparse points, saves `.cg-bak` before modifying `settings.json`, and propagates errors.
+/// checks reparse points, saves `.cg-bak` before modifying `settings.json`, and writes atomically
+/// via sibling temp rename so Linux symlinks on `9p` are never followed.
 pub fn sync_wsl_distro_home(linux_home: &Path, win_token_path: &Path) -> Result<PathBuf, String> {
     vault_win::ensure_no_reparse_points_chain(linux_home)?;
     let bin_dir = linux_home.join(".local").join("bin");
@@ -712,8 +897,7 @@ pub fn sync_wsl_distro_home(linux_home: &Path, win_token_path: &Path) -> Result<
     vault_win::ensure_no_reparse_points_chain(&shim_path)?;
     let wsl_token_mnt = windows_path_to_wsl_mnt_path(win_token_path);
     let script = render_wsl_gate_shim(&wsl_token_mnt);
-    std::fs::write(&shim_path, script.as_bytes())
-        .map_err(|e| format!("写入 WSL2 门禁探针失败（{}）：{e}", shim_path.display()))?;
+    atomic_write_wsl_file(&bin_dir, &shim_path, script.as_bytes())?;
 
     // Merge hook into WSL2 `~/.claude/settings.json` invoking via `python3` (9p safe without chmod +x).
     let settings_dir = linux_home.join(".claude");
@@ -737,9 +921,7 @@ pub fn sync_wsl_distro_home(linux_home: &Path, win_token_path: &Path) -> Result<
             return Err("WSL2 settings.json 根节点不是 JSON 对象，已中止写入".into());
         }
         let bak_path = settings_dir.join("settings.json.cg-bak");
-        vault_win::ensure_no_reparse_points_chain(&bak_path)?;
-        std::fs::write(&bak_path, &raw_bytes)
-            .map_err(|e| format!("创建 WSL2 settings.json.cg-bak 备份失败：{e}"))?;
+        atomic_write_wsl_file(&settings_dir, &bak_path, &raw_bytes)?;
         parsed
     } else {
         serde_json::Value::Object(serde_json::Map::new())
@@ -775,7 +957,7 @@ pub fn sync_wsl_distro_home(linux_home: &Path, win_token_path: &Path) -> Result<
                         {
                             "type": "command",
                             "command": "python3 \"$HOME/.local/bin/claudeguard-wsl-gate\" --agent claude-code",
-                            "timeout": 5
+                            "timeout": 8
                         }
                     ]
                 }));
@@ -785,12 +967,8 @@ pub fn sync_wsl_distro_home(linux_home: &Path, win_token_path: &Path) -> Result<
 
     let text = serde_json::to_string_pretty(&root)
         .map_err(|e| format!("序列化 WSL2 settings.json 失败：{e}"))?;
-    std::fs::write(&settings_path, format!("{text}\n")).map_err(|e| {
-        format!(
-            "写入 WSL2 settings.json 失败（{}）：{e}",
-            settings_path.display()
-        )
-    })?;
+    let payload = format!("{text}\n");
+    atomic_write_wsl_file(&settings_dir, &settings_path, payload.as_bytes())?;
     Ok(shim_path)
 }
 
@@ -810,7 +988,7 @@ pub fn discover_wsl_distro_names() -> Vec<String> {
         };
         if let Ok(name) = distro_key.get_value::<String, _>("DistributionName") {
             let trimmed = name.trim().to_string();
-            if !trimmed.is_empty() && !out.contains(&trimmed) {
+            if is_valid_wsl_distro_name(&trimmed) && !out.contains(&trimmed) {
                 out.push(trimmed);
             }
         }
@@ -835,10 +1013,27 @@ pub fn sync_wsl_distros(
         .map(|h| h.join(WSL_TOKEN_FILE))
         .unwrap_or_else(|| PathBuf::from(r"C:\Users\User").join(WSL_TOKEN_FILE));
 
+    #[cfg(windows)]
+    if win_token_path.is_file()
+        && (cg_platform::access_win::is_session_zero()
+            || cg_platform::access_win::is_elevated().unwrap_or(false))
+    {
+        let _ = apply_user_only_token_dacl(&win_token_path);
+    }
+
+    // When running in Session 0 (`LocalSystem`), `\\wsl.localhost\<distro>` (`P9Rdr`) is scoped
+    // to the interactive user's logon session; impersonate the active desktop user while syncing!
+    let _imp_guard =
+        cg_platform::access_win::ImpersonateInteractiveUserGuard::impersonate_if_session_zero()
+            .ok();
+
     let distros = discover_wsl_distro_names();
     let mut synced = Vec::new();
 
     for distro in &distros {
+        if !is_valid_wsl_distro_name(distro) {
+            continue;
+        }
         let home_root = PathBuf::from(format!(r"\\wsl.localhost\{distro}\home"));
         let Ok(entries) = std::fs::read_dir(&home_root) else {
             continue;

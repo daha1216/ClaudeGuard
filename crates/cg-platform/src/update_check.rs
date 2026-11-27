@@ -493,7 +493,7 @@ fn percent_decode_utf8(input: &str) -> String {
 fn build_update_agent(
     route: &ProbeRoute,
     timeout: Duration,
-    redirects: u32,
+    _redirects: u32,
 ) -> PlatformResult<ureq::Agent> {
     let connect_timeout = timeout.min(Duration::from_secs(5));
     match route {
@@ -507,7 +507,7 @@ fn build_update_agent(
                 .timeout_connect(connect_timeout)
                 .timeout_read(timeout)
                 .timeout(timeout)
-                .redirects(redirects)
+                .redirects(0)
                 .try_proxy_from_env(false)
                 .user_agent(PROBE_USER_AGENT)
                 .proxy(proxy)
@@ -518,11 +518,65 @@ fn build_update_agent(
             .timeout_connect(connect_timeout)
             .timeout_read(timeout)
             .timeout(timeout)
-            .redirects(redirects)
+            .redirects(0)
             .try_proxy_from_env(false)
             .user_agent(PROBE_USER_AGENT)
             .build()),
     }
+}
+
+/// Executes an HTTP GET for update checks with `.redirects(0)` and manual per-hop SSRF + HTTPS
+/// downgrade validation (`resolve_and_validate_probe_redirect`).
+#[allow(clippy::result_large_err)]
+fn get_update_url_with_safe_redirects(
+    agent: &ureq::Agent,
+    route: &ProbeRoute,
+    url: &str,
+    accept: Option<&str>,
+    timeout: Duration,
+) -> Result<ureq::Response, Result<ureq::Response, PlatformError>> {
+    let mut current_url = url.to_string();
+    for hop in 0..=MAX_PROBE_REDIRECTS {
+        let mut req = agent
+            .get(&current_url)
+            .timeout(timeout)
+            .set("User-Agent", PROBE_USER_AGENT);
+        if let Some(acc) = accept {
+            req = req.set("Accept", acc);
+        }
+        let resp = match req.call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(_, err_resp)) => return Err(Ok(err_resp)),
+            Err(err) => return Err(Err(map_transport_err(route, err))),
+        };
+        if matches!(resp.status(), 301 | 302 | 303 | 307 | 308) {
+            if hop == MAX_PROBE_REDIRECTS {
+                return Err(Err(PlatformError::Network(
+                    "更新源重定向次数超过安全上限".to_string(),
+                )));
+            }
+            let Some(loc) = resp
+                .header("Location")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err(Err(PlatformError::Network(
+                    "更新源重定向响应缺少 Location 头".to_string(),
+                )));
+            };
+            match crate::probe_http::resolve_and_validate_probe_redirect(&current_url, loc) {
+                Ok(next) => {
+                    current_url = next;
+                    continue;
+                }
+                Err(redirect_err) => return Err(Err(redirect_err)),
+            }
+        }
+        return Ok(resp);
+    }
+    Err(Err(PlatformError::Network(
+        "更新源重定向次数超过安全上限".to_string(),
+    )))
 }
 
 fn map_transport_err(route: &ProbeRoute, err: ureq::Error) -> PlatformError {
@@ -769,13 +823,13 @@ fn fetch_github_latest_via_web_redirect_base(
     if !preferred_exts.is_empty() {
         let expanded_url = format!("{base}/{trimmed}/releases/expanded_assets/{tag}");
         if let Ok(agent) = build_update_agent(route, timeout, MAX_PROBE_REDIRECTS) {
-            if let Ok(exp_resp) = agent
-                .get(&expanded_url)
-                .timeout(timeout)
-                .set("User-Agent", PROBE_USER_AGENT)
-                .set("Accept", "text/html,*/*;q=0.8")
-                .call()
-            {
+            if let Ok(exp_resp) = get_update_url_with_safe_redirects(
+                &agent,
+                route,
+                &expanded_url,
+                Some("text/html,*/*;q=0.8"),
+                timeout,
+            ) {
                 if let Ok(frag) = read_response_body(route, exp_resp) {
                     let (a_url, pub_at) =
                         parse_github_expanded_assets_html(&frag, trimmed, preferred_exts);
@@ -825,24 +879,26 @@ pub fn fetch_github_latest_from_url(
 ) -> PlatformResult<GithubReleaseInfo> {
     let agent = build_update_agent(route, timeout, MAX_PROBE_REDIRECTS)?;
 
-    let call = agent
-        .get(api_url)
-        .timeout(timeout)
-        .set("User-Agent", PROBE_USER_AGENT)
-        .set("Accept", "application/vnd.github+json")
-        .call();
-
-    match call {
+    match get_update_url_with_safe_redirects(
+        &agent,
+        route,
+        api_url,
+        Some("application/vnd.github+json"),
+        timeout,
+    ) {
         Ok(resp) => {
             let body = read_response_body(route, resp)?;
             parse_github_latest_release(&body, preferred_exts)
         }
-        Err(ureq::Error::Status(status, resp)) => Err(map_github_api_status_err(
-            status,
-            resp,
-            "GitHub API 请求失败",
-        )),
-        Err(err) => Err(map_transport_err(route, err)),
+        Err(Ok(resp)) => {
+            let status = resp.status();
+            Err(map_github_api_status_err(
+                status,
+                resp,
+                "GitHub API 请求失败",
+            ))
+        }
+        Err(Err(err)) => Err(err),
     }
 }
 
@@ -1030,16 +1086,13 @@ pub fn fetch_github_latest_release_or_commit(
     // Zero-rate-limit Atom feed first: `https://github.com/{repo}/commits.atom`
     let atom_url = format!("https://github.com/{trimmed}/commits.atom");
     let agent = build_update_agent(route, timeout, MAX_PROBE_REDIRECTS)?;
-    if let Ok(atom_resp) = agent
-        .get(&atom_url)
-        .timeout(timeout)
-        .set("User-Agent", PROBE_USER_AGENT)
-        .set(
-            "Accept",
-            "application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
-        )
-        .call()
-    {
+    if let Ok(atom_resp) = get_update_url_with_safe_redirects(
+        &agent,
+        route,
+        &atom_url,
+        Some("application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8"),
+        timeout,
+    ) {
         if let Ok(xml_body) = read_response_body(route, atom_resp) {
             if let Ok(info) = parse_github_commits_atom(&xml_body, trimmed) {
                 return Ok(remote_from_github_release(info, trimmed));
@@ -1049,22 +1102,23 @@ pub fn fetch_github_latest_release_or_commit(
 
     // Fallback: GitHub REST API `/commits?per_page=1` with 403/429 rate-limit mapping
     let commits_url = format!("https://api.github.com/repos/{trimmed}/commits?per_page=1");
-    let resp = match agent
-        .get(&commits_url)
-        .timeout(timeout)
-        .set("User-Agent", PROBE_USER_AGENT)
-        .set("Accept", "application/vnd.github+json")
-        .call()
-    {
+    let resp = match get_update_url_with_safe_redirects(
+        &agent,
+        route,
+        &commits_url,
+        Some("application/vnd.github+json"),
+        timeout,
+    ) {
         Ok(r) => r,
-        Err(ureq::Error::Status(code, err_resp)) => {
+        Err(Ok(err_resp)) => {
+            let code = err_resp.status();
             return Err(map_github_api_status_err(
                 code,
                 err_resp,
                 "GitHub 仓库提交查询失败",
             ));
         }
-        Err(err) => return Err(map_transport_err(route, err)),
+        Err(Err(err)) => return Err(err),
     };
     let body = read_response_body(route, resp)?;
     let info = parse_github_latest_commit(&body, trimmed)?;
@@ -1182,13 +1236,13 @@ pub fn fetch_claude_desktop_latest(
 
     let releases_url = format!("https://downloads.claude.ai/releases/win32/{arch}/RELEASES");
     if let Ok(rel_agent) = build_update_agent(route, timeout, MAX_PROBE_REDIRECTS) {
-        if let Ok(resp) = rel_agent
-            .get(&releases_url)
-            .timeout(timeout)
-            .set("User-Agent", PROBE_USER_AGENT)
-            .set("Accept", "text/plain,*/*;q=0.8")
-            .call()
-        {
+        if let Ok(resp) = get_update_url_with_safe_redirects(
+            &rel_agent,
+            route,
+            &releases_url,
+            Some("text/plain,*/*;q=0.8"),
+            timeout,
+        ) {
             if let Ok(body) = read_response_body(route, resp) {
                 if let Ok(parsed) = parse_claude_squirrel_releases(&body, arch) {
                     return Ok(parsed);
@@ -1334,12 +1388,13 @@ pub fn fetch_codex_desktop_latest(
 
     // 3. Fallback: Homebrew cask JSON (`https://formulae.brew.sh/api/cask/chatgpt.json`)
     if let Ok(cask_agent) = build_update_agent(route, timeout, MAX_PROBE_REDIRECTS) {
-        if let Ok(resp) = cask_agent
-            .get("https://formulae.brew.sh/api/cask/chatgpt.json")
-            .timeout(timeout)
-            .set("Accept", "application/json")
-            .call()
-        {
+        if let Ok(resp) = get_update_url_with_safe_redirects(
+            &cask_agent,
+            route,
+            "https://formulae.brew.sh/api/cask/chatgpt.json",
+            Some("application/json"),
+            timeout,
+        ) {
             if let Ok(body) = read_response_body(route, resp) {
                 if let Ok(res) = parse_homebrew_chatgpt_cask(&body) {
                     return Ok(res);
@@ -1384,14 +1439,15 @@ pub fn fetch_npm_latest_from_url(
     timeout: Duration,
 ) -> PlatformResult<RemoteClientVersion> {
     let agent = build_update_agent(route, timeout, MAX_PROBE_REDIRECTS)?;
-    let resp = match agent.get(url).timeout(timeout).call() {
+    let resp = match get_update_url_with_safe_redirects(&agent, route, url, None, timeout) {
         Ok(r) => r,
-        Err(ureq::Error::Status(code, _)) => {
+        Err(Ok(err_resp)) => {
             return Err(PlatformError::Network(format!(
-                "npm 官方仓库请求失败（HTTP {code}）"
+                "npm 官方仓库请求失败（HTTP {}）",
+                err_resp.status()
             )));
         }
-        Err(err) => return Err(map_transport_err(route, err)),
+        Err(Err(err)) => return Err(err),
     };
     let body = read_response_body(route, resp)?;
     parse_npm_latest_version(&body, pkg_name)
@@ -1463,14 +1519,15 @@ fn fetch_antigravity_ide_from_base(
 ) -> PlatformResult<RemoteClientVersion> {
     let url = format!("{base}/latest-{arch_seg}-win.yml");
     let agent = build_update_agent(route, timeout, MAX_PROBE_REDIRECTS)?;
-    let resp = match agent.get(&url).timeout(timeout).call() {
+    let resp = match get_update_url_with_safe_redirects(&agent, route, &url, None, timeout) {
         Ok(r) => r,
-        Err(ureq::Error::Status(code, _)) => {
+        Err(Ok(err_resp)) => {
             return Err(PlatformError::Network(format!(
-                "Antigravity 官方更新源请求失败（HTTP {code}）"
+                "Antigravity 官方更新源请求失败（HTTP {}）",
+                err_resp.status()
             )));
         }
-        Err(err) => return Err(map_transport_err(route, err)),
+        Err(Err(err)) => return Err(err),
     };
     let body = read_response_body(route, resp)?;
     parse_antigravity_yaml_latest(&body, base)

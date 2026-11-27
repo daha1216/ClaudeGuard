@@ -58,6 +58,18 @@
   - 通过托盘隐藏窗口原生 `RegisterHotKey` 注册全局「紧急一键锁死」与「快捷 HUD」热键（零 `SetWindowsHookEx` 钩子、退出自动注销、冲突优雅提示）。
   - 新增零外部依赖纯 Rust 脱敏健康卡（Markdown 文本 + `1200×680` Frost Ceramic / Obsidian 无元数据 PNG 导出），单元测试强约束零 IP、零 Windows 用户名泄露。
 
+### 深度安全加固、零误锁网络门禁与全栈交互精修
+
+- **内核 WFP 与 Session-0 特权边界加固（`wfp_win` / `antigravity_proxy_win` / `cleanroom_win` / `wsl_bridge` / `cg-v3-bridge`）**：
+  - 打通每应用 WFP 隧道分流放行策略（`sync_wfp_tunnel_only`），豁免已核验 TUN 网卡 LUID、本地回环 QUIC、ULA Fake-IP（`fc00::/7`）与 WSL2 虚拟网卡，并在撤防及卸载停服后幂等清零全部动态/持久过滤规则；动态加载 `FwpmNetEventSubscribe4` 兼容 Win10 1809 LTSC。
+  - 移除 `version.dll` 过宽用户写权限并强化缓存 SHA-256 校验，对数据目录、无尘室备份与升级暂存目录强制施加 `SY+BA` 受保护 DACL 及句柄读锁；补齐 Session-0 服务态交互用户目录解析、Windows 凭据管理器模拟登录（`ImpersonateInteractiveUserGuard`）、WSL2 令牌开机前 SID 赋权与 OneDrive `$PROFILE` 标准输入管道透传。
+- **零误判风险门禁、独立端口金库与全量脱敏闭环（`stun_probe` / `ip_intel` / `risk_scorer` / `engine_runtime` / `redact` / `diagnostics`）**：
+  - 严格限定仅在 `TUN` 模式下执行守护进程原始 UDP STUN 探测，消除 `SystemProxy` 用户误锁、Clash 规则分流下 EDNS/Tier-3 归属地污染、Null Island `(0,0)` 缺省坐标引发的同国瞬移误锁及合规跨国 IPv6 双栈误否决；拆分 `--hook-gate` 连接与同步重探超时（`500ms` / `6500ms`）消除冷启动假阻断。
+  - 支持多账号金库 `dedicated_proxy_port` 独立端口出口探测与缓存、完整 `GuardEngine` 启动门禁校验、句柄绑定进程身份终止及重 I/O 管道请求异步线程卸载；补齐 `mask_snapshot` 与诊断压缩包对全部 v5 新增字段的零泄露脱敏。
+- **GPUI 全闭环交互升级与「说人话」体验重塑（`cg-gui`）**：
+  - 升级 `1020×720` 宽屏 7 核心导航坞 + 顶栏工具胶囊，安全启动台与多账号仓完整覆盖 7 GUI + 4 CLI（对齐 Electron 防漏参数注入、豁免原生 `Zed.exe` 并通过交互式终端启动 `.cmd`/`.ps1` CLI，配置新增 6 款客户端专属徽标）。
+  - 10 维体检分、总览提示条与账号仓支持原地一键修复与冷却秒解，快捷 HUD 与系统托盘右键菜单支持多账号仓一键切换启动；修复无尘室末项取消反选与逐项还原加载态，全面落地零术语中文界面文案。
+
 ## [4.1.4] - 2026-11-27
 
 **TUN 重启零误锁自愈与反重力代理自动补注入完善版**：彻底根治 Windows 重启/关机竞态下 TUN 先退引发的误熔断、开机早于防火墙就绪导致的 `Degraded` 卡死无恢复路径（#25，感谢 @HL-slc 详尽复现分析），合入并完善社区反重力代理 ZIP 选包与客户端自更新后自动补注入机制（#26，感谢 @bkMoon1024 贡献 PR）。

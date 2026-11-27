@@ -302,6 +302,71 @@ pub fn mask_snapshot(snapshot: &GuardSnapshot) -> GuardSnapshot {
         trip.observed_summary = mask_text_ips(&trip.observed_summary);
     }
     out.launch_error = mask_text_ips(&out.launch_error);
+    out.last_error = mask_text_ips(&out.last_error);
+
+    // v5: 10D Risk Assessment, IP Purity, STUN Leak, DNS Coherence & Electron Hygiene
+    if let Some(ip) = out.risk_assessment.ip_purity.ip.as_deref() {
+        out.risk_assessment.ip_purity.ip = Some(mask_ip(ip));
+    }
+    out.risk_assessment.ip_purity.asn_org = mask_text_ips(&out.risk_assessment.ip_purity.asn_org);
+    if let Some(ip) = out.risk_assessment.stun_leak.reflexive_ip.as_deref() {
+        out.risk_assessment.stun_leak.reflexive_ip = Some(mask_ip(ip));
+    }
+    out.risk_assessment.stun_leak.summary = mask_text_ips(&out.risk_assessment.stun_leak.summary);
+    out.risk_assessment.dns_coherence.summary =
+        mask_text_ips(&out.risk_assessment.dns_coherence.summary);
+    out.risk_assessment.electron_hygiene.summary =
+        mask_text_ips(&out.risk_assessment.electron_hygiene.summary);
+    out.risk_assessment.headline = mask_text_ips(&out.risk_assessment.headline);
+    for dim in &mut out.risk_assessment.dimensions {
+        dim.detail = mask_text_ips(&dim.detail);
+        if let Some(rem) = dim.remediation_action.as_deref() {
+            dim.remediation_action = Some(mask_text_ips(rem));
+        }
+    }
+    out.risk_assessment.recommendations = out
+        .risk_assessment
+        .recommendations
+        .iter()
+        .map(|rec| mask_text_ips(rec))
+        .collect();
+
+    // v5: Kernel WFP blocked packet events & error detail
+    out.wfp.last_error = mask_text_ips(&out.wfp.last_error);
+    for ev in &mut out.wfp.recent_blocked {
+        ev.remote_ip = mask_ip(&ev.remote_ip);
+    }
+
+    // v5: Sovereign Account Vault config allowlists & runtime status
+    for vault_cfg in &mut out.config.vaults {
+        vault_cfg.pinned_ips = vault_cfg
+            .pinned_ips
+            .iter()
+            .map(|ip| mask_text_ips(ip))
+            .collect();
+    }
+    for vault_rt in &mut out.vaults {
+        if let Some(ip) = vault_rt.last_ip_masked.as_deref() {
+            vault_rt.last_ip_masked = Some(mask_ip(ip));
+        }
+        vault_rt.summary = mask_text_ips(&vault_rt.summary);
+    }
+
+    // v5: Clean-Room anti-correlation scan report
+    if let Some(report) = &mut out.last_cleanroom_report {
+        report.summary = mask_text_ips(&report.summary);
+        report.preserved_assets_summary = report
+            .preserved_assets_summary
+            .iter()
+            .map(|s| mask_text_ips(s))
+            .collect();
+        for finding in &mut report.findings {
+            finding.location_display = mask_text_ips(&finding.location_display);
+            finding.masked_preview = mask_text_ips(&finding.masked_preview);
+            finding.preservation_note = mask_text_ips(&finding.preservation_note);
+        }
+    }
+
     for toast in &mut out.recent_toasts {
         toast.title = mask_text_ips(&toast.title);
         toast.body = mask_text_ips(&toast.body);
@@ -509,5 +574,135 @@ mod tests {
         assert_eq!(masked.targets[0].reason, "出口 203.0.*.* 不在白名单");
         assert_eq!(masked.config.targets[1].expect_ips, vec!["198.51.*.*"]);
         assert_eq!(masked.leak.direct[0].remote, "203.0.*.*");
+    }
+
+    #[test]
+    fn mask_snapshot_scrubs_all_v5_telemetry_vault_wfp_cleanroom_and_last_error_fields() {
+        let mut snap = GuardSnapshot {
+            last_error: "上游探测 198.51.100.42 超时".into(),
+            ..GuardSnapshot::default()
+        };
+        snap.risk_assessment.ip_purity.ip = Some("198.51.100.42".into());
+        snap.risk_assessment.ip_purity.asn_org = "ISP 198.51.100.42".into();
+        snap.risk_assessment.stun_leak.reflexive_ip = Some("203.0.113.88".into());
+        snap.risk_assessment.stun_leak.summary = "STUN 反射公网 203.0.113.88 泄露".into();
+        snap.risk_assessment.dns_coherence.summary = "DNS 递归节点 114.114.114.114".into();
+        snap.risk_assessment.electron_hygiene.summary = "直连 203.0.113.88 风险".into();
+        snap.risk_assessment.headline = "F 级 · STUN 暴露 203.0.113.88".into();
+        snap.risk_assessment
+            .dimensions
+            .push(cg_protocol::RiskDimensionItem {
+                id: "webrtc_stun_exposure".into(),
+                name: "STUN".into(),
+                max_score: 2,
+                score: 0,
+                healthy: false,
+                detail: "检测到 203.0.113.88 与代理 198.51.100.42 不一致".into(),
+                remediation_action: Some("封堵 203.0.113.88 直连".into()),
+            });
+        snap.risk_assessment
+            .recommendations
+            .push("请勿直连 203.0.113.88".into());
+
+        snap.wfp.last_error = "WFP 拦截直连 203.0.113.99 异常".into();
+        snap.wfp.recent_blocked.push(cg_protocol::WfpBlockedEvent {
+            seq: 1,
+            timestamp_ms: 1_700_000_000_000,
+            pid: Some(4242),
+            agent_id: "claude".into(),
+            app_path: r"C:\Apps\Claude\claude.exe".into(),
+            remote_ip: "203.0.113.99".into(),
+            remote_port: 443,
+            protocol: "udp".into(),
+            layer: "ale_auth_connect_v4".into(),
+            filter_reason: "quic_shield".into(),
+        });
+
+        snap.config.vaults.push(cg_protocol::AccountVault {
+            id: "us-pro".into(),
+            name: "US Pro".into(),
+            accent_hex: "#3B82F6".into(),
+            enabled: true,
+            pinned_regions: vec!["US".into()],
+            pinned_ips: vec!["198.51.100.0/24".into(), "2001:db8:abcd::1".into()],
+            pinned_asn: None,
+            dedicated_proxy_port: None,
+            preferred_mihomo_group: None,
+            preferred_mihomo_node: None,
+            auto_align_mihomo_on_vault_launch: false,
+            min_safety_score: 75,
+            cooldown_after_ip_change_secs: 900,
+            share_ide_extensions: true,
+            msix_isolation_mode: cg_protocol::MsixIsolationMode::default(),
+        });
+        snap.vaults.push(cg_protocol::VaultRuntimeStatus {
+            id: "us-pro".into(),
+            name: "US Pro".into(),
+            accent_hex: "#3B82F6".into(),
+            state: cg_protocol::VaultRuntimeState::EgressMismatch,
+            running_pids: Vec::new(),
+            running_apps: Vec::new(),
+            egress_matches_contract: false,
+            cooldown_remaining_secs: 0,
+            last_active_at: None,
+            last_ip_masked: Some("198.51.100.42".into()),
+            last_country: Some("US".into()),
+            vault_dir: r"C:\Vaults\us-pro".into(),
+            summary: "当前出口 203.0.113.77 与绑定 198.51.100.42 不符".into(),
+        });
+
+        snap.last_cleanroom_report = Some(cg_protocol::CleanRoomReport {
+            scanned_at: 1_700_000_000,
+            scope: cg_protocol::CleanRoomScope::default(),
+            pollution_score: 40,
+            risk_level: cg_protocol::CleanRoomRiskLevel::Elevated,
+            findings: vec![cg_protocol::CleanRoomFinding {
+                id: "f1".into(),
+                client_id: "claude".into(),
+                vector: cg_protocol::CleanRoomVector::ClaudeCodeState,
+                risk_weight: 25,
+                location_display: "endpoint 198.51.100.42".into(),
+                correlation_keys: vec!["userID".into()],
+                masked_preview: "last_ip=203.0.113.88".into(),
+                bytes_size: 128,
+                preservation_note: "保留 198.51.100.42 配置".into(),
+            }],
+            preserved_assets_summary: vec!["保留 MCP 198.51.100.42".into()],
+            summary: "发现 203.0.113.88 历史痕迹".into(),
+        });
+
+        let masked = mask_snapshot(&snap);
+        let serialized = serde_json::to_string(&masked).unwrap();
+        for raw_ip in [
+            "198.51.100.42",
+            "198.51.100.0",
+            "203.0.113.88",
+            "203.0.113.99",
+            "203.0.113.77",
+            "114.114.114.114",
+            "2001:db8:abcd::1",
+        ] {
+            assert!(
+                !serialized.contains(raw_ip),
+                "mask_snapshot leaked raw IP {raw_ip}: {serialized}"
+            );
+        }
+        assert_eq!(
+            masked.risk_assessment.ip_purity.ip.as_deref(),
+            Some("198.51.*.*")
+        );
+        assert_eq!(
+            masked.risk_assessment.stun_leak.reflexive_ip.as_deref(),
+            Some("203.0.*.*")
+        );
+        assert_eq!(masked.wfp.recent_blocked[0].remote_ip, "203.0.*.*");
+        assert_eq!(
+            masked.config.vaults[0].pinned_ips,
+            vec!["198.51.*.*/24", "2001:db8:*:*"]
+        );
+        assert_eq!(
+            masked.vaults[0].last_ip_masked.as_deref(),
+            Some("198.51.*.*")
+        );
     }
 }

@@ -12,6 +12,7 @@ use cg_protocol::{
     AsnClassification, DnsCoherenceReport, ElectronHygieneReport, EnvCheck, GeoVelocityAlert,
     IpPurityReport, RiskAssessment, RiskDimensionItem, SafetyGrade, StunLeakReport, region_name,
 };
+use serde::{Deserialize, Serialize};
 
 /// Default cross-country teleportation cooldown window in minutes (60 min).
 pub const DEFAULT_TELEPORT_COOLDOWN_MINS: u32 = 60;
@@ -46,18 +47,22 @@ pub fn is_unsupported_region(country: &str) -> bool {
 }
 
 /// Sanitized egress ledger observation fed into [`evaluate_geo_velocity`] (no disk I/O in `cg-core`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EgressObservation {
     pub ip_hmac_hex: String,
     pub subnet_hmac_hex: String,
     pub country: String,
     pub city_or_colo: String,
-    /// Fixed-point latitude (`degrees * 10`, e.g. `341` = `34.1°N`).
-    pub lat_tenths: i16,
-    /// Fixed-point longitude (`degrees * 10`, e.g. `-1182` = `118.2°W`).
-    pub lon_tenths: i16,
+    /// Optional fixed-point latitude (`degrees * 10`, e.g. `Some(341)` = `34.1°N`; `None` when unknown).
+    #[serde(default)]
+    pub lat_tenths: Option<i16>,
+    /// Optional fixed-point longitude (`degrees * 10`, e.g. `Some(-1182)` = `118.2°W`; `None` when unknown).
+    #[serde(default)]
+    pub lon_tenths: Option<i16>,
     pub observed_at: u64,
     /// Optional Sovereign Vault identifier (`None` for global ledger).
+    #[serde(default)]
     pub vault_id: Option<String>,
 }
 
@@ -154,19 +159,22 @@ pub fn haversine_km(lat1_tenths: i16, lon1_tenths: i16, lat2_tenths: i16, lon2_t
     (6371.0 * c).round() as u32
 }
 
-fn resolve_coords(obs: &EgressObservation) -> (i16, i16) {
-    if obs.lat_tenths != 0 || obs.lon_tenths != 0 {
-        return (obs.lat_tenths, obs.lon_tenths);
+fn resolve_coords(obs: &EgressObservation) -> Option<(i16, i16)> {
+    if let (Some(lat), Some(lon)) = (obs.lat_tenths, obs.lon_tenths)
+        && (lat != 0 || lon != 0)
+    {
+        return Some((lat, lon));
     }
     let colo_opt = (!obs.city_or_colo.trim().is_empty()).then_some(obs.city_or_colo.as_str());
     let country_opt = (!obs.country.trim().is_empty()).then_some(obs.country.as_str());
     if let Some(place) = geo::resolve(colo_opt, country_opt) {
-        return (
-            (place.lat * 10.0).round() as i16,
-            (place.lon * 10.0).round() as i16,
-        );
+        let lat = (place.lat * 10.0).round() as i16;
+        let lon = (place.lon * 10.0).round() as i16;
+        if lat != 0 || lon != 0 {
+            return Some((lat, lon));
+        }
     }
-    (0, 0)
+    None
 }
 
 fn same_subnet_or_ip(a: &EgressObservation, b: &EgressObservation) -> bool {
@@ -215,9 +223,7 @@ pub fn evaluate_geo_velocity(
     let mut prev_diff: Option<&EgressObservation> = None;
 
     for item in history_7d {
-        if let Some(ref vid) = current.vault_id
-            && item.vault_id.as_deref() != Some(vid.as_str())
-        {
+        if item.vault_id != current.vault_id {
             continue;
         }
         if item.observed_at > now {
@@ -264,23 +270,31 @@ pub fn evaluate_geo_velocity(
     if let Some(prev) = prev_diff {
         let elapsed_secs = now.saturating_sub(prev.observed_at).max(1);
         let elapsed_mins = (elapsed_secs / 60) as u32;
-        let (lat1, lon1) = resolve_coords(prev);
-        let (lat2, lon2) = resolve_coords(current);
-        let dist_km = haversine_km(lat1, lon1, lat2, lon2);
-        let speed_kmh = ((f64::from(dist_km) * 3600.0) / (elapsed_secs as f64)).round() as u32;
+        let coords_pair = resolve_coords(prev).zip(resolve_coords(current));
+        let (dist_km, speed_kmh) = match coords_pair {
+            Some(((lat1, lon1), (lat2, lon2))) => {
+                let d = haversine_km(lat1, lon1, lat2, lon2);
+                let s = ((f64::from(d) * 3600.0) / (elapsed_secs as f64)).round() as u32;
+                (d, s)
+            }
+            None => (0, 0),
+        };
 
         let prev_cc = prev.country.trim().to_ascii_uppercase();
         let curr_cc = current.country.trim().to_ascii_uppercase();
         let cross_country = !prev_cc.is_empty() && !curr_cc.is_empty() && prev_cc != curr_cc;
 
-        // Same-country <= 350 km is exempted as normal Anycast drift.
-        let is_anycast_jitter = !cross_country && dist_km <= SAME_COUNTRY_ANYCAST_EXEMPT_KM;
+        // Same-country <= 350 km (or same-country with unmapped coordinates) is exempted as normal Anycast drift.
+        let is_anycast_jitter =
+            !cross_country && coords_pair.is_none_or(|_| dist_km <= SAME_COUNTRY_ANYCAST_EXEMPT_KM);
 
         let cross_country_teleport = cross_country
             && (elapsed_mins < teleport_cooldown_mins
-                || (dist_km > SPEED_TELEPORT_MIN_DIST_KM
+                || (coords_pair.is_some()
+                    && dist_km > SPEED_TELEPORT_MIN_DIST_KM
                     && speed_kmh > IMPOSSIBLE_TRAVEL_SPEED_KMH));
         let supersonic_same_country = !cross_country
+            && coords_pair.is_some()
             && dist_km > SPEED_TELEPORT_MIN_DIST_KM
             && speed_kmh > IMPOSSIBLE_TRAVEL_SPEED_KMH;
 
@@ -288,8 +302,11 @@ pub fn evaluate_geo_velocity(
             && teleport_cooldown_mins > 0
             && (cross_country_teleport || supersonic_same_country)
         {
-            let flight_mins = ((f64::from(dist_km) / f64::from(IMPOSSIBLE_TRAVEL_SPEED_KMH)) * 60.0)
-                .ceil() as u32;
+            let flight_mins = if coords_pair.is_some() {
+                ((f64::from(dist_km) / f64::from(IMPOSSIBLE_TRAVEL_SPEED_KMH)) * 60.0).ceil() as u32
+            } else {
+                0
+            };
             let target_window = teleport_cooldown_mins.max(flight_mins.min(180));
             let cooldown_left_mins = target_window.saturating_sub(elapsed_mins).max(1);
             let cooldown_until = Some(now.saturating_add(u64::from(cooldown_left_mins) * 60));
@@ -305,18 +322,45 @@ pub fn evaluate_geo_velocity(
                 current.city_or_colo.clone()
             };
 
-            let summary = format!(
-                "检测到跨国瞬移：{} 分钟前使用 {} ({}) 出口，当前为 {} ({}) 出口（跨越 {} km，等效 {} km/h）。建议切回原 {} 节点，或冷却 {} 分钟后再启动。",
-                elapsed_mins.max(1),
-                region_name(&prev_cc),
-                prev_city,
-                region_name(&curr_cc),
-                curr_city,
-                dist_km,
-                speed_kmh,
-                prev_cc,
-                cooldown_left_mins,
-            );
+            let summary = if cross_country {
+                if coords_pair.is_some() {
+                    format!(
+                        "检测到跨国瞬移：{} 分钟前使用 {} ({}) 出口，当前为 {} ({}) 出口（跨越 {} km，等效 {} km/h）。建议切回原 {} 节点，或冷却 {} 分钟后再启动。",
+                        elapsed_mins.max(1),
+                        region_name(&prev_cc),
+                        prev_city,
+                        region_name(&curr_cc),
+                        curr_city,
+                        dist_km,
+                        speed_kmh,
+                        prev_cc,
+                        cooldown_left_mins,
+                    )
+                } else {
+                    format!(
+                        "检测到跨国瞬移：{} 分钟前使用 {} ({}) 出口，当前为 {} ({}) 出口。建议切回原 {} 节点，或冷却 {} 分钟后再启动。",
+                        elapsed_mins.max(1),
+                        region_name(&prev_cc),
+                        prev_city,
+                        region_name(&curr_cc),
+                        curr_city,
+                        prev_cc,
+                        cooldown_left_mins,
+                    )
+                }
+            } else {
+                format!(
+                    "检测到同国超音速跃迁：{} 分钟前使用 {} ({}) 出口，当前为 {} ({}) 出口（跨越 {} km，等效 {} km/h）。建议固定单城节点，或冷却 {} 分钟后再启动。",
+                    elapsed_mins.max(1),
+                    region_name(&prev_cc),
+                    prev_city,
+                    region_name(&curr_cc),
+                    curr_city,
+                    dist_km,
+                    speed_kmh,
+                    cooldown_left_mins,
+                )
+            };
 
             return GeoVelocityEvaluation {
                 penalty: 15,
@@ -660,17 +704,13 @@ pub fn score_egress_risk(input: &RiskScoringInput) -> RiskAssessment {
     // ---- D4: Geo-Velocity & 7-Day Subnet Churn (15 pts) ----
     let current_obs = input.current_observation.clone().or_else(|| {
         let country = purity.country.clone()?;
-        let (lat, lon) = match (purity.lat_tenths, purity.lon_tenths) {
-            (Some(la), Some(lo)) => (la, lo),
-            _ => (0, 0),
-        };
         Some(EgressObservation {
             ip_hmac_hex: purity.ip.clone().unwrap_or_default(),
             subnet_hmac_hex: String::new(),
             country,
             city_or_colo: purity.city.clone().unwrap_or_default(),
-            lat_tenths: lat,
-            lon_tenths: lon,
+            lat_tenths: purity.lat_tenths,
+            lon_tenths: purity.lon_tenths,
             observed_at: input.now_secs.max(purity.checked_at),
             vault_id: None,
         })
@@ -775,13 +815,12 @@ pub fn score_egress_risk(input: &RiskScoringInput) -> RiskAssessment {
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let v6_split_critical = purity.dual_stack_split_detected
-        || (!unsupported_v4
-            && !v4_country.is_empty()
-            && v6_country.is_some_and(is_unsupported_region));
+    let v6_split_critical =
+        !unsupported_v4 && !v4_country.is_empty() && v6_country.is_some_and(is_unsupported_region);
     let v6_country_mismatch = !v6_split_critical
-        && !v4_country.is_empty()
-        && v6_country.is_some_and(|v6c| !v6c.eq_ignore_ascii_case(v4_country));
+        && (purity.dual_stack_split_detected
+            || (!v4_country.is_empty()
+                && v6_country.is_some_and(|v6c| !v6c.eq_ignore_ascii_case(v4_country))));
 
     let (d6_penalty, d6_detail, d6_rem) = if v6_split_critical {
         active_vetoes.push(("IPv6 双栈直连脑裂", VETO_CAP_IPV6_DUAL_STACK_SPLIT));
@@ -1218,8 +1257,8 @@ mod tests {
             subnet_hmac_hex: "sub-us".into(),
             country: "US".into(),
             city_or_colo: "LAX".into(),
-            lat_tenths: 341,
-            lon_tenths: -1182,
+            lat_tenths: Some(341),
+            lon_tenths: Some(-1182),
             observed_at: 9_700, // 5 min earlier
             vault_id: None,
         });
@@ -1228,8 +1267,8 @@ mod tests {
             subnet_hmac_hex: "sub-jp".into(),
             country: "JP".into(),
             city_or_colo: "NRT".into(),
-            lat_tenths: 357,
-            lon_tenths: 1398,
+            lat_tenths: Some(357),
+            lon_tenths: Some(1398),
             observed_at: 10_000,
             vault_id: None,
         });
@@ -1296,8 +1335,8 @@ mod tests {
             subnet_hmac_hex: "sub1".into(),
             country: "US".into(),
             city_or_colo: "LAX".into(),
-            lat_tenths: 341,
-            lon_tenths: -1182,
+            lat_tenths: Some(341),
+            lon_tenths: Some(-1182),
             observed_at: 10_000,
             vault_id: None,
         }];
@@ -1306,8 +1345,8 @@ mod tests {
             subnet_hmac_hex: "sub2".into(),
             country: "US".into(),
             city_or_colo: "SAN".into(),
-            lat_tenths: 327,
-            lon_tenths: -1172,
+            lat_tenths: Some(327),
+            lon_tenths: Some(-1172),
             observed_at: 10_060,
             vault_id: None,
         };
@@ -1321,8 +1360,8 @@ mod tests {
             subnet_hmac_hex: "sub-jp".into(),
             country: "JP".into(),
             city_or_colo: "NRT".into(),
-            lat_tenths: 357,
-            lon_tenths: 1398,
+            lat_tenths: Some(357),
+            lon_tenths: Some(1398),
             observed_at: 10_240,
             vault_id: None,
         };
@@ -1344,12 +1383,91 @@ mod tests {
         assert!(eval_flight.alert.is_none());
         assert_eq!(eval_flight.penalty, 0);
 
-        // Per-vault isolation: vault-b must NOT collide with vault-a history!
+        // Per-vault isolation: vault-b must NOT collide with vault-a history, and global (None) must NOT collide with vault-a!
         let mut hist_vault_a = history_local;
         hist_vault_a[0].vault_id = Some("vault-a".into());
-        let mut curr_vault_b = curr_jp;
+        let mut curr_vault_b = curr_jp.clone();
         curr_vault_b.vault_id = Some("vault-b".into());
         let eval_isolated = evaluate_geo_velocity(&hist_vault_a, &curr_vault_b, 60);
         assert!(eval_isolated.alert.is_none());
+
+        let eval_global_vs_vault = evaluate_geo_velocity(&hist_vault_a, &curr_jp, 60);
+        assert!(
+            eval_global_vs_vault.alert.is_none(),
+            "global observation (vault_id=None) must ignore vault-scoped history"
+        );
+    }
+
+    #[test]
+    fn null_island_missing_coords_never_false_trips_same_country_and_compliant_dual_stack_warns_only()
+     {
+        // 1) US (LAX known coords) -> US (unmapped small town, None coords or (0,0)): must NOT trip Null Island!
+        let hist_us = vec![EgressObservation {
+            ip_hmac_hex: "us1".into(),
+            subnet_hmac_hex: "sub-us1".into(),
+            country: "US".into(),
+            city_or_colo: "Los Angeles".into(),
+            lat_tenths: Some(341),
+            lon_tenths: Some(-1182),
+            observed_at: 10_000,
+            vault_id: None,
+        }];
+        for (lat_opt, lon_opt) in [(None, None), (Some(0), Some(0))] {
+            let curr_unmapped = EgressObservation {
+                ip_hmac_hex: "us2".into(),
+                subnet_hmac_hex: "sub-us2".into(),
+                country: "US".into(),
+                city_or_colo: "Bozeman".into(),
+                lat_tenths: lat_opt,
+                lon_tenths: lon_opt,
+                observed_at: 10_030,
+                vault_id: None,
+            };
+            let ev = evaluate_geo_velocity(&hist_us, &curr_unmapped, 60);
+            assert!(
+                ev.alert.is_none(),
+                "unmapped same-country US hop must never compute distance to Null Island (0,0): {ev:?}"
+            );
+        }
+
+        // 2) Unmapped cross-country US -> CA within cooldown window still enforces teleport_cooldown_mins with 0 fake distance.
+        let curr_ca_unmapped = EgressObservation {
+            ip_hmac_hex: "ca1".into(),
+            subnet_hmac_hex: "sub-ca1".into(),
+            country: "CA".into(),
+            city_or_colo: "Saskatoon".into(),
+            lat_tenths: None,
+            lon_tenths: None,
+            observed_at: 10_300, // 5m later
+            vault_id: None,
+        };
+        let ev_cross = evaluate_geo_velocity(&hist_us, &curr_ca_unmapped, 60);
+        let alert_cross = ev_cross.alert.expect("cross-country within 60m must alert");
+        assert_eq!(alert_cross.distance_km, 0);
+        assert_eq!(alert_cross.implied_speed_kmh, 0);
+        assert_eq!(ev_cross.recommended_cooldown_mins, 55);
+
+        // 3) Same-country supersonic (LAX -> JFK in 2m) uses accurate same-country copy.
+        let curr_jfk = EgressObservation {
+            ip_hmac_hex: "us-jfk".into(),
+            subnet_hmac_hex: "sub-jfk".into(),
+            country: "US".into(),
+            city_or_colo: "New York".into(),
+            lat_tenths: None,
+            lon_tenths: None,
+            observed_at: 10_120,
+            vault_id: None,
+        };
+        let ev_same_super = evaluate_geo_velocity(&hist_us, &curr_jfk, 60);
+        assert!(ev_same_super.alert.is_some());
+        assert!(ev_same_super.summary.contains("同国超音速跃迁"));
+
+        // 4) Compliant cross-country IPv6 (US v4 + CA v6 with dual_stack_split_detected=true) deducts 3 pts WITHOUT <=30 veto!
+        let mut us_ca_v6 = pristine_input(10_000);
+        us_ca_v6.ip_purity.dual_stack_split_detected = true;
+        us_ca_v6.ip_purity.ipv6_egress_country = Some("CA".into());
+        let res_v6 = score_egress_risk(&us_ca_v6);
+        assert_eq!(res_v6.score, 97);
+        assert_eq!(res_v6.grade, SafetyGrade::S);
     }
 }

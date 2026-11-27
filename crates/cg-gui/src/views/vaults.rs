@@ -17,7 +17,9 @@ use crate::protocol::{
 };
 use crate::state::format_relative_secs;
 use crate::theme::{BadgeTone, ThemePalette};
-use crate::views::shared::{labeled_field, page_guide_card, switch_row_gated};
+use crate::views::shared::{
+    canonical_agent_label, labeled_field, page_guide_card, switch_row_gated,
+};
 use crate::widgets::controls::{
     ButtonKind, action_button, bento_card_bloom, icon_action_button, inset_box, mono_tabular,
     segmented_capsule_item, segmented_capsule_track, status_dot, tone_tag,
@@ -128,13 +130,13 @@ pub fn render_vaults_page(
                                 .text_size(px(13.5))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(p.text_primary))
-                                .child("多账号主权隔离仓"),
+                                .child("多账号独立防封空间"),
                         )
-                        .child(tone_tag("100% 物理隔离", BadgeTone::Pass, p)),
+                        .child(tone_tag("数据独立防串号", BadgeTone::Pass, p)),
                 )
                 .child(
                     mono_tabular(format!(
-                        "已纳管主权仓 {total_vaults} 个 · 当前活跃 {active_vaults} 仓 · 独立配置目录 + 独立机器码种子 + 独立出口契约"
+                        "账号数据互不串号，节点不符自动拒启 · 已创建 {total_vaults} 个空间 · 当前运行中 {active_vaults} 个"
                     ))
                     .truncate()
                     .text_size(px(11.))
@@ -154,7 +156,7 @@ pub fn render_vaults_page(
                         if show_drawer && !draft.editing_existing {
                             "收起表单"
                         } else {
-                            "新建主权账号仓"
+                            "新建账号空间"
                         },
                         ButtonKind::Primary,
                         connected,
@@ -193,6 +195,7 @@ pub fn render_vaults_page(
         let in_cool = inputs.vault_cooldown.clone();
 
         let ctrl_adopt = ctrl.clone();
+        let ctrl_adopt_strict = ctrl.clone();
         let ctrl_save = ctrl.clone();
         let ctrl_cancel = ctrl.clone();
         let ctrl_share = ctrl.clone();
@@ -300,38 +303,65 @@ pub fn render_vaults_page(
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(p.text_primary))
                                     .child(if draft.editing_existing {
-                                        "编辑主权账号隔离仓"
+                                        "编辑账号防封空间"
                                     } else {
-                                        "新建主权账号隔离仓"
+                                        "新建账号防封空间"
                                     }),
                             )
                             .child(
                                 div()
                                     .text_size(px(10.5))
                                     .text_color(rgb(p.text_muted))
-                                    .child("草稿与后台 1s 轮询严格隔离，可放心编辑 IP/ASN/代理绑定契约。"),
+                                    .child("按 Esc 关闭、Ctrl+S 保存；推荐使用「绑定当前节点地区」避免动态节点换 IP 被误拦。"),
                             ),
                     )
                     .child(
-                        icon_action_button(
-                            "vault-adopt-egress",
-                            "icons/ui/globe.svg",
-                            "采纳当前实时出口作为基线",
-                            ButtonKind::Secondary,
-                            connected,
-                            p,
-                        )
-                        .h(px(28.))
-                        .when(connected, |b| {
-                            b.on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |_, _, _, cx| {
-                                    ctrl_adopt.update(cx, |c, cx| {
-                                        c.adopt_egress_into_vault_draft(cx);
-                                    });
+                        div()
+                            .flex()
+                            .items_center()
+                            .flex_shrink_0()
+                            .gap(px(6.))
+                            .child(
+                                icon_action_button(
+                                    "vault-adopt-egress",
+                                    "icons/ui/globe.svg",
+                                    "一键绑定当前节点地区（推荐）",
+                                    ButtonKind::Primary,
+                                    connected,
+                                    p,
+                                )
+                                .h(px(28.))
+                                .when(connected, |b| {
+                                    b.on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            ctrl_adopt.update(cx, |c, cx| {
+                                                c.adopt_egress_into_vault_draft(cx);
+                                            });
+                                        }),
+                                    )
                                 }),
                             )
-                        }),
+                            .child(
+                                action_button(
+                                    "vault-adopt-strict-ip",
+                                    "严格绑定当前静态 IP",
+                                    ButtonKind::Secondary,
+                                    connected,
+                                    p,
+                                )
+                                .h(px(28.))
+                                .when(connected, |b| {
+                                    b.on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            ctrl_adopt_strict.update(cx, |c, cx| {
+                                                c.adopt_egress_strict_ip_into_vault_draft(cx);
+                                            });
+                                        }),
+                                    )
+                                }),
+                            ),
                     ),
             )
             .child(
@@ -339,7 +369,35 @@ pub fn render_vaults_page(
                     .flex()
                     .flex_row()
                     .gap(px(10.))
-                    .child(labeled_field("隔离仓 ID (a-z/0-9/-/_)", in_id, p))
+                    .child(if draft.editing_existing {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(p.text_secondary))
+                                    .child("隔离仓 ID（创建后固定防克隆）"),
+                            )
+                            .child(
+                                inset_box(p)
+                                    .h(px(32.))
+                                    .px(px(10.))
+                                    .justify_center()
+                                    .child(
+                                        mono_tabular(format!("{}（已锁定）", draft.id))
+                                            .truncate()
+                                            .text_size(px(11.5))
+                                            .text_color(rgb(p.text_muted)),
+                                    ),
+                            )
+                    } else {
+                        labeled_field("隔离仓 ID (a-z/0-9/-/_)", in_id, p)
+                    })
                     .child(labeled_field("显示名称", in_name, p))
                     .child(labeled_field("锁定地区 (ISO-2 如 US, JP)", in_regions, p)),
             )
@@ -388,8 +446,17 @@ pub fn render_vaults_page(
                             .flex()
                             .items_center()
                             .gap(px(8.))
-                            .w(px(300.))
-                            .child(segmented_capsule_track(p).children(msix_items)),
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child("商店版 Claude 防串号保护"),
+                            )
+                            .child(
+                                div()
+                                    .w(px(280.))
+                                    .child(segmented_capsule_track(p).children(msix_items)),
+                            ),
                     ),
             )
             .child(
@@ -559,32 +626,50 @@ pub fn render_vaults_page(
                 _ => "尚未活跃".into(),
             };
 
+            let mihomo_can_align = v.auto_align_mihomo_on_vault_launch
+                && v.preferred_mihomo_node
+                    .as_deref()
+                    .is_some_and(|n| !n.trim().is_empty());
             let launch_targets = [
-                (VaultAppTarget::ClaudeDesktop, "安全启动 Claude"),
-                (VaultAppTarget::ClaudeCodeCli, "启动 Code CLI"),
-                (VaultAppTarget::ChatgptDesktop, "启动 Codex"),
-                (VaultAppTarget::AntigravityIde, "启动 Antigravity"),
-                (VaultAppTarget::CursorIde, "启动 Cursor"),
+                (VaultAppTarget::ClaudeDesktop, "Claude"),
+                (VaultAppTarget::ClaudeCodeCli, "Code CLI"),
+                (VaultAppTarget::CursorIde, "Cursor"),
+                (VaultAppTarget::AntigravityIde, "Antigravity"),
+                (VaultAppTarget::ChatgptDesktop, "ChatGPT"),
+                (VaultAppTarget::WindsurfIde, "Windsurf"),
+                (VaultAppTarget::ZedIde, "Zed"),
+                (VaultAppTarget::TraeIde, "Trae"),
+                (VaultAppTarget::CodexCli, "Codex CLI"),
+                (VaultAppTarget::GeminiCli, "Gemini CLI"),
+                (VaultAppTarget::AiderCli, "Aider CLI"),
             ];
             let can_launch_vault = can_act
                 && v.enabled
-                && rt.state != VaultRuntimeState::EgressMismatch
-                && rt.state != VaultRuntimeState::CoolingDown;
+                && rt.state != VaultRuntimeState::CoolingDown
+                && (rt.state != VaultRuntimeState::EgressMismatch || mihomo_can_align);
 
             let launch_btns = launch_targets.into_iter().map(|(target, label)| {
                 let ctrl_l = ctrl.clone();
                 let vid = v.id.clone();
+                let btn_lbl = if rt.state == VaultRuntimeState::EgressMismatch
+                    && mihomo_can_align
+                    && target == VaultAppTarget::ClaudeDesktop
+                {
+                    "一键切节点启动 Claude"
+                } else {
+                    label
+                };
                 icon_action_button(
                     gpui::ElementId::Name(format!("vault-launch-{}-{target:?}", v.id).into()),
                     "icons/ui/play.svg",
-                    label,
+                    btn_lbl,
                     ButtonKind::Secondary,
                     can_launch_vault,
                     p,
                 )
-                .h(px(26.))
-                .px(px(9.))
-                .text_size(px(11.))
+                .h(px(25.))
+                .px(px(8.5))
+                .text_size(px(10.5))
                 .when(can_launch_vault, |b| {
                     b.on_mouse_up(
                         MouseButton::Left,
@@ -597,7 +682,7 @@ pub fn render_vaults_page(
                                         app: target,
                                         extra_args: Vec::new(),
                                     },
-                                    Some(format!("已在主权隔离仓启动 {}", target.label())),
+                                    Some(format!("已在账号空间启动 {}", target.label())),
                                     cx,
                                 );
                             });
@@ -605,6 +690,150 @@ pub fn render_vaults_page(
                     )
                 })
             });
+
+            // Closed-loop 1-click inline recovery bar when vault is blocked by EgressMismatch or CoolingDown
+            let recovery_bar = if rt.state == VaultRuntimeState::EgressMismatch {
+                let ctrl_rc = ctrl.clone();
+                let ctrl_ed = ctrl.clone();
+                let vid_ed = v.id.clone();
+                Some(
+                    inset_box(p)
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .px(px(10.))
+                        .py(px(6.5))
+                        .bg(gpui::rgba(p.badge_fail.bg))
+                        .border_color(gpui::rgba(p.hero_tripped.border))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(p.badge_fail.text))
+                                .child(if mihomo_can_align {
+                                    "当前节点不符 · 点击下方客户端将自动切回绑定节点"
+                                } else {
+                                    "当前代理节点与本空间绑定地区/IP不符，已自动拦停"
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .flex_shrink_0()
+                                .gap(px(5.))
+                                .child(
+                                    action_button(
+                                        gpui::ElementId::Name(
+                                            format!("vault-mismatch-recheck-{}", v.id).into(),
+                                        ),
+                                        "重检节点",
+                                        ButtonKind::Secondary,
+                                        can_act,
+                                        p,
+                                    )
+                                    .h(px(23.))
+                                    .px(px(7.5))
+                                    .text_size(px(10.))
+                                    .when(can_act, |b| {
+                                        b.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _, _, cx| {
+                                                ctrl_rc.update(cx, |c, cx| {
+                                                    c.send_request(
+                                                        PipeRequest::RecheckNow { target_id: None },
+                                                        Some("已完成当前节点复查"),
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                        )
+                                    }),
+                                )
+                                .child(
+                                    action_button(
+                                        gpui::ElementId::Name(
+                                            format!("vault-mismatch-edit-{}", v.id).into(),
+                                        ),
+                                        "改绑地区",
+                                        ButtonKind::Ghost,
+                                        connected,
+                                        p,
+                                    )
+                                    .h(px(23.))
+                                    .px(px(7.5))
+                                    .text_size(px(10.))
+                                    .when(connected, |b| {
+                                        b.on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |_, _, _, cx| {
+                                                let id = vid_ed.clone();
+                                                ctrl_ed.update(cx, |c, cx| {
+                                                    c.open_edit_vault_drawer(&id, cx);
+                                                });
+                                            }),
+                                        )
+                                    }),
+                                ),
+                        ),
+                )
+            } else if rt.state == VaultRuntimeState::CoolingDown {
+                let ctrl_cool = ctrl.clone();
+                Some(
+                    inset_box(p)
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .px(px(10.))
+                        .py(px(6.5))
+                        .bg(gpui::rgba(p.badge_warn.bg))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(p.badge_warn.text))
+                                .child("刚切换节点地区，防异地登录风控冷却保护中"),
+                        )
+                        .child(
+                            action_button(
+                                gpui::ElementId::Name(
+                                    format!("vault-clear-cooldown-{}", v.id).into(),
+                                ),
+                                "确认本人换线 · 立即放行",
+                                ButtonKind::Secondary,
+                                can_act,
+                                p,
+                            )
+                            .h(px(23.))
+                            .px(px(8.))
+                            .text_size(px(10.))
+                            .when(can_act, |b| {
+                                b.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |_, _, _, cx| {
+                                        ctrl_cool.update(cx, |c, cx| {
+                                            c.send_request(
+                                                PipeRequest::ClearGeoVelocityCooldown,
+                                                Some("已解除换线冷却保护，可立即启动"),
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                                )
+                            }),
+                        ),
+                )
+            } else {
+                None
+            };
 
             let ctrl_lnk = ctrl.clone();
             let vid_lnk = v.id.clone();
@@ -751,16 +980,20 @@ pub fn render_vaults_page(
                                     .text_color(rgb(p.text_secondary)),
                                 )
                                 .when(!rt.running_apps.is_empty(), |row| {
+                                    let friendly_running = rt
+                                        .running_apps
+                                        .iter()
+                                        .map(|id| canonical_agent_label(id, id))
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
                                     row.child(
-                                        mono_tabular(format!(
-                                            "运行中：{}",
-                                            rt.running_apps.join(", ")
-                                        ))
-                                        .text_size(px(10.5))
-                                        .text_color(rgb(p.badge_pass.text)),
+                                        mono_tabular(format!("运行中：{friendly_running}"))
+                                            .text_size(px(10.5))
+                                            .text_color(rgb(p.badge_pass.text)),
                                     )
                                 }),
                         )
+                        .when_some(recovery_bar, |col, bar| col.child(bar))
                         .when(!rt.summary.is_empty(), |col| {
                             col.child(
                                 div()
@@ -769,8 +1002,8 @@ pub fn render_vaults_page(
                                     .child(rt.summary.clone()),
                             )
                         })
-                        // 1-click safe launch row
-                        .child(div().flex().flex_wrap().gap(px(6.)).children(launch_btns)),
+                        // 1-click safe launch row (all 11 managed GUI & CLI clients)
+                        .child(div().flex().flex_wrap().gap(px(5.5)).children(launch_btns)),
                 )
                 // Footer operations
                 .child(

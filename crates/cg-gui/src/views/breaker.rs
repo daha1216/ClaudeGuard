@@ -790,13 +790,13 @@ pub fn render_breaker_page(
                                                     .text_size(px(11.5))
                                                     .font_weight(FontWeight::MEDIUM)
                                                     .text_color(rgb(p.text_primary))
-                                                    .child("开机早期 WFP 防抢跑 (BOOTTIME，默认关闭)"),
+                                                    .child("开机联网前抢先保护（默认关闭）"),
                                             )
                                             .child(
                                                 div()
                                                     .text_size(px(10.5))
                                                     .text_color(rgb(p.text_muted))
-                                                    .child("显式开启后在系统开机登录前即拦截受管 AI 客户端抢跑直连"),
+                                                    .child("系统刚开机、后台服务尚未完全就绪前，提前阻断 AI 软件偷跑直连"),
                                             ),
                                     )
                                     .child(
@@ -1252,10 +1252,16 @@ pub fn render_breaker_page(
                                         .text_color(rgb(p.text_muted)),
                                 )
                                 .child(
-                                    mono_tabular(format!("{} ({pid_str})", ev.agent_id))
-                                        .text_size(px(11.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(p.text_primary)),
+                                    mono_tabular(format!(
+                                        "{} ({pid_str})",
+                                        crate::views::shared::canonical_agent_label(
+                                            &ev.agent_id,
+                                            &ev.agent_id
+                                        )
+                                    ))
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(p.text_primary)),
                                 )
                                 .child(
                                     mono_tabular(format!(
@@ -1284,6 +1290,7 @@ pub fn render_breaker_page(
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .justify_between()
                             .gap(px(8.))
@@ -1291,19 +1298,24 @@ pub fn render_breaker_page(
                                 div()
                                     .flex()
                                     .items_center()
+                                    .min_w(px(0.))
                                     .gap(px(8.))
                                     .child(
                                         div()
                                             .text_size(px(12.5))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(rgb(p.text_primary))
-                                            .child("WFP 实时拦截瀑布流"),
+                                            .child("实时防漏拦截记录"),
                                     )
                                     .child(
                                         mono_tabular(format!(
-                                            "{} · 累计 {} 包",
-                                            wfp.active_backend, wfp.total_blocked_packets
+                                            "{} · 累计阻断 {} 次泄露请求",
+                                            crate::state::friendly_firewall_backend(
+                                                &wfp.active_backend
+                                            ),
+                                            wfp.total_blocked_packets
                                         ))
+                                        .truncate()
                                         .text_size(px(10.5))
                                         .text_color(rgb(p.text_muted)),
                                     ),
@@ -1311,6 +1323,7 @@ pub fn render_breaker_page(
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap(px(6.))
                                     .children(filter_chips)

@@ -64,7 +64,6 @@ pub fn render_cleanroom_page(
     let backups = ctrl_r.cleanroom_backups.clone();
     let scanning = ctrl_r.is_scope_busy(&ActionScope::CleanRoomScan);
     let executing = ctrl_r.is_scope_busy(&ActionScope::CleanRoomExecute);
-    let restoring = ctrl_r.is_scope_busy(&ActionScope::CleanRoomRestore);
     let purge_armed = ctrl_r.is_confirm_armed("cr-execute-purge");
     let can_act = connected && !busy;
     let now = now_unix_secs();
@@ -192,7 +191,7 @@ pub fn render_cleanroom_page(
                                         .text_size(px(13.5))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(rgb(p.text_primary))
-                                        .child("Step 1 · 选择扫描范围并执行只读深度审计"),
+                                        .child("封号残留深度清理 · 选择扫描范围"),
                                 )
                                 .child(tone_tag("100% 纯只读扫描", BadgeTone::Pass, p)),
                         )
@@ -200,7 +199,7 @@ pub fn render_cleanroom_page(
                             div()
                                 .text_size(px(11.))
                                 .text_color(rgb(p.text_secondary))
-                                .child("扫描阶段绝不修改或删除任何磁盘文件与凭据，仅精准定位四维跨号关联源。"),
+                                .child("换新号前先做只读扫描定位旧号残留痕迹（扫描阶段绝不改动任何文件，清理前自动加密备份）。"),
                         ),
                 )
                 .child(
@@ -330,13 +329,20 @@ pub fn render_cleanroom_page(
             )
     });
 
+    let selected_count = findings
+        .iter()
+        .filter(|f| selected_ids.contains(&f.id))
+        .count();
+    let all_finding_ids_header: Vec<String> = findings.iter().map(|x| x.id.clone()).collect();
+    let ctrl_sel_all = ctrl.clone();
+    let ctrl_sel_clear = ctrl.clone();
+
     let finding_rows: Vec<gpui::Stateful<Div>> = findings
         .iter()
         .map(|f| {
             let fid = f.id.clone();
-            let is_checked = selected_ids.is_empty() || selected_ids.contains(&f.id);
+            let is_checked = selected_ids.contains(&f.id);
             let ctrl_sel = ctrl.clone();
-            let all_ids: Vec<String> = findings.iter().map(|x| x.id.clone()).collect();
             let weight_tone = if f.risk_weight >= 30 {
                 BadgeTone::Fail
             } else if f.risk_weight >= 15 {
@@ -430,7 +436,7 @@ pub fn render_cleanroom_page(
                         .text_size(px(10.5))
                         .text_color(rgb(p.text_muted))
                         .child(format!(
-                            "命中键：{} · {}",
+                            "关联字段：{} · {}",
                             f.correlation_keys.join(", "),
                             f.masked_preview
                         )),
@@ -440,22 +446,16 @@ pub fn render_cleanroom_page(
                         div()
                             .text_size(px(10.5))
                             .text_color(rgb(p.badge_pass.text))
-                            .child(format!("绿盾保障：{}", f.preservation_note)),
+                            .child(format!("保留承诺：{}", f.preservation_note)),
                     )
                 })
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |_, _, _, cx| {
                         let id = fid.clone();
-                        let universe = all_ids.clone();
                         ctrl_sel.update(cx, |c, cx| {
-                            if c.cleanroom_selected_ids.is_empty() {
-                                for item in &universe {
-                                    if item != &id {
-                                        c.cleanroom_selected_ids.insert(item.clone());
-                                    }
-                                }
-                            } else if !c.cleanroom_selected_ids.remove(&id) {
+                            c.cleanroom_selection_initialized = true;
+                            if !c.cleanroom_selected_ids.remove(&id) {
                                 c.cleanroom_selected_ids.insert(id);
                             }
                             cx.notify();
@@ -478,26 +478,91 @@ pub fn render_cleanroom_page(
                     div()
                         .flex()
                         .flex_col()
+                        .min_w(px(0.))
+                        .flex_1()
                         .gap(px(2.))
                         .child(
                             div()
                                 .text_size(px(13.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(p.text_primary))
-                                .child("Step 2 · 关联污染评估与四维证据清单"),
+                                .child("旧号关联残留清单"),
                         )
                         .child(
-                            mono_tabular(format!("上次扫描：{scanned_age} · {report_summary}"))
-                                .truncate()
-                                .text_size(px(10.5))
-                                .text_color(rgb(p.text_muted)),
+                            mono_tabular(format!(
+                                "已选 {selected_count}/{} 项 · 上次扫描：{scanned_age} · {report_summary}",
+                                findings.len()
+                            ))
+                            .truncate()
+                            .text_size(px(10.5))
+                            .text_color(rgb(p.text_muted)),
                         ),
                 )
-                .child(tone_tag(
-                    format!("{score}/100 · {}", level.label()),
-                    score_tone,
-                    p,
-                )),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_shrink_0()
+                        .gap(px(5.))
+                        .when(!findings.is_empty(), |row| {
+                            let all_ids_clone = all_finding_ids_header.clone();
+                            row.child(
+                                action_button(
+                                    "cr-select-all",
+                                    "全选",
+                                    ButtonKind::Ghost,
+                                    selected_count < findings.len(),
+                                    p,
+                                )
+                                .h(px(24.))
+                                .px(px(7.5))
+                                .text_size(px(10.5))
+                                .when(selected_count < findings.len(), |b| {
+                                    b.on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            let ids = all_ids_clone.clone();
+                                            ctrl_sel_all.update(cx, |c, cx| {
+                                                c.cleanroom_selection_initialized = true;
+                                                c.cleanroom_selected_ids =
+                                                    ids.into_iter().collect();
+                                                cx.notify();
+                                            });
+                                        }),
+                                    )
+                                }),
+                            )
+                            .child(
+                                action_button(
+                                    "cr-select-clear",
+                                    "清空",
+                                    ButtonKind::Ghost,
+                                    selected_count > 0,
+                                    p,
+                                )
+                                .h(px(24.))
+                                .px(px(7.5))
+                                .text_size(px(10.5))
+                                .when(selected_count > 0, |b| {
+                                    b.on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            ctrl_sel_clear.update(cx, |c, cx| {
+                                                c.cleanroom_selection_initialized = true;
+                                                c.cleanroom_selected_ids.clear();
+                                                cx.notify();
+                                            });
+                                        }),
+                                    )
+                                }),
+                            )
+                        })
+                        .child(tone_tag(
+                            format!("{score}/100 · {}", level.label()),
+                            score_tone,
+                            p,
+                        )),
+                ),
         )
         // Pollution Score Gauge Bar
         .child(
@@ -570,8 +635,16 @@ pub fn render_cleanroom_page(
     });
 
     let ctrl_purge = ctrl.clone();
-    let has_findings = !findings.is_empty();
-    let can_purge = can_act && has_findings && !executing;
+    let can_purge = can_act && selected_count > 0 && !executing;
+    let purge_btn_label: String = if executing {
+        "正在自动备份并清理…".into()
+    } else if purge_armed {
+        format!("确认立即备份并清理已选 {selected_count} 项？")
+    } else if selected_count > 0 {
+        format!("自动加密备份并清理已选 ({selected_count} 项)")
+    } else {
+        "请先勾选需要清理的残留项".into()
+    };
 
     let shield_and_action_card = bento_card_bloom(p, 16.0, 14.0, choreo.tile(1, 1))
         .flex_1()
@@ -592,16 +665,16 @@ pub fn render_cleanroom_page(
                                 .text_size(px(13.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(p.text_primary))
-                                .child("100% 保留资产绿盾清单"),
+                                .child("100% 完整保留的配置与技能清单"),
                         )
-                        .child(tone_tag("零损手术", BadgeTone::Pass, p)),
+                        .child(tone_tag("无损清理", BadgeTone::Pass, p)),
                 )
                 .child(
                     div()
                         .text_size(px(11.))
                         .line_height(px(16.))
                         .text_color(rgb(p.text_secondary))
-                        .child("净室手术仅剥离身份指纹、遥测队列、Cookies 与崩溃信封，以下核心开发资产绝对不触碰："),
+                        .child("仅清除旧号登录态、设备识别码、遥测缓存与崩溃记录，以下个人配置与工作流绝对保留："),
                 )
                 .child(div().flex().flex_col().gap(px(6.)).children(preserved_rows)),
         )
@@ -615,32 +688,27 @@ pub fn render_cleanroom_page(
                         .text_size(px(12.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(p.text_primary))
-                        .child("Step 3 · 加密备份并一键洗白"),
+                        .child("安全备份并一键清理残留"),
                 )
                 .child(
                     div()
                         .text_size(px(10.5))
                         .line_height(px(15.5))
                         .text_color(rgb(p.text_secondary))
-                        .child("执行顺序：① 清退内存孤儿进程防止回写 → ② 生成 DPAPI + AES-256-GCM 加密 .cgbak 时光机备份 → ③ 执行手术洗白并自动后置复核清零。"),
+                        .child("自动执行：① 关闭后台残留进程防回写 → ② 在本机加密保存清理前备份 → ③ 清理所选痕迹并自动复查确认。"),
                 )
                 .child(
-                    icon_action_button(
+                    spinning_action_button(
                         "cr-execute-purge",
                         "icons/ui/shield.svg",
-                        if executing {
-                            "加密备份并洗白中…"
-                        } else if purge_armed {
-                            "确认立即备份并洗白？"
-                        } else {
-                            "加密备份并一键洗白"
-                        },
+                        purge_btn_label,
                         if purge_armed {
                             ButtonKind::Danger
                         } else {
                             ButtonKind::Primary
                         },
                         can_purge,
+                        executing,
                         p,
                     )
                     .w_full()
@@ -663,18 +731,26 @@ pub fn render_cleanroom_page(
     // Time-Machine Encrypted `.cgbak` Backup Restore List
     // -------------------------------------------------------------------------
     let ctrl_refresh_bk = ctrl.clone();
+    let ctrl_open_bk_dir = ctrl.clone();
     let backup_rows: Vec<Div> = backups
         .iter()
         .map(|bk| {
             let bid = bk.backup_id.clone();
+            let row_restoring = ctrl
+                .read(cx)
+                .is_scope_busy(&ActionScope::CleanRoomRestore(bk.backup_id.clone()));
             let arm_key = format!("cr-restore-{}", bk.backup_id);
             let armed = ctrl.read(cx).is_confirm_armed(&arm_key);
             let ctrl_rst = ctrl.clone();
             let sha_short: String = bk.sha256_hex.chars().take(12).collect();
             let clients_lbl = if bk.clients_included.is_empty() {
-                "claude".into()
+                "Claude".into()
             } else {
-                bk.clients_included.join(", ")
+                bk.clients_included
+                    .iter()
+                    .map(|id| crate::views::shared::canonical_agent_label(id, id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             };
 
             div()
@@ -706,11 +782,11 @@ pub fn render_cleanroom_page(
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(rgb(p.text_primary)),
                                 )
-                                .child(tone_tag("AES-GCM + DPAPI", BadgeTone::Pass, p)),
+                                .child(tone_tag("本机加密保护", BadgeTone::Pass, p)),
                         )
                         .child(
                             mono_tabular(format!(
-                                "{} · 范围 [{}] · {} 项 · {} · SHA256:{}…",
+                                "{} · 范围 [{}] · {} 项 · {} · 校验:{}…",
                                 format_unix_ymdhms(bk.created_at),
                                 clients_lbl,
                                 bk.item_count,
@@ -723,27 +799,29 @@ pub fn render_cleanroom_page(
                         ),
                 )
                 .child(
-                    action_button(
+                    spinning_action_button(
                         gpui::ElementId::Name(format!("cr-restore-btn-{}", bk.backup_id).into()),
-                        if restoring {
-                            "还原中…"
+                        "icons/ui/refresh.svg",
+                        if row_restoring {
+                            "正在还原…"
                         } else if armed {
-                            "确认时光机还原？"
+                            "确认无损还原？"
                         } else {
-                            "时光机还原"
+                            "一键还原"
                         },
                         if armed {
                             ButtonKind::DangerSoft
                         } else {
                             ButtonKind::Secondary
                         },
-                        can_act && !restoring,
+                        can_act && !row_restoring,
+                        row_restoring,
                         p,
                     )
                     .h(px(26.))
                     .px(px(10.))
                     .text_size(px(11.))
-                    .when(can_act && !restoring, |b| {
+                    .when(can_act && !row_restoring, |b| {
                         b.on_mouse_up(
                             MouseButton::Left,
                             cx.listener(move |_, _, _, cx| {
@@ -775,41 +853,69 @@ pub fn render_cleanroom_page(
                         .flex()
                         .items_center()
                         .gap(px(8.))
+                        .min_w(px(0.))
                         .child(
                             div()
                                 .text_size(px(12.5))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(p.text_primary))
-                                .child("加密时光机备份 (.cgbak) 与一键回滚"),
+                                .child("清理前自动备份记录（本机加密保护，可一键无损还原）"),
                         )
                         .child(
-                            mono_tabular(format!("共 {} 份本地加密快照", backups.len()))
+                            mono_tabular(format!("共 {} 份备份", backups.len()))
                                 .text_size(px(11.))
                                 .text_color(rgb(p.text_muted)),
                         ),
                 )
                 .child(
-                    icon_action_button(
-                        "cr-refresh-backups",
-                        "icons/ui/refresh.svg",
-                        "刷新备份列表",
-                        ButtonKind::Secondary,
-                        can_act,
-                        p,
-                    )
-                    .h(px(26.))
-                    .px(px(9.))
-                    .text_size(px(11.))
-                    .when(can_act, |b| {
-                        b.on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(move |_, _, _, cx| {
-                                ctrl_refresh_bk.update(cx, |c, cx| {
-                                    c.refresh_cleanroom_backups(cx);
-                                });
-                            }),
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_shrink_0()
+                        .gap(px(6.))
+                        .child(
+                            action_button(
+                                "cr-open-backup-dir",
+                                "打开备份目录",
+                                ButtonKind::Secondary,
+                                true,
+                                p,
+                            )
+                            .h(px(26.))
+                            .px(px(9.))
+                            .text_size(px(11.))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, _, cx| {
+                                    ctrl_open_bk_dir.update(cx, |c, cx| {
+                                        c.open_cleanroom_backup_dir(cx);
+                                    });
+                                }),
+                            ),
                         )
-                    }),
+                        .child(
+                            icon_action_button(
+                                "cr-refresh-backups",
+                                "icons/ui/refresh.svg",
+                                "刷新列表",
+                                ButtonKind::Secondary,
+                                can_act,
+                                p,
+                            )
+                            .h(px(26.))
+                            .px(px(9.))
+                            .text_size(px(11.))
+                            .when(can_act, |b| {
+                                b.on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |_, _, _, cx| {
+                                        ctrl_refresh_bk.update(cx, |c, cx| {
+                                            c.refresh_cleanroom_backups(cx);
+                                        });
+                                    }),
+                                )
+                            }),
+                        ),
                 ),
         )
         .child(if backup_rows.is_empty() {

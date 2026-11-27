@@ -142,6 +142,14 @@ fn normalize_ip_and_subnet(raw_ip: &str) -> (String, String) {
     }
 }
 
+fn normalize_opt_coords(lat: Option<i16>, lon: Option<i16>) -> (Option<i16>, Option<i16>) {
+    match (lat, lon) {
+        (Some(0), Some(0)) => (None, None),
+        (Some(la), Some(lo)) => (Some(la), Some(lo)),
+        _ => (None, None),
+    }
+}
+
 /// Sanitized single ledger observation persisted on disk (ZERO plaintext IP fields).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -150,8 +158,10 @@ pub struct EgressLedgerEntry {
     pub subnet_hmac_hex: String,
     pub country: String,
     pub city_or_colo: String,
-    pub lat_tenths: i16,
-    pub lon_tenths: i16,
+    #[serde(default)]
+    pub lat_tenths: Option<i16>,
+    #[serde(default)]
+    pub lon_tenths: Option<i16>,
     pub observed_at: u64,
     #[serde(default)]
     pub vault_id: Option<String>,
@@ -159,13 +169,14 @@ pub struct EgressLedgerEntry {
 
 impl From<&EgressLedgerEntry> for EgressObservation {
     fn from(e: &EgressLedgerEntry) -> Self {
+        let (lat_tenths, lon_tenths) = normalize_opt_coords(e.lat_tenths, e.lon_tenths);
         Self {
             ip_hmac_hex: e.ip_hmac_hex.clone(),
             subnet_hmac_hex: e.subnet_hmac_hex.clone(),
             country: e.country.clone(),
             city_or_colo: e.city_or_colo.clone(),
-            lat_tenths: e.lat_tenths,
-            lon_tenths: e.lon_tenths,
+            lat_tenths,
+            lon_tenths,
             observed_at: e.observed_at,
             vault_id: e.vault_id.clone(),
         }
@@ -200,7 +211,19 @@ impl EgressLedger {
     /// Opens or initializes `<data_dir>\ledger_key.dpapi` and `<data_dir>\egress_history.json`.
     pub fn open(data_dir: impl Into<PathBuf>) -> Self {
         let dir = data_dir.into();
-        let secret = load_or_init_dpapi_secret(&dir).unwrap_or_else(|_| {
+        let secret = load_or_init_dpapi_secret(&dir).unwrap_or_else(|err| {
+            crate::diagnostics::append_redacted_daemon_log_entries(
+                &dir,
+                &[cg_protocol::LogEntry {
+                    id: 0,
+                    timestamp: crate::protocol::now_unix_secs(),
+                    level: cg_protocol::LogLevel::Warn,
+                    category: "ledger".into(),
+                    message: format!(
+                        "DPAPI 出口轨迹密钥初始化失败，已降级使用内存临时密钥（重启后轨迹将重置）：{err}"
+                    ),
+                }],
+            );
             let mut fallback = [0u8; 32];
             let _ = crypto_win::random_bytes(&mut fallback);
             fallback
@@ -243,13 +266,14 @@ impl EgressLedger {
     ) -> EgressObservation {
         let (ip_hmac_hex, subnet_hmac_hex) = self.hash_ip_and_subnet(raw_ip);
         let norm_vault = normalize_vault_opt(vault_id);
+        let (lat_norm, lon_norm) = normalize_opt_coords(lat_tenths, lon_tenths);
         EgressObservation {
             ip_hmac_hex,
             subnet_hmac_hex,
             country: country.trim().to_ascii_uppercase(),
             city_or_colo: city_or_colo.trim().to_string(),
-            lat_tenths: lat_tenths.unwrap_or(0),
-            lon_tenths: lon_tenths.unwrap_or(0),
+            lat_tenths: lat_norm,
+            lon_tenths: lon_norm,
             observed_at: now_secs,
             vault_id: norm_vault,
         }
@@ -323,7 +347,7 @@ impl EgressLedger {
                         if !entry.city_or_colo.is_empty() {
                             prev.city_or_colo = entry.city_or_colo.clone();
                         }
-                        if entry.lat_tenths != 0 || entry.lon_tenths != 0 {
+                        if entry.lat_tenths.is_some() && entry.lon_tenths.is_some() {
                             prev.lat_tenths = entry.lat_tenths;
                             prev.lon_tenths = entry.lon_tenths;
                         }

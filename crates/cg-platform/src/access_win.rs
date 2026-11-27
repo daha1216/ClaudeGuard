@@ -64,7 +64,7 @@ const TUN_EXCLUDES: &[&str] = &[
 ];
 
 /// Service domain suffixes whose appearance in `ProxyOverride` implies direct leak risk.
-const SENSITIVE_SUFFIXES: [&str; 8] = [
+const SENSITIVE_SUFFIXES: [&str; 15] = [
     "anthropic.com",
     "claude.ai",
     "openai.com",
@@ -73,6 +73,13 @@ const SENSITIVE_SUFFIXES: [&str; 8] = [
     "oaiusercontent.com",
     "googleapis.com",
     "google.com",
+    "cursor.com",
+    "cursor.sh",
+    "cursorapi.com",
+    "codeium.com",
+    "windsurf.com",
+    "zed.dev",
+    "trae.ai",
 ];
 
 /// Raw registry evidence read from Windows Internet Settings.
@@ -859,6 +866,314 @@ pub fn active_interactive_user_sid() -> Option<String> {
     None
 }
 
+/// RAII thread-impersonation guard for Session-0 (`LocalSystem`) Windows Service threads.
+///
+/// - When `!is_session_zero()`, [`Self::enter`] returns an inert guard (`is_impersonating() == false`)
+///   with zero Win32 syscalls.
+/// - When `is_session_zero()`, queries the active interactive console/RDP user token via
+///   `WTSQueryUserToken`, duplicates it at `SecurityImpersonation` (`TokenImpersonation`), and calls
+///   `ImpersonateLoggedOnUser`. Returns an explicit `Err` if no interactive user session is logged on.
+/// - `Drop` unconditionally calls `RevertToSelf()` whenever impersonation was activated.
+pub struct ImpersonateInteractiveUserGuard {
+    impersonating: bool,
+    _not_send: core::marker::PhantomData<*mut ()>,
+}
+
+impl std::fmt::Debug for ImpersonateInteractiveUserGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImpersonateInteractiveUserGuard")
+            .field("impersonating", &self.impersonating)
+            .finish()
+    }
+}
+
+impl ImpersonateInteractiveUserGuard {
+    /// Enters interactive user thread impersonation when running in Session 0 (`LocalSystem`),
+    /// or returns a safe no-op guard in normal desktop sessions.
+    pub fn enter() -> Result<Self, String> {
+        if !is_session_zero() {
+            return Ok(Self {
+                impersonating: false,
+                _not_send: core::marker::PhantomData,
+            });
+        }
+        Self::enter_session_zero_impl()
+    }
+
+    /// Alias for [`Self::enter`].
+    pub fn acquire() -> Result<Self, String> {
+        Self::enter()
+    }
+
+    /// Returns `Ok(None)` when `!is_session_zero()`, or `Ok(Some(guard))` after impersonating the
+    /// active interactive user in Session 0 (failing closed with `Err` if no user is logged on).
+    pub fn impersonate_if_session_zero() -> Result<Option<Self>, String> {
+        if !is_session_zero() {
+            return Ok(None);
+        }
+        Self::enter_session_zero_impl().map(Some)
+    }
+
+    /// Whether this guard actively called `ImpersonateLoggedOnUser` on the current OS thread.
+    pub fn is_impersonating(&self) -> bool {
+        self.impersonating
+    }
+
+    #[cfg(windows)]
+    fn enter_session_zero_impl() -> Result<Self, String> {
+        use core::ffi::c_void;
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::Security::{
+            DuplicateTokenEx, ImpersonateLoggedOnUser, SecurityImpersonation, TokenImpersonation,
+            TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
+        };
+        use windows::Win32::System::RemoteDesktop::{
+            WTSActive, WTSEnumerateSessionsW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
+            WTSQueryUserToken, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW,
+        };
+
+        struct HandleGuard(HANDLE);
+        impl Drop for HandleGuard {
+            fn drop(&mut self) {
+                if !self.0.is_invalid() && !self.0 .0.is_null() {
+                    unsafe {
+                        let _ = CloseHandle(self.0);
+                    }
+                }
+            }
+        }
+
+        struct WtsMemGuard(*mut c_void);
+        impl Drop for WtsMemGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        WTSFreeMemory(self.0);
+                    }
+                }
+            }
+        }
+
+        let raw_user_token = unsafe {
+            let mut found: Option<HANDLE> = None;
+            let console_id = WTSGetActiveConsoleSessionId();
+            if console_id != 0 && console_id != u32::MAX {
+                let mut tok = HANDLE::default();
+                if WTSQueryUserToken(console_id, &mut tok).is_ok()
+                    && !tok.is_invalid()
+                    && !tok.0.is_null()
+                {
+                    found = Some(tok);
+                }
+            }
+            if found.is_none() {
+                let mut sessions_ptr: *mut WTS_SESSION_INFOW = core::ptr::null_mut();
+                let mut count: u32 = 0;
+                if WTSEnumerateSessionsW(
+                    WTS_CURRENT_SERVER_HANDLE,
+                    0,
+                    1,
+                    &mut sessions_ptr,
+                    &mut count,
+                )
+                .is_ok()
+                    && !sessions_ptr.is_null()
+                {
+                    let _mem = WtsMemGuard(sessions_ptr.cast::<c_void>());
+                    let sessions = core::slice::from_raw_parts(sessions_ptr, count as usize);
+                    for info in sessions {
+                        if info.SessionId != 0 && info.State == WTSActive {
+                            let mut tok = HANDLE::default();
+                            if WTSQueryUserToken(info.SessionId, &mut tok).is_ok()
+                                && !tok.is_invalid()
+                                && !tok.0.is_null()
+                            {
+                                found = Some(tok);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            found
+        }
+        .ok_or_else(|| "当前无活动的交互式桌面会话，无法模拟桌面用户身份".to_string())?;
+        let _raw_guard = HandleGuard(raw_user_token);
+
+        let mut imp_token = HANDLE::default();
+        unsafe {
+            DuplicateTokenEx(
+                raw_user_token,
+                TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE,
+                None,
+                SecurityImpersonation,
+                TokenImpersonation,
+                &mut imp_token,
+            )
+        }
+        .map_err(|e| format!("DuplicateTokenEx(SecurityImpersonation) 失败：{e}"))?;
+        let _imp_guard = HandleGuard(imp_token);
+
+        unsafe { ImpersonateLoggedOnUser(imp_token) }
+            .map_err(|e| format!("ImpersonateLoggedOnUser 失败：{e}"))?;
+
+        Ok(Self {
+            impersonating: true,
+            _not_send: core::marker::PhantomData,
+        })
+    }
+
+    #[cfg(not(windows))]
+    fn enter_session_zero_impl() -> Result<Self, String> {
+        Err("Windows user impersonation is only supported on Windows".to_string())
+    }
+}
+
+impl Drop for ImpersonateInteractiveUserGuard {
+    fn drop(&mut self) {
+        if self.impersonating {
+            #[cfg(windows)]
+            unsafe {
+                let _ = windows::Win32::Security::RevertToSelf();
+            }
+            self.impersonating = false;
+        }
+    }
+}
+
+/// Resolves the interactive user SID (`S-1-5-21-...` or `S-1-12-1-...`) owning `user_home`.
+///
+/// 1. Queries NTFS owner SID via `GetNamedSecurityInfoW(OWNER_SECURITY_INFORMATION)` when it is an
+///    interactive user SID (never returning `S-1-5-18` `SYSTEM` or `S-1-5-32-544` `Administrators`).
+/// 2. Falls back to matching `user_home` against `HKLM\...\ProfileList\<SID>\ProfileImagePath`,
+///    which succeeds even at early service boot before any user logs on interactively.
+#[cfg(windows)]
+pub fn resolve_user_sid_string_for_home(user_home: &std::path::Path) -> Option<String> {
+    use core::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    let norm_path = |p: &std::path::Path| -> String {
+        let raw = p.to_string_lossy();
+        let stripped = raw
+            .trim()
+            .strip_prefix(r"\\?\")
+            .or_else(|| raw.trim().strip_prefix("//?/"))
+            .unwrap_or(raw.trim());
+        stripped
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+
+    let target_norm = norm_path(user_home);
+    if target_norm.is_empty() {
+        return None;
+    }
+
+    // 1. Direct NTFS directory owner SID via GetNamedSecurityInfoW.
+    if user_home.exists() {
+        struct SdMemGuard(PSECURITY_DESCRIPTOR);
+        impl Drop for SdMemGuard {
+            fn drop(&mut self) {
+                if !self.0 .0.is_null() {
+                    unsafe {
+                        let _ = LocalFree(HLOCAL(self.0 .0.cast::<c_void>()));
+                    }
+                }
+            }
+        }
+        struct PwstrMemGuard(windows::core::PWSTR);
+        impl Drop for PwstrMemGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        let _ = LocalFree(HLOCAL(self.0 .0.cast::<c_void>()));
+                    }
+                }
+            }
+        }
+
+        let wide: Vec<u16> = user_home.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut owner_sid = PSID::default();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(&mut owner_sid),
+                None,
+                None,
+                None,
+                &mut sd,
+            )
+        };
+        let _sd_guard = SdMemGuard(sd);
+        if rc == ERROR_SUCCESS && !owner_sid.is_invalid() && !owner_sid.0.is_null() {
+            let mut sid_pwstr = windows::core::PWSTR::null();
+            if unsafe { ConvertSidToStringSidW(owner_sid, &mut sid_pwstr) }.is_ok()
+                && !sid_pwstr.is_null()
+            {
+                let _pw_guard = PwstrMemGuard(sid_pwstr);
+                let sid_str = wide_to_string(&unsafe { pwstr_units(sid_pwstr) });
+                if is_interactive_user_sid(&sid_str) {
+                    return Some(sid_str);
+                }
+            }
+        }
+    }
+
+    // 2. Boot-time safe fallback: match against HKLM ProfileList\<SID>\ProfileImagePath.
+    let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    if let Ok(profile_list) = hklm.open_subkey_with_flags(
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList",
+        KEY_READ,
+    ) {
+        for sid in profile_list.enum_keys().flatten() {
+            if !is_interactive_user_sid(&sid) {
+                continue;
+            }
+            let Ok(sub) = profile_list.open_subkey_with_flags(&sid, KEY_READ) else {
+                continue;
+            };
+            let Ok(raw_img) = sub.get_value::<String, _>("ProfileImagePath") else {
+                continue;
+            };
+            let expanded =
+                if let Some(rest) = strip_ascii_prefix_ci(raw_img.trim(), "%SystemDrive%") {
+                    format!("{}{rest}", sys_drive.trim_end_matches(['\\', '/']))
+                } else {
+                    raw_img
+                };
+            let prof_norm = norm_path(std::path::Path::new(&expanded));
+            if !prof_norm.is_empty()
+                && (target_norm == prof_norm
+                    || target_norm
+                        .strip_prefix(&prof_norm)
+                        .is_some_and(|tail| tail.starts_with('\\')))
+            {
+                return Some(sid);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(not(windows))]
+pub fn resolve_user_sid_string_for_home(_user_home: &std::path::Path) -> Option<String> {
+    None
+}
+
 /// Opens a per-user registry subkey for the interactive desktop user.
 ///
 /// - When running in an interactive user session (`Session > 0`), opens `HKCU\<subpath>` directly.
@@ -1263,6 +1578,21 @@ mod tests {
             AccessPath::Unknown { .. }
         ));
 
+        for v5_override in [
+            "*.cursor.sh",
+            "*.cursor.com",
+            "*.windsurf.com",
+            "*.codeium.com",
+            "*.zed.dev",
+            "*.trae.ai",
+        ] {
+            e.overrides = Some(v5_override.into());
+            assert!(
+                matches!(verdict(&e, None, &hosts()), AccessPath::Unknown { .. }),
+                "expected ProxyOverride {v5_override} to flag bypass risk"
+            );
+        }
+
         e.overrides = Some("*".into());
         assert_eq!(verdict(&e, None, &hosts()), AccessPath::Uncovered);
     }
@@ -1465,5 +1795,20 @@ mod tests {
         let _elevated = is_elevated().expect("OpenProcessToken/GetTokenInformation should succeed");
         let _ev = read_proxy_evidence();
         let _tun = detect_tun_adapter();
+        if !is_session_zero() {
+            let guard = ImpersonateInteractiveUserGuard::enter()
+                .expect("interactive session impersonation guard must be a safe no-op");
+            assert!(!guard.is_impersonating());
+            assert!(
+                ImpersonateInteractiveUserGuard::impersonate_if_session_zero()
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        if let Some(home) = crate::process_win::user_home_dirs().into_iter().next() {
+            if let Some(sid) = resolve_user_sid_string_for_home(&home) {
+                assert!(is_interactive_user_sid(&sid));
+            }
+        }
     }
 }

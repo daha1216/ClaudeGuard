@@ -314,6 +314,12 @@ pub fn ensure_no_reparse_point_in_ancestors(path: &Path) -> PlatformResult<()> {
     Ok(())
 }
 
+/// Convenience boolean wrapper returning `true` when `path` or any of its ancestors contains a
+/// symlink, NTFS junction, mount point, or `..` parent traversal segment.
+pub fn has_reparse_point_in_chain(path: &Path) -> bool {
+    ensure_no_reparse_point_in_ancestors(path).is_err()
+}
+
 // ---------- Reversible IShellLinkW Shortcut Hygiene Patcher ----------
 
 /// Extracted metadata from a Windows `.lnk` Shell Link file.
@@ -482,6 +488,11 @@ pub fn create_shortcut_lnk(
         ensure_no_reparse_point_in_ancestors(parent)?;
     }
 
+    let _imp = if crate::access_win::is_session_zero() {
+        crate::access_win::ImpersonateInteractiveUserGuard::enter().ok()
+    } else {
+        None
+    };
     let _com = crate::com::ComGuard::init_mta()?;
     let target_w: Vec<u16> = target_exe
         .as_os_str()
@@ -676,6 +687,11 @@ pub fn patch_shortcut_for_safe_launch(
         rec
     };
 
+    let _imp = if crate::access_win::is_session_zero() {
+        crate::access_win::ImpersonateInteractiveUserGuard::enter().ok()
+    } else {
+        None
+    };
     let _com = crate::com::ComGuard::init_mta()?;
     let lnk_w: Vec<u16> = lnk_path.as_os_str().encode_wide().chain(Some(0)).collect();
     let launcher_w: Vec<u16> = launcher_exe
@@ -780,7 +796,14 @@ pub fn restore_shortcut_from_backup(
             )));
         }
 
-        atomic_write_bytes(&target_path, &decoded)?;
+        {
+            let _imp = if crate::access_win::is_session_zero() {
+                crate::access_win::ImpersonateInteractiveUserGuard::enter().ok()
+            } else {
+                None
+            };
+            atomic_write_bytes(&target_path, &decoded)?;
+        }
         restored += 1;
     }
 

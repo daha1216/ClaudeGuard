@@ -9,6 +9,8 @@
 //! - All mutating/query IPC requests, background monitor ticks, async probe completions,
 //!   and periodic telemetry updates flow through one dedicated single-writer coordinator thread.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, RwLock};
@@ -16,10 +18,12 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use cg_core::{BurstGuardConfig, BurstGuardTracker, CheckPurpose};
+use cg_platform::process_win::ProcessIdentity;
 use cg_protocol::{
-    matched_ip_rule, normalize_region, AccountVault, AnchorKind, BurstGuardStatus, Config,
-    HookDecision, HookFailMode, HookIntegrationStatus, Lifecycle, ProtectionState, RiskAssessment,
-    TargetState, VaultRuntimeState, WfpStatus, WslBridgeStatus,
+    matched_ip_rule, normalize_region, AccountVault, AnchorKind, AsnClassification,
+    BurstGuardStatus, CleanRoomBackupMeta, CleanRoomReport, Config, HookDecision, HookFailMode,
+    HookIntegrationStatus, Lifecycle, ProtectionState, RiskAssessment, SanitizedHealthCard,
+    TargetState, VaultAppTarget, VaultRuntimeState, WfpStatus, WslBridgeStatus,
 };
 
 use crate::protocol::{
@@ -65,6 +69,42 @@ impl HookGateMetrics {
 pub enum FastGateOutcome {
     Immediate(PipeResponse),
     NeedsSyncProbe,
+}
+
+/// Cached egress observation probed through a dedicated local proxy port (`vault.dedicated_proxy_port`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PortEgressObservation {
+    pub port: u16,
+    pub ip: Option<String>,
+    pub country: Option<String>,
+    pub city: Option<String>,
+    pub colo: Option<String>,
+    pub lat_tenths: Option<i16>,
+    pub lon_tenths: Option<i16>,
+    pub asn: Option<u32>,
+    pub observed_at: u64,
+}
+
+/// Result produced by the off-thread `LaunchVault` worker.
+#[derive(Clone, Debug)]
+pub enum VaultLaunchWorkerOutcome {
+    Launched {
+        obs_ip: Option<String>,
+        obs_country: Option<String>,
+        obs_city: Option<String>,
+        lat_tenths: Option<i16>,
+        lon_tenths: Option<i16>,
+        port_obs: Option<PortEgressObservation>,
+        discovered_sessions: Vec<(ProcessIdentity, String)>,
+    },
+    AutoAlignedMihomo {
+        node: String,
+        detail: String,
+    },
+    Failed {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 /// Extracts primary observed `(ip, country, asn)` from the latest snapshot.
@@ -169,6 +209,31 @@ pub fn evaluate_fast_hook_gate_at(
     now_secs: u64,
     now_ms: u64,
 ) -> FastGateOutcome {
+    let empty_ports = HashMap::new();
+    evaluate_fast_hook_gate_with_ports_at(
+        snap,
+        burst_guard,
+        &empty_ports,
+        agent_id,
+        vault_id,
+        hook_event,
+        now_secs,
+        now_ms,
+    )
+}
+
+/// Pure O(1) evaluator for [`PipeRequest::FastHookGate`] with per-port dedicated Vault egress cache.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_fast_hook_gate_with_ports_at(
+    snap: &GuardSnapshot,
+    burst_guard: &Mutex<BurstGuardTracker>,
+    port_egress: &HashMap<u16, PortEgressObservation>,
+    agent_id: &str,
+    vault_id: Option<&str>,
+    hook_event: Option<&str>,
+    now_secs: u64,
+    now_ms: u64,
+) -> FastGateOutcome {
     let safety_score = if snap.risk_assessment.evaluated_at > 0 {
         snap.risk_assessment.score
     } else if snap.all_enabled_pass() {
@@ -214,15 +279,6 @@ pub fn evaluate_fast_hook_gate_at(
                 .to_string(),
         );
     }
-    if snap.lifecycle == Lifecycle::Armed
-        && snap.config.enforce_access_path
-        && snap.access.is_uncovered()
-    {
-        return block(
-            "🛡️ [ClaudeGuard 裸连拦截] 未检测到活跃代理通道（TUN/系统代理均离线），已阻断直连风险"
-                .to_string(),
-        );
-    }
 
     // 2. Non-armed lifecycle states.
     match snap.lifecycle {
@@ -261,13 +317,13 @@ pub fn evaluate_fast_hook_gate_at(
         return allow("ClaudeGuard 临时暂停中，门禁放行".to_string());
     }
 
-    // 3. Snapshot freshness & target compliance check BEFORE mutating BurstGuardTracker.
-    // Guarantees NeedsSyncProbe never inflates BurstGuard counts on stale-snapshot fallback.
+    // 3. Snapshot freshness, Pending state, non-tripped Uncovered/Fail, and dedicated-port cache
+    //    checks BEFORE mutating BurstGuardTracker so NeedsSyncProbe never double-counts prompts.
     let ttl = snap.config.hook_freshness_ttl_secs.clamp(10, 300);
     let is_fresh = snap
         .checked_at
         .is_some_and(|ts| now_secs.saturating_sub(ts) <= ttl);
-    if !is_fresh {
+    if !is_fresh || snap.protection == ProtectionState::Pending {
         return FastGateOutcome::NeedsSyncProbe;
     }
 
@@ -278,20 +334,43 @@ pub fn evaluate_fast_hook_gate_at(
         ));
     }
 
-    if let Some(failed) = snap.targets.iter().find(|t| t.state == TargetState::Fail) {
-        return block(format!(
-            "🛡️ [ClaudeGuard 出口违规拦截] {} 未通过合规核验：{}",
-            failed.name, failed.reason
-        ));
+    let normalized_vault = vault_id.map(str::trim).filter(|s| !s.is_empty());
+    let mut dedicated_egress: Option<&PortEgressObservation> = None;
+    let mut uses_dedicated_port = false;
+
+    if let Some(vid) = normalized_vault {
+        if let Some(vault) = snap
+            .config
+            .vaults
+            .iter()
+            .find(|v| v.id.eq_ignore_ascii_case(vid))
+        {
+            if vault.enabled {
+                if let Some(port) = vault
+                    .dedicated_proxy_port
+                    .filter(|&p| p > 0 && p != snap.config.proxy_port)
+                {
+                    uses_dedicated_port = true;
+                    match port_egress.get(&port) {
+                        Some(obs) if now_secs.saturating_sub(obs.observed_at) <= ttl => {
+                            dedicated_egress = Some(obs);
+                        }
+                        _ => return FastGateOutcome::NeedsSyncProbe,
+                    }
+                }
+            }
+        }
     }
 
-    if !snap.all_enabled_pass() {
+    if !uses_dedicated_port
+        && ((snap.config.enforce_access_path && !snap.access.is_known())
+            || !snap.all_enabled_pass())
+    {
         return FastGateOutcome::NeedsSyncProbe;
     }
 
     // 4. BurstGuard sliding-window rate & robotic cadence check (O(1) in-memory).
     // Only executes once we know this evaluation produces a terminal Immediate verdict.
-    let normalized_vault = vault_id.map(str::trim).filter(|s| !s.is_empty());
     let is_pre_tool = hook_event.is_some_and(|e| {
         let lower = e.trim().to_ascii_lowercase();
         matches!(lower.as_str(), "pretooluse" | "pre_tool_use" | "pre-tool")
@@ -312,24 +391,31 @@ pub fn evaluate_fast_hook_gate_at(
         ));
     }
 
-    // 5. M2 10-Dimension Ban-Risk, Geo-Velocity cooldown & Datacenter ASN checks.
-    if snap.risk_assessment.evaluated_at > 0 {
+    // 5. M2 10-Dimension Ban-Risk, Geo-Velocity cooldown & Datacenter ASN checks (for global proxy).
+    if !uses_dedicated_port && snap.risk_assessment.evaluated_at > 0 {
         if snap.config.enforce_geo_velocity {
             if let Some(alert) = snap.risk_assessment.geo_velocity_alert.as_ref() {
-                if let Some(until) = alert.cooldown_until {
-                    if until > now_secs {
-                        let remain = until.saturating_sub(now_secs);
-                        return block(format!(
-                            "🛡️ [ClaudeGuard 时空瞬移冷却] 检测到异常跨国跃迁（{} -> {}，{}km），剩余冷却 {}s",
-                            alert.from_country, alert.to_country, alert.distance_km, remain
-                        ));
-                    }
+                let active = alert.cooldown_until.is_none_or(|until| until > now_secs);
+                if active {
+                    let remain = alert
+                        .cooldown_until
+                        .map_or(0, |until| until.saturating_sub(now_secs));
+                    return block(format!(
+                        "🛡️ [ClaudeGuard 时空瞬移冷却] 检测到异常跨国跃迁（{} -> {}，{}km），剩余冷却 {}s",
+                        alert.from_country, alert.to_country, alert.distance_km, remain
+                    ));
                 }
             }
         }
-        if snap.config.block_datacenter_asn && snap.risk_assessment.ip_purity.is_datacenter {
+        if snap.config.block_datacenter_asn
+            && (snap.risk_assessment.ip_purity.is_datacenter
+                || matches!(
+                    snap.risk_assessment.ip_purity.classification,
+                    AsnClassification::DatacenterHosting | AsnClassification::PublicProxyVpnTor
+                ))
+        {
             return block(
-                "🛡️ [ClaudeGuard 机房 IP 拦截] 当前出口属于云机房/VPS 段，已按策略阻断提示词"
+                "🛡️ [ClaudeGuard 机房 IP 拦截] 当前出口属于云机房/VPS 或高风险共享代理段，已按策略阻断提示词"
                     .to_string(),
             );
         }
@@ -366,13 +452,18 @@ pub fn evaluate_fast_hook_gate_at(
             }
         }
 
-        let (obs_ip, obs_country, obs_asn) = current_primary_egress(snap);
+        let (obs_ip, obs_country, obs_asn) = if let Some(obs) = dedicated_egress {
+            (obs.ip.clone(), obs.country.clone(), obs.asn)
+        } else {
+            current_primary_egress(snap)
+        };
         if let Err(reason) =
             check_vault_egress_contract(vault, obs_ip.as_deref(), obs_country.as_deref(), obs_asn)
         {
             return block(format!("🛡️ [ClaudeGuard 分身契约拦截] {reason}"));
         }
-        if snap.risk_assessment.evaluated_at > 0
+        if !uses_dedicated_port
+            && snap.risk_assessment.evaluated_at > 0
             && snap.risk_assessment.score < vault.min_safety_score
         {
             return block(format!(
@@ -530,6 +621,57 @@ pub enum CoordinatorEvent {
     UpdateWslBridgeStatus {
         status: Box<WslBridgeStatus>,
     },
+    ExportDiagnosticsFinished {
+        result: Result<PathBuf, String>,
+        now_secs: u64,
+        reply: SyncSender<PipeResponse>,
+    },
+    HealthCardBuilt {
+        card: Box<SanitizedHealthCard>,
+        export_png: bool,
+        now_secs: u64,
+        reply: SyncSender<PipeResponse>,
+    },
+    CleanRoomScanned {
+        report: Box<CleanRoomReport>,
+        backup_count: usize,
+        now_secs: u64,
+        reply: SyncSender<PipeResponse>,
+    },
+    CleanRoomExecuted {
+        result: Result<(CleanRoomBackupMeta, CleanRoomReport, usize), String>,
+        now_secs: u64,
+        reply: SyncSender<PipeResponse>,
+    },
+    CleanRoomRestored {
+        backup_id: String,
+        result: Result<usize, String>,
+        now_secs: u64,
+        reply: SyncSender<PipeResponse>,
+    },
+    VaultShortcutsGenerated {
+        vault_id: String,
+        vault_name: String,
+        result: Result<usize, String>,
+        now_secs: u64,
+        reply: SyncSender<PipeResponse>,
+    },
+    CliHooksConfigured {
+        result: Result<HookIntegrationStatus, String>,
+        now_secs: u64,
+        reply: SyncSender<PipeResponse>,
+    },
+    VaultLaunchFinished {
+        vault: Box<AccountVault>,
+        app: VaultAppTarget,
+        outcome: Box<VaultLaunchWorkerOutcome>,
+        now_secs: u64,
+        reply: SyncSender<PipeResponse>,
+    },
+    PortEgressProbed {
+        observations: Vec<PortEgressObservation>,
+        now_secs: u64,
+    },
     BeginStopping {
         reply: SyncSender<Result<OperationReceipt, String>>,
     },
@@ -542,6 +684,7 @@ pub struct CoordinatorContext<'a> {
     pub event_tx: &'a SyncSender<CoordinatorEvent>,
     pub burst_guard: &'a Arc<Mutex<BurstGuardTracker>>,
     pub hook_metrics: &'a Arc<HookGateMetrics>,
+    pub port_egress: &'a Arc<RwLock<HashMap<u16, PortEgressObservation>>>,
 }
 
 /// Stateful single-writer actor owned exclusively by the coordinator thread.
@@ -558,6 +701,7 @@ pub struct CoordinatorHandle {
     worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     burst_guard: Arc<Mutex<BurstGuardTracker>>,
     hook_metrics: Arc<HookGateMetrics>,
+    port_egress: Arc<RwLock<HashMap<u16, PortEgressObservation>>>,
 }
 
 impl CoordinatorHandle {
@@ -624,6 +768,36 @@ impl CoordinatorHandle {
         }
     }
 
+    /// Reads a clone of the cached per-port dedicated Vault egress map in O(1).
+    pub fn port_egress_map(&self) -> HashMap<u16, PortEgressObservation> {
+        match self.port_egress.read() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Publishes background dedicated-port egress observations into the shared cache and coordinator.
+    pub fn publish_port_egress(&self, observations: Vec<PortEgressObservation>, now_secs: u64) {
+        if observations.is_empty() {
+            return;
+        }
+        {
+            let mut guard = match self.port_egress.write() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            for obs in &observations {
+                guard.insert(obs.port, obs.clone());
+            }
+        }
+        if !self.stopped.load(Ordering::Acquire) {
+            let _ = self.tx.try_send(CoordinatorEvent::PortEgressProbed {
+                observations,
+                now_secs,
+            });
+        }
+    }
+
     /// Executes the O(1) `<2ms` `FastHookGate` fast path, falling back to the coordinator
     /// queue only when the snapshot is stale or unverified.
     pub fn fast_hook_gate(
@@ -636,10 +810,12 @@ impl CoordinatorHandle {
         let snap = self.snapshot.read();
         let now_s = now_unix_secs();
         let now_ms = now_unix_millis();
+        let ports = self.port_egress_map();
 
-        let resp = match evaluate_fast_hook_gate_at(
+        let resp = match evaluate_fast_hook_gate_with_ports_at(
             &snap,
             &self.burst_guard,
+            &ports,
             agent_id,
             vault_id,
             hook_event,
@@ -788,11 +964,13 @@ where
     let stopped = Arc::new(AtomicBool::new(false));
     let burst_guard = Arc::new(Mutex::new(BurstGuardTracker::new()));
     let hook_metrics = Arc::new(HookGateMetrics::default());
+    let port_egress = Arc::new(RwLock::new(HashMap::new()));
 
     let worker_snapshot = snapshot.clone();
     let worker_tx = tx.clone();
     let worker_burst = burst_guard.clone();
     let worker_metrics = hook_metrics.clone();
+    let worker_ports = port_egress.clone();
 
     let handle = std::thread::Builder::new()
         .name("cg-mutation-coordinator".to_string())
@@ -802,6 +980,7 @@ where
                 event_tx: &worker_tx,
                 burst_guard: &worker_burst,
                 hook_metrics: &worker_metrics,
+                port_egress: &worker_ports,
             };
             while let Ok(event) = rx.recv() {
                 if matches!(event, CoordinatorEvent::Shutdown) {
@@ -822,6 +1001,7 @@ where
             worker: Arc::new(Mutex::new(Some(handle))),
             burst_guard,
             hook_metrics,
+            port_egress,
         },
         extra,
     )

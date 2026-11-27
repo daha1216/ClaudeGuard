@@ -68,6 +68,13 @@ fn short_launch_name(agent_id: &str, fallback: &str) -> String {
         "claude-code" => "Code CLI".into(),
         "chatgpt" => "ChatGPT".into(),
         "antigravity" => "Antigravity".into(),
+        "cursor" => "Cursor".into(),
+        "windsurf" => "Windsurf".into(),
+        "zed" => "Zed".into(),
+        "trae" => "Trae".into(),
+        "codex" => "Codex CLI".into(),
+        "gemini" => "Gemini CLI".into(),
+        "aider" => "Aider CLI".into(),
         _ => fallback.to_string(),
     }
 }
@@ -694,6 +701,14 @@ pub fn render_overview(
         BadgeTone::Muted
     };
     let health_card_busy = ctrl_r.is_scope_busy(&ActionScope::BuildHealthCard);
+    let configuring_hooks = ctrl_r.is_scope_busy(&ActionScope::ConfigureHooks);
+    let expand_launch_deck = ctrl_r.overview_expand_launch_deck;
+    let hooks_unconfigured = snap
+        .as_deref()
+        .is_some_and(|s| !s.hooks.claude_code_hook_installed);
+    let geo_cooldown_alert = snap
+        .as_deref()
+        .and_then(|s| s.risk_assessment.geo_velocity_alert.clone());
     let ctrl_to_radar = ctrl.clone();
     let ctrl_health_card = ctrl.clone();
 
@@ -706,9 +721,9 @@ pub fn render_overview(
         .hover(|s| s.opacity(0.88))
         .child(tone_tag(
             if risk_evaluated {
-                format!("{risk_score}分 · {} 级防封", risk_grade.code())
+                format!("体检 {risk_score}分 · {}级", risk_grade.code())
             } else {
-                "10D 防封待检".into()
+                "防封体检待检".into()
             },
             risk_tone,
             p,
@@ -729,7 +744,7 @@ pub fn render_overview(
         if health_card_busy {
             "生成中…"
         } else {
-            "导出防封体检卡"
+            "导出体检图（隐去IP）"
         },
         ButtonKind::Secondary,
         can_act && !health_card_busy,
@@ -1118,6 +1133,75 @@ pub fn render_overview(
         .children(pad_cards.drain(0..pad_cards.len().min(2)));
     let pads_row2 = div().flex().w_full().gap(px(8.)).children(pad_cards);
 
+    let extra_launch_apps: Vec<_> = proj.launch_apps.iter().skip(4).collect();
+    let extra_count = extra_launch_apps.len();
+    let ctrl_toggle_deck = ctrl.clone();
+    let extra_strip = (expand_launch_deck && !extra_launch_apps.is_empty()).then(|| {
+        let pills = extra_launch_apps.into_iter().map(|app| {
+            let aid = app.agent_id.clone();
+            let paths = app.install_paths.clone();
+            let ctrl_el = ctrl.clone();
+            let hard_locked = !connected
+                || really_tripped
+                || pre_trip_fail
+                || app.quarantined
+                || app.ag_proxy_blocked;
+            let can_click =
+                connected && !busy && app.installed && !hard_locked && proj.hero.can_launch;
+            let hover_bg = p.sidebar_hover_bg;
+            div()
+                .id(gpui::ElementId::Name(
+                    format!("ov-launch-extra-{}", app.agent_id).into(),
+                ))
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .px(px(8.5))
+                .py(px(4.5))
+                .rounded(px(8.))
+                .bg(rgb(p.inset_bg))
+                .border_1()
+                .border_color(rgb(p.card_border))
+                .when(can_click, |el| {
+                    el.cursor_pointer()
+                        .hover(move |s| s.bg(rgb(hover_bg)).border_color(rgb(p.line_strong)))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                ctrl_el.update(cx, |c, cx| {
+                                    c.launch_app_with_gate(aid.clone(), paths.clone(), cx);
+                                });
+                            }),
+                        )
+                })
+                .when(!app.installed || hard_locked, |el| el.opacity(0.52))
+                .child(brand_icon_scaled(&app.agent_id, 16.0, 4.5, p.is_dark, 1.0))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(p.text_primary))
+                        .child(short_launch_name(&app.agent_id, &app.label)),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(if app.installed {
+                            p.accent_soft_text
+                        } else {
+                            p.text_muted
+                        }))
+                        .child(if !app.installed { "未装" } else { "启动" }),
+                )
+        });
+        div()
+            .flex()
+            .flex_wrap()
+            .gap(px(6.))
+            .pt(px(2.))
+            .children(pills)
+    });
+
     let deck_pose = choreo.tile(0, 1);
     let launch_deck = bento_card_bloom(p, 16.0, 14.0, deck_pose)
         .flex_1()
@@ -1149,7 +1233,52 @@ pub fn render_overview(
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(p.text_primary))
                                 .child("安全启动台"),
-                        ),
+                        )
+                        .when(extra_count > 0, |row| {
+                            let hover_bg = p.sidebar_hover_bg;
+                            row.child(
+                                div()
+                                    .id("ov-toggle-more-clients")
+                                    .cursor_pointer()
+                                    .px(px(7.))
+                                    .py(px(2.))
+                                    .rounded(px(999.))
+                                    .bg(rgb(if expand_launch_deck {
+                                        p.accent_soft_bg
+                                    } else {
+                                        p.inset_bg
+                                    }))
+                                    .border_1()
+                                    .border_color(rgb(if expand_launch_deck {
+                                        p.accent_soft_border
+                                    } else {
+                                        p.card_border
+                                    }))
+                                    .hover(move |s| s.bg(rgb(hover_bg)))
+                                    .text_size(px(10.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(if expand_launch_deck {
+                                        p.accent_soft_text
+                                    } else {
+                                        p.text_secondary
+                                    }))
+                                    .child(if expand_launch_deck {
+                                        "收起更多客户端 ▴".to_string()
+                                    } else {
+                                        format!("更多已支持端 (+{extra_count}) ▾")
+                                    })
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            ctrl_toggle_deck.update(cx, |c, cx| {
+                                                c.overview_expand_launch_deck =
+                                                    !c.overview_expand_launch_deck;
+                                                cx.notify();
+                                            });
+                                        }),
+                                    ),
+                            )
+                        }),
                 )
                 .child(
                     div()
@@ -1171,7 +1300,8 @@ pub fn render_overview(
                 ),
         )
         .child(pads_row1)
-        .child(pads_row2);
+        .child(pads_row2)
+        .when_some(extra_strip, |d, strip| d.child(strip));
     let deck_slot = div().flex_1().min_w(px(0.)).flex().child(launch_deck);
 
     // -------------------------------------------------------------------------
@@ -2034,6 +2164,146 @@ pub fn render_overview(
         );
     let shield_slot = div().flex_1().min_w(px(0.)).flex().child(col_shield);
 
+    // Closed-loop 1-click inline remediation strip (Geo-Velocity Cooldown or Unprotected CLI Hooks)
+    let inline_remediation_banner = if connected && !really_tripped {
+        if let Some(alert) = geo_cooldown_alert {
+            let ctrl_geo_fix = ctrl.clone();
+            let rem_secs = alert
+                .cooldown_until
+                .unwrap_or(0)
+                .saturating_sub(crate::demo::now_unix_secs());
+            let mins = rem_secs / 60;
+            let secs = rem_secs % 60;
+            Some(
+                inset_box(p)
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.))
+                    .px(px(12.))
+                    .py(px(7.5))
+                    .bg(rgba(p.badge_warn.bg))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.))
+                            .min_w(px(0.))
+                            .flex_1()
+                            .child(status_dot(p.badge_warn.dot, 6.0))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(p.badge_warn.text))
+                                    .child(format!(
+                                        "跨国秒切保护生效中（距上次节点约 {} km，剩余冷却 {:02}:{:02}）",
+                                        alert.distance_km, mins, secs
+                                    )),
+                            ),
+                    )
+                    .child(
+                        action_button(
+                            "ov-clear-geo-cooldown",
+                            "确认本人切换节点 · 立即放行",
+                            ButtonKind::Secondary,
+                            can_act,
+                            p,
+                        )
+                        .h(px(25.))
+                        .px(px(10.))
+                        .text_size(px(11.))
+                        .when(can_act, |b| {
+                            b.on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, _, cx| {
+                                    ctrl_geo_fix.update(cx, |c, cx| {
+                                        c.send_request(
+                                            PipeRequest::ClearGeoVelocityCooldown,
+                                            Some("已确认本人切换节点，立即恢复放行"),
+                                            cx,
+                                        );
+                                    });
+                                }),
+                            )
+                        }),
+                    )
+                    .into_any_element(),
+            )
+        } else if hooks_unconfigured && lifecycle == Lifecycle::Armed {
+            let ctrl_hook_fix = ctrl.clone();
+            Some(
+                inset_box(p)
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.))
+                    .px(px(12.))
+                    .py(px(7.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.))
+                            .min_w(px(0.))
+                            .flex_1()
+                            .child(status_dot(p.badge_warn.dot, 5.5))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(p.text_secondary))
+                                    .child(
+                                        "终端命令行（Claude Code / PowerShell）尚未开启每次提问前自动防封检查",
+                                    ),
+                            ),
+                    )
+                    .child(
+                        spinning_action_button(
+                            "ov-oneclick-cli-hooks",
+                            "icons/ui/shield.svg",
+                            if configuring_hooks {
+                                "正在保护…"
+                            } else {
+                                "一键保护终端"
+                            },
+                            ButtonKind::Primary,
+                            can_act && !configuring_hooks,
+                            configuring_hooks,
+                            p,
+                        )
+                        .h(px(25.))
+                        .px(px(10.))
+                        .text_size(px(11.))
+                        .when(can_act && !configuring_hooks, |b| {
+                            b.on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, _, cx| {
+                                    ctrl_hook_fix.update(cx, |c, cx| {
+                                        c.send_request(
+                                            PipeRequest::ConfigureCliHooks {
+                                                install_claude_code: true,
+                                                install_pwsh_profile: true,
+                                                sync_all_vaults: true,
+                                            },
+                                            Some("已为终端 Claude Code 与 PowerShell 开启防封保护"),
+                                            cx,
+                                        );
+                                    });
+                                }),
+                            )
+                        }),
+                    )
+                    .into_any_element(),
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     div()
         .flex()
         .flex_col()
@@ -2041,6 +2311,7 @@ pub fn render_overview(
         .flex_1()
         .min_w(px(0.))
         .gap(px(11.))
+        .when_some(inline_remediation_banner, |col, banner| col.child(banner))
         .child(
             div()
                 .flex()

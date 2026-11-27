@@ -1649,7 +1649,7 @@ pub fn classify_org_heuristic(org: &str) -> AsnClassification {
         "server",
         "cloud",
         "vps",
-        "colo",
+        "colocation",
     ];
     if DATACENTER_HINTS.iter().any(|kw| lower.contains(kw)) {
         return AsnClassification::DatacenterHosting;
@@ -1826,6 +1826,18 @@ mod tests {
         assert_eq!(
             classify_org_heuristic("Example University Network"),
             AsnClassification::EducationGov
+        );
+        assert_eq!(
+            classify_org_heuristic("Equinix Colocation Services"),
+            AsnClassification::DatacenterHosting
+        );
+        assert_ne!(
+            classify_org_heuristic("ETB Colombia Telecom ISP"),
+            AsnClassification::DatacenterHosting
+        );
+        assert_ne!(
+            classify_org_heuristic("Colorado Broadband Communications"),
+            AsnClassification::DatacenterHosting
         );
         assert_eq!(classify_org_heuristic(""), AsnClassification::Unknown);
     }

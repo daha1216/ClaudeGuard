@@ -1,5 +1,5 @@
-; ClaudeGuard v4 Inno Setup script
-; Build: ISCC.exe claude-guard.iss  (from repo root D:\ClaudeGuard-v4)
+; ClaudeGuard v5 Inno Setup script
+; Build: ISCC.exe claude-guard.iss  (from repo root)
 ; All wizard text comes from ChineseSimplified.isl (official Inno translation),
 ; so this file is pure ASCII on purpose - do NOT add non-ASCII here without
 ; saving as UTF-8 with BOM (write/edit tools strip BOM).
@@ -189,6 +189,10 @@ begin
     Exec(ExpandConstant('{sys}\sc.exe'), 'stop {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
     Exec(ExpandConstant('{sys}\sc.exe'), 'delete {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
     Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM {#MyAppDaemonExeName} >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
+
+    // Run a final post-service-stop offline --restore sweep so no persistent boot/WFP/firewall rules survive.
+    if FileExists(CliPath) then
+      Exec(CliPath, '--restore', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
 
     // Clean autostart & legacy v1/v3 registry keys while preserving %ProgramData%\ClaudeGuard & %APPDATA%\ClaudeGuard.
     RegDeleteValue(HKLM, 'Software\Microsoft\Windows\CurrentVersion\Run', 'ClaudeGuardGui');

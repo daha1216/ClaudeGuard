@@ -1042,12 +1042,12 @@ pub fn c_hsla(hex: u32) -> Hsla {
 /// Layout constants for Mode A (Tray Quick HUD) and Mode B (Main Console).
 pub mod layout {
     pub const HUD_WIDTH: f32 = 398.0;
-    pub const HUD_HEIGHT: f32 = 432.0;
+    pub const HUD_HEIGHT: f32 = 472.0;
 
-    pub const CONSOLE_WIDTH: f32 = 944.0;
-    pub const CONSOLE_HEIGHT: f32 = 682.0;
-    pub const CONSOLE_MIN_WIDTH: f32 = 820.0;
-    pub const CONSOLE_MIN_HEIGHT: f32 = 580.0;
+    pub const CONSOLE_WIDTH: f32 = 1020.0;
+    pub const CONSOLE_HEIGHT: f32 = 700.0;
+    pub const CONSOLE_MIN_WIDTH: f32 = 900.0;
+    pub const CONSOLE_MIN_HEIGHT: f32 = 600.0;
 
     pub const SIDEBAR_WIDTH: f32 = 192.0;
     pub const TOPBAR_HEIGHT: f32 = 44.0;

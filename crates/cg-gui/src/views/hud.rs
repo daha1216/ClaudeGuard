@@ -1,13 +1,15 @@
-//! Mode A — Compact Frost Ceramic v2 Tray Quick HUD (`398 × 432` logical px, pixel-locked).
+//! Mode A — Compact Frost Ceramic v2 Tray Quick HUD (`398 × 472` logical px, pixel-locked).
 //!
 //! Zero layout shift: toast banners render as a floating overlay in `HudWindowView`,
-//! while `ag_proxy_warning` shares the fixed bottom strip slot (clickable to jump to repair).
+//! Sovereign Account Vaults launch in 1 click directly from the Quick HUD strip,
+//! and `ag_proxy_warning` shares the fixed bottom strip slot (clickable to jump to repair).
 
 use crate::app::{AppController, EnvSubTab, HudWindowView, open_console_window};
 use crate::assets::{brand_icon, ui_icon};
-use crate::protocol::{Lifecycle, PipeRequest};
+use crate::protocol::{Lifecycle, PipeRequest, VaultAppTarget, VaultRuntimeState};
 use crate::state::{HudProjection, NavSection, safety_grade_tone};
 use crate::theme::{BadgeTone, HeroTone, ThemePalette};
+use crate::views::shared::canonical_agent_label;
 use crate::widgets::controls::{
     ButtonKind, action_button, inset_box, mono_tabular, pulse_status_dot, status_dot, tone_tag,
 };
@@ -22,7 +24,14 @@ fn hud_short_app(agent_id: &str, fallback: &str) -> String {
         "claude-code" => "Code CLI".into(),
         "chatgpt" => "ChatGPT".into(),
         "antigravity" => "Antigravity".into(),
-        _ => fallback.to_string(),
+        "cursor" => "Cursor".into(),
+        "windsurf" => "Windsurf".into(),
+        "zed" => "Zed".into(),
+        "trae" => "Trae".into(),
+        "codex" => "Codex CLI".into(),
+        "gemini" => "Gemini CLI".into(),
+        "aider" => "Aider CLI".into(),
+        _ => canonical_agent_label(agent_id, fallback).to_string(),
     }
 }
 
@@ -374,8 +383,186 @@ pub fn render_hud(
     let pad_row2 = div().flex().w_full().gap(px(7.)).children(launch_pads);
 
     let hover_close = p.sidebar_hover_bg;
+    let ctrl_vaults_page = ctrl.clone();
 
-    // Single fixed-height bottom health/warning strip: keeps 3-target strip & 2x2 deck pixel-locked!
+    // Sovereign Account Vault 1-click switcher / launcher strip (multi-account HUD superpower!)
+    let vault_strip = if proj.vaults.is_empty() {
+        inset_box(p)
+            .id("hud-open-vaults-empty")
+            .cursor_pointer()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px(px(10.))
+            .py(px(5.5))
+            .hover(move |s| s.bg(rgb(hover_close)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .min_w(px(0.))
+                    .child(ui_icon("icons/ui/lock.svg", 11.0, p.text_secondary))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(p.text_secondary))
+                            .child("多账号隔离空间 · 防串号独立运行"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(p.accent_soft_text))
+                    .child("+ 新建账号仓 →"),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |_, _, window, cx| {
+                    ctrl_vaults_page.update(cx, |c, cx| {
+                        c.set_nav(NavSection::Vaults, cx);
+                        c.open_new_vault_drawer(cx);
+                        c.hud_window = None;
+                    });
+                    open_console_window(ctrl_vaults_page.clone(), cx);
+                    window.remove_window();
+                }),
+            )
+            .into_any_element()
+    } else {
+        let chips: Vec<gpui::Stateful<Div>> = proj
+            .vaults
+            .iter()
+            .take(2)
+            .map(|v| {
+                let vid = v.vault_id.clone();
+                let vname = v.name.clone();
+                let ctrl_vl = ctrl.clone();
+                let is_running = v.state == VaultRuntimeState::ActiveRunning;
+                let is_mismatch = v.state == VaultRuntimeState::EgressMismatch;
+                let clickable = can_act && v.can_launch;
+                let dot_c = if is_running {
+                    p.badge_pass.dot
+                } else if is_mismatch {
+                    p.badge_fail.dot
+                } else if v.state == VaultRuntimeState::CoolingDown {
+                    p.badge_warn.dot
+                } else {
+                    p.accent_soft_text
+                };
+                div()
+                    .id(gpui::ElementId::Name(
+                        format!("hud-vault-{}", v.vault_id).into(),
+                    ))
+                    .flex_1()
+                    .flex_basis(px(0.))
+                    .min_w(px(0.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(4.))
+                    .px(px(7.5))
+                    .py(px(4.5))
+                    .rounded(px(8.))
+                    .bg(rgb(if is_running {
+                        p.accent_soft_bg
+                    } else {
+                        p.card_bg
+                    }))
+                    .border_1()
+                    .border_color(rgb(if is_running {
+                        p.accent_soft_border
+                    } else {
+                        p.card_border
+                    }))
+                    .when(clickable, |el| {
+                        el.cursor_pointer()
+                            .hover(move |s| s.bg(rgb(hover_close)).border_color(rgb(p.line_strong)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, window, cx| {
+                                    let id = vid.clone();
+                                    let nm = vname.clone();
+                                    ctrl_vl.update(cx, |c, cx| {
+                                        c.send_request_msg(
+                                            PipeRequest::LaunchVault {
+                                                vault_id: id,
+                                                app: VaultAppTarget::ClaudeDesktop,
+                                                extra_args: Vec::new(),
+                                            },
+                                            Some(format!("已在账号仓「{nm}」启动 Claude")),
+                                            cx,
+                                        );
+                                        c.hud_window = None;
+                                    });
+                                    window.remove_window();
+                                }),
+                            )
+                    })
+                    .when(!clickable, |el| el.opacity(0.60))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.5))
+                            .min_w(px(0.))
+                            .flex_1()
+                            .child(status_dot(dot_c, 5.0))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(p.text_primary))
+                                    .child(format!("{}·{}", v.region_tag, v.name)),
+                            ),
+                    )
+                    .child(ui_icon("icons/ui/play.svg", 9.0, p.accent_soft_text))
+            })
+            .collect();
+
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .gap(px(5.5))
+            .children(chips)
+            .child(
+                div()
+                    .id("hud-vault-more")
+                    .cursor_pointer()
+                    .flex_shrink_0()
+                    .px(px(7.))
+                    .py(px(4.5))
+                    .rounded(px(8.))
+                    .bg(rgb(p.inset_bg))
+                    .border_1()
+                    .border_color(rgb(p.card_border))
+                    .hover(move |s| s.bg(rgb(hover_close)))
+                    .text_size(px(10.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(p.text_secondary))
+                    .child("管仓 →")
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, window, cx| {
+                            ctrl_vaults_page.update(cx, |c, cx| {
+                                c.set_nav(NavSection::Vaults, cx);
+                                c.hud_window = None;
+                            });
+                            open_console_window(ctrl_vaults_page.clone(), cx);
+                            window.remove_window();
+                        }),
+                    ),
+            )
+            .into_any_element()
+    };
+
+    // Single fixed-height bottom health/warning strip: surfaces live WFP block counter + probe age!
     let bottom_strip = if let Some(warn) = proj.ag_proxy_warning.clone() {
         inset_box(p)
             .id("hud-ag-warning-strip")
@@ -435,13 +622,19 @@ pub fn render_hud(
                     .child(status_dot(dot_rgb, 5.5))
                     .child(
                         div()
+                            .truncate()
                             .text_size(px(10.5))
                             .text_color(rgb(p.text_secondary))
-                            .child("只读探测 · 不改代理策略"),
+                            .child(if proj.wfp_blocked_total > 0 {
+                                format!("内核已拦 {} 次泄露 · 只读防封保护", proj.wfp_blocked_total)
+                            } else {
+                                "零泄露运行中 · 只读探测不改代理".into()
+                            }),
                     ),
             )
             .child(
-                mono_tabular(format!("探测 · {}", proj.hero.checked_age_text))
+                mono_tabular(format!("核验 · {}", proj.hero.checked_age_text))
+                    .flex_shrink_0()
                     .text_size(px(10.))
                     .text_color(rgb(p.text_muted)),
             )
@@ -505,6 +698,7 @@ pub fn render_hud(
                         .child(
                             div()
                                 .flex_1()
+                                .min_w(px(32.))
                                 .h(px(24.))
                                 .window_control_area(WindowControlArea::Drag),
                         )
@@ -512,9 +706,12 @@ pub fn render_hud(
                             div()
                                 .flex()
                                 .items_center()
+                                .min_w(px(0.))
                                 .gap(px(7.))
                                 .child(
                                     mono_tabular(right_metric)
+                                        .max_w(px(126.))
+                                        .truncate()
                                         .text_size(px(11.5))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(rgb(right_metric_color)),
@@ -568,6 +765,8 @@ pub fn render_hud(
                 )
                 // 3-target compact strip
                 .child(div().flex().w_full().gap(px(6.)).children(mini_targets))
+                // Sovereign Account Vault 1-click switcher / launcher strip
+                .child(vault_strip)
                 // 2x2 Safe Launch Deck
                 .child(
                     div()

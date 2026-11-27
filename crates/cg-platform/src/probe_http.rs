@@ -289,7 +289,7 @@ pub struct HttpProbeResponse {
     pub latency_ms: u64,
 }
 
-fn parse_probe_url_parts(url: &str) -> Option<(bool, &str, String)> {
+pub(crate) fn parse_probe_url_parts(url: &str) -> Option<(bool, &str, String)> {
     let trimmed = url.trim();
     let (is_https, rest) = if trimmed
         .as_bytes()
@@ -344,7 +344,7 @@ fn parse_probe_url_parts(url: &str) -> Option<(bool, &str, String)> {
     Some((is_https, host, format!("{scheme_str}://{authority}")))
 }
 
-fn resolve_and_validate_probe_redirect(
+pub(crate) fn resolve_and_validate_probe_redirect(
     current_url: &str,
     location: &str,
 ) -> PlatformResult<String> {

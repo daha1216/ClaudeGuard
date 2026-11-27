@@ -33,17 +33,19 @@ use cg_platform::mihomo_win;
 use cg_platform::netwatch_win;
 use cg_platform::probe_http::{self, NetworkPolicy, ProbeRoute};
 use cg_platform::process_win::{
-    self, CachedProcessSnapshot, ClaudePresence, LaunchTarget, ProcessScanner, SweepMode,
+    self, CachedProcessSnapshot, ClaudePresence, LaunchTarget, ProcessIdentity, ProcessScanner,
+    SweepMode,
 };
 use cg_platform::stun_probe;
 use cg_platform::vault_win;
 use cg_platform::{update_check, wfp_win, PlatformDriver, PlatformError};
 
-use crate::config_store::{ConfigStore, LoadedConfig};
+use crate::config_store::{validate_targets_for_config, ConfigStore, LoadedConfig};
 use crate::coordinator::{
-    check_vault_egress_contract, current_primary_egress, evaluate_fast_hook_gate_at, ActorControl,
-    CoordinatorActor, CoordinatorContext, CoordinatorEvent, CoordinatorHandle, FastGateOutcome,
-    HookGateMetrics, TelemetryBundle,
+    check_vault_egress_contract, current_primary_egress, evaluate_fast_hook_gate_with_ports_at,
+    ActorControl, CoordinatorActor, CoordinatorContext, CoordinatorEvent, CoordinatorHandle,
+    FastGateOutcome, HookGateMetrics, PortEgressObservation, TelemetryBundle,
+    VaultLaunchWorkerOutcome,
 };
 use crate::diagnostics;
 use crate::disarm;
@@ -342,6 +344,7 @@ fn build_skipped_update_summary(
     out
 }
 
+#[allow(dead_code)]
 fn paired_cli_id(agent_id: &str) -> Option<&'static str> {
     match agent_id {
         "claude" => Some("claude-code"),
@@ -350,6 +353,7 @@ fn paired_cli_id(agent_id: &str) -> Option<&'static str> {
     }
 }
 
+#[allow(dead_code)]
 fn paired_gui_for_cli(cli_id: &str) -> Option<&'static str> {
     match cli_id {
         "claude-code" => Some("claude"),
@@ -358,6 +362,7 @@ fn paired_gui_for_cli(cli_id: &str) -> Option<&'static str> {
     }
 }
 
+#[allow(dead_code)]
 fn paired_clis_for_agents(agents: &[String]) -> Vec<&'static str> {
     let mut out = Vec::new();
     for agent in agents {
@@ -621,6 +626,12 @@ pub struct RealEngineActor {
     ag_repair_in_flight: Arc<AtomicBool>,
     deep_audit_in_flight: Arc<AtomicBool>,
     wsl_sync_in_flight: Arc<AtomicBool>,
+    diag_export_in_flight: Arc<AtomicBool>,
+    health_card_in_flight: Arc<AtomicBool>,
+    cleanroom_op_in_flight: Arc<AtomicBool>,
+    vault_launch_in_flight: Arc<AtomicBool>,
+    vault_shortcuts_in_flight: Arc<AtomicBool>,
+    cli_hooks_in_flight: Arc<AtomicBool>,
     recent_toasts: VecDeque<ToastNotificationEvent>,
     toast_seq: u64,
     leak_shield: LeakShieldStatus,
@@ -635,9 +646,10 @@ pub struct RealEngineActor {
     cleanroom_backup_count: usize,
     hooks: HookIntegrationStatus,
     wsl_bridge: WslBridgeStatus,
-    vault_sessions: HashMap<String, Vec<(u32, String)>>,
+    vault_sessions: HashMap<String, Vec<(ProcessIdentity, String)>>,
     burst_guard_ref: Option<Arc<Mutex<BurstGuardTracker>>>,
     hook_metrics_ref: Option<Arc<HookGateMetrics>>,
+    port_egress_ref: Option<Arc<std::sync::RwLock<HashMap<u16, PortEgressObservation>>>>,
     test_user_home_override: Option<PathBuf>,
     test_vaults_root_override: Option<PathBuf>,
 }
@@ -701,7 +713,7 @@ impl RealEngineActor {
             LoadedConfig::NotFound => (Config::default(), None),
             LoadedConfig::Loaded(outcome) => {
                 let mut loaded = outcome.config;
-                match cg_core::targets::validate(loaded.targets.clone()) {
+                match validate_targets_for_config(loaded.targets.clone(), loaded.first_run) {
                     Ok(valid_targets) => {
                         loaded.targets = valid_targets;
                         (loaded, None)
@@ -735,7 +747,7 @@ impl RealEngineActor {
         let disarmed_reason = disarm::read_disarmed(&data_dir).ok().flatten();
         if disarmed_reason.is_some() {
             if caps.app_quarantine {
-                let _ = leak_shield_win::clear_leak_shield();
+                clear_all_claudeguard_firewall_state(&*driver);
             }
             let _ = diagnostics::rollback_env_alignment(&data_dir);
         }
@@ -830,7 +842,7 @@ impl RealEngineActor {
         }
         let init_shield =
             if caps.app_quarantine && init_fw_query_ok && engine.lifecycle != Lifecycle::Disarmed {
-                leak_shield_win::inspect_leak_shield()
+                inspect_active_leak_shield(&*driver)
             } else {
                 LeakShieldStatus::default()
             };
@@ -886,6 +898,12 @@ impl RealEngineActor {
             ag_repair_in_flight: Arc::new(AtomicBool::new(false)),
             deep_audit_in_flight: Arc::new(AtomicBool::new(false)),
             wsl_sync_in_flight: Arc::new(AtomicBool::new(false)),
+            diag_export_in_flight: Arc::new(AtomicBool::new(false)),
+            health_card_in_flight: Arc::new(AtomicBool::new(false)),
+            cleanroom_op_in_flight: Arc::new(AtomicBool::new(false)),
+            vault_launch_in_flight: Arc::new(AtomicBool::new(false)),
+            vault_shortcuts_in_flight: Arc::new(AtomicBool::new(false)),
+            cli_hooks_in_flight: Arc::new(AtomicBool::new(false)),
             recent_toasts: VecDeque::new(),
             toast_seq: 0,
             leak_shield: init_shield,
@@ -902,11 +920,15 @@ impl RealEngineActor {
             vault_sessions: HashMap::new(),
             burst_guard_ref: None,
             hook_metrics_ref: None,
+            port_egress_ref: None,
             test_user_home_override: None,
             test_vaults_root_override: None,
         };
 
         actor.sync_wfp_config(now);
+        if actor.engine.lifecycle == Lifecycle::Armed && caps.app_quarantine {
+            actor.sync_wfp_runtime_posture(now);
+        }
 
         actor.step_and_run(
             EngineEvent::AntigravityProxyUpdated {
@@ -990,11 +1012,16 @@ impl RealEngineActor {
         if let Some(ref root) = self.test_vaults_root_override {
             return Ok(root.clone());
         }
+        if let Some(home) = self.effective_user_home() {
+            return Ok(vault_win::vaults_root_for_user_home(&home));
+        }
         vault_win::default_vaults_root()
     }
 
     fn sync_wfp_config(&mut self, now: u64) {
-        if self.driver.capabilities().app_quarantine {
+        if self.driver.capabilities().app_quarantine
+            && self.driver.firewall().engine_name() != "in-memory-mock"
+        {
             if let Some(hybrid) = cg_platform::active_hybrid_firewall() {
                 let _ = hybrid.set_preference(self.engine.config.firewall_backend);
                 // Safest default: `wfp_boot_guard` is default `false`. Only arm persistent boot
@@ -1028,6 +1055,12 @@ impl RealEngineActor {
                     }
                 } else {
                     let _ = hybrid.sync_boot_guard(false, &[]);
+                    let _ = self.journal.retain_active_layers(
+                        self.engine.runtime_epoch,
+                        self.engine.lockdown_applied == Some(true),
+                        self.engine.protection.is_isolated(),
+                        false,
+                    );
                 }
             }
         }
@@ -1038,6 +1071,85 @@ impl RealEngineActor {
             },
             now,
         );
+    }
+
+    /// Synchronizes the dynamic WFP Per-App Split-Permit Sandwich (`WfpRuntimePostureSpec`).
+    /// Clears dynamic posture filters immediately whenever Disarmed, Paused, Stopping, or Unconfigured.
+    fn sync_wfp_runtime_posture(&mut self, now: u64) {
+        if !self.driver.capabilities().app_quarantine
+            || self.driver.firewall().engine_name() == "in-memory-mock"
+        {
+            return;
+        }
+        let Some(hybrid) = cg_platform::active_hybrid_firewall() else {
+            return;
+        };
+
+        let should_arm_posture = self.engine.lifecycle == Lifecycle::Armed
+            && !self.engine.is_paused(now)
+            && self.engine.config.firewall_backend != cg_protocol::FirewallBackendPref::ComLegacy;
+
+        if !should_arm_posture {
+            if let Ok(wfp) =
+                hybrid.sync_tunnel_only_split_permit(&wfp_win::WfpRuntimePostureSpec::default())
+            {
+                self.step_and_run(
+                    EngineEvent::WfpUpdated {
+                        status: Box::new(wfp),
+                    },
+                    now,
+                );
+            }
+            return;
+        }
+
+        let mut guarded_apps: Vec<(String, Vec<PathBuf>)> = Vec::new();
+        for agent in &self.engine.config.guarded_agents {
+            let discovered = self
+                .synced_agent_exes
+                .get(agent)
+                .cloned()
+                .unwrap_or_else(|| self.driver.discover_agent_exes(agent).unwrap_or_default());
+            if !discovered.is_empty() {
+                guarded_apps.push((agent.clone(), discovered));
+            }
+        }
+
+        let (active_tun_name, active_tun_luid) =
+            match self.driver.detect_tun_adapter_with_luid().ok().flatten() {
+                Some((name, luid)) => (Some(name), Some(luid)),
+                None => (None, None),
+            };
+
+        let strict_tunnel_only = self.engine.config.enforce_access_path
+            && match self.engine.access.level {
+                AccessLevel::SystemProxy => true,
+                AccessLevel::Tun => active_tun_luid.is_some(),
+                _ => false,
+            };
+
+        let spec = wfp_win::WfpRuntimePostureSpec {
+            guarded_apps,
+            strict_tunnel_only,
+            active_tun_luid,
+            active_tun_name,
+            block_quic_udp443: self.engine.config.leak_shield_quic,
+            block_direct_dns_doh: self.engine.config.leak_shield_dns_doh,
+            block_global_ipv6: self.engine.config.leak_shield_ipv6,
+            allow_lan_dev_servers: false,
+            locked_or_quarantined_apps: Vec::new(),
+            global_cut_active: false,
+            daemon_self_exe: std::env::current_exe().ok(),
+        };
+
+        if let Ok(wfp) = hybrid.sync_tunnel_only_split_permit(&spec) {
+            self.step_and_run(
+                EngineEvent::WfpUpdated {
+                    status: Box::new(wfp),
+                },
+                now,
+            );
+        }
     }
 
     fn sync_leak_shield_rules(&mut self, now: u64) -> Result<OperationReceipt, PlatformError> {
@@ -1304,36 +1416,59 @@ impl RealEngineActor {
             }
         }
 
-        // 3. Re-sync 4-Vector Leak Shield rules if armed and any vector is enabled.
-        if self.engine.lifecycle == Lifecycle::Armed
-            && (self.engine.config.leak_shield_quic
+        // 3. Re-sync 4-Vector Leak Shield & WFP Split-Permit posture if armed.
+        if self.engine.lifecycle == Lifecycle::Armed {
+            if self.engine.config.leak_shield_quic
                 || self.engine.config.leak_shield_dns_doh
-                || self.engine.config.leak_shield_ipv6)
-        {
-            let _ = self.sync_leak_shield_rules(now);
+                || self.engine.config.leak_shield_ipv6
+            {
+                let _ = self.sync_leak_shield_rules(now);
+            }
+            self.sync_wfp_runtime_posture(now);
+        }
+    }
+
+    fn current_port_egress_map(&self) -> HashMap<u16, PortEgressObservation> {
+        self.port_egress_ref
+            .as_ref()
+            .map(|cell| match cell.read() {
+                Ok(g) => g.clone(),
+                Err(p) => p.into_inner().clone(),
+            })
+            .unwrap_or_default()
+    }
+
+    fn record_port_egress(&self, obs: PortEgressObservation) {
+        if let Some(ref cell) = self.port_egress_ref {
+            let mut g = match cell.write() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            g.insert(obs.port, obs);
         }
     }
 
     fn build_vault_statuses(&self, snap: &GuardSnapshot, now: u64) -> Vec<VaultRuntimeStatus> {
         let vaults_root = self.effective_vaults_root().ok();
-        let (obs_ip, obs_country, obs_asn) = current_primary_egress(snap);
+        let primary_egress = current_primary_egress(snap);
+        let port_map = self.current_port_egress_map();
         self.engine
             .config
             .vaults
             .iter()
             .map(|vault| {
-                let sessions: Vec<(u32, String)> = self
+                let sessions: Vec<(ProcessIdentity, String)> = self
                     .vault_sessions
                     .get(&vault.id)
                     .map(|entries| {
                         entries
                             .iter()
-                            .filter(|(pid, _)| *pid > 0 && is_pid_alive(*pid))
+                            .filter(|(id, _)| id.pid > 0 && is_identity_alive(id))
                             .cloned()
                             .collect()
                     })
                     .unwrap_or_default();
-                let running_pids: Vec<u32> = sessions.iter().map(|(pid, _)| *pid).collect();
+                let running_pids: Vec<u32> = sessions.iter().map(|(id, _)| id.pid).collect();
                 let mut running_apps: Vec<String> = Vec::new();
                 for (_, app) in &sessions {
                     if !running_apps.contains(app) {
@@ -1342,6 +1477,16 @@ impl RealEngineActor {
                 }
                 let cooldown_remaining =
                     self.egress_ledger.vault_cooldown_remaining(&vault.id, now);
+                let (obs_ip, obs_country, obs_asn) = match vault
+                    .dedicated_proxy_port
+                    .filter(|&p| p > 0 && p != self.engine.config.proxy_port)
+                {
+                    Some(port) => match port_map.get(&port) {
+                        Some(obs) => (obs.ip.clone(), obs.country.clone(), obs.asn),
+                        None => (None, None, None),
+                    },
+                    None => primary_egress.clone(),
+                };
                 let egress_match_res = check_vault_egress_contract(
                     vault,
                     obs_ip.as_deref(),
@@ -1453,13 +1598,23 @@ impl RealEngineActor {
             }
         };
 
+        let interactive_desktop_present =
+            !access_win::is_session_zero() || access_win::active_interactive_user_sid().is_some();
+        let hk_registered =
+            self.engine.config.global_hotkeys_enabled && interactive_desktop_present;
         snap.hotkeys = HotkeyStatus {
             enabled: self.engine.config.global_hotkeys_enabled,
             panic_lockdown_chord: self.engine.config.hotkey_panic_lockdown.clone(),
             quick_hud_chord: self.engine.config.hotkey_quick_hud.clone(),
-            panic_registered_ok: self.engine.config.global_hotkeys_enabled,
-            hud_registered_ok: self.engine.config.global_hotkeys_enabled,
-            conflict_note: String::new(),
+            panic_registered_ok: hk_registered,
+            hud_registered_ok: hk_registered,
+            conflict_note: if self.engine.config.global_hotkeys_enabled
+                && !interactive_desktop_present
+            {
+                "当前处于无桌面交互会话（Session 0），全局热键将在桌面客户端启动后自动挂载".into()
+            } else {
+                String::new()
+            },
         };
 
         snap.vaults = self.build_vault_statuses(&snap, now);
@@ -1652,7 +1807,7 @@ impl RealEngineActor {
                         let _ = self.driver.kill_gui_agent(agent);
                     }
                     if include_claude_cli {
-                        for cli_id in paired_clis_for_agents(&agents) {
+                        for cli_id in KNOWN_CLI_AGENT_IDS {
                             let _ = self.driver.kill_cli_agent(cli_id);
                         }
                     }
@@ -1726,15 +1881,14 @@ impl RealEngineActor {
                     self.active_journal = None;
                     let keep_lockdown = self.engine.lockdown_applied == Some(true);
                     let keep_isolated = self.engine.protection.is_isolated();
-                    if !keep_lockdown && !keep_isolated {
-                        let _ = self.journal.clear();
-                    } else {
-                        let _ = self.journal.retain_coexisting_committed(
-                            self.engine.runtime_epoch,
-                            keep_lockdown,
-                            keep_isolated,
-                        );
-                    }
+                    let keep_boot_guard = self.engine.config.wfp_boot_guard
+                        && self.engine.lifecycle == Lifecycle::Armed;
+                    let _ = self.journal.retain_active_layers(
+                        self.engine.runtime_epoch,
+                        keep_lockdown,
+                        keep_isolated,
+                        keep_boot_guard,
+                    );
                 }
                 EffectCommand::PersistTimeline => {
                     let _ = self.engine.timeline.save_to(&self.timeline_path);
@@ -1941,15 +2095,14 @@ impl RealEngineActor {
                 self.active_journal = None;
                 let keep_lockdown = self.engine.lockdown_applied == Some(true);
                 let keep_isolated = self.engine.protection.is_isolated();
-                if !keep_lockdown && !keep_isolated {
-                    let _ = self.journal.clear();
-                } else {
-                    let _ = self.journal.retain_coexisting_committed(
-                        self.engine.runtime_epoch,
-                        keep_lockdown,
-                        keep_isolated,
-                    );
-                }
+                let keep_boot_guard =
+                    self.engine.config.wfp_boot_guard && self.engine.lifecycle == Lifecycle::Armed;
+                let _ = self.journal.retain_active_layers(
+                    self.engine.runtime_epoch,
+                    keep_lockdown,
+                    keep_isolated,
+                    keep_boot_guard,
+                );
             }
         }
     }
@@ -2062,9 +2215,8 @@ impl RealEngineActor {
                 kill_gui_list_with_receipt(&*self.driver, agents, "kill", &mut receipt);
             killed = gui_n;
             if kill_cli_on_fail {
-                let cli_targets = paired_clis_for_agents(agents);
                 let (cli_n, _, _) =
-                    kill_cli_list_with_receipt(&*self.driver, &cli_targets, &mut receipt);
+                    kill_cli_list_with_receipt(&*self.driver, &KNOWN_CLI_AGENT_IDS, &mut receipt);
                 cli_killed = cli_n;
             }
         }
@@ -2376,14 +2528,8 @@ impl RealEngineActor {
 
         let heal = journal::heal_offline(&self.journal, &*self.recovery_executor);
         if self.driver.capabilities().app_quarantine {
-            if let Some(hybrid) = cg_platform::active_hybrid_firewall() {
-                let _ = hybrid.clear_persistent_boot_guard();
-            }
-            if let Ok(removed) = leak_shield_win::clear_leak_shield() {
-                if removed > 0 {
-                    self.leak_shield = LeakShieldStatus::default();
-                }
-            }
+            clear_all_claudeguard_firewall_state(&*self.driver);
+            self.leak_shield = LeakShieldStatus::default();
         }
         if self.engine.env_applied.is_some()
             && diagnostics::rollback_env_alignment(&self.data_dir).is_ok()
@@ -2513,13 +2659,15 @@ impl RealEngineActor {
         if !self.fast_hook_waiters.is_empty() {
             let waiters = std::mem::take(&mut self.fast_hook_waiters);
             let fallback_tracker = Mutex::new(BurstGuardTracker::new());
+            let port_map = self.current_port_egress_map();
             let now_ms = now_unix_millis();
             for (agent_id, vault_id, hook_event, tx) in waiters {
                 let tracker_ref: &Mutex<BurstGuardTracker> =
                     self.burst_guard_ref.as_deref().unwrap_or(&fallback_tracker);
-                let resp = match evaluate_fast_hook_gate_at(
+                let resp = match evaluate_fast_hook_gate_with_ports_at(
                     snapshot,
                     tracker_ref,
+                    &port_map,
                     &agent_id,
                     vault_id.as_deref(),
                     hook_event.as_deref(),
@@ -2540,15 +2688,32 @@ impl RealEngineActor {
                         latency_path: "sync_probe_fallback".into(),
                     },
                     FastGateOutcome::Immediate(other) => other,
-                    FastGateOutcome::NeedsSyncProbe => PipeResponse::FastGateVerdict {
-                        allowed: false,
-                        decision: HookDecision::Block,
-                        safety_score: snapshot.risk_assessment.score,
-                        reason:
+                    FastGateOutcome::NeedsSyncProbe => {
+                        let detail = if snapshot.config.enforce_access_path
+                            && snapshot.access.is_uncovered()
+                        {
+                            "🛡️ [ClaudeGuard 裸连拦截] 实时复核确认未检测到活跃代理通道（TUN/系统代理均离线），已阻断提示词发送".to_string()
+                        } else if let Some(failed) = snapshot
+                            .targets
+                            .iter()
+                            .find(|t| t.state == crate::protocol::TargetState::Fail)
+                        {
+                            format!(
+                                "🛡️ [ClaudeGuard 出口违规拦截] {} 未通过合规核验：{}",
+                                failed.name, failed.reason
+                            )
+                        } else {
                             "🛡️ [ClaudeGuard 复核未通过] 出口探测仍未确认合规，已阻止提示词发送"
-                                .into(),
-                        latency_path: "sync_probe_fallback".into(),
-                    },
+                                .to_string()
+                        };
+                        PipeResponse::FastGateVerdict {
+                            allowed: false,
+                            decision: HookDecision::Block,
+                            safety_score: snapshot.risk_assessment.score,
+                            reason: detail,
+                            latency_path: "sync_probe_fallback".into(),
+                        }
+                    }
                 };
                 let _ = tx.send(resp);
             }
@@ -2775,6 +2940,13 @@ impl RealEngineActor {
                         }
                     }
                 }
+                if self.last_rejected.is_none()
+                    && self.mutation_error.is_none()
+                    && self.engine.lifecycle == Lifecycle::Armed
+                    && self.driver.capabilities().app_quarantine
+                {
+                    self.sync_wfp_runtime_posture(now);
+                }
                 let snap = self.publish_snapshot(snapshot_store, now);
                 self.flush_superseded_waiters(&snap);
                 self.send_mutation_reply(reply, snap);
@@ -2786,6 +2958,7 @@ impl RealEngineActor {
                         Some(secs) if secs > 0 => Some(Instant::now() + Duration::from_secs(secs)),
                         _ => None,
                     };
+                    self.sync_wfp_runtime_posture(now);
                 }
                 let snap = self.publish_snapshot(snapshot_store, now);
                 self.send_mutation_reply(reply, snap);
@@ -2815,6 +2988,10 @@ impl RealEngineActor {
                 }
                 if was_unconfigured && self.last_rejected.is_none() {
                     let heal = journal::heal_offline(&self.journal, &*self.recovery_executor);
+                    if self.driver.capabilities().app_quarantine {
+                        clear_all_claudeguard_firewall_state(&*self.driver);
+                        self.leak_shield = LeakShieldStatus::default();
+                    }
                     if !heal.ok || !heal.verified {
                         self.mutation_error = Some(heal.summary);
                     } else if let Err(err) = disarm::mark_disarmed(&self.data_dir, &reason_text) {
@@ -2830,25 +3007,33 @@ impl RealEngineActor {
                 if self.last_rejected.is_none()
                     && self.mutation_error.is_none()
                     && self.engine.lifecycle == Lifecycle::Armed
-                    && self.driver.capabilities().app_quarantine
                 {
-                    self.sync_wfp_config(now);
-                    match self.sync_leak_shield_rules(now) {
-                        Ok(receipt) => {
-                            self.engine.last_receipt = Some(receipt);
-                        }
-                        Err(err) => {
-                            let detail = format!("重新布防后自动同步防泄露护盾规则失败：{err}");
-                            self.engine.push_log(now, LogLevel::Warn, "shield", &detail);
-                            let mut receipt = OperationReceipt::new(
-                                format!("shield-sync-{now}"),
-                                OperationStatus::Partial,
-                            );
-                            receipt.verified_scope = "leak_shield".into();
-                            receipt.push_item("leak_shield", OperationStatus::Failed, detail);
-                            self.engine.last_receipt = Some(receipt);
+                    if self.driver.capabilities().app_quarantine {
+                        self.sync_wfp_config(now);
+                        self.sync_wfp_runtime_posture(now);
+                        match self.sync_leak_shield_rules(now) {
+                            Ok(receipt) => {
+                                self.engine.last_receipt = Some(receipt);
+                            }
+                            Err(err) => {
+                                let detail = format!("重新布防后自动同步防泄露护盾规则失败：{err}");
+                                self.engine.push_log(now, LogLevel::Warn, "shield", &detail);
+                                let mut receipt = OperationReceipt::new(
+                                    format!("shield-sync-{now}"),
+                                    OperationStatus::Partial,
+                                );
+                                receipt.verified_scope = "leak_shield".into();
+                                receipt.push_item("leak_shield", OperationStatus::Failed, detail);
+                                self.engine.last_receipt = Some(receipt);
+                            }
                         }
                     }
+                    self.step_and_run(
+                        EngineEvent::StartRound {
+                            purpose: CheckPurpose::Monitor,
+                        },
+                        now,
+                    );
                 }
                 let snap = self.publish_snapshot(snapshot_store, now);
                 self.flush_superseded_waiters(&snap);
@@ -3030,18 +3215,20 @@ impl RealEngineActor {
                 let persisted_ok = self.mutation_error.is_none();
                 if !rejected && persisted_ok && self.engine.lifecycle == Lifecycle::Armed {
                     self.sync_wfp_config(now);
-                    if self.driver.capabilities().app_quarantine
-                        && (self.engine.config.leak_shield_quic
+                    if self.driver.capabilities().app_quarantine {
+                        self.sync_wfp_runtime_posture(now);
+                        if self.engine.config.leak_shield_quic
                             || self.engine.config.leak_shield_dns_doh
-                            || self.engine.config.leak_shield_ipv6)
-                    {
-                        if let Err(err) = self.sync_leak_shield_rules(now) {
-                            self.engine.push_log(
-                                now,
-                                LogLevel::Warn,
-                                "shield",
-                                &format!("首次布防同步防泄露护盾规则失败：{err}"),
-                            );
+                            || self.engine.config.leak_shield_ipv6
+                        {
+                            if let Err(err) = self.sync_leak_shield_rules(now) {
+                                self.engine.push_log(
+                                    now,
+                                    LogLevel::Warn,
+                                    "shield",
+                                    &format!("首次布防同步防泄露护盾规则失败：{err}"),
+                                );
+                            }
                         }
                     }
                     self.step_and_run(
@@ -3209,7 +3396,7 @@ impl RealEngineActor {
                                 }
                             }
                             let clis = if include_cli {
-                                vec!["claude-code", "codex"]
+                                KNOWN_CLI_AGENT_IDS.to_vec()
                             } else {
                                 Vec::new()
                             };
@@ -3665,39 +3852,43 @@ impl RealEngineActor {
                 }
             }
             PipeRequest::ExportDiagnostics => {
+                let Some(in_flight) = InFlightGuard::try_acquire(&self.diag_export_in_flight)
+                else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "脱敏诊断包正在导出中，请稍候".into(),
+                        receipt: None,
+                    });
+                    return;
+                };
                 self.flush_pending_daemon_logs();
                 let snap = self.build_snapshot(now);
-                match diagnostics::export_redacted_diagnostics_zip(&self.data_dir, &snap, now, None)
+                let data_dir = self.data_dir.clone();
+                let event_tx = self.event_tx.clone();
+                let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                let worker_reply = reply_cell.clone();
+                if std::thread::Builder::new()
+                    .name("cg-diag-export".to_string())
+                    .spawn(move || {
+                        let _guard = in_flight;
+                        let ts = now_unix_secs();
+                        let result = diagnostics::export_redacted_diagnostics_zip(
+                            &data_dir, &snap, ts, None,
+                        );
+                        if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = event_tx.send(CoordinatorEvent::ExportDiagnosticsFinished {
+                                result,
+                                now_secs: now_unix_secs(),
+                                reply: tx,
+                            });
+                        }
+                    })
+                    .is_err()
                 {
-                    Ok(path) => {
-                        let path_s = path.to_string_lossy().to_string();
-                        let mut receipt = OperationReceipt::new(
-                            format!("diag-export-{now}"),
-                            OperationStatus::Verified,
-                        );
-                        receipt.verified_scope = path_s.clone();
-                        receipt.push_item(
-                            "diagnostics_zip",
-                            OperationStatus::Verified,
-                            format!("已导出脱敏诊断包：{path_s}"),
-                        );
-                        self.engine.push_log(
-                            now,
-                            LogLevel::Audit,
-                            "diagnostics",
-                            &format!("导出脱敏诊断压缩包：{path_s}"),
-                        );
-                        self.engine.last_receipt = Some(receipt.clone());
-                        let next_snap = self.publish_snapshot(snapshot_store, now);
-                        let _ = reply.send(PipeResponse::Ack {
-                            receipt: Some(receipt),
-                            snapshot: Some(Box::new(next_snap)),
-                        });
-                    }
-                    Err(msg) => {
-                        let _ = reply.send(PipeResponse::Error {
-                            code: ErrorCode::IoFailed,
-                            message: msg,
+                    if let Some(tx) = reply_cell.lock().ok().and_then(|mut g| g.take()) {
+                        let _ = tx.send(PipeResponse::Error {
+                            code: ErrorCode::Busy,
+                            message: "创建诊断导出工作线程失败，请稍后重试".into(),
                             receipt: None,
                         });
                     }
@@ -3718,13 +3909,103 @@ impl RealEngineActor {
                 hook_event,
             } => {
                 self.sync_monotonic_pause(now);
+                // If targeting an enabled vault with a dedicated proxy port whose cache is missing/stale,
+                // probe that dedicated port off-thread before deciding!
+                let dedicated_port_needed = vault_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|vid| {
+                        self.engine
+                            .config
+                            .vaults
+                            .iter()
+                            .find(|v| v.id.eq_ignore_ascii_case(vid) && v.enabled)
+                    })
+                    .and_then(|v| {
+                        v.dedicated_proxy_port
+                            .filter(|&p| p > 0 && p != self.engine.config.proxy_port)
+                    })
+                    .filter(|port| {
+                        let ttl = self.engine.config.hook_freshness_ttl_secs.clamp(10, 300);
+                        let map = self.current_port_egress_map();
+                        !map.get(port)
+                            .is_some_and(|obs| now.saturating_sub(obs.observed_at) <= ttl)
+                    });
+
                 let cur_snap = self.build_snapshot(now);
+                if let Some(port) = dedicated_port_needed {
+                    let proxy_host = self.engine.config.proxy_host.clone();
+                    let event_tx = self.event_tx.clone();
+                    let burst = self.burst_guard_ref.clone();
+                    let port_cell = self.port_egress_ref.clone();
+                    let snap_clone = cur_snap;
+                    let _ = std::thread::Builder::new()
+                        .name("cg-hook-port-probe".to_string())
+                        .spawn(move || {
+                            let ts = now_unix_secs();
+                            let obs = probe_dedicated_proxy_port(&proxy_host, port, ts);
+                            if let Some(ref cell) = port_cell {
+                                if let Ok(mut g) = cell.write() {
+                                    g.insert(port, obs.clone());
+                                }
+                            }
+                            let _ = event_tx.try_send(CoordinatorEvent::PortEgressProbed {
+                                observations: vec![obs.clone()],
+                                now_secs: ts,
+                            });
+                            let mut map = HashMap::new();
+                            map.insert(port, obs);
+                            let fallback_tracker = Mutex::new(BurstGuardTracker::new());
+                            let tracker_ref: &Mutex<BurstGuardTracker> =
+                                burst.as_deref().unwrap_or(&fallback_tracker);
+                            let resp = match evaluate_fast_hook_gate_with_ports_at(
+                                &snap_clone,
+                                tracker_ref,
+                                &map,
+                                &agent_id,
+                                vault_id.as_deref(),
+                                hook_event.as_deref(),
+                                ts,
+                                now_unix_millis(),
+                            ) {
+                                FastGateOutcome::Immediate(PipeResponse::FastGateVerdict {
+                                    allowed,
+                                    decision,
+                                    safety_score,
+                                    reason,
+                                    ..
+                                }) => PipeResponse::FastGateVerdict {
+                                    allowed,
+                                    decision,
+                                    safety_score,
+                                    reason,
+                                    latency_path: "dedicated_port_probe".into(),
+                                },
+                                FastGateOutcome::Immediate(other) => other,
+                                FastGateOutcome::NeedsSyncProbe => PipeResponse::FastGateVerdict {
+                                    allowed: false,
+                                    decision: HookDecision::Block,
+                                    safety_score: snap_clone.risk_assessment.score,
+                                    reason: format!(
+                                        "🛡️ [ClaudeGuard 独立端口探测失败] 无法通过独立代理端口 {port} 验证出口合规性"
+                                    ),
+                                    latency_path: "dedicated_port_probe".into(),
+                                },
+                            };
+                            let _ = reply.send(resp);
+                        });
+                    return;
+                }
+
                 let fallback_tracker = Mutex::new(BurstGuardTracker::new());
                 let tracker_ref: &Mutex<BurstGuardTracker> =
                     self.burst_guard_ref.as_deref().unwrap_or(&fallback_tracker);
-                if let FastGateOutcome::Immediate(resp) = evaluate_fast_hook_gate_at(
+                let port_map = self.current_port_egress_map();
+                if let FastGateOutcome::Immediate(resp) = evaluate_fast_hook_gate_with_ports_at(
                     &cur_snap,
                     tracker_ref,
+                    &port_map,
                     &agent_id,
                     vault_id.as_deref(),
                     hook_event.as_deref(),
@@ -3776,6 +4057,22 @@ impl RealEngineActor {
                 }
             }
             PipeRequest::UpsertVault { mut vault } => {
+                if self.engine.lifecycle == Lifecycle::Stopping {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: "服务正在停止，暂不允许修改账号保险箱".into(),
+                        receipt: None,
+                    });
+                    return;
+                }
+                if self.engine.pending_tx.is_some() {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "当前有隔离/恢复事务正在执行，请稍后再保存保险箱".into(),
+                        receipt: None,
+                    });
+                    return;
+                }
                 vault.normalize();
                 if !is_valid_vault_id(&vault.id) {
                     let _ = reply.send(PipeResponse::Error {
@@ -3799,17 +4096,6 @@ impl RealEngineActor {
                         return;
                     }
                 };
-                let paths = match vault_win::ensure_vault_layout_in(&vaults_root, &vault) {
-                    Ok(p) => p,
-                    Err(err) => {
-                        let _ = reply.send(PipeResponse::Error {
-                            code: ErrorCode::IoFailed,
-                            message: err,
-                            receipt: None,
-                        });
-                        return;
-                    }
-                };
 
                 let mut next_cfg = self.engine.config.clone();
                 if let Some(existing) = next_cfg
@@ -3821,9 +4107,24 @@ impl RealEngineActor {
                 } else {
                     next_cfg.vaults.push(vault.clone());
                 }
+
+                // Persist & verify config BEFORE mutating vault layout so failed saves leave zero disk drift.
                 match self.config_store.save_verified(&next_cfg) {
                     Ok(saved) => {
+                        let paths = match vault_win::ensure_vault_layout_in(&vaults_root, &vault) {
+                            Ok(p) => p,
+                            Err(err) => {
+                                let _ = self.config_store.save_verified(&self.engine.config);
+                                let _ = reply.send(PipeResponse::Error {
+                                    code: ErrorCode::IoFailed,
+                                    message: err,
+                                    receipt: None,
+                                });
+                                return;
+                            }
+                        };
                         self.engine.config = saved;
+                        self.engine.cfg_rev = self.engine.cfg_rev.saturating_add(1);
                         if self.hooks.claude_code_hook_installed {
                             let cli_exe = hook_installer::resolve_cli_exe_path();
                             let _ = hook_installer::sync_claude_code_settings(
@@ -3862,6 +4163,22 @@ impl RealEngineActor {
                 vault_id,
                 purge_disk_data,
             } => {
+                if self.engine.lifecycle == Lifecycle::Stopping {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: "服务正在停止，暂不允许删除账号保险箱".into(),
+                        receipt: None,
+                    });
+                    return;
+                }
+                if self.engine.pending_tx.is_some() {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "当前有隔离/恢复事务正在执行，请稍后再删除保险箱".into(),
+                        receipt: None,
+                    });
+                    return;
+                }
                 let norm_id = vault_id.trim().to_ascii_lowercase();
                 if !is_valid_vault_id(&norm_id) {
                     let _ = reply.send(PipeResponse::Error {
@@ -3896,31 +4213,32 @@ impl RealEngineActor {
                         return;
                     }
                 };
-                let _ = self.stop_vault_processes(&norm_id, &vaults_root);
-                let archived = match vault_win::remove_vault_files_in(
-                    &vaults_root,
-                    &norm_id,
-                    purge_disk_data,
-                    now,
-                ) {
-                    Ok(p) => p,
-                    Err(err) => {
-                        let _ = reply.send(PipeResponse::Error {
-                            code: ErrorCode::IoFailed,
-                            message: err,
-                            receipt: None,
-                        });
-                        return;
-                    }
-                };
-
                 let mut next_cfg = self.engine.config.clone();
                 next_cfg
                     .vaults
                     .retain(|v| !v.id.eq_ignore_ascii_case(&norm_id));
                 match self.config_store.save_verified(&next_cfg) {
                     Ok(saved) => {
+                        let _ = self.stop_vault_processes(&norm_id, &vaults_root);
+                        let archived = match vault_win::remove_vault_files_in(
+                            &vaults_root,
+                            &norm_id,
+                            purge_disk_data,
+                            now,
+                        ) {
+                            Ok(p) => p,
+                            Err(err) => {
+                                let _ = self.config_store.save_verified(&self.engine.config);
+                                let _ = reply.send(PipeResponse::Error {
+                                    code: ErrorCode::IoFailed,
+                                    message: err,
+                                    receipt: None,
+                                });
+                                return;
+                            }
+                        };
                         self.engine.config = saved;
+                        self.engine.cfg_rev = self.engine.cfg_rev.saturating_add(1);
                         let detail = match archived {
                             Some(p) => {
                                 format!("已移除保险箱 `{norm_id}` 并安全归档至 {}", p.display())
@@ -3955,6 +4273,7 @@ impl RealEngineActor {
                 app,
                 extra_args,
             } => {
+                self.sync_monotonic_pause(now);
                 let norm_id = vault_id.trim().to_ascii_lowercase();
                 let Some(vault) = self
                     .engine
@@ -3979,7 +4298,46 @@ impl RealEngineActor {
                     });
                     return;
                 }
-                if self.engine.is_tripped() || self.engine.lockdown_applied == Some(true) {
+                // Enforce core GuardEngine lifecycle, pause, lockdown, Degraded, and AntigravityProxy invariants (`#43 [CRIT-5]`).
+                if app == VaultAppTarget::AntigravityIde
+                    && self.engine.config.require_antigravity_proxy
+                    && self.engine.antigravity_proxy.installed
+                    && !self.engine.antigravity_proxy.is_ready_for_launch()
+                {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: format!(
+                            "反重力透明代理未就绪（{}）：{}",
+                            self.engine.antigravity_proxy.state.label_zh(),
+                            self.engine.antigravity_proxy.summary
+                        ),
+                        receipt: None,
+                    });
+                    return;
+                }
+                if self.engine.lifecycle != Lifecycle::Armed {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: format!(
+                            "当前生命周期（{}）不允许启动主权账号保险箱，请先完成配置并布防",
+                            self.engine.lifecycle.label()
+                        ),
+                        receipt: None,
+                    });
+                    return;
+                }
+                if self.engine.is_paused(now) {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: "守卫当前处于暂停状态，为防止裸连串号已拒绝启动主权保险箱".into(),
+                        receipt: None,
+                    });
+                    return;
+                }
+                if self.engine.is_tripped()
+                    || self.engine.lockdown_manual
+                    || self.engine.lockdown_applied == Some(true)
+                {
                     let _ = reply.send(PipeResponse::Error {
                         code: ErrorCode::IllegalState,
                         message: "当前处于熔断隔离或锁死状态，已拒绝启动分身保险箱".into(),
@@ -3987,21 +4345,16 @@ impl RealEngineActor {
                     });
                     return;
                 }
-                let snap = self.build_snapshot(now);
-                if self.engine.lifecycle == Lifecycle::Armed
-                    && self.engine.config.enforce_access_path
-                    && snap.access.is_uncovered()
-                {
+                if self.engine.protection == ProtectionState::Degraded {
                     let _ = reply.send(PipeResponse::Error {
                         code: ErrorCode::IllegalState,
-                        message: "未检测到活跃代理通道（TUN/系统代理离线），拒绝启动分身保险箱"
+                        message: "当前保护状态处于降级异常（Degraded），请先修复后再启动分身保险箱"
                             .into(),
                         receipt: None,
                     });
                     return;
                 }
 
-                // Cooldown enforcement.
                 let cooldown = self.egress_ledger.vault_cooldown_remaining(&vault.id, now);
                 if cooldown > 0 {
                     let _ = reply.send(PipeResponse::Error {
@@ -4015,81 +4368,32 @@ impl RealEngineActor {
                     return;
                 }
 
-                // Contract verification (safest default: read-only HARD BLOCK on mismatch unless
-                // `vault.auto_align_mihomo_on_vault_launch == true`).
-                let (obs_ip, obs_country, obs_asn) = current_primary_egress(&snap);
-                if let Err(mismatch_reason) = check_vault_egress_contract(
-                    &vault,
-                    obs_ip.as_deref(),
-                    obs_country.as_deref(),
-                    obs_asn,
-                ) {
-                    if vault.auto_align_mihomo_on_vault_launch {
-                        if let (Some(group), Some(node)) = (
-                            vault.preferred_mihomo_group.as_deref(),
-                            vault.preferred_mihomo_node.as_deref(),
-                        ) {
-                            match mihomo_win::switch_mihomo_node(group, node, true) {
-                                Ok(msg) => {
-                                    self.engine.push_log(
-                                        now,
-                                        LogLevel::Audit,
-                                        "vault",
-                                        &format!(
-                                            "保险箱「{}」自动对齐 Mihomo 节点（{msg}），触发复检等待核验",
-                                            vault.name
-                                        ),
-                                    );
-                                    self.step_and_run(
-                                        EngineEvent::StartRound {
-                                            purpose: CheckPurpose::Manual,
-                                        },
-                                        now,
-                                    );
-                                    let _ = reply.send(PipeResponse::Error {
-                                        code: ErrorCode::IllegalState,
-                                        message: format!(
-                                            "出口不匹配，已自动请求 Mihomo 切换至 `{node}` 并发起出口复检，请等待 2 秒核验通过后再次启动"
-                                        ),
-                                        receipt: None,
-                                    });
-                                    return;
-                                }
-                                Err(err) => {
-                                    let _ = reply.send(PipeResponse::Error {
-                                        code: ErrorCode::IllegalState,
-                                        message: format!(
-                                            "{mismatch_reason}；自动对齐 Mihomo 节点失败：{err}"
-                                        ),
-                                        receipt: None,
-                                    });
-                                    return;
-                                }
-                            }
+                let dedicated_port = vault
+                    .dedicated_proxy_port
+                    .filter(|&p| p > 0 && p != self.engine.config.proxy_port);
+
+                let mut needs_live_global_probe = false;
+                if dedicated_port.is_none() {
+                    let gate = GuardEngine::evaluate_launch_gate_for_agent(
+                        &self.engine,
+                        Some(app.agent_id()),
+                        now,
+                    );
+                    if !gate.allowed {
+                        if gate.requires_recheck {
+                            needs_live_global_probe = true;
+                        } else if !(vault.auto_align_mihomo_on_vault_launch
+                            && vault.preferred_mihomo_group.is_some()
+                            && vault.preferred_mihomo_node.is_some())
+                        {
+                            let _ = reply.send(PipeResponse::Error {
+                                code: ErrorCode::IllegalState,
+                                message: gate.reason,
+                                receipt: None,
+                            });
+                            return;
                         }
                     }
-                    let _ = reply.send(PipeResponse::Error {
-                        code: ErrorCode::IllegalState,
-                        message: format!(
-                            "出口契约阻断（只读硬拦截，未改动您的代理配置）：{mismatch_reason}"
-                        ),
-                        receipt: None,
-                    });
-                    return;
-                }
-
-                if snap.risk_assessment.evaluated_at > 0
-                    && snap.risk_assessment.score < vault.min_safety_score
-                {
-                    let _ = reply.send(PipeResponse::Error {
-                        code: ErrorCode::IllegalState,
-                        message: format!(
-                            "当前 10D 出口安全分 {} 低于保险箱「{}」最低要求 {}，已拒绝启动",
-                            snap.risk_assessment.score, vault.name, vault.min_safety_score
-                        ),
-                        receipt: None,
-                    });
-                    return;
                 }
 
                 let vaults_root = match self.effective_vaults_root() {
@@ -4103,180 +4407,62 @@ impl RealEngineActor {
                         return;
                     }
                 };
-                if let Err(err) = vault_win::ensure_vault_layout_in(&vaults_root, &vault) {
+                let Some(in_flight) = InFlightGuard::try_acquire(&self.vault_launch_in_flight)
+                else {
                     let _ = reply.send(PipeResponse::Error {
-                        code: ErrorCode::IoFailed,
-                        message: err,
+                        code: ErrorCode::Busy,
+                        message: "另一个主权账号保险箱正在启动中，请稍候".into(),
                         receipt: None,
                     });
                     return;
-                }
+                };
 
+                let snap = self.build_snapshot(now);
                 let user_home = self.effective_user_home();
-                let mut spec = match vault_win::plan_vault_launch_env_and_args_in(
-                    &vaults_root,
-                    user_home.as_deref(),
-                    &vault,
-                    app,
-                    &self.engine.config.proxy_host,
-                    self.engine.config.proxy_port,
-                    &extra_args,
-                ) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        let _ = reply.send(PipeResponse::Error {
-                            code: ErrorCode::ValidationFailed,
-                            message: err,
-                            receipt: None,
-                        });
-                        return;
-                    }
-                };
+                let ag_healthy = self.engine.antigravity_proxy.state.is_healthy();
+                let driver = self.driver.clone();
+                let probe_runner = self.probe_runner.clone();
+                let scanner = self.process_scanner.clone();
+                let event_tx = self.event_tx.clone();
+                let vault_box = Box::new(vault);
+                let vault_for_worker = vault_box.clone();
+                let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                let worker_reply = reply_cell.clone();
 
-                if let vault_win::MsixLaunchStrategy::ExclusiveSwapLock { .. } = &spec.msix_strategy
-                {
-                    if let Err(err) = vault_win::acquire_msix_exclusive_lock(
-                        &vaults_root,
-                        app.agent_id(),
-                        &vault.id,
-                        now,
-                    ) {
-                        let _ = reply.send(PipeResponse::Error {
-                            code: ErrorCode::IllegalState,
-                            message: err,
-                            receipt: None,
-                        });
-                        return;
-                    }
-                }
-
-                // Append mode-aware Electron anti-leak hygiene args when enabled.
-                if self.engine.config.enforce_electron_hygiene_flags
-                    && hygiene_plan::is_electron_agent(app.agent_id())
-                {
-                    let proxy_addr = format!(
-                        "{}:{}",
-                        self.engine.config.proxy_host, spec.effective_proxy_port
-                    );
-                    let ag_dll_active = app == VaultAppTarget::AntigravityIde
-                        && self.engine.antigravity_proxy.state.is_healthy();
-                    let plan =
-                        hygiene_plan::plan_electron_hygiene(&hygiene_plan::HygienePlanInput {
-                            agent_id: app.agent_id().to_string(),
-                            access_level: snap.access.level,
-                            proxy_addr: Some(proxy_addr),
-                            antigravity_version_dll_active: ag_dll_active,
-                            enabled: true,
-                        });
-                    for flag in plan.args {
-                        if !spec.args.contains(&flag) {
-                            spec.args.push(flag);
-                        }
-                    }
-                }
-
-                let exe_candidates = if app.is_cli() {
-                    self.driver
-                        .discover_cli_exes(app.agent_id())
-                        .unwrap_or_default()
-                } else {
-                    self.driver
-                        .discover_agent_exes(app.agent_id())
-                        .unwrap_or_default()
-                };
-                let Some(exe_path) = exe_candidates.into_iter().next() else {
-                    let _ = reply.send(PipeResponse::Error {
-                        code: ErrorCode::NotFound,
-                        message: format!(
-                            "未在本机找到目标客户端 `{}` 的可执行文件",
-                            app.agent_id()
-                        ),
-                        receipt: None,
-                    });
-                    return;
-                };
-
-                let target = LaunchTarget::executable_with_env(
-                    exe_path,
-                    spec.args,
-                    spec.env,
-                    spec.working_dir,
-                );
-                let has_process_guard = self.driver.capabilities().process_guard;
-                let before_pids: std::collections::HashSet<u32> = if has_process_guard {
-                    self.process_scanner
-                        .refresh()
-                        .procs
-                        .iter()
-                        .map(|p| p.pid)
-                        .collect()
-                } else {
-                    std::collections::HashSet::new()
-                };
-                match self.driver.launch_app_normal_privilege(&target) {
-                    Ok(()) => {
-                        if has_process_guard {
-                            let mut discovered = discover_launched_vault_pids(
-                                &self.process_scanner.refresh(),
-                                &vaults_root,
-                                &vault.id,
+                if std::thread::Builder::new()
+                    .name("cg-vault-launch".to_string())
+                    .spawn(move || {
+                        let _guard = in_flight;
+                        let outcome = execute_vault_launch_off_thread(
+                            &*driver,
+                            &*probe_runner,
+                            &scanner,
+                            &snap,
+                            &vault_for_worker,
+                            app,
+                            &extra_args,
+                            &vaults_root,
+                            user_home.as_deref(),
+                            ag_healthy,
+                            dedicated_port,
+                            needs_live_global_probe,
+                        );
+                        if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = event_tx.send(CoordinatorEvent::VaultLaunchFinished {
+                                vault: vault_box,
                                 app,
-                                &before_pids,
-                            );
-                            if discovered.is_empty() {
-                                std::thread::sleep(Duration::from_millis(80));
-                                discovered = discover_launched_vault_pids(
-                                    &self.process_scanner.refresh(),
-                                    &vaults_root,
-                                    &vault.id,
-                                    app,
-                                    &before_pids,
-                                );
-                            }
-                            if !discovered.is_empty() {
-                                merge_vault_session_pids(
-                                    self.vault_sessions.entry(vault.id.clone()).or_default(),
-                                    discovered,
-                                );
-                            }
+                                outcome: Box::new(outcome),
+                                now_secs: now_unix_secs(),
+                                reply: tx,
+                            });
                         }
-                        let _ = self.egress_ledger.record_vault_activity(
-                            &vault.id,
-                            obs_ip.as_deref(),
-                            obs_country.as_deref(),
-                            snap.risk_assessment.ip_purity.city.as_deref(),
-                            snap.risk_assessment.ip_purity.lat_tenths,
-                            snap.risk_assessment.ip_purity.lon_tenths,
-                            vault.cooldown_after_ip_change_secs,
-                            now,
-                        );
-                        let mut receipt = OperationReceipt::new(
-                            format!("vault-launch-{}-{now}", vault.id),
-                            OperationStatus::Verified,
-                        );
-                        receipt.verified_scope = format!("{}:{}", vault.id, app.agent_id());
-                        receipt.push_item(
-                            "vault_launch",
-                            OperationStatus::Verified,
-                            format!("已在主权保险箱「{}」启动 {}", vault.name, app.agent_id()),
-                        );
-                        self.engine.push_log(
-                            now,
-                            LogLevel::Audit,
-                            "vault",
-                            &format!("启动主权保险箱「{}」应用 {}", vault.name, app.agent_id()),
-                        );
-                        self.engine.last_receipt = Some(receipt.clone());
-                        let next_snap = self.publish_snapshot(snapshot_store, now);
-                        let _ = reply.send(PipeResponse::Ack {
-                            receipt: Some(receipt),
-                            snapshot: Some(Box::new(next_snap)),
-                        });
-                    }
-                    Err(err) => {
-                        let _ = reply.send(PipeResponse::Error {
-                            code: ErrorCode::IoFailed,
-                            message: format!("启动分身保险箱进程失败：{err}"),
+                    })
+                    .is_err()
+                {
+                    if let Some(tx) = reply_cell.lock().ok().and_then(|mut g| g.take()) {
+                        let _ = tx.send(PipeResponse::Error {
+                            code: ErrorCode::Busy,
+                            message: "创建保险箱启动工作线程失败，请稍后重试".into(),
                             receipt: None,
                         });
                     }
@@ -4355,114 +4541,147 @@ impl RealEngineActor {
                         return;
                     }
                 };
+                let Some(in_flight) = InFlightGuard::try_acquire(&self.vault_shortcuts_in_flight)
+                else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "快捷方式正在生成中，请稍候".into(),
+                        receipt: None,
+                    });
+                    return;
+                };
                 let cli_exe = hook_installer::resolve_cli_exe_path();
                 let desktop_dir = self
                     .effective_user_home()
                     .map(|h| h.join("Desktop"))
                     .unwrap_or_else(|| vaults_root.join(&vault.id).join("shortcuts"));
-                match vault_win::generate_vault_shortcuts_in(
-                    &vaults_root,
-                    &vault,
-                    &cli_exe,
-                    &desktop_dir,
-                ) {
-                    Ok(created) => {
-                        let mut receipt = OperationReceipt::new(
-                            format!("vault-shortcuts-{norm_id}-{now}"),
-                            OperationStatus::Verified,
-                        );
-                        receipt.verified_scope = format!("created={}", created.len());
-                        receipt.push_item(
-                            "vault_shortcuts",
-                            OperationStatus::Verified,
-                            format!("已生成 {} 个直启快捷方式与终端环境脚本", created.len()),
-                        );
-                        self.engine.push_log(
-                            now,
-                            LogLevel::Audit,
-                            "vault",
-                            &format!(
-                                "已为保险箱「{}」生成 {} 个快捷方式",
-                                vault.name,
-                                created.len()
-                            ),
-                        );
-                        self.engine.last_receipt = Some(receipt.clone());
-                        let snap = self.publish_snapshot(snapshot_store, now);
-                        let _ = reply.send(PipeResponse::Ack {
-                            receipt: Some(receipt),
-                            snapshot: Some(Box::new(snap)),
-                        });
-                    }
-                    Err(err) => {
-                        let _ = reply.send(PipeResponse::Error {
-                            code: ErrorCode::IoFailed,
-                            message: err,
+                let event_tx = self.event_tx.clone();
+                let v_name = vault.name.clone();
+                let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                let worker_reply = reply_cell.clone();
+                if std::thread::Builder::new()
+                    .name("cg-vault-shortcuts".to_string())
+                    .spawn(move || {
+                        let _guard = in_flight;
+                        let result = vault_win::generate_vault_shortcuts_in(
+                            &vaults_root,
+                            &vault,
+                            &cli_exe,
+                            &desktop_dir,
+                        )
+                        .map(|created| created.len());
+                        if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = event_tx.send(CoordinatorEvent::VaultShortcutsGenerated {
+                                vault_id: norm_id,
+                                vault_name: v_name,
+                                result,
+                                now_secs: now_unix_secs(),
+                                reply: tx,
+                            });
+                        }
+                    })
+                    .is_err()
+                {
+                    if let Some(tx) = reply_cell.lock().ok().and_then(|mut g| g.take()) {
+                        let _ = tx.send(PipeResponse::Error {
+                            code: ErrorCode::Busy,
+                            message: "创建快捷方式工作线程失败，请稍后重试".into(),
                             receipt: None,
                         });
                     }
                 }
             }
             PipeRequest::ScanCleanRoom { scope } => {
+                let Some(in_flight) = InFlightGuard::try_acquire(&self.cleanroom_op_in_flight)
+                else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "净室扫描或清理任务正在进行中，请稍候".into(),
+                        receipt: None,
+                    });
+                    return;
+                };
                 let user_home = self.effective_user_home();
-                let report = cleanroom_win::scan_cleanroom(&scope, user_home.as_deref(), now);
-                self.last_cleanroom_report = Some(report.clone());
-                self.cleanroom_backup_count =
-                    cleanroom_win::list_cleanroom_backups(&self.data_dir).len();
-                let _ = self.publish_snapshot(snapshot_store, now);
-                let _ = reply.send(PipeResponse::CleanRoomScan {
-                    report: Box::new(report),
-                });
+                let data_dir = self.data_dir.clone();
+                let event_tx = self.event_tx.clone();
+                let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                let worker_reply = reply_cell.clone();
+                if std::thread::Builder::new()
+                    .name("cg-cleanroom-scan".to_string())
+                    .spawn(move || {
+                        let _guard = in_flight;
+                        let ts = now_unix_secs();
+                        let report =
+                            cleanroom_win::scan_cleanroom(&scope, user_home.as_deref(), ts);
+                        let backup_count = cleanroom_win::list_cleanroom_backups(&data_dir).len();
+                        if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = event_tx.send(CoordinatorEvent::CleanRoomScanned {
+                                report: Box::new(report),
+                                backup_count,
+                                now_secs: now_unix_secs(),
+                                reply: tx,
+                            });
+                        }
+                    })
+                    .is_err()
+                {
+                    if let Some(tx) = reply_cell.lock().ok().and_then(|mut g| g.take()) {
+                        let _ = tx.send(PipeResponse::Error {
+                            code: ErrorCode::Busy,
+                            message: "创建净室扫描工作线程失败，请稍后重试".into(),
+                            receipt: None,
+                        });
+                    }
+                }
             }
             PipeRequest::ExecuteCleanRoom {
                 scope,
                 selected_finding_ids,
             } => {
+                let Some(in_flight) = InFlightGuard::try_acquire(&self.cleanroom_op_in_flight)
+                else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "净室扫描或清理任务正在进行中，请稍候".into(),
+                        receipt: None,
+                    });
+                    return;
+                };
                 let user_home = self.effective_user_home();
-                match cleanroom_win::execute_cleanroom_with_backup(
-                    &self.data_dir,
-                    &scope,
-                    &selected_finding_ids,
-                    user_home.as_deref(),
-                    now,
-                ) {
-                    Ok((meta, post_report)) => {
-                        self.last_cleanroom_report = Some(post_report.clone());
-                        self.cleanroom_backup_count =
-                            cleanroom_win::list_cleanroom_backups(&self.data_dir).len();
-                        let mut receipt = OperationReceipt::new(
-                            format!("cleanroom-exec-{now}"),
-                            OperationStatus::Verified,
-                        );
-                        receipt.verified_scope = meta.backup_id.clone();
-                        receipt.push_item(
-                            "cleanroom_backup",
-                            OperationStatus::Verified,
-                            format!(
-                                "已生成加密备份 {}（{} 项，残余污染分 {}/100）",
-                                meta.backup_id, meta.item_count, post_report.pollution_score
-                            ),
-                        );
-                        self.engine.push_log(
-                            now,
-                            LogLevel::Audit,
-                            "cleanroom",
-                            &format!(
-                                "净室洗白完成：已加密备份 {}（{} 项），复扫污染分 {}/100",
-                                meta.backup_id, meta.item_count, post_report.pollution_score
-                            ),
-                        );
-                        self.engine.last_receipt = Some(receipt.clone());
-                        let snap = self.publish_snapshot(snapshot_store, now);
-                        let _ = reply.send(PipeResponse::Ack {
-                            receipt: Some(receipt),
-                            snapshot: Some(Box::new(snap)),
+                let data_dir = self.data_dir.clone();
+                let event_tx = self.event_tx.clone();
+                let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                let worker_reply = reply_cell.clone();
+                if std::thread::Builder::new()
+                    .name("cg-cleanroom-exec".to_string())
+                    .spawn(move || {
+                        let _guard = in_flight;
+                        let ts = now_unix_secs();
+                        let result = cleanroom_win::execute_cleanroom_with_backup(
+                            &data_dir,
+                            &scope,
+                            &selected_finding_ids,
+                            user_home.as_deref(),
+                            ts,
+                        )
+                        .map(|(meta, post)| {
+                            let count = cleanroom_win::list_cleanroom_backups(&data_dir).len();
+                            (meta, post, count)
                         });
-                    }
-                    Err(msg) => {
-                        let _ = reply.send(PipeResponse::Error {
-                            code: ErrorCode::IoFailed,
-                            message: msg,
+                        if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = event_tx.send(CoordinatorEvent::CleanRoomExecuted {
+                                result,
+                                now_secs: now_unix_secs(),
+                                reply: tx,
+                            });
+                        }
+                    })
+                    .is_err()
+                {
+                    if let Some(tx) = reply_cell.lock().ok().and_then(|mut g| g.take()) {
+                        let _ = tx.send(PipeResponse::Error {
+                            code: ErrorCode::Busy,
+                            message: "创建净室洗白工作线程失败，请稍后重试".into(),
                             receipt: None,
                         });
                     }
@@ -4475,35 +4694,39 @@ impl RealEngineActor {
                 let _ = reply.send(PipeResponse::CleanRoomBackups { backups });
             }
             PipeRequest::RestoreCleanRoomBackup { backup_id } => {
-                match cleanroom_win::restore_cleanroom_backup(&self.data_dir, &backup_id) {
-                    Ok(restored) => {
-                        let mut receipt = OperationReceipt::new(
-                            format!("cleanroom-restore-{now}"),
-                            OperationStatus::Verified,
-                        );
-                        receipt.verified_scope = format!("backup={backup_id}, restored={restored}");
-                        receipt.push_item(
-                            "cleanroom_restore",
-                            OperationStatus::Verified,
-                            format!("已从加密备份 `{backup_id}` 还原 {restored} 项文件/凭据"),
-                        );
-                        self.engine.push_log(
-                            now,
-                            LogLevel::Audit,
-                            "cleanroom",
-                            &format!("净室回滚完成：已从 `{backup_id}` 还原 {restored} 项"),
-                        );
-                        self.engine.last_receipt = Some(receipt.clone());
-                        let snap = self.publish_snapshot(snapshot_store, now);
-                        let _ = reply.send(PipeResponse::Ack {
-                            receipt: Some(receipt),
-                            snapshot: Some(Box::new(snap)),
-                        });
-                    }
-                    Err(msg) => {
-                        let _ = reply.send(PipeResponse::Error {
-                            code: ErrorCode::IoFailed,
-                            message: msg,
+                let Some(in_flight) = InFlightGuard::try_acquire(&self.cleanroom_op_in_flight)
+                else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "净室扫描或还原任务正在进行中，请稍候".into(),
+                        receipt: None,
+                    });
+                    return;
+                };
+                let data_dir = self.data_dir.clone();
+                let event_tx = self.event_tx.clone();
+                let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                let worker_reply = reply_cell.clone();
+                if std::thread::Builder::new()
+                    .name("cg-cleanroom-restore".to_string())
+                    .spawn(move || {
+                        let _guard = in_flight;
+                        let result = cleanroom_win::restore_cleanroom_backup(&data_dir, &backup_id);
+                        if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = event_tx.send(CoordinatorEvent::CleanRoomRestored {
+                                backup_id,
+                                result,
+                                now_secs: now_unix_secs(),
+                                reply: tx,
+                            });
+                        }
+                    })
+                    .is_err()
+                {
+                    if let Some(tx) = reply_cell.lock().ok().and_then(|mut g| g.take()) {
+                        let _ = tx.send(PipeResponse::Error {
+                            code: ErrorCode::Busy,
+                            message: "创建净室还原工作线程失败，请稍后重试".into(),
                             receipt: None,
                         });
                     }
@@ -4533,38 +4756,46 @@ impl RealEngineActor {
                         return;
                     }
                 };
+                let Some(in_flight) = InFlightGuard::try_acquire(&self.cli_hooks_in_flight) else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "CLI 门禁钩子配置正在同步中，请稍候".into(),
+                        receipt: None,
+                    });
+                    return;
+                };
                 let cli_exe = hook_installer::resolve_cli_exe_path();
-                match hook_installer::configure_cli_hooks_in(
-                    &user_home,
-                    Some(&vaults_root),
-                    &cli_exe,
-                    &self.engine.config.vaults,
-                    install_claude_code,
-                    install_pwsh_profile,
-                    sync_all_vaults,
-                ) {
-                    Ok(status) => {
-                        let summary = status.summary.clone();
-                        self.hooks = status;
-                        let mut receipt = OperationReceipt::new(
-                            format!("cli-hooks-{now}"),
-                            OperationStatus::Verified,
+                let vaults = self.engine.config.vaults.clone();
+                let event_tx = self.event_tx.clone();
+                let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                let worker_reply = reply_cell.clone();
+                if std::thread::Builder::new()
+                    .name("cg-cli-hooks".to_string())
+                    .spawn(move || {
+                        let _guard = in_flight;
+                        let result = hook_installer::configure_cli_hooks_in(
+                            &user_home,
+                            Some(&vaults_root),
+                            &cli_exe,
+                            &vaults,
+                            install_claude_code,
+                            install_pwsh_profile,
+                            sync_all_vaults,
                         );
-                        receipt.verified_scope = "cli_hooks".into();
-                        receipt.push_item("cli_hooks", OperationStatus::Verified, summary.clone());
-                        self.engine
-                            .push_log(now, LogLevel::Audit, "hooks", &summary);
-                        self.engine.last_receipt = Some(receipt.clone());
-                        let snap = self.publish_snapshot(snapshot_store, now);
-                        let _ = reply.send(PipeResponse::Ack {
-                            receipt: Some(receipt),
-                            snapshot: Some(Box::new(snap)),
-                        });
-                    }
-                    Err(msg) => {
-                        let _ = reply.send(PipeResponse::Error {
-                            code: ErrorCode::IoFailed,
-                            message: msg,
+                        if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = event_tx.send(CoordinatorEvent::CliHooksConfigured {
+                                result,
+                                now_secs: now_unix_secs(),
+                                reply: tx,
+                            });
+                        }
+                    })
+                    .is_err()
+                {
+                    if let Some(tx) = reply_cell.lock().ok().and_then(|mut g| g.take()) {
+                        let _ = tx.send(PipeResponse::Error {
+                            code: ErrorCode::Busy,
+                            message: "创建 CLI 钩子配置工作线程失败，请稍后重试".into(),
                             receipt: None,
                         });
                     }
@@ -4756,8 +4987,64 @@ impl RealEngineActor {
             }
             PipeRequest::ClearGeoVelocityCooldown => {
                 let _ = self.egress_ledger.clear_cooldown(now);
-                let mut next_risk = self.engine.risk_assessment.clone();
-                next_risk.geo_velocity_alert = None;
+                // Immediately recompute offline 10D safety score preserving cached IP/STUN/DNS/Electron
+                // telemetry (`#43 [MED-1]`), lifting any `<=35` impossible-travel veto cap right away!
+                let cur_snap = self.build_snapshot(now);
+                let prev = self.engine.risk_assessment.clone();
+                let next_risk = if prev.evaluated_at > 0 {
+                    let (obs_ip, obs_country, _) = current_primary_egress(&cur_snap);
+                    let cur_obs = match (
+                        prev.ip_purity.ip.as_deref().or(obs_ip.as_deref()),
+                        prev.ip_purity.country.as_deref().or(obs_country.as_deref()),
+                    ) {
+                        (Some(ip), Some(cc)) => Some(self.egress_ledger.make_observation(
+                            ip,
+                            cc,
+                            prev.ip_purity.city.as_deref().unwrap_or(""),
+                            prev.ip_purity.lat_tenths,
+                            prev.ip_purity.lon_tenths,
+                            None,
+                            now,
+                        )),
+                        _ => None,
+                    };
+                    let mut lat_min = u64::MAX;
+                    let mut lat_max = 0u64;
+                    for t in &cur_snap.targets {
+                        if t.latency_ms > 0 {
+                            lat_min = lat_min.min(t.latency_ms);
+                            lat_max = lat_max.max(t.latency_ms);
+                        }
+                    }
+                    let input = risk_scorer::RiskScoringInput {
+                        ip_purity: prev.ip_purity,
+                        stun_leak: prev.stun_leak,
+                        dns_coherence: prev.dns_coherence,
+                        electron_hygiene: prev.electron_hygiene,
+                        env_check: Some(cur_snap.env.clone()),
+                        windows_geo_name: env_win::read_user_geo_name(),
+                        accept_language: Some(env_win::read_accept_language_hint()),
+                        edge_challenged: false,
+                        tls_or_http_downgraded: false,
+                        active_mtu: None,
+                        rtt_jitter_ms: lat_max.saturating_sub(lat_min),
+                        history_7d: self.egress_ledger.observations_for_scoring(None, now),
+                        current_observation: cur_obs,
+                        teleport_cooldown_mins: if cur_snap.config.enforce_geo_velocity {
+                            risk_scorer::DEFAULT_TELEPORT_COOLDOWN_MINS
+                        } else {
+                            0
+                        },
+                        now_secs: now,
+                    };
+                    let mut rescored = risk_scorer::score_egress_risk(&input);
+                    rescored.geo_velocity_alert = None;
+                    rescored
+                } else {
+                    let mut cleared = prev;
+                    cleared.geo_velocity_alert = None;
+                    cleared
+                };
                 self.step_and_run(
                     EngineEvent::RiskUpdated {
                         assessment: Box::new(next_risk),
@@ -4772,13 +5059,13 @@ impl RealEngineActor {
                 receipt.push_item(
                     "clear_geo_velocity_cooldown",
                     OperationStatus::Verified,
-                    "已确认行程并清除时空瞬移冷却锁定",
+                    "已确认行程并清除时空瞬移冷却锁定（安全评分已即时恢复）",
                 );
                 self.engine.push_log(
                     now,
                     LogLevel::Audit,
                     "risk",
-                    "用户手动确认并清除了跨国瞬移冷却锁",
+                    "用户手动确认并清除了跨国瞬移冷却锁，已即时刷新安全评分",
                 );
                 self.engine.last_receipt = Some(receipt.clone());
                 let snap = self.publish_snapshot(snapshot_store, now);
@@ -4789,31 +5076,60 @@ impl RealEngineActor {
             }
             PipeRequest::BuildHealthCard { export_png } => {
                 let snap = self.build_snapshot(now);
-                let card = diagnostics::build_sanitized_health_card(
-                    &snap,
-                    &self.data_dir,
-                    now,
-                    export_png,
-                );
-                if export_png {
-                    self.engine.push_log(
-                        now,
-                        LogLevel::Audit,
-                        "diagnostics",
-                        "已导出脱敏防封健康体检卡 PNG",
-                    );
-                    let _ = self.publish_snapshot(snapshot_store, now);
+                if !export_png {
+                    let card =
+                        diagnostics::build_sanitized_health_card(&snap, &self.data_dir, now, false);
+                    let _ = reply.send(PipeResponse::HealthCard {
+                        card: Box::new(card),
+                    });
+                    return;
                 }
-                let _ = reply.send(PipeResponse::HealthCard {
-                    card: Box::new(card),
-                });
+                let Some(in_flight) = InFlightGuard::try_acquire(&self.health_card_in_flight)
+                else {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::Busy,
+                        message: "防封体检卡图片正在导出中，请稍候".into(),
+                        receipt: None,
+                    });
+                    return;
+                };
+                let data_dir = self.data_dir.clone();
+                let event_tx = self.event_tx.clone();
+                let reply_cell = Arc::new(Mutex::new(Some(reply)));
+                let worker_reply = reply_cell.clone();
+                if std::thread::Builder::new()
+                    .name("cg-health-card".to_string())
+                    .spawn(move || {
+                        let _guard = in_flight;
+                        let ts = now_unix_secs();
+                        let card =
+                            diagnostics::build_sanitized_health_card(&snap, &data_dir, ts, true);
+                        if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = event_tx.send(CoordinatorEvent::HealthCardBuilt {
+                                card: Box::new(card),
+                                export_png: true,
+                                now_secs: now_unix_secs(),
+                                reply: tx,
+                            });
+                        }
+                    })
+                    .is_err()
+                {
+                    if let Some(tx) = reply_cell.lock().ok().and_then(|mut g| g.take()) {
+                        let _ = tx.send(PipeResponse::Error {
+                            code: ErrorCode::Busy,
+                            message: "创建体检卡导出工作线程失败，请稍后重试".into(),
+                            receipt: None,
+                        });
+                    }
+                }
             }
         }
     }
 
     fn refresh_live_vault_sessions(&mut self, procs: &CachedProcessSnapshot) {
         self.vault_sessions.retain(|_, entries| {
-            entries.retain(|(pid, _)| *pid > 0 && is_pid_alive(*pid));
+            entries.retain(|(id, _)| id.pid > 0 && is_identity_alive(id));
             !entries.is_empty()
         });
         let Ok(vaults_root) = self.effective_vaults_root() else {
@@ -4827,33 +5143,36 @@ impl RealEngineActor {
             .map(|v| v.id.clone())
             .collect();
         for vid in vault_ids {
-            let discovered = discover_live_vault_pids(procs, &vaults_root, &vid);
+            let discovered = discover_live_vault_identities(procs, &vaults_root, &vid);
             if !discovered.is_empty() {
-                merge_vault_session_pids(self.vault_sessions.entry(vid).or_default(), discovered);
+                merge_vault_session_identities(
+                    self.vault_sessions.entry(vid).or_default(),
+                    discovered,
+                );
             }
         }
     }
 
     fn stop_vault_processes(&mut self, vault_id: &str, vaults_root: &std::path::Path) -> usize {
-        let mut target_pids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut targets: Vec<ProcessIdentity> = Vec::new();
         if let Some(entries) = self.vault_sessions.remove(vault_id) {
-            for (pid, _app) in entries {
-                if pid > 0 {
-                    target_pids.insert(pid);
+            for (id, _app) in entries {
+                if id.pid > 0 && !targets.iter().any(|t| t.pid == id.pid) {
+                    targets.push(id);
                 }
             }
         }
         if self.driver.capabilities().process_guard {
             let procs = self.process_scanner.refresh();
-            for (pid, _app) in discover_live_vault_pids(&procs, vaults_root, vault_id) {
-                if pid > 0 {
-                    target_pids.insert(pid);
+            for (id, _app) in discover_live_vault_identities(&procs, vaults_root, vault_id) {
+                if id.pid > 0 && !targets.iter().any(|t| t.pid == id.pid) {
+                    targets.push(id);
                 }
             }
         }
         let mut count = 0usize;
-        for pid in target_pids {
-            if terminate_pid_best_effort(pid) {
+        for id in &targets {
+            if terminate_verified_vault_identity(id) {
                 count += 1;
             }
         }
@@ -4915,29 +5234,530 @@ fn format_wfp_persistent_sublayer_guid() -> String {
     )
 }
 
+fn inspect_active_leak_shield(driver: &dyn PlatformDriver) -> LeakShieldStatus {
+    if driver.firewall().engine_name() != "in-memory-mock" {
+        if let Some(hybrid) = cg_platform::active_hybrid_firewall() {
+            return hybrid.inspect_leak_shield();
+        }
+    }
+    leak_shield_win::inspect_leak_shield()
+}
+
+fn clear_all_claudeguard_firewall_state(driver: &dyn PlatformDriver) {
+    if driver.firewall().engine_name() != "in-memory-mock" {
+        if let Some(hybrid) = cg_platform::active_hybrid_firewall() {
+            let _ = hybrid.clear_all_claudeguard_state();
+            return;
+        }
+    }
+    let _ = leak_shield_win::clear_leak_shield();
+}
+
+fn clean_proxy_host_authority(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    let without_scheme = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .or_else(|| trimmed.strip_prefix("HTTP://"))
+        .or_else(|| trimmed.strip_prefix("HTTPS://"))
+        .unwrap_or(trimmed);
+    without_scheme.trim_end_matches('/')
+}
+
+fn probe_dedicated_proxy_port(proxy_host: &str, port: u16, now_secs: u64) -> PortEgressObservation {
+    let host = clean_proxy_host_authority(proxy_host);
+    let host_clean = if host.is_empty() { "127.0.0.1" } else { host };
+    let route = ProbeRoute::Proxy(format!("http://{host_clean}:{port}"));
+    let purity = ip_intel::fetch_ip_purity_via_route(&route, None, None, now_secs);
+    PortEgressObservation {
+        port,
+        ip: purity.ip,
+        country: purity.country,
+        city: purity.city,
+        colo: None,
+        lat_tenths: purity.lat_tenths,
+        lon_tenths: purity.lon_tenths,
+        asn: purity.asn,
+        observed_at: now_secs,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_vault_launch_off_thread(
+    driver: &dyn PlatformDriver,
+    probe_runner: &dyn ProbeRunner,
+    process_scanner: &ProcessScanner,
+    snap: &GuardSnapshot,
+    vault: &crate::protocol::AccountVault,
+    app: VaultAppTarget,
+    extra_args: &[String],
+    vaults_root: &std::path::Path,
+    user_home: Option<&std::path::Path>,
+    antigravity_dll_healthy: bool,
+    dedicated_port: Option<u16>,
+    needs_live_global_probe: bool,
+) -> VaultLaunchWorkerOutcome {
+    let now = now_unix_secs();
+
+    let mut obs_ip: Option<String>;
+    let mut obs_country: Option<String>;
+    let obs_asn: Option<u32>;
+    let mut obs_city = snap.risk_assessment.ip_purity.city.clone();
+    let mut obs_lat = snap.risk_assessment.ip_purity.lat_tenths;
+    let mut obs_lon = snap.risk_assessment.ip_purity.lon_tenths;
+    let mut port_obs_out: Option<PortEgressObservation> = None;
+
+    if let Some(port) = dedicated_port {
+        let probed = probe_dedicated_proxy_port(&snap.config.proxy_host, port, now);
+        obs_ip = probed.ip.clone();
+        obs_country = probed.country.clone();
+        obs_asn = probed.asn;
+        obs_city = probed.city.clone();
+        obs_lat = probed.lat_tenths;
+        obs_lon = probed.lon_tenths;
+        port_obs_out = Some(probed);
+    } else if needs_live_global_probe {
+        let (access, probes) = probe_runner.inspect_and_probe(
+            driver,
+            &snap.config,
+            snap.cfg_rev,
+            &snap.config.targets,
+            snap.config.enforce_access_path,
+            false,
+            now,
+        );
+        if snap.config.enforce_access_path
+            && driver.capabilities().app_quarantine
+            && !access.is_known()
+        {
+            return VaultLaunchWorkerOutcome::Failed {
+                code: ErrorCode::IllegalState,
+                message: format!("未检测到有效代理接入路径：{}", access.note),
+            };
+        }
+        for target in snap.config.targets.iter().filter(|t| t.enabled) {
+            let p = probes
+                .iter()
+                .find(|(id, _)| id == &target.id)
+                .map(|(_, p)| p.clone())
+                .unwrap_or_else(|| ProbeResult::failed("未返回探测结果"));
+            let eval = policy::evaluate_with_preset(target, &p, snap.config.preset);
+            if eval.verdict != crate::protocol::PolicyVerdict::Pass {
+                return VaultLaunchWorkerOutcome::Failed {
+                    code: ErrorCode::IllegalState,
+                    message: format!("出口核验未通过（{}）：{}", target.name, eval.reason),
+                };
+            }
+        }
+        let first_geo = probes
+            .iter()
+            .map(|(_, p)| p)
+            .find(|p| p.ip.is_some() || p.country.is_some());
+        obs_ip = first_geo.and_then(|p| p.ip.clone());
+        obs_country = first_geo.and_then(|p| p.country.clone());
+        obs_asn = snap.risk_assessment.ip_purity.asn;
+    } else {
+        let primary = current_primary_egress(snap);
+        obs_ip = primary.0;
+        obs_country = primary.1;
+        obs_asn = primary.2;
+    }
+
+    if let Err(mismatch_reason) =
+        check_vault_egress_contract(vault, obs_ip.as_deref(), obs_country.as_deref(), obs_asn)
+    {
+        if vault.auto_align_mihomo_on_vault_launch {
+            if let (Some(group), Some(node)) = (
+                vault.preferred_mihomo_group.as_deref(),
+                vault.preferred_mihomo_node.as_deref(),
+            ) {
+                match mihomo_win::switch_mihomo_node(group, node, true) {
+                    Ok(msg) => {
+                        if let Some(port) = dedicated_port {
+                            let re_probed =
+                                probe_dedicated_proxy_port(&snap.config.proxy_host, port, now);
+                            if check_vault_egress_contract(
+                                vault,
+                                re_probed.ip.as_deref(),
+                                re_probed.country.as_deref(),
+                                re_probed.asn,
+                            )
+                            .is_ok()
+                            {
+                                obs_ip = re_probed.ip.clone();
+                                obs_country = re_probed.country.clone();
+                                obs_city = re_probed.city.clone();
+                                obs_lat = re_probed.lat_tenths;
+                                obs_lon = re_probed.lon_tenths;
+                                port_obs_out = Some(re_probed);
+                            } else {
+                                return VaultLaunchWorkerOutcome::AutoAlignedMihomo {
+                                    node: node.to_string(),
+                                    detail: msg,
+                                };
+                            }
+                        } else {
+                            return VaultLaunchWorkerOutcome::AutoAlignedMihomo {
+                                node: node.to_string(),
+                                detail: msg,
+                            };
+                        }
+                    }
+                    Err(err) => {
+                        return VaultLaunchWorkerOutcome::Failed {
+                            code: ErrorCode::IllegalState,
+                            message: format!("{mismatch_reason}；自动对齐 Mihomo 节点失败：{err}"),
+                        };
+                    }
+                }
+            } else {
+                return VaultLaunchWorkerOutcome::Failed {
+                    code: ErrorCode::IllegalState,
+                    message: format!(
+                        "出口契约阻断（只读硬拦截，未改动您的代理配置）：{mismatch_reason}"
+                    ),
+                };
+            }
+        } else {
+            return VaultLaunchWorkerOutcome::Failed {
+                code: ErrorCode::IllegalState,
+                message: format!(
+                    "出口契约阻断（只读硬拦截，未改动您的代理配置）：{mismatch_reason}"
+                ),
+            };
+        }
+    }
+
+    if dedicated_port.is_none()
+        && snap.risk_assessment.evaluated_at > 0
+        && snap.risk_assessment.score < vault.min_safety_score
+    {
+        return VaultLaunchWorkerOutcome::Failed {
+            code: ErrorCode::IllegalState,
+            message: format!(
+                "当前 10D 出口安全分 {} 低于保险箱「{}」最低要求 {}，已拒绝启动",
+                snap.risk_assessment.score, vault.name, vault.min_safety_score
+            ),
+        };
+    }
+
+    if let Err(err) = vault_win::ensure_vault_layout_in(vaults_root, vault) {
+        return VaultLaunchWorkerOutcome::Failed {
+            code: ErrorCode::IoFailed,
+            message: err,
+        };
+    }
+
+    let mut spec = match vault_win::plan_vault_launch_env_and_args_in(
+        vaults_root,
+        user_home,
+        vault,
+        app,
+        &snap.config.proxy_host,
+        snap.config.proxy_port,
+        extra_args,
+    ) {
+        Ok(s) => s,
+        Err(err) => {
+            return VaultLaunchWorkerOutcome::Failed {
+                code: ErrorCode::ValidationFailed,
+                message: err,
+            };
+        }
+    };
+
+    if let vault_win::MsixLaunchStrategy::ExclusiveSwapLock { .. } = &spec.msix_strategy {
+        if let Err(err) =
+            vault_win::acquire_msix_exclusive_lock(vaults_root, app.agent_id(), &vault.id, now)
+        {
+            return VaultLaunchWorkerOutcome::Failed {
+                code: ErrorCode::IllegalState,
+                message: err,
+            };
+        }
+    }
+
+    if snap.config.enforce_electron_hygiene_flags && hygiene_plan::is_electron_agent(app.agent_id())
+    {
+        let proxy_addr = format!("{}:{}", snap.config.proxy_host, spec.effective_proxy_port);
+        let ag_dll_active = app == VaultAppTarget::AntigravityIde && antigravity_dll_healthy;
+        let effective_access = if dedicated_port.is_some() {
+            AccessLevel::SystemProxy
+        } else {
+            snap.access.level
+        };
+        let plan = hygiene_plan::plan_electron_hygiene(&hygiene_plan::HygienePlanInput {
+            agent_id: app.agent_id().to_string(),
+            access_level: effective_access,
+            proxy_addr: Some(proxy_addr),
+            antigravity_version_dll_active: ag_dll_active,
+            enabled: true,
+        });
+        for flag in plan.args {
+            if !spec.args.contains(&flag) {
+                spec.args.push(flag);
+            }
+        }
+    }
+
+    let exe_candidates = if app.is_cli() {
+        driver.discover_cli_exes(app.agent_id()).unwrap_or_default()
+    } else {
+        driver
+            .discover_agent_exes(app.agent_id())
+            .unwrap_or_default()
+    };
+    let Some(exe_path) = exe_candidates.into_iter().next() else {
+        return VaultLaunchWorkerOutcome::Failed {
+            code: ErrorCode::NotFound,
+            message: format!("未在本机找到目标客户端 `{}` 的可执行文件", app.agent_id()),
+        };
+    };
+
+    let target = LaunchTarget::executable_with_env(exe_path, spec.args, spec.env, spec.working_dir);
+    let has_process_guard = driver.capabilities().process_guard;
+    let before_pids: std::collections::HashSet<u32> = if has_process_guard {
+        process_scanner
+            .refresh()
+            .procs
+            .iter()
+            .map(|p| p.pid)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    match driver.launch_app_normal_privilege(&target) {
+        Ok(()) => {
+            let mut discovered_sessions = Vec::new();
+            if has_process_guard {
+                discovered_sessions = discover_launched_vault_identities(
+                    &process_scanner.refresh(),
+                    vaults_root,
+                    &vault.id,
+                    app,
+                    &before_pids,
+                );
+                if discovered_sessions.is_empty() {
+                    std::thread::sleep(Duration::from_millis(80));
+                    discovered_sessions = discover_launched_vault_identities(
+                        &process_scanner.refresh(),
+                        vaults_root,
+                        &vault.id,
+                        app,
+                        &before_pids,
+                    );
+                }
+            }
+            VaultLaunchWorkerOutcome::Launched {
+                obs_ip,
+                obs_country,
+                obs_city,
+                lat_tenths: obs_lat,
+                lon_tenths: obs_lon,
+                port_obs: port_obs_out,
+                discovered_sessions,
+            }
+        }
+        Err(err) => VaultLaunchWorkerOutcome::Failed {
+            code: ErrorCode::IoFailed,
+            message: format!("启动分身保险箱进程失败：{err}"),
+        },
+    }
+}
+
+fn normalize_identity_path_cmp(raw: &str) -> String {
+    raw.trim()
+        .strip_prefix(r"\\?\")
+        .unwrap_or(raw.trim())
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+/// Handle-pinned `(pid, start_time, exe_path)` verification before `TerminateProcess` (`R04`),
+/// eliminating PID-reuse collateral damage in `StopVault` / `DeleteVault` / `TriggerPanicLockdown`.
 #[cfg(windows)]
-fn terminate_pid_best_effort(pid: u32) -> bool {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-    if pid == 0 || pid == std::process::id() {
+fn terminate_verified_vault_identity(expected: &ProcessIdentity) -> bool {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+        TerminateProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    const STILL_ACTIVE_EXIT_CODE: u32 = 259;
+    const WINDOWS_TO_UNIX_EPOCH_SECS: u64 = 11_644_473_600;
+
+    if expected.pid == 0 || expected.pid == std::process::id() {
         return false;
     }
     unsafe {
-        let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, pid) else {
+        let Ok(handle) = OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            expected.pid,
+        ) else {
             return false;
         };
-        let ok = TerminateProcess(handle, 1).is_ok();
-        let _ = CloseHandle(handle);
-        ok
+        struct HandleGuard(windows::Win32::Foundation::HANDLE);
+        impl Drop for HandleGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+        let _guard = HandleGuard(handle);
+
+        let mut exit_code: u32 = 0;
+        if GetExitCodeProcess(handle, &mut exit_code).is_err()
+            || exit_code != STILL_ACTIVE_EXIT_CODE
+        {
+            return false;
+        }
+
+        if expected.start_time != 0 {
+            let mut creation = FILETIME::default();
+            let mut exit_time = FILETIME::default();
+            let mut kernel_time = FILETIME::default();
+            let mut user_time = FILETIME::default();
+            if GetProcessTimes(
+                handle,
+                &mut creation,
+                &mut exit_time,
+                &mut kernel_time,
+                &mut user_time,
+            )
+            .is_err()
+            {
+                return false;
+            }
+            let ticks = ((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64);
+            let actual_secs = (ticks / 10_000_000).saturating_sub(WINDOWS_TO_UNIX_EPOCH_SECS);
+            if actual_secs.abs_diff(expected.start_time) > 1 {
+                return false;
+            }
+        }
+
+        if !expected.exe_path.trim().is_empty() {
+            let mut buf = vec![0u16; 4096];
+            let mut size = buf.len() as u32;
+            if QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut size,
+            )
+            .is_err()
+                || size == 0
+            {
+                return false;
+            }
+            let actual_path = String::from_utf16_lossy(&buf[..(size as usize).min(buf.len())]);
+            if normalize_identity_path_cmp(&actual_path)
+                != normalize_identity_path_cmp(&expected.exe_path)
+            {
+                return false;
+            }
+        }
+
+        TerminateProcess(handle, 1).is_ok()
     }
 }
 
 #[cfg(not(windows))]
-fn terminate_pid_best_effort(_pid: u32) -> bool {
+fn terminate_verified_vault_identity(_expected: &ProcessIdentity) -> bool {
     false
 }
 
 #[cfg(windows)]
+fn is_identity_alive(expected: &ProcessIdentity) -> bool {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    const STILL_ACTIVE_EXIT_CODE: u32 = 259;
+    const WINDOWS_TO_UNIX_EPOCH_SECS: u64 = 11_644_473_600;
+
+    if expected.pid == 0 {
+        return false;
+    }
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, expected.pid) else {
+            return false;
+        };
+        struct HandleGuard(windows::Win32::Foundation::HANDLE);
+        impl Drop for HandleGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+        let _guard = HandleGuard(handle);
+
+        let mut exit_code: u32 = 0;
+        if GetExitCodeProcess(handle, &mut exit_code).is_err()
+            || exit_code != STILL_ACTIVE_EXIT_CODE
+        {
+            return false;
+        }
+        if expected.start_time != 0 {
+            let mut creation = FILETIME::default();
+            let mut exit_time = FILETIME::default();
+            let mut kernel_time = FILETIME::default();
+            let mut user_time = FILETIME::default();
+            if GetProcessTimes(
+                handle,
+                &mut creation,
+                &mut exit_time,
+                &mut kernel_time,
+                &mut user_time,
+            )
+            .is_ok()
+            {
+                let ticks =
+                    ((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64);
+                let actual_secs = (ticks / 10_000_000).saturating_sub(WINDOWS_TO_UNIX_EPOCH_SECS);
+                if actual_secs.abs_diff(expected.start_time) > 1 {
+                    return false;
+                }
+            }
+        }
+        if !expected.exe_path.trim().is_empty() {
+            let mut buf = vec![0u16; 2048];
+            let mut size = buf.len() as u32;
+            if QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut size,
+            )
+            .is_ok()
+                && size > 0
+            {
+                let actual_path = String::from_utf16_lossy(&buf[..(size as usize).min(buf.len())]);
+                if normalize_identity_path_cmp(&actual_path)
+                    != normalize_identity_path_cmp(&expected.exe_path)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+#[cfg(not(windows))]
+fn is_identity_alive(_expected: &ProcessIdentity) -> bool {
+    false
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn is_pid_alive(pid: u32) -> bool {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
@@ -4960,21 +5780,59 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub(crate) fn is_pid_alive(_pid: u32) -> bool {
     false
+}
+
+fn is_root_electron_gui_proc(
+    agent_id: &str,
+    p: &process_win::ProcInfo,
+    by_pid: &HashMap<u32, &process_win::ProcInfo>,
+    procs: &CachedProcessSnapshot,
+) -> bool {
+    if p.cmd_l.contains("--type=")
+        || p.cmd_l.contains("electron_run_as_node")
+        || p.cmd_l.contains("--import=")
+        || p.cmd_l.contains("sidecar_sdk")
+    {
+        return false;
+    }
+    match agent_id {
+        "claude" => process_win::is_live_root_claude_gui(p, by_pid, &procs.claude_dirs_l),
+        "chatgpt" => process_win::is_live_root_chatgpt_codex_gui(p, by_pid, &procs.chatgpt_dirs_l),
+        "antigravity" => process_win::is_live_root_antigravity_gui(p, by_pid),
+        "cursor" => {
+            p.name_l == "cursor.exe"
+                && !by_pid
+                    .get(&p.ppid)
+                    .is_some_and(|parent| parent.name_l == "cursor.exe")
+        }
+        "windsurf" => {
+            p.name_l == "windsurf.exe"
+                && !by_pid
+                    .get(&p.ppid)
+                    .is_some_and(|parent| parent.name_l == "windsurf.exe")
+        }
+        "trae" => {
+            matches!(p.name_l.as_str(), "trae.exe" | "trae cn.exe")
+                && !by_pid.get(&p.ppid).is_some_and(|parent| {
+                    matches!(parent.name_l.as_str(), "trae.exe" | "trae cn.exe")
+                })
+        }
+        _ => false,
+    }
 }
 
 /// Extracts main Electron GUI client `(agent_id, pid)` pairs from a cached process snapshot
 /// for live command-line anti-leak hygiene auditing (`NtQueryInformationProcess(60)`).
 ///
-/// Filters out Chromium child helper processes (`--type=renderer`, `--type=gpu-process`, etc.),
-/// SCM service/updater helpers, and non-Electron clients such as `zed`.
+/// Strictly filters out Chromium child helpers (`--type=*`), `ELECTRON_RUN_AS_NODE` sidecars,
+/// LSP/MCP helper binaries (`language_server.exe`, `resources\codex.exe`, `rg.exe`), SCM services,
+/// and non-Electron clients such as `zed` (`#42 [HIGH-3]`).
 pub fn collect_electron_agent_pids(procs: &CachedProcessSnapshot) -> Vec<(String, u32)> {
-    let pid_to_name: HashMap<u32, &str> = procs
-        .procs
-        .iter()
-        .map(|p| (p.pid, p.name_l.as_str()))
-        .collect();
+    let by_pid: HashMap<u32, &process_win::ProcInfo> =
+        procs.procs.iter().map(|p| (p.pid, p)).collect();
     let mut out: Vec<(String, u32)> = Vec::new();
     let mut seen_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
@@ -4986,15 +5844,6 @@ pub fn collect_electron_agent_pids(procs: &CachedProcessSnapshot) -> Vec<(String
             || p.name_l.contains("crashpad")
             || p.name_l.contains("updater")
             || p.name_l == "update.exe"
-            || p.cmd_l.contains("--type=")
-        {
-            continue;
-        }
-        if p.cmd_l.is_empty()
-            && p.ppid != 0
-            && pid_to_name
-                .get(&p.ppid)
-                .is_some_and(|parent_name| *parent_name == p.name_l.as_str())
         {
             continue;
         }
@@ -5002,14 +5851,16 @@ pub fn collect_electron_agent_pids(procs: &CachedProcessSnapshot) -> Vec<(String
             if !hygiene_plan::is_electron_agent(agent.id) {
                 continue;
             }
-            if cg_core::agents::gui_agent_matches_with_all_dirs(
-                agent.id,
-                &p.name_l,
-                &p.path_l,
-                &procs.claude_dirs_l,
-                &procs.chatgpt_dirs_l,
-                &procs.antigravity_dirs_l,
-            ) {
+            if is_root_electron_gui_proc(agent.id, p, &by_pid, procs)
+                && cg_core::agents::gui_agent_matches_with_all_dirs(
+                    agent.id,
+                    &p.name_l,
+                    &p.path_l,
+                    &procs.claude_dirs_l,
+                    &procs.chatgpt_dirs_l,
+                    &procs.antigravity_dirs_l,
+                )
+            {
                 out.push((agent.id.to_string(), p.pid));
                 break;
             }
@@ -5090,6 +5941,17 @@ pub fn discover_vault_pids_in_snapshot(
     vaults_root: &std::path::Path,
     vault_id: &str,
 ) -> Vec<(u32, String)> {
+    discover_vault_identities_in_snapshot(procs, vaults_root, vault_id)
+        .into_iter()
+        .map(|(id, app)| (id.pid, app))
+        .collect()
+}
+
+fn discover_vault_identities_in_snapshot(
+    procs: &CachedProcessSnapshot,
+    vaults_root: &std::path::Path,
+    vault_id: &str,
+) -> Vec<(ProcessIdentity, String)> {
     let vault_dir = vaults_root.join(vault_id);
     let (needle_bs, needle_fs) = normalize_path_needle(&vault_dir);
     let self_pid = std::process::id();
@@ -5102,19 +5964,19 @@ pub fn discover_vault_pids_in_snapshot(
         if cmd_contains_path_prefix(&p.cmd_l, &needle_bs)
             || cmd_contains_path_prefix(&p.cmd_l, &needle_fs)
         {
-            out.push((p.pid, infer_vault_proc_app_label(p, &p.cmd_l, procs)));
+            out.push((p.identity(), infer_vault_proc_app_label(p, &p.cmd_l, procs)));
         }
     }
     out
 }
 
-fn discover_live_vault_pids(
+fn discover_live_vault_identities(
     procs: &CachedProcessSnapshot,
     vaults_root: &std::path::Path,
     vault_id: &str,
-) -> Vec<(u32, String)> {
-    let mut found = discover_vault_pids_in_snapshot(procs, vaults_root, vault_id);
-    let mut seen: std::collections::HashSet<u32> = found.iter().map(|(pid, _)| *pid).collect();
+) -> Vec<(ProcessIdentity, String)> {
+    let mut found = discover_vault_identities_in_snapshot(procs, vaults_root, vault_id);
+    let mut seen: std::collections::HashSet<u32> = found.iter().map(|(id, _)| id.pid).collect();
     let vault_dir = vaults_root.join(vault_id);
     let (needle_bs, needle_fs) = normalize_path_needle(&vault_dir);
     let self_pid = std::process::id();
@@ -5142,22 +6004,22 @@ fn discover_live_vault_pids(
                 || cmd_contains_path_prefix(&cmd_l, &needle_fs)
             {
                 seen.insert(p.pid);
-                found.push((p.pid, infer_vault_proc_app_label(p, &cmd_l, procs)));
+                found.push((p.identity(), infer_vault_proc_app_label(p, &cmd_l, procs)));
             }
         }
     }
     found
 }
 
-fn discover_launched_vault_pids(
+fn discover_launched_vault_identities(
     after_procs: &CachedProcessSnapshot,
     vaults_root: &std::path::Path,
     vault_id: &str,
     app: VaultAppTarget,
     before_pids: &std::collections::HashSet<u32>,
-) -> Vec<(u32, String)> {
-    let mut found = discover_live_vault_pids(after_procs, vaults_root, vault_id);
-    let mut seen: std::collections::HashSet<u32> = found.iter().map(|(pid, _)| *pid).collect();
+) -> Vec<(ProcessIdentity, String)> {
+    let mut found = discover_live_vault_identities(after_procs, vaults_root, vault_id);
+    let mut seen: std::collections::HashSet<u32> = found.iter().map(|(id, _)| id.pid).collect();
     let self_pid = std::process::id();
     let agent_id = app.agent_id();
 
@@ -5180,22 +6042,27 @@ fn discover_launched_vault_pids(
         };
         if matched {
             seen.insert(p.pid);
-            found.push((p.pid, agent_id.to_string()));
+            found.push((p.identity(), agent_id.to_string()));
         }
     }
     found
 }
 
-fn merge_vault_session_pids(existing: &mut Vec<(u32, String)>, incoming: Vec<(u32, String)>) {
-    for (pid, app) in incoming {
-        if pid == 0 {
+fn merge_vault_session_identities(
+    existing: &mut Vec<(ProcessIdentity, String)>,
+    incoming: Vec<(ProcessIdentity, String)>,
+) {
+    for (id, app) in incoming {
+        if id.pid == 0 {
             continue;
         }
-        if !existing
-            .iter()
-            .any(|(existing_pid, _)| *existing_pid == pid)
+        if let Some(slot) = existing
+            .iter_mut()
+            .find(|(existing_id, _)| existing_id.pid == id.pid)
         {
-            existing.push((pid, app));
+            *slot = (id, app);
+        } else {
+            existing.push((id, app));
         }
     }
 }
@@ -5240,15 +6107,31 @@ pub fn compute_deep_risk_assessment(
         ip_intel::attach_dual_stack_ipv6_check(&mut ip_purity, ipv6_cc);
     }
 
+    // Gate raw daemon UDP STUN probing strictly on `AccessLevel::Tun && !Skip` (`#42 [CRIT-1]`).
+    // In `SystemProxy` mode, HTTP proxies do not intercept raw OS UDP sockets in `claudeguard-daemon`,
+    // so probing STUN from the daemon would falsely observe domestic ISP UDP and trigger Grade-F lockouts!
     let stun_leak = if allow_network
         && snap.config.enable_stun_dns_audit
         && driver.capabilities().access_path_inspection
+        && snap.access.level == AccessLevel::Tun
+        && !matches!(route, ProbeRoute::Skip(_))
     {
         stun_probe::probe_webrtc_stun_leak(
             ip_purity.ip.as_deref().or(obs_ip.as_deref()),
             1200,
             now_secs,
         )
+    } else if snap.access.level == AccessLevel::SystemProxy {
+        crate::protocol::StunLeakReport {
+            checked_at: now_secs,
+            stun_reachable_direct: false,
+            leaked: false,
+            reflexive_ip: None,
+            reflexive_country: None,
+            summary:
+                "系统代理模式：已免除守护进程裸 UDP 试探（客户端由 WebRTC 防漏参数与 QUIC 护盾保护）"
+                    .into(),
+        }
     } else {
         crate::protocol::StunLeakReport::default()
     };
@@ -5257,11 +6140,15 @@ pub fn compute_deep_risk_assessment(
         && snap.config.enable_stun_dns_audit
         && !matches!(route, ProbeRoute::Skip(_))
     {
-        ip_intel::probe_dns_coherence(
+        let mut dns = ip_intel::probe_dns_coherence_for_posture(
             &route,
             ip_purity.country.as_deref().or(obs_country.as_deref()),
-            now_secs,
-        )
+            3000,
+            snap.access.level,
+            snap.config.enforce_electron_hygiene_flags,
+        );
+        dns.checked_at = now_secs;
+        dns
     } else {
         crate::protocol::DnsCoherenceReport::default()
     };
@@ -5485,6 +6372,9 @@ impl CoordinatorActor for RealEngineActor {
         }
         if self.hook_metrics_ref.is_none() {
             self.hook_metrics_ref = Some(ctx.hook_metrics.clone());
+        }
+        if self.port_egress_ref.is_none() {
+            self.port_egress_ref = Some(ctx.port_egress.clone());
         }
         match event {
             CoordinatorEvent::Pipe { req, reply } => {
@@ -5820,6 +6710,9 @@ impl CoordinatorActor for RealEngineActor {
                     },
                     now_secs,
                 );
+                if accepted_round && self.engine.lifecycle == Lifecycle::Armed {
+                    self.sync_wfp_runtime_posture(now_secs);
+                }
                 let snap = self.publish_snapshot(ctx.snapshot, now_secs);
                 if accepted_round {
                     self.fulfill_round_waiters(&snap, now_secs);
@@ -6237,10 +7130,330 @@ impl CoordinatorActor for RealEngineActor {
                 self.wsl_bridge = *status;
                 let _ = self.publish_snapshot(ctx.snapshot, now_unix_secs());
             }
+            CoordinatorEvent::ExportDiagnosticsFinished {
+                result,
+                now_secs,
+                reply,
+            } => match result {
+                Ok(path) => {
+                    let path_s = path.to_string_lossy().to_string();
+                    let mut receipt = OperationReceipt::new(
+                        format!("diag-export-{now_secs}"),
+                        OperationStatus::Verified,
+                    );
+                    receipt.verified_scope = path_s.clone();
+                    receipt.push_item(
+                        "diagnostics_zip",
+                        OperationStatus::Verified,
+                        format!("已导出脱敏诊断包：{path_s}"),
+                    );
+                    self.engine.push_log(
+                        now_secs,
+                        LogLevel::Audit,
+                        "diagnostics",
+                        &format!("导出脱敏诊断压缩包：{path_s}"),
+                    );
+                    self.engine.last_receipt = Some(receipt.clone());
+                    let next_snap = self.publish_snapshot(ctx.snapshot, now_secs);
+                    let _ = reply.send(PipeResponse::Ack {
+                        receipt: Some(receipt),
+                        snapshot: Some(Box::new(next_snap)),
+                    });
+                }
+                Err(msg) => {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IoFailed,
+                        message: msg,
+                        receipt: None,
+                    });
+                }
+            },
+            CoordinatorEvent::HealthCardBuilt {
+                card,
+                export_png,
+                now_secs,
+                reply,
+            } => {
+                if export_png {
+                    self.engine.push_log(
+                        now_secs,
+                        LogLevel::Audit,
+                        "diagnostics",
+                        "已导出脱敏防封健康体检卡 PNG",
+                    );
+                    let _ = self.publish_snapshot(ctx.snapshot, now_secs);
+                }
+                let _ = reply.send(PipeResponse::HealthCard { card });
+            }
+            CoordinatorEvent::CleanRoomScanned {
+                report,
+                backup_count,
+                now_secs,
+                reply,
+            } => {
+                self.last_cleanroom_report = Some((*report).clone());
+                self.cleanroom_backup_count = backup_count;
+                let _ = self.publish_snapshot(ctx.snapshot, now_secs);
+                let _ = reply.send(PipeResponse::CleanRoomScan { report });
+            }
+            CoordinatorEvent::CleanRoomExecuted {
+                result,
+                now_secs,
+                reply,
+            } => match result {
+                Ok((meta, post_report, backup_count)) => {
+                    self.last_cleanroom_report = Some(post_report.clone());
+                    self.cleanroom_backup_count = backup_count;
+                    let mut receipt = OperationReceipt::new(
+                        format!("cleanroom-exec-{now_secs}"),
+                        OperationStatus::Verified,
+                    );
+                    receipt.verified_scope = meta.backup_id.clone();
+                    receipt.push_item(
+                        "cleanroom_backup",
+                        OperationStatus::Verified,
+                        format!(
+                            "已生成加密备份 {}（{} 项，残余污染分 {}/100）",
+                            meta.backup_id, meta.item_count, post_report.pollution_score
+                        ),
+                    );
+                    self.engine.push_log(
+                        now_secs,
+                        LogLevel::Audit,
+                        "cleanroom",
+                        &format!(
+                            "净室洗白完成：已加密备份 {}（{} 项），复扫污染分 {}/100",
+                            meta.backup_id, meta.item_count, post_report.pollution_score
+                        ),
+                    );
+                    self.engine.last_receipt = Some(receipt.clone());
+                    let snap = self.publish_snapshot(ctx.snapshot, now_secs);
+                    let _ = reply.send(PipeResponse::Ack {
+                        receipt: Some(receipt),
+                        snapshot: Some(Box::new(snap)),
+                    });
+                }
+                Err(msg) => {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IoFailed,
+                        message: msg,
+                        receipt: None,
+                    });
+                }
+            },
+            CoordinatorEvent::CleanRoomRestored {
+                backup_id,
+                result,
+                now_secs,
+                reply,
+            } => match result {
+                Ok(restored) => {
+                    let mut receipt = OperationReceipt::new(
+                        format!("cleanroom-restore-{now_secs}"),
+                        OperationStatus::Verified,
+                    );
+                    receipt.verified_scope = format!("backup={backup_id}, restored={restored}");
+                    receipt.push_item(
+                        "cleanroom_restore",
+                        OperationStatus::Verified,
+                        format!("已从加密备份 `{backup_id}` 还原 {restored} 项文件/凭据"),
+                    );
+                    self.engine.push_log(
+                        now_secs,
+                        LogLevel::Audit,
+                        "cleanroom",
+                        &format!("净室回滚完成：已从 `{backup_id}` 还原 {restored} 项"),
+                    );
+                    self.engine.last_receipt = Some(receipt.clone());
+                    let snap = self.publish_snapshot(ctx.snapshot, now_secs);
+                    let _ = reply.send(PipeResponse::Ack {
+                        receipt: Some(receipt),
+                        snapshot: Some(Box::new(snap)),
+                    });
+                }
+                Err(msg) => {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IoFailed,
+                        message: msg,
+                        receipt: None,
+                    });
+                }
+            },
+            CoordinatorEvent::VaultShortcutsGenerated {
+                vault_id,
+                vault_name,
+                result,
+                now_secs,
+                reply,
+            } => match result {
+                Ok(created_count) => {
+                    let mut receipt = OperationReceipt::new(
+                        format!("vault-shortcuts-{vault_id}-{now_secs}"),
+                        OperationStatus::Verified,
+                    );
+                    receipt.verified_scope = format!("created={created_count}");
+                    receipt.push_item(
+                        "vault_shortcuts",
+                        OperationStatus::Verified,
+                        format!("已生成 {created_count} 个直启快捷方式与终端环境脚本"),
+                    );
+                    self.engine.push_log(
+                        now_secs,
+                        LogLevel::Audit,
+                        "vault",
+                        &format!("已为保险箱「{vault_name}」生成 {created_count} 个快捷方式"),
+                    );
+                    self.engine.last_receipt = Some(receipt.clone());
+                    let snap = self.publish_snapshot(ctx.snapshot, now_secs);
+                    let _ = reply.send(PipeResponse::Ack {
+                        receipt: Some(receipt),
+                        snapshot: Some(Box::new(snap)),
+                    });
+                }
+                Err(err) => {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IoFailed,
+                        message: err,
+                        receipt: None,
+                    });
+                }
+            },
+            CoordinatorEvent::CliHooksConfigured {
+                result,
+                now_secs,
+                reply,
+            } => match result {
+                Ok(status) => {
+                    let summary = status.summary.clone();
+                    self.hooks = status;
+                    let mut receipt = OperationReceipt::new(
+                        format!("cli-hooks-{now_secs}"),
+                        OperationStatus::Verified,
+                    );
+                    receipt.verified_scope = "cli_hooks".into();
+                    receipt.push_item("cli_hooks", OperationStatus::Verified, summary.clone());
+                    self.engine
+                        .push_log(now_secs, LogLevel::Audit, "hooks", &summary);
+                    self.engine.last_receipt = Some(receipt.clone());
+                    let snap = self.publish_snapshot(ctx.snapshot, now_secs);
+                    let _ = reply.send(PipeResponse::Ack {
+                        receipt: Some(receipt),
+                        snapshot: Some(Box::new(snap)),
+                    });
+                }
+                Err(msg) => {
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IoFailed,
+                        message: msg,
+                        receipt: None,
+                    });
+                }
+            },
+            CoordinatorEvent::VaultLaunchFinished {
+                vault,
+                app,
+                outcome,
+                now_secs,
+                reply,
+            } => match *outcome {
+                VaultLaunchWorkerOutcome::Launched {
+                    obs_ip,
+                    obs_country,
+                    obs_city,
+                    lat_tenths,
+                    lon_tenths,
+                    port_obs,
+                    discovered_sessions,
+                } => {
+                    if let Some(obs) = port_obs {
+                        self.record_port_egress(obs);
+                    }
+                    if !discovered_sessions.is_empty() {
+                        merge_vault_session_identities(
+                            self.vault_sessions.entry(vault.id.clone()).or_default(),
+                            discovered_sessions,
+                        );
+                    }
+                    let _ = self.egress_ledger.record_vault_activity(
+                        &vault.id,
+                        obs_ip.as_deref(),
+                        obs_country.as_deref(),
+                        obs_city.as_deref(),
+                        lat_tenths,
+                        lon_tenths,
+                        vault.cooldown_after_ip_change_secs,
+                        now_secs,
+                    );
+                    let mut receipt = OperationReceipt::new(
+                        format!("vault-launch-{}-{now_secs}", vault.id),
+                        OperationStatus::Verified,
+                    );
+                    receipt.verified_scope = format!("{}:{}", vault.id, app.agent_id());
+                    receipt.push_item(
+                        "vault_launch",
+                        OperationStatus::Verified,
+                        format!("已在主权保险箱「{}」启动 {}", vault.name, app.agent_id()),
+                    );
+                    self.engine.push_log(
+                        now_secs,
+                        LogLevel::Audit,
+                        "vault",
+                        &format!("启动主权保险箱「{}」应用 {}", vault.name, app.agent_id()),
+                    );
+                    self.engine.last_receipt = Some(receipt.clone());
+                    let next_snap = self.publish_snapshot(ctx.snapshot, now_secs);
+                    let _ = reply.send(PipeResponse::Ack {
+                        receipt: Some(receipt),
+                        snapshot: Some(Box::new(next_snap)),
+                    });
+                }
+                VaultLaunchWorkerOutcome::AutoAlignedMihomo { node, detail } => {
+                    self.engine.push_log(
+                        now_secs,
+                        LogLevel::Audit,
+                        "vault",
+                        &format!(
+                            "保险箱「{}」自动对齐 Mihomo 节点（{detail}），触发复检等待核验",
+                            vault.name
+                        ),
+                    );
+                    self.step_and_run(
+                        EngineEvent::StartRound {
+                            purpose: CheckPurpose::Manual,
+                        },
+                        now_secs,
+                    );
+                    let _ = self.publish_snapshot(ctx.snapshot, now_secs);
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IllegalState,
+                        message: format!(
+                            "出口不匹配，已自动请求 Mihomo 切换至 `{node}` 并发起出口复检，请等待 2 秒核验通过后再次启动"
+                        ),
+                        receipt: None,
+                    });
+                }
+                VaultLaunchWorkerOutcome::Failed { code, message } => {
+                    let _ = reply.send(PipeResponse::Error {
+                        code,
+                        message,
+                        receipt: None,
+                    });
+                }
+            },
+            CoordinatorEvent::PortEgressProbed {
+                observations,
+                now_secs,
+            } => {
+                for obs in observations {
+                    self.record_port_egress(obs);
+                }
+                let _ = self.publish_snapshot(ctx.snapshot, now_secs);
+            }
             CoordinatorEvent::BeginStopping { reply } => {
                 let now = now_unix_secs();
                 self.stopping_ready = false;
                 self.step_and_run(EngineEvent::BeginStopping, now);
+                self.sync_wfp_runtime_posture(now);
                 let snap = self.publish_snapshot(ctx.snapshot, now);
                 self.flush_superseded_waiters(&snap);
                 let receipt = self.engine.last_receipt.clone().unwrap_or_default();
@@ -6315,9 +7528,7 @@ pub fn build_agent_statuses(
             .map(|p| p.to_string_lossy().to_string())
             .collect();
         let installed = running > 0 || orphans > 0 || !install_paths.is_empty();
-        let guarded = cfg.kill_cli_on_fail
-            && paired_gui_for_cli(cid)
-                .is_some_and(|gui| cfg.guarded_agents.iter().any(|g| g == gui));
+        let guarded = cfg.kill_cli_on_fail;
         out.push(AgentRuntimeStatus {
             id: (*cid).to_string(),
             name: (*cname).to_string(),
@@ -6811,7 +8022,7 @@ impl BackgroundMonitorHandle {
                             && fw_query_ok
                             && (!fw_rules.is_empty() || snap.leak_shield.enabled)
                         {
-                            leak_shield_win::inspect_leak_shield()
+                            inspect_active_leak_shield(&*driver)
                         } else {
                             LeakShieldStatus::default()
                         };
@@ -6824,6 +8035,48 @@ impl BackgroundMonitorHandle {
                             blocks,
                             latency_us,
                         );
+
+                        // Refresh dedicated per-port Vault egress cache when enabled & due (`#43 [CRIT-4]`).
+                        if snap.lifecycle == Lifecycle::Armed && !snap.is_paused_at(now) {
+                            let port_map = coordinator.port_egress_map();
+                            let ttl = snap.config.clamped_interval_secs();
+                            let mut due_ports = Vec::new();
+                            for v in snap.config.vaults.iter().filter(|v| v.enabled) {
+                                if let Some(p) = v
+                                    .dedicated_proxy_port
+                                    .filter(|&p| p > 0 && p != snap.config.proxy_port)
+                                {
+                                    let stale = !port_map.get(&p).is_some_and(|obs| {
+                                        now.saturating_sub(obs.observed_at) < ttl
+                                    });
+                                    if stale && !due_ports.contains(&p) {
+                                        due_ports.push(p);
+                                    }
+                                }
+                            }
+                            if !due_ports.is_empty() {
+                                let p_coord = coordinator.clone();
+                                let p_host = snap.config.proxy_host.clone();
+                                let p_stop = t_flag.clone();
+                                let _ = std::thread::Builder::new()
+                                    .name("cg-vault-port-probe".to_string())
+                                    .spawn(move || {
+                                        let ts = now_unix_secs();
+                                        let mut results = Vec::with_capacity(due_ports.len());
+                                        for port in due_ports {
+                                            if p_stop.load(Ordering::Acquire) {
+                                                return;
+                                            }
+                                            results.push(probe_dedicated_proxy_port(
+                                                &p_host, port, ts,
+                                            ));
+                                        }
+                                        if !p_stop.load(Ordering::Acquire) {
+                                            p_coord.publish_port_egress(results, now_unix_secs());
+                                        }
+                                    });
+                            }
+                        }
                         let suspicious_oauth_processes = Vec::new();
 
                         coordinator.try_send_telemetry(TelemetryBundle {
@@ -8600,7 +9853,7 @@ mod tests {
             .any(|l| l.category == "trip" && l.message.contains("CLI 3")));
         assert_eq!(
             driver.cli_killed_calls.lock().unwrap().as_slice(),
-            &["claude-code", "codex"]
+            &["claude-code", "codex", "gemini", "aider"]
         );
 
         // Next round while still Quarantined triggers KillGuardedAgents -> also kills both CLIs.
@@ -8611,7 +9864,7 @@ mod tests {
         ));
         assert_eq!(
             driver.cli_killed_calls.lock().unwrap().as_slice(),
-            &["claude-code", "codex"]
+            &["claude-code", "codex", "gemini", "aider"]
         );
 
         // Recover via Flow A, disable kill_cli_on_fail, trip again -> zero CLI kills!
@@ -8734,7 +9987,10 @@ mod tests {
         );
         let gemini_row = rows.iter().find(|r| r.id == "gemini").unwrap();
         assert!(gemini_row.installed, "running > 0 marks gemini installed");
-        assert!(!gemini_row.guarded);
+        assert!(
+            gemini_row.guarded,
+            "kill_cli_on_fail covers all KNOWN_CLI_AGENT_IDS"
+        );
 
         // Now test PipeRequest::ForceKillAgent via actor.
         let runner = Arc::new(DelayedProbeRunner {
@@ -8789,7 +10045,7 @@ mod tests {
             &["codex"]
         );
 
-        // 3) Global ForceKillAgent(None, include_cli=true) kills all guarded GUI + claude-code + codex.
+        // 3) Global ForceKillAgent(None, include_cli=true) kills all guarded GUI + all known CLIs.
         driver.gui_killed_calls.lock().unwrap().clear();
         driver.cli_killed_calls.lock().unwrap().clear();
         match coord.dispatch(PipeRequest::ForceKillAgent {
@@ -8810,7 +10066,7 @@ mod tests {
         );
         assert_eq!(
             driver.cli_killed_calls.lock().unwrap().as_slice(),
-            &["claude-code", "codex"]
+            &["claude-code", "codex", "gemini", "aider"]
         );
 
         coord.shutdown();

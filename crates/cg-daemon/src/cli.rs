@@ -295,10 +295,18 @@ pub fn run_cli_with_executor(
             hook_event,
             exit_code_block,
         } => {
-            let effective_timeout = if parsed.timeout_explicit {
+            // Fast 500ms connect timeout detects an offline daemon immediately, while a 6,500ms
+            // RPC call timeout gives `FastHookGate::NeedsSyncProbe` enough headroom to complete
+            // live HTTPS egress checks comfortably inside Claude Code's 8s hook budget.
+            let connect_timeout_ms = if parsed.timeout_explicit {
                 parsed.timeout_ms
             } else {
                 500
+            };
+            let call_timeout_ms = if parsed.timeout_explicit {
+                parsed.timeout_ms.max(500)
+            } else {
+                6_500
             };
             let resolved_vault = vault.or_else(|| {
                 std::env::var("CG_VAULT_ID")
@@ -309,7 +317,8 @@ pub fn run_cli_with_executor(
             run_hook_gate(
                 &pipe_name,
                 &data_dir,
-                effective_timeout,
+                connect_timeout_ms,
+                call_timeout_ms,
                 &agent,
                 resolved_vault,
                 hook_event,
@@ -367,10 +376,12 @@ fn format_hook_block_output(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_hook_gate(
     pipe_name: &str,
     data_dir: &Path,
-    timeout_ms: u32,
+    connect_timeout_ms: u32,
+    call_timeout_ms: u32,
     agent_id: &str,
     vault_id: Option<String>,
     hook_event: Option<String>,
@@ -382,8 +393,8 @@ fn run_hook_gate(
         hook_event,
     };
 
-    let call_res = PipeClient::connect(pipe_name, timeout_ms).and_then(|mut c| {
-        c.set_call_timeout_ms(timeout_ms.max(500));
+    let call_res = PipeClient::connect(pipe_name, connect_timeout_ms).and_then(|mut c| {
+        c.set_call_timeout_ms(call_timeout_ms.max(500));
         c.call(&req)
     });
 
