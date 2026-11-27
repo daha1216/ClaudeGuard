@@ -2,12 +2,14 @@
 
 use crate::model::{
     CutMode, PolicyPreset, Target, ThemeMode, default_builtin_targets, default_true,
-    ensure_builtin_targets, normalize_ip_or_cidr, normalize_region,
+    ensure_builtin_targets, is_builtin_target, is_known_region, normalize_ip_or_cidr,
+    normalize_region,
 };
 use crate::v5::{
     AccountVault, BurstGuardMode, FirewallBackendPref, HookFailMode, is_valid_vault_id,
 };
 use serde::{Deserialize, Serialize};
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Current config schema version (v5).
 pub const CONFIG_VERSION: u32 = 5;
@@ -384,10 +386,14 @@ impl Config {
         let mut notes = Vec::new();
         let mut preserved_cut_mode = None;
 
-        if !has_explicit_cut_mode && let Some(cut_net) = cfg.legacy_cut_network {
+        if has_explicit_cut_mode {
+            cfg.legacy_cut_network = None;
+            cfg.legacy_disable_network_adapters = None;
+        } else if let Some(cut_net) = cfg.legacy_cut_network.take() {
+            let disable_nics = cfg.legacy_disable_network_adapters.take().unwrap_or(false);
             let mapped = if !cut_net {
                 CutMode::Off
-            } else if cfg.legacy_disable_network_adapters.unwrap_or(false) {
+            } else if disable_nics {
                 CutMode::Nics
             } else {
                 CutMode::Firewall
@@ -397,6 +403,8 @@ impl Config {
                 preserved_cut_mode = Some(mapped);
                 notes.push(format!("已无损保留旧配置断网档位：{}", mapped.label()));
             }
+        } else {
+            cfg.legacy_disable_network_adapters = None;
         }
 
         if has_v2_fields {
@@ -406,6 +414,9 @@ impl Config {
             notes.push("已将 check_interval_secs 映射到 interval_secs".to_string());
         }
 
+        if !cfg.targets.is_empty() {
+            cfg.targets = sanitize_migrated_targets(std::mem::take(&mut cfg.targets));
+        }
         cfg.migrate();
         let migrated = source_version < CONFIG_VERSION || has_v2_fields || !has_explicit_cut_mode;
         Ok(MigrationOutcome {
@@ -449,7 +460,9 @@ impl Config {
             .iter()
             .filter_map(|ip| normalize_ip_or_cidr(ip))
             .collect();
-        let legacy_region = normalize_region(&self.egress_region).unwrap_or_default();
+        let legacy_region = normalize_region(&self.egress_region)
+            .filter(|c| is_known_region(c))
+            .unwrap_or_default();
         let legacy_regions: Vec<String> = if legacy_region.is_empty() {
             Vec::new()
         } else {
@@ -458,6 +471,21 @@ impl Config {
 
         if self.targets.is_empty() {
             self.targets = default_builtin_targets(&legacy_ips, &legacy_regions);
+        } else {
+            let defaults = default_builtin_targets(&[], &[]);
+            for target in &mut self.targets {
+                target.timeout_secs = target.timeout_secs.clamp(3, 60);
+                let id_norm = target.id.trim().to_ascii_lowercase();
+                if is_builtin_target(&id_norm) {
+                    target.builtin = true;
+                    if let Some(base) = defaults.iter().find(|d| d.id == id_norm) {
+                        target.bind_agent = base.bind_agent.clone();
+                    }
+                } else {
+                    target.builtin = false;
+                    target.bind_agent = None;
+                }
+            }
         }
         self.targets = ensure_builtin_targets(
             std::mem::take(&mut self.targets),
@@ -542,6 +570,174 @@ pub fn clean_guarded_agents(raw: &[String]) -> Vec<String> {
     }
     if out.is_empty() && !raw.is_empty() {
         out.push("claude".into());
+    }
+    out
+}
+
+fn is_forbidden_probe_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || o[0] == 0
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+        || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+        || o[0] >= 240
+}
+
+fn is_forbidden_probe_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_forbidden_probe_ipv4(v4);
+    }
+    let seg = ip.segments();
+    if seg[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+        let v4 = Ipv4Addr::from(((u32::from(seg[6])) << 16) | u32::from(seg[7]));
+        return is_forbidden_probe_ipv4(v4);
+    }
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (seg[0] & 0xffc0) == 0xfe80
+        || (seg[0] & 0xfe00) == 0xfc00
+}
+
+fn is_safe_target_anchor_url(raw: &str) -> bool {
+    let url = raw.trim();
+    if url.is_empty() || url.len() > 300 || url.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return false;
+    }
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty()
+        || authority.starts_with(':')
+        || authority.contains('\\')
+        || authority.contains('@')
+    {
+        return false;
+    }
+    let valid_port = |s: &str| {
+        !s.is_empty()
+            && s.bytes().all(|b| b.is_ascii_digit())
+            && s.parse::<u16>().ok().is_some_and(|p| p > 0)
+    };
+    if authority.starts_with('[') {
+        let Some(close_idx) = authority.find(']') else {
+            return false;
+        };
+        let host_inner = &authority[1..close_idx];
+        let after = &authority[close_idx + 1..];
+        if !after.is_empty() && !after.strip_prefix(':').is_some_and(valid_port) {
+            return false;
+        }
+        let Ok(v6) = host_inner.parse::<Ipv6Addr>() else {
+            return false;
+        };
+        return !is_forbidden_probe_ipv6(v6);
+    }
+    if authority.contains(']') || authority.matches(':').count() > 1 {
+        return false;
+    }
+    let host_raw = if let Some((h, p)) = authority.split_once(':') {
+        if h.is_empty() || !valid_port(p) {
+            return false;
+        }
+        h
+    } else {
+        authority
+    };
+    let host_clean = host_raw.trim_end_matches('.').to_ascii_lowercase();
+    if host_clean.is_empty()
+        || host_clean == "localhost"
+        || host_clean.ends_with(".localhost")
+        || host_clean == "local"
+        || host_clean.ends_with(".local")
+    {
+        return false;
+    }
+    if let Ok(v4) = host_clean.parse::<Ipv4Addr>() {
+        return !is_forbidden_probe_ipv4(v4);
+    }
+    if let Some(last_label) = host_clean.rsplit('.').next()
+        && !last_label.is_empty()
+        && (last_label.bytes().all(|b| b.is_ascii_digit()) || last_label.starts_with("0x"))
+    {
+        return false;
+    }
+    true
+}
+
+fn sanitize_migrated_targets(targets: Vec<Target>) -> Vec<Target> {
+    let defaults = default_builtin_targets(&[], &[]);
+    let mut out: Vec<Target> = Vec::with_capacity(targets.len());
+    for mut target in targets {
+        target.id = target.id.trim().to_ascii_lowercase();
+        if target.id.is_empty()
+            || target.id.len() > 24
+            || !target
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            || out.iter().any(|existing| existing.id == target.id)
+        {
+            continue;
+        }
+
+        target.name = target.name.trim().to_string();
+        if target.name.chars().count() > 16 {
+            target.name = target.name.chars().take(16).collect();
+        }
+        target.anchor_url = target.anchor_url.trim().to_string();
+        target.timeout_secs = target.timeout_secs.clamp(3, 60);
+
+        let mut clean_ips = Vec::new();
+        for ip in &target.expect_ips {
+            if let Some(norm) = normalize_ip_or_cidr(ip)
+                && !clean_ips.contains(&norm)
+            {
+                clean_ips.push(norm);
+            }
+        }
+        target.expect_ips = clean_ips;
+
+        let mut clean_regions = Vec::new();
+        for reg in &target.expect_regions {
+            if let Some(code) = normalize_region(reg)
+                && is_known_region(&code)
+                && !clean_regions.contains(&code)
+            {
+                clean_regions.push(code);
+            }
+        }
+        target.expect_regions = clean_regions;
+
+        if is_builtin_target(&target.id) {
+            target.builtin = true;
+            if let Some(base) = defaults.iter().find(|d| d.id == target.id) {
+                if target.name.is_empty() {
+                    target.name = base.name.clone();
+                }
+                if !is_safe_target_anchor_url(&target.anchor_url) {
+                    target.anchor_url = base.anchor_url.clone();
+                }
+                target.bind_agent = base.bind_agent.clone();
+            }
+        } else {
+            target.builtin = false;
+            target.bind_agent = None;
+            if target.name.is_empty() {
+                target.name = target.id.chars().take(16).collect();
+            }
+            if !is_safe_target_anchor_url(&target.anchor_url) {
+                continue;
+            }
+        }
+        out.push(target);
     }
     out
 }
@@ -794,5 +990,51 @@ mod tests {
                 .expect_regions
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn migrate_preserves_explicit_cut_mode_off_and_sanitizes_ssrf_targets() {
+        let mixed_cut = r#"{
+            "version": 4,
+            "first_run": false,
+            "cut_mode": "off",
+            "cut_network": true,
+            "disable_network_adapters": true,
+            "targets": [
+                {
+                    "id": " claude ",
+                    "name": "Claude",
+                    "builtin": false,
+                    "enabled": true,
+                    "anchor_url": "http://127.0.0.1:9090/ssrf",
+                    "anchor_kind": "auto",
+                    "expect_ips": ["198.51.100.42/24"],
+                    "expect_regions": ["usa", "XX", "ZZ"],
+                    "timeout_secs": 999,
+                    "bind_agent": "chatgpt"
+                },
+                {
+                    "id": "bad_ssrf",
+                    "name": "Bad",
+                    "builtin": false,
+                    "enabled": true,
+                    "anchor_url": "https://192.168.1.1/ip",
+                    "anchor_kind": "json_ip",
+                    "expect_ips": [],
+                    "expect_regions": ["US"],
+                    "timeout_secs": 1
+                }
+            ]
+        }"#;
+        let cfg = Config::from_json_str(mixed_cut).expect("migrate mixed cut_mode");
+        assert_eq!(cfg.cut_mode, CutMode::Off);
+        let claude = cfg.target("claude").expect("claude builtin");
+        assert!(claude.builtin);
+        assert_eq!(claude.anchor_url, "https://claude.ai/cdn-cgi/trace");
+        assert_eq!(claude.bind_agent.as_deref(), Some("claude"));
+        assert_eq!(claude.timeout_secs, 60);
+        assert_eq!(claude.expect_ips, vec!["198.51.100.0/24"]);
+        assert_eq!(claude.expect_regions, vec!["US"]);
+        assert!(cfg.target("bad_ssrf").is_none());
     }
 }

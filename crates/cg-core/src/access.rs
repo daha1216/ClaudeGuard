@@ -5,7 +5,6 @@ use cg_protocol::{AccessEvidence, AccessLevel, Config};
 const TUN_KEYWORDS: &[&str] = &[
     "mihomo",
     "clash",
-    "meta",
     "sing-box",
     "singbox",
     "sing-tun",
@@ -104,6 +103,15 @@ fn has_bounded_tun_token(lower: &str) -> bool {
         })
 }
 
+fn has_bounded_meta_token(lower: &str) -> bool {
+    if lower.contains("meta quest") || lower.contains("meta virtual") {
+        return false;
+    }
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| tok == "meta")
+}
+
 /// Checks whether a network adapter name/description looks like a full-tunnel TUN device.
 pub fn is_tun_name(name: &str) -> bool {
     let lower = name.to_lowercase();
@@ -112,6 +120,7 @@ pub fn is_tun_name(name: &str) -> bool {
     }
     lower.starts_with("utun")
         || has_bounded_tun_token(&lower)
+        || has_bounded_meta_token(&lower)
         || TUN_KEYWORDS.iter().any(|kw| lower.contains(kw))
 }
 
@@ -699,5 +708,13 @@ mod tests {
         assert!(mhosts.contains(&"claude.ai".to_string()));
         assert!(mhosts.contains(&"[2606:4700::1]".to_string()));
         assert!(bypass_hits_host("2606:4700::*", "[2606:4700::1]"));
+
+        // Word-bounded "meta" matches Clash Meta TUN without false-matching Baremetal/MetaLink/Meta Quest.
+        assert!(is_tun_name("Meta"));
+        assert!(is_tun_name("Meta Tunnel"));
+        assert!(is_tun_name("Clash-Meta"));
+        assert!(!is_tun_name("Baremetal Ethernet Adapter"));
+        assert!(!is_tun_name("MetaLink Wi-Fi 6"));
+        assert!(!is_tun_name("Meta Quest Virtual Adapter"));
     }
 }

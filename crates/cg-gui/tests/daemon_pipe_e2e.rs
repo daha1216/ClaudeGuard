@@ -235,6 +235,7 @@ fn gui_daemon_client_roundtrips_live_daemon_over_named_pipe() {
             until_ts: None,
             limit: Some(50),
             query: None,
+            level: None,
         })
         .expect("QueryLogs")
     {

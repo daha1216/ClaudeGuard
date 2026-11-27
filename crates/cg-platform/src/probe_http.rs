@@ -356,8 +356,31 @@ pub(crate) fn resolve_and_validate_probe_redirect(
         format!("{scheme}{loc}")
     } else if loc.starts_with('/') {
         format!("{cur_origin}{loc}")
-    } else {
+    } else if loc.contains("://") {
         loc.to_string()
+    } else if loc.contains(':') {
+        // Reject non-HTTP schemes lacking `://` such as `javascript:`, `data:`, `file:`.
+        return Err(PlatformError::Network(
+            "探测重定向目标 URL 协议不受支持，已拒绝".to_string(),
+        ));
+    } else {
+        // RFC 3986 relative path reference (e.g. `trace2` or `?step=2`).
+        let path_part = current_url
+            .get(cur_origin.len()..)
+            .unwrap_or("/")
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("/");
+        if loc.starts_with('?') {
+            let base_path = if path_part.is_empty() { "/" } else { path_part };
+            format!("{cur_origin}{base_path}{loc}")
+        } else {
+            let dir_prefix = match path_part.rfind('/') {
+                Some(idx) => &path_part[..=idx],
+                None => "/",
+            };
+            format!("{cur_origin}{dir_prefix}{loc}")
+        }
     };
 
     let Some((next_https, host_raw, _)) = parse_probe_url_parts(&next_url) else {
@@ -471,17 +494,19 @@ pub fn probe_url(
     };
 
     let status = resp.status();
+    let read_cap = (max_body_bytes as u64).saturating_add(1);
     let mut buf = Vec::new();
-    if let Err(io_err) = resp
-        .into_reader()
-        .take(max_body_bytes as u64)
-        .read_to_end(&mut buf)
-    {
+    if let Err(io_err) = resp.into_reader().take(read_cap).read_to_end(&mut buf) {
         let detail = format!("读取响应体失败：{io_err}");
         return Err(PlatformError::Network(match route {
             ProbeRoute::Proxy(_) => proxy_required_error(&detail),
             _ => detail,
         }));
+    }
+    if buf.len() > max_body_bytes {
+        return Err(PlatformError::Network(format!(
+            "探测响应体超出安全上限（>{max_body_bytes} 字节），已拒绝截断流"
+        )));
     }
     let body = String::from_utf8_lossy(&buf).into_owned();
     Ok(HttpProbeResponse {

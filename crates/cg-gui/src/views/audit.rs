@@ -40,7 +40,6 @@ pub fn render_audit_page(
     let health_card_busy = ctrl_r.is_scope_busy(&ActionScope::BuildHealthCard);
     let total_server = ctrl_r.queried_logs_total;
     let connected = ctrl_r.connected;
-    let busy = ctrl_r.busy_action;
 
     let ctrl_clear = ctrl.clone();
     let ctrl_refresh = ctrl.clone();
@@ -203,6 +202,8 @@ pub fn render_audit_page(
                 cx.listener(move |_, _, _, cx| {
                     ctrl_l.update(cx, |c, cx| {
                         c.audit_level_filter = lvl;
+                        c.selected_log_id = None;
+                        c.refresh_audit_logs(cx);
                         cx.notify();
                     });
                 }),
@@ -256,7 +257,18 @@ pub fn render_audit_page(
                 ),
             )
     } else {
+        let (show_scrollbar, thumb_top_ratio, thumb_h_ratio) = {
+            let base = &scroll_handle.0.borrow().base_handle;
+            let view_h = base.bounds().size.height.as_f32().max(240.0);
+            let total_h = (log_count as f32 * 31.0).max(view_h);
+            let h_ratio = (view_h / total_h).clamp(0.10, 1.0);
+            let max_scroll = (total_h - view_h).max(1.0);
+            let cur_scroll = (-base.offset().y.as_f32()).clamp(0.0, max_scroll);
+            let top_ratio = (cur_scroll / max_scroll) * (1.0 - h_ratio);
+            (total_h > view_h + 4.0, top_ratio.clamp(0.0, 0.90), h_ratio)
+        };
         div()
+            .relative()
             .flex_1()
             .min_h(px(260.))
             .w_full()
@@ -264,7 +276,8 @@ pub fn render_audit_page(
             .bg(rgb(p.inset_bg))
             .border_1()
             .border_color(rgb(p.inset_border))
-            .px(px(6.))
+            .pl(px(6.))
+            .pr(px(if show_scrollbar { 11.0 } else { 6.0 }))
             .py(px(4.))
             .child(
                 uniform_list("audit-log-stream", log_count, move |range, _window, _cx| {
@@ -372,6 +385,28 @@ pub fn render_audit_page(
                 .track_scroll(&scroll_handle)
                 .size_full(),
             )
+            .when(show_scrollbar, |wrap| {
+                wrap.child(
+                    div()
+                        .absolute()
+                        .top(px(6.))
+                        .bottom(px(6.))
+                        .right(px(3.5))
+                        .w(px(3.5))
+                        .rounded(px(999.))
+                        .bg(rgb(p.card_border))
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(0.))
+                                .right(px(0.))
+                                .top(gpui::relative(thumb_top_ratio))
+                                .h(gpui::relative(thumb_h_ratio))
+                                .rounded(px(999.))
+                                .bg(rgb(p.text_muted)),
+                        ),
+                )
+            })
     };
 
     let count_display = if total_server > all_count {
@@ -380,8 +415,8 @@ pub fn render_audit_page(
         format!("{log_count} / {all_count} 条")
     };
     let can_pull = connected && !logs_loading;
-    let can_export = connected && !busy;
-    let can_export_health = connected && !busy && !health_card_busy;
+    let can_export = connected && !export_busy;
+    let can_export_health = connected && !health_card_busy;
     let hover_tile = p.sidebar_hover_bg;
 
     let ctrl_copy_log = ctrl.clone();

@@ -12,9 +12,21 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use cg_platform::vault_win;
-use cg_protocol::{AccountVault, HookIntegrationStatus};
+use cg_protocol::{AccountVault, HookFailMode, HookIntegrationStatus};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tempfile::NamedTempFile;
+
+/// Non-secret user-readable offline hook policy file written under `<user_home>` so non-elevated
+/// `claudeguard-cli --hook-gate` honors `FailOpenWithWarn` and `Disarmed` when the service is offline.
+pub const HOOK_POLICY_FILE: &str = ".claudeguard-hook-policy.json";
+
+/// Public, credential-free offline hook policy mirrored for non-admin CLI processes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicHookPolicy {
+    pub hook_fail_mode: HookFailMode,
+    pub disarmed: bool,
+}
 
 /// Primary start marker injected into PowerShell `$PROFILE`.
 pub const PWSH_BLOCK_START: &str = "# >>> ClaudeGuard v5 Hook >>>";
@@ -230,7 +242,7 @@ pub fn merge_claude_settings_value(
         ]
     });
     let desired_pre_tool = json!({
-        "matcher": "WebFetch|WebSearch",
+        "matcher": "WebFetch|WebSearch|Bash",
         "hooks": [
             {
                 "type": "command",
@@ -328,12 +340,23 @@ pub fn sync_claude_code_settings(
         (None, Value::Object(Map::new()))
     };
 
+    let had_cg_hook = root
+        .pointer("/hooks/UserPromptSubmit")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| arr.iter().any(entry_is_claudeguard_managed))
+        || root
+            .pointer("/hooks/PreToolUse")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| arr.iter().any(entry_is_claudeguard_managed));
+
     merge_claude_settings_value(&mut root, cli_exe, vault_id, install)?;
 
     if let Some(orig) = original_bytes {
         let bak_path = backup_path_for(settings_path);
-        vault_win::ensure_no_reparse_points_chain(&bak_path)?;
-        atomic_write_bytes(&bak_path, &orig)?;
+        if !bak_path.exists() || !had_cg_hook {
+            vault_win::ensure_no_reparse_points_chain(&bak_path)?;
+            atomic_write_bytes(&bak_path, &orig)?;
+        }
     }
 
     let serialized = serde_json::to_string_pretty(&root)
@@ -443,10 +466,15 @@ pub fn sync_pwsh_profile(profile_path: &Path, cli_exe: &Path, install: bool) -> 
                 profile_path.display()
             )
         })?;
+        let orig_str = String::from_utf8_lossy(&orig_bytes).into_owned();
+        let already_wrapped =
+            orig_str.contains(PWSH_BLOCK_START) || orig_str.contains(ALT_PWSH_BLOCK_START);
         let bak_path = backup_path_for(profile_path);
-        vault_win::ensure_no_reparse_points_chain(&bak_path)?;
-        atomic_write_bytes(&bak_path, &orig_bytes)?;
-        String::from_utf8_lossy(&orig_bytes).into_owned()
+        if !bak_path.exists() || !already_wrapped {
+            vault_win::ensure_no_reparse_points_chain(&bak_path)?;
+            atomic_write_bytes(&bak_path, &orig_bytes)?;
+        }
+        orig_str
     } else if !install {
         return Ok(());
     } else {
@@ -454,6 +482,9 @@ pub fn sync_pwsh_profile(profile_path: &Path, cli_exe: &Path, install: bool) -> 
     };
 
     let merged = merge_pwsh_profile_text(&existing, cli_exe, install);
+    if !install && merged.is_empty() {
+        return atomic_write_bytes(profile_path, b"");
+    }
     // Write UTF-8 with BOM + CRLF for dual PowerShell 5.1 / PowerShell 7 compatibility.
     let mut out = Vec::with_capacity(3 + merged.len());
     out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
@@ -477,14 +508,34 @@ pub fn inspect_hook_status_in(
         .map(default_pwsh_profile_path)
         .is_some_and(|p| is_pwsh_profile_wrapped(&p));
 
+    let mut counted_settings: Vec<PathBuf> = Vec::new();
     let mut vault_hooks_synced_count = 0usize;
     if let Some(vroot) = vaults_root {
         for v in vaults {
             if let Ok(root) = vault_win::resolve_vault_root_under(vroot, &v.id) {
                 let paths = vault_win::VaultPaths::from_root(&v.id, root);
-                if is_claude_settings_hook_installed(&paths.claude_code_home.join("settings.json"))
-                {
+                let sp = paths.claude_code_home.join("settings.json");
+                if is_claude_settings_hook_installed(&sp) {
                     vault_hooks_synced_count += 1;
+                    counted_settings.push(sp);
+                }
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(vroot) {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&dir) else {
+                    continue;
+                };
+                if crate::journal::is_reparse_point_metadata(&meta) || !meta.is_dir() {
+                    continue;
+                }
+                for sub in ["claude_code_home", "claude-code"] {
+                    let sp = dir.join(sub).join("settings.json");
+                    if !counted_settings.contains(&sp) && is_claude_settings_hook_installed(&sp) {
+                        vault_hooks_synced_count += 1;
+                        counted_settings.push(sp);
+                    }
                 }
             }
         }
@@ -519,17 +570,54 @@ pub fn configure_cli_hooks_in(
     let profile_path = default_pwsh_profile_path(user_home);
     sync_pwsh_profile(&profile_path, cli_exe, install_pwsh_profile)?;
 
-    if sync_all_vaults {
-        if let Some(vroot) = vaults_root {
+    if let Some(vroot) = vaults_root {
+        if install_claude_code {
+            if sync_all_vaults {
+                for vault in vaults {
+                    let paths = vault_win::ensure_vault_layout_in(vroot, vault)?;
+                    let vault_settings = paths.claude_code_home.join("settings.json");
+                    sync_claude_code_settings(&vault_settings, cli_exe, Some(&vault.id), true)?;
+                }
+            }
+        } else {
+            // Uninstalling Claude Code hooks ALWAYS cleans Sovereign Vault hooks without
+            // creating new vault directories on disk (`#88` [HIGH-1] + `#86` #2).
+            let mut cleaned_paths: Vec<PathBuf> = Vec::new();
             for vault in vaults {
-                let paths = vault_win::ensure_vault_layout_in(vroot, vault)?;
-                let vault_settings = paths.claude_code_home.join("settings.json");
-                sync_claude_code_settings(
-                    &vault_settings,
-                    cli_exe,
-                    Some(&vault.id),
-                    install_claude_code,
-                )?;
+                if let Ok(root) = vault_win::resolve_vault_root_under(vroot, &vault.id) {
+                    let paths = vault_win::VaultPaths::from_root(&vault.id, root);
+                    let vault_settings = paths.claude_code_home.join("settings.json");
+                    if vault_settings.is_file() {
+                        sync_claude_code_settings(
+                            &vault_settings,
+                            cli_exe,
+                            Some(&vault.id),
+                            false,
+                        )?;
+                        cleaned_paths.push(vault_settings);
+                    }
+                }
+            }
+            if let Ok(entries) = std::fs::read_dir(vroot) {
+                for entry in entries.flatten() {
+                    let dir = entry.path();
+                    let Ok(meta) = std::fs::symlink_metadata(&dir) else {
+                        continue;
+                    };
+                    if crate::journal::is_reparse_point_metadata(&meta) || !meta.is_dir() {
+                        continue;
+                    }
+                    for sub in ["claude_code_home", "claude-code"] {
+                        let sp = dir.join(sub).join("settings.json");
+                        if !cleaned_paths.contains(&sp)
+                            && sp.is_file()
+                            && is_claude_settings_hook_installed(&sp)
+                        {
+                            let _ = sync_claude_code_settings(&sp, cli_exe, None, false);
+                            cleaned_paths.push(sp);
+                        }
+                    }
+                }
             }
         }
     }
@@ -622,8 +710,100 @@ fn backup_path_for(path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// Writes `<dir>\.claudeguard-hook-policy.json` atomically with interactive-user read/modify ACL.
+pub fn sync_public_hook_policy_in(
+    dir: &Path,
+    hook_fail_mode: HookFailMode,
+    disarmed: bool,
+) -> Result<(), String> {
+    vault_win::safe_create_dir_all_no_reparse(dir)?;
+    let target = dir.join(HOOK_POLICY_FILE);
+    let payload = PublicHookPolicy {
+        hook_fail_mode,
+        disarmed,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&payload)
+        .map_err(|e| format!("序列化离线 Hook 策略文件失败：{e}"))?;
+    bytes.push(b'\n');
+    atomic_write_bytes(&target, &bytes)
+}
+
+/// Reads `<dir>\.claudeguard-hook-policy.json` if present and valid.
+pub fn read_public_hook_policy_in(dir: &Path) -> Option<PublicHookPolicy> {
+    let target = dir.join(HOOK_POLICY_FILE);
+    vault_win::ensure_no_reparse_points_chain(&target).ok()?;
+    let raw = std::fs::read_to_string(&target).ok()?;
+    serde_json::from_str(raw.trim()).ok()
+}
+
+/// Reads the current user's `.claudeguard-hook-policy.json` from `USERPROFILE` or interactive user home.
+pub fn read_public_hook_policy() -> Option<PublicHookPolicy> {
+    if let Some(up) = std::env::var_os("USERPROFILE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+    {
+        if let Some(pol) = read_public_hook_policy_in(&up) {
+            return Some(pol);
+        }
+    }
+    let home = resolve_interactive_user_home()?;
+    read_public_hook_policy_in(&home)
+}
+
+/// Mirrors `PublicHookPolicy` to interactive user home(s) when operating on the production
+/// `%ProgramData%\ClaudeGuard` directory, or inside `data_dir` itself for hermetic test/custom dirs.
+pub fn sync_public_hook_policy_for_data_dir(
+    data_dir: &Path,
+    hook_fail_mode: HookFailMode,
+    disarmed: bool,
+) {
+    if crate::journal::is_default_programdata_claudeguard_dir(data_dir) {
+        let mut homes = cg_platform::process_win::user_home_dirs();
+        if let Some(active) = resolve_interactive_user_home() {
+            if !homes.contains(&active) {
+                homes.push(active);
+            }
+        }
+        for home in homes {
+            let _ = sync_public_hook_policy_in(&home, hook_fail_mode, disarmed);
+        }
+    } else {
+        let _ = sync_public_hook_policy_in(data_dir, hook_fail_mode, disarmed);
+    }
+}
+
+/// Strips ClaudeGuard CLI hooks, Sovereign Vault hooks, PowerShell `$PROFILE` blocks, WSL2 gate shims,
+/// and `.claudeguard-*` helper files across all discovered interactive user profiles (`--unhook-all`).
+pub fn unhook_all_user_profiles(vaults: &[AccountVault]) -> Result<usize, String> {
+    let cli_exe = resolve_cli_exe_path();
+    let mut homes = cg_platform::process_win::user_home_dirs();
+    if let Some(active) = resolve_interactive_user_home() {
+        if !homes.contains(&active) {
+            homes.push(active);
+        }
+    }
+    let mut cleaned = 0usize;
+    for home in &homes {
+        let vroot = vaults_root_for_user(home);
+        if configure_cli_hooks_in(home, Some(&vroot), &cli_exe, vaults, false, false, true).is_ok()
+        {
+            cleaned += 1;
+        }
+        let policy_file = home.join(HOOK_POLICY_FILE);
+        if vault_win::ensure_no_reparse_points_chain(&policy_file).is_ok() {
+            let _ = std::fs::remove_file(&policy_file);
+        }
+        let wsl_tok = home.join(crate::wsl_bridge::WSL_TOKEN_FILE);
+        if vault_win::ensure_no_reparse_points_chain(&wsl_tok).is_ok() {
+            let _ = std::fs::remove_file(&wsl_tok);
+        }
+    }
+    let _ = crate::wsl_bridge::unsync_all_wsl_distros();
+    Ok(cleaned)
+}
+
 #[cfg(windows)]
-fn ensure_interactive_user_modify_dacl_if_service(target: &Path) {
+pub(crate) fn ensure_interactive_user_modify_dacl_if_service(target: &Path) {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
@@ -805,7 +985,7 @@ mod tests {
 
         let pre = parsed["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 1);
-        assert_eq!(pre[0]["matcher"], "WebFetch|WebSearch");
+        assert_eq!(pre[0]["matcher"], "WebFetch|WebSearch|Bash");
 
         // Uninstall removes ONLY ClaudeGuard hooks while keeping user hooks 100% intact.
         sync_claude_code_settings(&settings, cli, None, false).unwrap();
@@ -886,14 +1066,17 @@ mod tests {
             onedrive_docs
         );
 
-        // Re-running uninstall strips wrapper block while keeping oh-my-posh line intact.
-        let st_off = configure_cli_hooks_in(&home, Some(&vroot), cli, &vaults, false, false, true)
-            .expect("uninstall hooks");
+        // Re-running uninstall with sync_all_vaults=false (exact UI button payload) STILL cleans
+        // all Sovereign Vault hooks and keeps oh-my-posh line & original .cg-bak intact!
+        let st_off = configure_cli_hooks_in(&home, Some(&vroot), cli, &vaults, false, false, false)
+            .expect("uninstall hooks with sync_all_vaults=false");
         assert!(!st_off.claude_code_hook_installed);
         assert!(!st_off.pwsh_profile_wrapped);
         assert_eq!(st_off.vault_hooks_synced_count, 0);
         let prof_after = std::fs::read_to_string(&profile).unwrap();
         assert!(prof_after.contains("oh-my-posh init pwsh | Invoke-Expression"));
         assert!(!prof_after.contains(PWSH_BLOCK_START));
+        let bak_text = std::fs::read_to_string(backup_path_for(&profile)).unwrap();
+        assert!(!bak_text.contains(PWSH_BLOCK_START));
     }
 }

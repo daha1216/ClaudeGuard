@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tempfile::NamedTempFile;
 
-use cg_core::redact::{mask_snapshot, mask_text_ips, redact};
+use cg_core::redact::{mask_config_for_diagnostics, mask_snapshot, mask_text_ips, redact};
 use cg_platform::{env_win, process_win, zip_util};
 use cg_protocol::{
     normalize_region, region_name, AppliedEnv, GuardSnapshot, LogEntry, LogLevel, SafetyGrade,
@@ -271,6 +271,14 @@ fn resolve_diagnostics_dir_with(
         if desktop.is_dir() && !has_reparse_point_in_chain(&desktop) {
             return desktop;
         }
+        let downloads = profile.join("Downloads");
+        if downloads.is_dir() && !has_reparse_point_in_chain(&downloads) {
+            return downloads;
+        }
+        let local_app = profile.join("AppData").join("Local");
+        if local_app.is_dir() && !has_reparse_point_in_chain(&local_app) {
+            return local_app.join("ClaudeGuard").join("Exports");
+        }
         if profile.is_dir() && !has_reparse_point_in_chain(profile) {
             return profile.to_path_buf();
         }
@@ -281,6 +289,14 @@ fn resolve_diagnostics_dir_with(
             let desktop = home.join("Desktop");
             if desktop.is_dir() && !has_reparse_point_in_chain(&desktop) {
                 return desktop;
+            }
+            let downloads = home.join("Downloads");
+            if downloads.is_dir() && !has_reparse_point_in_chain(&downloads) {
+                return downloads;
+            }
+            let local_app = home.join("AppData").join("Local");
+            if local_app.is_dir() && !has_reparse_point_in_chain(&local_app) {
+                return local_app.join("ClaudeGuard").join("Exports");
             }
             if home.is_dir() && !has_reparse_point_in_chain(home) {
                 return home.to_path_buf();
@@ -534,6 +550,9 @@ fn write_diagnostics_zip_create_new(
                     let _ = fs::remove_file(&candidate);
                     return Err(format!("写入诊断压缩包失败：{e}"));
                 }
+                drop(file);
+                #[cfg(windows)]
+                crate::hook_installer::ensure_interactive_user_modify_dacl_if_service(&candidate);
                 return Ok(candidate);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -558,6 +577,7 @@ pub fn export_redacted_diagnostics_zip(
     explicit_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
     let mut masked = mask_snapshot(snap);
+    masked.config = mask_config_for_diagnostics(&masked.config);
 
     // 1. Scrub proxy credentials across config, access evidence, and antigravity_proxy.
     masked.config.proxy_host = scrub_proxy_credentials(&masked.config.proxy_host);
@@ -721,6 +741,41 @@ pub fn export_redacted_diagnostics_zip(
         &masked.wsl_bridge.summary,
         false,
     )));
+    masked.mihomo.controller_url = scrub_user_profile_paths(&scrub_credentials_in_text(&redact(
+        &masked.mihomo.controller_url,
+        false,
+    )));
+    masked.mihomo.active_group = scrub_user_profile_paths(&scrub_credentials_in_text(&redact(
+        &masked.mihomo.active_group,
+        false,
+    )));
+    masked.mihomo.active_node = scrub_user_profile_paths(&scrub_credentials_in_text(&redact(
+        &masked.mihomo.active_node,
+        false,
+    )));
+    masked.mihomo.note = scrub_user_profile_paths(&scrub_credentials_in_text(&redact(
+        &masked.mihomo.note,
+        false,
+    )));
+    for node in &mut masked.mihomo.candidates {
+        node.name =
+            scrub_user_profile_paths(&scrub_credentials_in_text(&redact(&node.name, false)));
+    }
+    for comp in [
+        &mut masked.updates.claudeguard,
+        &mut masked.updates.antigravity_proxy,
+        &mut masked.updates.claude_desktop,
+        &mut masked.updates.claude_code,
+        &mut masked.updates.codex_desktop,
+        &mut masked.updates.codex_cli,
+        &mut masked.updates.antigravity_ide,
+        &mut masked.updates.antigravity_cn,
+        &mut masked.updates.ag_usage_monitor,
+        &mut masked.updates.ag_capsule,
+    ] {
+        comp.note =
+            scrub_user_profile_paths(&scrub_credentials_in_text(&redact(&comp.note, false)));
+    }
 
     let mut logs_txt = String::new();
     for entry in &mut masked.recent_logs {
@@ -829,6 +884,22 @@ fn scrub_health_card_text(raw: &str) -> String {
     s
 }
 
+/// Builds a 100% desensitized shareable Pre-Flight Health Card (`M7`) with zero IP/coordinate/PII leaks,
+/// propagating PNG export errors when `export_png == true`.
+pub fn try_build_sanitized_health_card(
+    snap: &GuardSnapshot,
+    data_dir: &Path,
+    now_secs: u64,
+    export_png: bool,
+) -> Result<SanitizedHealthCard, String> {
+    let mut card = build_sanitized_health_card_meta(snap, now_secs);
+    if export_png {
+        let p = export_health_card_png(data_dir, card.safety_score, card.grade, now_secs)?;
+        card.saved_png_path = Some(p.to_string_lossy().to_string());
+    }
+    Ok(card)
+}
+
 /// Builds a 100% desensitized shareable Pre-Flight Health Card (`M7`) with zero IP/coordinate/PII leaks.
 pub fn build_sanitized_health_card(
     snap: &GuardSnapshot,
@@ -836,6 +907,17 @@ pub fn build_sanitized_health_card(
     now_secs: u64,
     export_png: bool,
 ) -> SanitizedHealthCard {
+    let mut card = build_sanitized_health_card_meta(snap, now_secs);
+    if export_png {
+        card.saved_png_path =
+            export_health_card_png(data_dir, card.safety_score, card.grade, now_secs)
+                .ok()
+                .map(|p| p.to_string_lossy().to_string());
+    }
+    card
+}
+
+fn build_sanitized_health_card_meta(snap: &GuardSnapshot, now_secs: u64) -> SanitizedHealthCard {
     let cg_version = if snap.version.trim().is_empty() {
         env!("CARGO_PKG_VERSION").to_string()
     } else {
@@ -943,14 +1025,6 @@ pub fn build_sanitized_health_card(
         grade.code()
     ));
 
-    let saved_png_path = if export_png {
-        export_health_card_png(data_dir, safety_score, grade, now_secs)
-            .ok()
-            .map(|p| p.to_string_lossy().to_string())
-    } else {
-        None
-    };
-
     SanitizedHealthCard {
         generated_at: now_secs,
         cg_version,
@@ -963,7 +1037,7 @@ pub fn build_sanitized_health_card(
         geo_stability_badge,
         vault_isolation_badge,
         markdown_snippet,
-        saved_png_path,
+        saved_png_path: None,
     }
 }
 
@@ -1014,11 +1088,39 @@ fn export_health_card_png(
     grade: SafetyGrade,
     now_secs: u64,
 ) -> Result<PathBuf, String> {
-    let out_dir = resolve_diagnostics_dir(data_dir);
+    let fallback_dir = data_dir.join("diagnostics");
+    let mut out_dir = resolve_diagnostics_dir(data_dir);
     if has_reparse_point_in_chain(&out_dir) {
-        return Err("refusing to export health card PNG through reparse point".into());
+        if let Some(home) = crate::hook_installer::resolve_interactive_user_home()
+            .filter(|h| !is_system_profile_path(h))
+        {
+            let dl = home.join("Downloads");
+            let exp = home
+                .join("AppData")
+                .join("Local")
+                .join("ClaudeGuard")
+                .join("Exports");
+            if dl.is_dir() && !has_reparse_point_in_chain(&dl) {
+                out_dir = dl;
+            } else if !has_reparse_point_in_chain(&exp) {
+                out_dir = exp;
+            } else {
+                out_dir = fallback_dir.clone();
+            }
+        } else {
+            out_dir = fallback_dir.clone();
+        }
+    }
+    if out_dir == fallback_dir {
+        crate::journal::ensure_secure_data_dir(data_dir)?;
+    }
+    if has_reparse_point_in_chain(&out_dir) {
+        return Err("拒绝向包含符号链接或重解析点的目录导出健康体检卡 PNG".into());
     }
     fs::create_dir_all(&out_dir).map_err(|e| format!("创建健康卡导出目录失败：{e}"))?;
+    if has_reparse_point_in_chain(&out_dir) {
+        return Err("检测到健康卡导出目录存在重解析点，已拒绝写入".into());
+    }
 
     let base = format!("ClaudeGuard-HealthCard-{now_secs}");
     let mut chosen = out_dir.join(format!("{base}.png"));
@@ -1048,6 +1150,9 @@ fn export_health_card_png(
     f.write_all(&bytes)
         .and_then(|()| f.sync_all())
         .map_err(|e| format!("写入健康卡 PNG 失败：{e}"))?;
+    drop(f);
+    #[cfg(windows)]
+    crate::hook_installer::ensure_interactive_user_modify_dacl_if_service(&chosen);
 
     let is_desktop = out_dir
         .file_name()

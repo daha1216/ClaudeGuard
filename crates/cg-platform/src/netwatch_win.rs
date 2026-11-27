@@ -117,16 +117,44 @@ pub fn is_local_addr(ip: IpAddr) -> bool {
     }
 }
 
-/// Classify a TCP peer relative to the local proxy port.
-pub fn classify(remote: IpAddr, port: u16, proxy_port: u16) -> Remote {
+/// Classify a TCP peer relative to the configured proxy endpoint (loopback or LAN gateway).
+pub fn classify_with_proxy_endpoint(
+    remote: IpAddr,
+    port: u16,
+    proxy_port: u16,
+    proxy_ip: Option<IpAddr>,
+) -> Remote {
     let ip = canonical_ip(remote);
-    if proxy_port > 0 && ip.is_loopback() && port == proxy_port {
+    let canon_proxy = proxy_ip.map(canonical_ip);
+    if proxy_port > 0 && port == proxy_port && (ip.is_loopback() || canon_proxy == Some(ip)) {
         Remote::Proxy
     } else if is_local_addr(ip) {
         Remote::Local
     } else {
         Remote::Public
     }
+}
+
+/// Classify a TCP peer relative to the local proxy port.
+pub fn classify(remote: IpAddr, port: u16, proxy_port: u16) -> Remote {
+    classify_with_proxy_endpoint(remote, port, proxy_port, None)
+}
+
+fn extract_proxy_ip_from_access_note(note: &str) -> Option<IpAddr> {
+    let raw = note.trim();
+    let addr_part = raw.strip_prefix("系统代理").map(str::trim).unwrap_or(raw);
+    if addr_part.is_empty() {
+        return None;
+    }
+    if let Some(rest) = addr_part.strip_prefix('[') {
+        let (v6_str, _) = rest.split_once(']')?;
+        return v6_str.parse::<IpAddr>().ok().map(canonical_ip);
+    }
+    let host_str = addr_part
+        .rsplit_once(':')
+        .map(|(h, _)| h.trim())
+        .unwrap_or(addr_part);
+    host_str.parse::<IpAddr>().ok().map(canonical_ip)
 }
 
 /// Detects whether a guarded agent/process label corresponds to an MCP plugin or helper subprocess
@@ -174,6 +202,7 @@ pub fn fold(
         return report;
     }
 
+    let active_proxy_ip = extract_proxy_ip_from_access_note(&access.note);
     let mut fake_ip = 0usize;
     for c in conns {
         let Some(agent) = agents.get(&c.pid) else {
@@ -184,7 +213,7 @@ pub fn fold(
         if is_fake_ip_addr(ip) {
             fake_ip += 1;
         }
-        match classify(ip, c.port, proxy_port) {
+        match classify_with_proxy_endpoint(ip, c.port, proxy_port, active_proxy_ip) {
             Remote::Proxy => report.proxied += 1,
             Remote::Local => report.local += 1,
             Remote::Public => {

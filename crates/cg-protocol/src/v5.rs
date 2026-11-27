@@ -7,7 +7,7 @@
 //! - M6: Sub-2ms CLI Hook Gate, WSL2 Bridge & BurstGuard (`HookDecision`, `HookFailMode`, `BurstGuardMode`, `HookIntegrationStatus`, `WslBridgeStatus`, `BurstGuardStatus`)
 //! - M7: Global Hotkeys & Desensitized Health Card (`HotkeyStatus`, `SanitizedHealthCard`)
 
-use crate::model::{default_true, normalize_ip_or_cidr, normalize_region};
+use crate::model::{default_true, is_known_region, normalize_ip_or_cidr, normalize_region};
 use serde::{Deserialize, Serialize};
 
 fn default_min_safety_score() -> u8 {
@@ -494,6 +494,7 @@ impl AccountVault {
         let mut regions = Vec::new();
         for r in &self.pinned_regions {
             if let Some(norm) = normalize_region(r)
+                && is_known_region(&norm)
                 && !regions.contains(&norm)
             {
                 regions.push(norm);

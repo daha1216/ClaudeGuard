@@ -105,6 +105,10 @@ pub enum ActionScope {
     LaunchGate(String),
     StartService,
     Flow,
+    Lockdown,
+    KillOrSweep,
+    SwitchNode,
+    PauseGuard,
     VaultOp(String),
     CleanRoomScan,
     CleanRoomExecute,
@@ -113,6 +117,23 @@ pub enum ActionScope {
     ConfigureHooks,
     SyncWslBridge,
     BuildHealthCard,
+}
+
+impl ActionScope {
+    /// Only exclusive config/lifecycle state transitions raise `busy_action`; background
+    /// probes, update checks, downloads, exports, and emergency kill/lockdown scopes stay
+    /// isolated so `紧急锁死`, `立即封锁出站`, `一键全清`, `切节点`, and `暂停/恢复` never freeze.
+    pub fn blocks_global_mutations(&self) -> bool {
+        matches!(
+            self,
+            Self::SaveTargets
+                | Self::SaveFeishu
+                | Self::StartService
+                | Self::Flow
+                | Self::CleanRoomExecute
+                | Self::CleanRoomRestore(_)
+        )
+    }
 }
 
 actions!([
@@ -325,6 +346,7 @@ pub struct InputHandles {
     pub feishu_secret: Entity<DraftTextInput>,
     pub onboarding_cidr: Entity<DraftTextInput>,
     pub onboarding_regions: Entity<DraftTextInput>,
+    pub onboarding_port: Entity<DraftTextInput>,
     pub vault_id: Entity<DraftTextInput>,
     pub vault_name: Entity<DraftTextInput>,
     pub vault_regions: Entity<DraftTextInput>,
@@ -378,10 +400,15 @@ pub struct AppController {
     pub show_onboarding: bool,
     pub onboarding_dismissed: bool,
     pub onboarding_probe: Option<OnboardingProbeResult>,
+    pub onboarding_detected_ports: Vec<u16>,
+    pub onboarding_port_override: String,
     pub onboarding_loading: bool,
     pub onboarding_submitting: bool,
     pub onboarding_error: Option<String>,
     pub onboarding_proxy_off_sim: bool,
+    pub dismissed_overview_banner_key: Option<String>,
+    pub hud_pending_vault_close: Option<String>,
+    audit_search_debounce_seq: u64,
     pub toast: Option<(String, bool)>,
     pub toast_action: Option<ToastAction>,
     pub toast_seq: u64,
@@ -457,7 +484,7 @@ impl AppController {
         let search_input = cx.new(|cx| {
             let weak_cb = weak.clone();
             DraftTextInput::new(cx)
-                .with_placeholder("Ctrl+K 搜索日志（Enter 检索）")
+                .with_placeholder("Ctrl+K 实时检索审计日志")
                 .with_compact(true)
                 .with_masked(false)
                 .with_monospace(false)
@@ -466,6 +493,7 @@ impl AppController {
                         ctrl.drafts.search_query = text.to_string();
                         ctrl.invalidate_console_cache();
                         if ctrl.nav_section == NavSection::Audit {
+                            ctrl.schedule_debounced_audit_logs(cx);
                             cx.notify();
                         }
                     });
@@ -621,6 +649,18 @@ impl AppController {
                     false
                 },
                 Some(AppController::complete_onboarding),
+                cx,
+            ),
+            onboarding_port: make_input(
+                "端口如 7897",
+                true,
+                false,
+                true,
+                |ctrl, text| {
+                    ctrl.onboarding_port_override = text.to_string();
+                    ctrl.onboarding_error.take().is_some()
+                },
+                Some(AppController::adopt_typed_onboarding_port),
                 cx,
             ),
             vault_id: make_input(
@@ -823,10 +863,15 @@ impl AppController {
             show_onboarding: false,
             onboarding_dismissed: false,
             onboarding_probe: None,
+            onboarding_detected_ports: Vec::new(),
+            onboarding_port_override: String::new(),
             onboarding_loading: false,
             onboarding_submitting: false,
             onboarding_error: None,
             onboarding_proxy_off_sim: false,
+            dismissed_overview_banner_key: None,
+            hud_pending_vault_close: None,
+            audit_search_debounce_seq: 0,
             toast: None,
             toast_action: None,
             toast_seq: 0,
@@ -1078,6 +1123,48 @@ impl AppController {
         self.in_flight.contains(scope)
     }
 
+    fn refresh_busy_action(&mut self) {
+        self.busy_action = self
+            .in_flight
+            .iter()
+            .any(ActionScope::blocks_global_mutations);
+    }
+
+    pub fn can_trigger_lockdown(&self) -> bool {
+        self.connected && !self.is_scope_busy(&ActionScope::Lockdown)
+    }
+
+    pub fn can_kill_processes(&self) -> bool {
+        self.connected && !self.is_scope_busy(&ActionScope::KillOrSweep)
+    }
+
+    pub fn can_switch_node(&self) -> bool {
+        self.connected && !self.is_scope_busy(&ActionScope::SwitchNode)
+    }
+
+    pub fn can_toggle_pause(&self) -> bool {
+        self.connected && !self.is_scope_busy(&ActionScope::PauseGuard)
+    }
+
+    pub fn schedule_debounced_audit_logs(&mut self, cx: &mut Context<Self>) {
+        self.audit_search_debounce_seq = self.audit_search_debounce_seq.wrapping_add(1);
+        let seq = self.audit_search_debounce_seq;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            let _ = this.update(cx, |ctrl, cx| {
+                if ctrl.audit_search_debounce_seq == seq
+                    && ctrl.nav_section == NavSection::Audit
+                    && (ctrl.connected || ctrl.client.is_demo())
+                {
+                    ctrl.refresh_audit_logs(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn effective_toggle(&self, key: &'static str, actual: bool) -> bool {
         self.optimistic_toggles.get(key).copied().unwrap_or(actual)
     }
@@ -1147,7 +1234,8 @@ impl AppController {
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    let clean_path = path.trim().trim_matches('"').replace('/', "\\");
+                    let expanded = expand_windows_env_vars(path.trim().trim_matches('"'));
+                    let clean_path = expanded.replace('/', "\\");
                     if clean_path.is_empty()
                         || clean_path.chars().any(|c| c.is_control() || c == '"')
                     {
@@ -1156,9 +1244,29 @@ impl AppController {
                     #[cfg(windows)]
                     {
                         use std::os::windows::process::CommandExt;
-                        std::process::Command::new("explorer.exe")
-                            .raw_arg(format!("/select,\"{clean_path}\""))
-                            .spawn()
+                        let target_path = std::path::Path::new(&clean_path);
+                        let mut cmd = std::process::Command::new("explorer.exe");
+                        if target_path.is_dir() {
+                            cmd.raw_arg(format!("\"{clean_path}\""));
+                        } else if target_path.is_file() {
+                            cmd.raw_arg(format!("/select,\"{clean_path}\""));
+                        } else {
+                            let mut anc = target_path.parent();
+                            let mut existing_dir = None;
+                            while let Some(dir) = anc {
+                                if dir.is_dir() {
+                                    existing_dir = Some(dir.to_string_lossy().into_owned());
+                                    break;
+                                }
+                                anc = dir.parent();
+                            }
+                            if let Some(dir_str) = existing_dir {
+                                cmd.raw_arg(format!("\"{dir_str}\""));
+                            } else {
+                                return Err(format!("目标路径尚不存在：{clean_path}"));
+                            }
+                        }
+                        cmd.spawn()
                             .map(|_| ())
                             .map_err(|e| format!("无法打开资源管理器：{e}"))
                     }
@@ -1305,6 +1413,7 @@ impl AppController {
             })
             .unwrap_or((None, None));
 
+        let level = self.audit_level_filter;
         self.logs_loading = true;
         cx.notify();
 
@@ -1314,6 +1423,7 @@ impl AppController {
                 until_ts,
                 limit: Some(250),
                 query,
+                level,
             };
             let res = cx
                 .background_executor()
@@ -1688,9 +1798,17 @@ impl AppController {
         action: Option<ToastAction>,
         cx: &mut Context<Self>,
     ) {
+        let msg_str = msg.into();
+        if !ok
+            && self.console_window.is_none()
+            && self.hud_window.is_none()
+            && let Some(tray) = self.tray.as_ref()
+        {
+            tray.show_balloon("ClaudeGuard 操作提醒", &msg_str, true);
+        }
         self.toast_seq = self.toast_seq.wrapping_add(1);
         let seq = self.toast_seq;
-        self.toast = Some((msg.into(), ok));
+        self.toast = Some((msg_str, ok));
         self.toast_action = action;
         cx.notify();
 
@@ -1734,9 +1852,15 @@ impl AppController {
             }
             PipeRequest::RecoverSafeFlowA
             | PipeRequest::DisarmAndRestoreFlowB { .. }
-            | PipeRequest::Rearm
-            | PipeRequest::SetManualLockdown { .. }
-            | PipeRequest::TriggerPanicLockdown => Some(ActionScope::Flow),
+            | PipeRequest::Rearm => Some(ActionScope::Flow),
+            PipeRequest::SetManualLockdown { .. } | PipeRequest::TriggerPanicLockdown => {
+                Some(ActionScope::Lockdown)
+            }
+            PipeRequest::ForceKillAgent { .. } | PipeRequest::SweepOrphans => {
+                Some(ActionScope::KillOrSweep)
+            }
+            PipeRequest::SwitchProxyNode { .. } => Some(ActionScope::SwitchNode),
+            PipeRequest::Pause { .. } => Some(ActionScope::PauseGuard),
             PipeRequest::UpsertVault { vault } => Some(ActionScope::VaultOp(vault.id.clone())),
             PipeRequest::DeleteVault { vault_id, .. }
             | PipeRequest::LaunchVault { vault_id, .. }
@@ -1805,12 +1929,20 @@ impl AppController {
             clear_feishu_inputs_on_ok,
         } = opts;
         let is_export = matches!(req, PipeRequest::ExportDiagnostics);
+        let is_cleanroom_exec = matches!(req, PipeRequest::ExecuteCleanRoom { .. });
+        let is_shortcuts = matches!(req, PipeRequest::GenerateVaultShortcuts { .. });
+        let is_hud_vault_launch = match &req {
+            PipeRequest::LaunchVault { vault_id, .. } => {
+                self.hud_pending_vault_close.as_deref() == Some(vault_id.as_str())
+            }
+            _ => false,
+        };
         let scope = explicit_scope.or_else(|| Self::scope_for_request(&req));
         let client = self.client.clone();
-        self.busy_action = true;
         if let Some(sc) = scope.clone() {
             self.in_flight.insert(sc);
         }
+        self.refresh_busy_action();
         if is_ui_pref_save {
             self.pending_ui_prefs_ops = self.pending_ui_prefs_ops.saturating_add(1);
         }
@@ -1840,7 +1972,7 @@ impl AppController {
                 if is_ui_pref_save {
                     ctrl.pending_ui_prefs_ops = ctrl.pending_ui_prefs_ops.saturating_sub(1);
                 }
-                ctrl.busy_action = !ctrl.in_flight.is_empty();
+                ctrl.refresh_busy_action();
                 match res {
                     Ok(PipeResponse::Snapshot { snapshot }) => {
                         if clear_targets_dirty_on_ok {
@@ -1867,9 +1999,20 @@ impl AppController {
                             if clear_feishu_inputs_on_ok {
                                 ctrl.clear_feishu_draft_inputs(cx);
                             }
+                            if is_cleanroom_exec {
+                                ctrl.refresh_cleanroom_backups(cx);
+                            }
                         }
                         if let Some(snap) = snapshot {
                             ctrl.apply_snapshot(*snap, cx);
+                        }
+                        if is_hud_vault_launch {
+                            ctrl.hud_pending_vault_close = None;
+                            if !hard_failed && let Some(handle) = ctrl.hud_window.take() {
+                                let _ = handle.update(cx, |_, window, _| {
+                                    window.remove_window();
+                                });
+                            }
                         }
                         if let Some(ref rc) = receipt
                             && rc.status == OperationStatus::Failed
@@ -1903,6 +2046,14 @@ impl AppController {
                                 format!("已导出脱敏诊断包：{path}"),
                                 true,
                                 Some(path),
+                                cx,
+                            );
+                        } else if is_shortcuts {
+                            let dir_path = extract_shortcut_dir_from_receipt(receipt.as_ref());
+                            ctrl.set_toast_with_path(
+                                ok_msg.unwrap_or_else(|| "已生成桌面直启快捷方式".into()),
+                                true,
+                                Some(dir_path),
                                 cx,
                             );
                         } else if let Some(msg) = ok_msg {
@@ -1955,10 +2106,20 @@ impl AppController {
                         ctrl.set_toast(reason, allowed, cx);
                     }
                     Ok(PipeResponse::Error { message, .. }) => {
+                        if is_hud_vault_launch {
+                            ctrl.hud_pending_vault_close = None;
+                        }
                         ctrl.set_toast(message, false, cx);
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        if is_hud_vault_launch {
+                            ctrl.hud_pending_vault_close = None;
+                        }
+                    }
                     Err(err) => {
+                        if is_hud_vault_launch {
+                            ctrl.hud_pending_vault_close = None;
+                        }
                         let msg = err.to_string();
                         if matches!(err, TransportError::DaemonOffline(_)) {
                             ctrl.connected = false;
@@ -2180,7 +2341,7 @@ impl AppController {
         let rc_scope = ActionScope::RecheckTarget(target_id.clone());
         self.in_flight.insert(save_scope.clone());
         self.in_flight.insert(rc_scope.clone());
-        self.busy_action = true;
+        self.refresh_busy_action();
         let client = self.client.clone();
         cx.notify();
 
@@ -2217,7 +2378,7 @@ impl AppController {
                 {
                     ctrl.in_flight_config = None;
                 }
-                ctrl.busy_action = !ctrl.in_flight.is_empty();
+                ctrl.refresh_busy_action();
 
                 match outcome {
                     Ok((save_resp, recheck_opt)) => match save_resp {
@@ -2396,7 +2557,7 @@ impl AppController {
         }
         let client = self.client.clone();
         self.in_flight.insert(ActionScope::StartService);
-        self.busy_action = true;
+        self.refresh_busy_action();
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -2408,7 +2569,7 @@ impl AppController {
             if let Err(err) = start_res {
                 let _ = this.update(cx, |ctrl, cx| {
                     ctrl.in_flight.remove(&ActionScope::StartService);
-                    ctrl.busy_action = !ctrl.in_flight.is_empty();
+                    ctrl.refresh_busy_action();
                     ctrl.set_toast_with_action(
                         err,
                         false,
@@ -2441,7 +2602,7 @@ impl AppController {
 
             let _ = this.update(cx, |ctrl, cx| {
                 ctrl.in_flight.remove(&ActionScope::StartService);
-                ctrl.busy_action = !ctrl.in_flight.is_empty();
+                ctrl.refresh_busy_action();
                 if let Some(snap) = recovered {
                     ctrl.apply_snapshot(snap, cx);
                     if ctrl.show_onboarding && ctrl.onboarding_probe.is_none() {
@@ -2534,7 +2695,7 @@ impl AppController {
         }
         let client = self.client.clone();
         self.in_flight.insert(scope.clone());
-        self.busy_action = true;
+        self.refresh_busy_action();
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -2560,7 +2721,7 @@ impl AppController {
                             let disp_name = friendly_launch_name(&agent_id);
                             if ctrl.client.is_demo() {
                                 ctrl.in_flight.remove(&scope);
-                                ctrl.busy_action = !ctrl.in_flight.is_empty();
+                                ctrl.refresh_busy_action();
                                 ctrl.set_toast(
                                     format!("[演示] 门禁放行：已安全启动 {disp_name}"),
                                     true,
@@ -2596,7 +2757,7 @@ impl AppController {
                                         .await;
                                     let _ = this_l.update(cx, |c, cx| {
                                         c.in_flight.remove(&scope_bg);
-                                        c.busy_action = !c.in_flight.is_empty();
+                                        c.refresh_busy_action();
                                         match launch_res {
                                             Ok(msg) => c.set_toast(msg, true, cx),
                                             Err(err) => c.set_toast(err, false, cx),
@@ -2608,7 +2769,7 @@ impl AppController {
                             }
                         } else {
                             ctrl.in_flight.remove(&scope);
-                            ctrl.busy_action = !ctrl.in_flight.is_empty();
+                            ctrl.refresh_busy_action();
                             let recovery_action =
                                 ctrl.suggest_launch_block_action(&agent_id, &reason);
                             ctrl.set_toast_with_action(
@@ -2621,16 +2782,16 @@ impl AppController {
                     }
                     Ok(PipeResponse::Error { message, .. }) => {
                         ctrl.in_flight.remove(&scope);
-                        ctrl.busy_action = !ctrl.in_flight.is_empty();
+                        ctrl.refresh_busy_action();
                         ctrl.set_toast(message, false, cx);
                     }
                     Ok(_) => {
                         ctrl.in_flight.remove(&scope);
-                        ctrl.busy_action = !ctrl.in_flight.is_empty();
+                        ctrl.refresh_busy_action();
                     }
                     Err(err) => {
                         ctrl.in_flight.remove(&scope);
-                        ctrl.busy_action = !ctrl.in_flight.is_empty();
+                        ctrl.refresh_busy_action();
                         ctrl.set_toast(err.to_string(), false, cx);
                     }
                 }
@@ -2721,7 +2882,18 @@ impl AppController {
     pub fn probe_onboarding(&mut self, cx: &mut Context<Self>) {
         self.onboarding_error = None;
         if self.client.is_demo() {
-            let probe = crate::demo::build_demo_onboarding_probe(!self.onboarding_proxy_off_sim);
+            let mut probe =
+                crate::demo::build_demo_onboarding_probe(!self.onboarding_proxy_off_sim);
+            if let Ok(port_ov) = self.onboarding_port_override.trim().parse::<u16>()
+                && port_ov > 0
+            {
+                probe.detected_proxy_port = Some(port_ov);
+            }
+            self.onboarding_detected_ports = if self.onboarding_proxy_off_sim {
+                vec![7897, 10809, 2080]
+            } else {
+                vec![7890, 7897, 10809]
+            };
             if let Some(rec) = probe.recommended_strategy {
                 self.drafts.onboarding_strategy = rec;
             } else if let Some(first) = probe.options.first() {
@@ -2747,7 +2919,16 @@ impl AppController {
             let _ = this.update(cx, |ctrl, cx| {
                 ctrl.onboarding_loading = false;
                 match res {
-                    Ok(PipeResponse::OnboardingProbe { probe }) => {
+                    Ok(PipeResponse::OnboardingProbe {
+                        mut probe,
+                        detected_local_ports,
+                    }) => {
+                        if let Ok(port_ov) = ctrl.onboarding_port_override.trim().parse::<u16>()
+                            && port_ov > 0
+                        {
+                            probe.detected_proxy_port = Some(port_ov);
+                        }
+                        ctrl.onboarding_detected_ports = detected_local_ports;
                         if let Some(rec) = probe.recommended_strategy {
                             ctrl.drafts.onboarding_strategy = rec;
                         } else if let Some(first) = probe.options.first() {
@@ -2792,12 +2973,26 @@ impl AppController {
             cx.notify();
             return;
         };
-        let cfg = match crate::state::build_onboarding_config(
+        let port_override = if self.onboarding_port_override.trim().is_empty() {
+            None
+        } else {
+            match self.onboarding_port_override.trim().parse::<u16>() {
+                Ok(p) if p > 0 => Some(p),
+                _ => {
+                    self.onboarding_error =
+                        Some("本地代理端口须为 1–65535 之间的有效端口号".into());
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        let cfg = match crate::state::build_onboarding_config_with_port(
             &base,
             probe,
             self.drafts.onboarding_strategy,
             &self.drafts.onboarding_custom_cidr,
             &self.drafts.onboarding_custom_regions,
+            port_override,
         ) {
             Ok(cfg) => cfg,
             Err(err) => {
@@ -2909,6 +3104,81 @@ impl AppController {
         cx.notify();
     }
 
+    pub fn adopt_onboarding_proxy_port(&mut self, port: u16, cx: &mut Context<Self>) {
+        if port == 0 {
+            return;
+        }
+        let port_str = port.to_string();
+        self.onboarding_port_override = port_str.clone();
+        self.onboarding_error = None;
+        self.inputs
+            .onboarding_port
+            .update(cx, |i, cx| i.set_text_silent(&port_str, cx));
+        if self.client.is_demo() {
+            self.onboarding_proxy_off_sim = false;
+            self.probe_onboarding(cx);
+            self.set_toast(
+                format!("已采纳本机代理端口 :{port} 并完成出口重测"),
+                true,
+                cx,
+            );
+            return;
+        }
+        if let Some(mut cfg) = self.base_config_for_patch() {
+            cfg.proxy_port = port;
+            let client = self.client.clone();
+            self.onboarding_loading = true;
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                let _ = cx
+                    .background_executor()
+                    .spawn(async move { client.exchange(PipeRequest::SaveConfig { config: cfg }) })
+                    .await;
+                let _ = this.update(cx, |ctrl, cx| {
+                    ctrl.probe_onboarding(cx);
+                    ctrl.set_toast(format!("已采纳本机代理端口 :{port} 并重新探测"), true, cx);
+                });
+            })
+            .detach();
+        } else {
+            self.probe_onboarding(cx);
+            self.set_toast(format!("已选定本机代理端口 :{port}"), true, cx);
+        }
+    }
+
+    pub fn adopt_typed_onboarding_port(&mut self, cx: &mut Context<Self>) {
+        let trimmed = self.onboarding_port_override.trim();
+        if trimmed.is_empty() {
+            self.probe_onboarding(cx);
+            return;
+        }
+        match trimmed.parse::<u16>() {
+            Ok(port) if port > 0 => self.adopt_onboarding_proxy_port(port, cx),
+            _ => {
+                self.onboarding_error = Some("请输入 1–65535 之间的有效本地代理端口".into());
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn launch_vault_from_hud(
+        &mut self,
+        vault_id: String,
+        vault_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.hud_pending_vault_close = Some(vault_id.clone());
+        self.send_request_msg(
+            PipeRequest::LaunchVault {
+                vault_id,
+                app: VaultAppTarget::ClaudeDesktop,
+                extra_args: Vec::new(),
+            },
+            Some(format!("已在账号仓「{vault_name}」启动 Claude")),
+            cx,
+        );
+    }
+
     pub fn toggle_pause_30m(&mut self, cx: &mut Context<Self>) {
         let now = crate::demo::now_unix_secs();
         let is_paused = self.snapshot.as_ref().is_some_and(|s| s.is_paused_at(now));
@@ -2974,8 +3244,39 @@ impl AppController {
     }
 
     pub fn close_vault_drawer(&mut self, cx: &mut Context<Self>) {
+        if self.drafts.vault_dirty && !self.arm_or_consume_confirm("vault-discard-draft", cx) {
+            self.set_toast(
+                "当前空间有未保存修改，再点一次「取消」或按 Esc 放弃修改",
+                false,
+                cx,
+            );
+            return;
+        }
         self.show_vault_drawer = false;
         self.drafts.vault_dirty = false;
+        self.drafts.vault_validation_error = None;
+        cx.notify();
+    }
+
+    pub fn set_vault_mihomo_selection(
+        &mut self,
+        group: Option<String>,
+        node: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(g) = group {
+            self.drafts.vault_draft.preferred_mihomo_group = g.clone();
+            self.inputs
+                .vault_mihomo_group
+                .update(cx, |i, cx| i.set_text_silent(&g, cx));
+        }
+        if let Some(n) = node {
+            self.drafts.vault_draft.preferred_mihomo_node = n.clone();
+            self.inputs
+                .vault_mihomo_node
+                .update(cx, |i, cx| i.set_text_silent(&n, cx));
+        }
+        self.drafts.vault_dirty = true;
         self.drafts.vault_validation_error = None;
         cx.notify();
     }
@@ -3081,7 +3382,6 @@ impl AppController {
             Some("已完成本机加密备份并清理所选残留项"),
             cx,
         );
-        self.refresh_cleanroom_backups(cx);
     }
 
     pub fn open_cleanroom_backup_dir(&mut self, cx: &mut Context<Self>) {
@@ -5485,16 +5785,19 @@ fn render_ceramic_dock(
         None
     };
 
+    let vault_dot = if ctrl.read(cx).drafts.vault_dirty {
+        Some(p.badge_warn.dot)
+    } else if vault_active {
+        Some(p.badge_pass.dot)
+    } else {
+        None
+    };
+
     // Streamlined 7-item daily-driver protection Dock (low-frequency `更新` & `通知` live in the top utility bar,
     // while `Ctrl+1..9` and all `NavSection` deep-links remain 100% preserved).
     let items: [(NavSection, &'static str, &'static str, Option<u32>); 7] = [
         (NavSection::Overview, "总览", "icons/ui/home.svg", None),
-        (
-            NavSection::Vaults,
-            "账号仓",
-            "icons/ui/lock.svg",
-            vault_active.then_some(p.badge_pass.dot),
-        ),
+        (NavSection::Vaults, "账号仓", "icons/ui/lock.svg", vault_dot),
         (
             NavSection::CleanRoom,
             "防连坐",
@@ -5785,6 +6088,72 @@ pub fn run(args: LaunchArgs) {
         });
 }
 
+fn expand_windows_env_vars(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after_pct = &rest[start + 1..];
+        if let Some(end) = after_pct.find('%') {
+            let var_name = &after_pct[..end];
+            if !var_name.is_empty()
+                && var_name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && let Ok(val) = std::env::var(var_name)
+            {
+                out.push_str(&val);
+                rest = &after_pct[end + 1..];
+                continue;
+            }
+            out.push('%');
+            rest = after_pct;
+        } else {
+            out.push_str(&rest[start..]);
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn extract_shortcut_dir_from_receipt(
+    receipt: Option<&crate::protocol::OperationReceipt>,
+) -> String {
+    if let Some(rc) = receipt {
+        let scope = rc.verified_scope.trim();
+        for part in scope.split([';', '|']) {
+            let trimmed = part.trim();
+            let candidate = trimmed
+                .strip_prefix("dir=")
+                .or_else(|| trimmed.strip_prefix("path="))
+                .unwrap_or(trimmed)
+                .trim();
+            if candidate.contains('\\') || candidate.contains('/') || candidate.starts_with('%') {
+                return candidate.to_string();
+            }
+        }
+        for item in &rc.items {
+            if let Some(idx) = item.detail.find(":\\")
+                && idx >= 1
+            {
+                let start = idx - 1;
+                let rest = item.detail[start..].trim();
+                let clean = rest
+                    .trim_end_matches(['。', ')', '）', '"', '\''])
+                    .trim()
+                    .to_string();
+                if !clean.is_empty() {
+                    return clean;
+                }
+            }
+        }
+    }
+    std::env::var("USERPROFILE")
+        .map(|u| format!(r"{u}\Desktop"))
+        .unwrap_or_else(|_| r"C:\Users\Public\Desktop".into())
+}
+
 fn handle_tray_event(ctrl: Entity<AppController>, event: TrayEvent, cx: &mut App) {
     match event {
         TrayEvent::ToggleHud => toggle_hud_window(ctrl, cx),
@@ -5873,7 +6242,7 @@ fn handle_tray_event(ctrl: Entity<AppController>, event: TrayEvent, cx: &mut App
             let client = ctrl.read(cx).client.clone();
             ctrl.update(cx, |c, cx| {
                 c.in_flight.insert(ActionScope::Flow);
-                c.busy_action = true;
+                c.refresh_busy_action();
                 cx.notify();
             });
             cx.spawn(async move |cx| {
@@ -5915,7 +6284,7 @@ fn handle_tray_event(ctrl: Entity<AppController>, event: TrayEvent, cx: &mut App
                         Ok(()) => {
                             ctrl.update(cx, |c, _| {
                                 c.in_flight.remove(&ActionScope::Flow);
-                                c.busy_action = !c.in_flight.is_empty();
+                                c.refresh_busy_action();
                                 if let Some(mut tray) = c.tray.take() {
                                     tray.shutdown();
                                 }
@@ -5930,7 +6299,7 @@ fn handle_tray_event(ctrl: Entity<AppController>, event: TrayEvent, cx: &mut App
                             cx.activate(true);
                             ctrl.update(cx, |c, cx| {
                                 c.in_flight.remove(&ActionScope::Flow);
-                                c.busy_action = !c.in_flight.is_empty();
+                                c.refresh_busy_action();
                                 if let Some(tray) = c.tray.as_ref() {
                                     tray.show_balloon(
                                         "ClaudeGuard 安全撤防未完成",
@@ -6048,7 +6417,39 @@ mod tests {
         );
         assert_eq!(
             AppController::scope_for_request(&PipeRequest::TriggerPanicLockdown),
-            Some(ActionScope::Flow)
+            Some(ActionScope::Lockdown)
+        );
+        assert!(!ActionScope::UpdatesAll.blocks_global_mutations());
+        assert!(!ActionScope::RepairAntigravity.blocks_global_mutations());
+        assert!(!ActionScope::DeepRiskAudit.blocks_global_mutations());
+        assert!(!ActionScope::RecheckAll.blocks_global_mutations());
+        assert!(!ActionScope::Lockdown.blocks_global_mutations());
+        assert!(!ActionScope::KillOrSweep.blocks_global_mutations());
+        assert!(ActionScope::SaveTargets.blocks_global_mutations());
+    }
+
+    #[test]
+    fn explorer_env_expansion_and_shortcut_receipt_dir_extraction_work() {
+        let raw_unchanged = r"C:\ProgramData\ClaudeGuard\cleanroom_backups";
+        assert_eq!(expand_windows_env_vars(raw_unchanged), raw_unchanged);
+        if let Ok(up) = std::env::var("USERPROFILE") {
+            assert_eq!(
+                expand_windows_env_vars(r"%USERPROFILE%\Desktop"),
+                format!(r"{up}\Desktop")
+            );
+        }
+
+        let rc = crate::protocol::OperationReceipt {
+            id: "rcpt-1".into(),
+            status: crate::protocol::OperationStatus::Verified,
+            items: Vec::new(),
+            error: None,
+            verified_scope: r"created=3;dir=C:\Users\alice\Desktop".into(),
+            remaining: Vec::new(),
+        };
+        assert_eq!(
+            extract_shortcut_dir_from_receipt(Some(&rc)),
+            r"C:\Users\alice\Desktop"
         );
     }
 }

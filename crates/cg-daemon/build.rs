@@ -139,7 +139,7 @@ fn main() {
     let major: u32 = env::var("CARGO_PKG_VERSION_MAJOR")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
+        .unwrap_or(5);
     let minor: u32 = env::var("CARGO_PKG_VERSION_MINOR")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -153,7 +153,7 @@ fn main() {
         &rc_exe,
         &out_dir,
         "claudeguard-daemon",
-        "ClaudeGuard v4 Network Egress Daemon Service",
+        "ClaudeGuard v5 Network Egress Daemon Service",
         major,
         minor,
         patch,
@@ -168,7 +168,7 @@ fn main() {
         &rc_exe,
         &out_dir,
         "claudeguard-cli",
-        "ClaudeGuard v4 CLI & Emergency Recovery Tool",
+        "ClaudeGuard v5 CLI & Emergency Recovery Tool",
         major,
         minor,
         patch,

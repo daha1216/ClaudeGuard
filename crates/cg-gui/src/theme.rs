@@ -1045,7 +1045,7 @@ pub mod layout {
     pub const HUD_HEIGHT: f32 = 472.0;
 
     pub const CONSOLE_WIDTH: f32 = 1020.0;
-    pub const CONSOLE_HEIGHT: f32 = 700.0;
+    pub const CONSOLE_HEIGHT: f32 = 720.0;
     pub const CONSOLE_MIN_WIDTH: f32 = 900.0;
     pub const CONSOLE_MIN_HEIGHT: f32 = 600.0;
 

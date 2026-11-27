@@ -359,6 +359,7 @@ mod tests {
                 until_ts: Some(200),
                 limit: Some(50),
                 query: Some("trip".into()),
+                level: Some(LogLevel::Error),
             },
             PipeRequest::CheckUpdates {
                 component: Some("antigravity_proxy".into()),
@@ -401,6 +402,15 @@ mod tests {
         cursor.set_position(0);
         let decoded: PipeResponse = read_frame(&mut cursor).expect("read_frame");
         assert_eq!(decoded, resp);
+
+        let onb_resp = PipeResponse::OnboardingProbe {
+            probe: OnboardingProbeResult::default(),
+            detected_local_ports: vec![7897, 7890],
+        };
+        let encoded_onb = encode_frame(&onb_resp).expect("encode onboarding probe");
+        let decoded_onb: PipeResponse =
+            decode_frame(&encoded_onb).expect("decode onboarding probe");
+        assert_eq!(decoded_onb, onb_resp);
     }
 
     #[test]

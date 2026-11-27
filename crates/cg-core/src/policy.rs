@@ -1,8 +1,8 @@
 //! Egress policy evaluation matrix supporting exact IP, IPv4 CIDR subnets, ISO regions, and `PolicyPreset`.
 
 use cg_protocol::{
-    AnchorKind, Evaluation, PolicyPreset, PolicyVerdict, ProbeResult, Target, matched_ip_rule,
-    normalize_region, region_hit, region_name,
+    AnchorKind, Evaluation, PolicyPreset, PolicyVerdict, ProbeResult, Target, is_known_region,
+    matched_ip_rule, normalize_region, region_hit, region_name,
 };
 
 const NO_INFO: &str = "有响应，但未识别到出口信息";
@@ -115,6 +115,14 @@ fn evaluate_strict_static(
     eval(PolicyVerdict::Fail, fail_reason(probe), None)
 }
 
+fn is_tor_region(raw: Option<&str>) -> bool {
+    raw.is_some_and(|r| r.trim().eq_ignore_ascii_case("T1"))
+}
+
+fn is_sentinel_unknown_region(raw: Option<&str>) -> bool {
+    raw.is_some_and(|r| matches!(r.trim().to_ascii_uppercase().as_str(), "XX" | "ZZ"))
+}
+
 fn evaluate_standard_region(
     target: &Target,
     probe: &ProbeResult,
@@ -135,12 +143,27 @@ fn evaluate_standard_region(
             Some(rule),
         );
     }
-    if probe.ip.is_some()
-        && probe.country.is_none()
-        && probe.raw_region.is_none()
+    if is_tor_region(probe.raw_region.as_deref()) {
+        return eval(
+            PolicyVerdict::Fail,
+            format!(
+                "检测到 Tor 匿名出口 {}（T1），不在白名单",
+                egress_label(probe)
+            ),
+            None,
+        );
+    }
+    if probe.country.is_none()
         && !target.expect_regions.is_empty()
+        && ((probe.ip.is_some() && probe.raw_region.is_none())
+            || is_sentinel_unknown_region(probe.raw_region.as_deref()))
     {
-        return eval(PolicyVerdict::Unverified, "只有 IP，无法核对地区", None);
+        let msg = if probe.raw_region.is_some() {
+            "探针返回未知地区标记（XX/ZZ），暂无法核对地区"
+        } else {
+            "只有 IP，无法核对地区"
+        };
+        return eval(PolicyVerdict::Unverified, msg, None);
     }
     eval(PolicyVerdict::Fail, fail_reason(probe), None)
 }
@@ -164,11 +187,22 @@ fn evaluate_loose_anti_direct(
             Some(rule),
         );
     }
+    if is_tor_region(probe.raw_region.as_deref()) {
+        return eval(
+            PolicyVerdict::Fail,
+            format!(
+                "检测到 Tor 匿名出口 {}（T1），按高危拦截",
+                egress_label(probe)
+            ),
+            None,
+        );
+    }
     let country = probe
         .country
         .as_deref()
         .and_then(normalize_region)
-        .or_else(|| probe.raw_region.as_deref().and_then(normalize_region));
+        .or_else(|| probe.raw_region.as_deref().and_then(normalize_region))
+        .filter(|c| is_known_region(c));
     match country.as_deref() {
         Some("CN") => eval(
             PolicyVerdict::Fail,
@@ -481,6 +515,46 @@ mod tests {
                 PolicyPreset::StrictStaticIp
             )
             .verdict,
+            PolicyVerdict::Fail
+        );
+    }
+
+    #[test]
+    fn cloudflare_sentinel_xx_zz_returns_unverified_and_tor_t1_fails() {
+        let t = target(AnchorKind::Auto, &[], &["US"]);
+        for sentinel in ["XX", "ZZ"] {
+            let p = ProbeResult {
+                reachable: true,
+                status: Some(200),
+                ip: Some("198.51.100.77".into()),
+                country: None,
+                raw_region: Some(sentinel.into()),
+                ..ProbeResult::default()
+            };
+            assert_eq!(
+                evaluate_with_preset(&t, &p, PolicyPreset::StandardRegion).verdict,
+                PolicyVerdict::Unverified
+            );
+            assert_eq!(
+                evaluate_with_preset(&t, &p, PolicyPreset::LooseAntiDirect).verdict,
+                PolicyVerdict::Unverified
+            );
+        }
+
+        let tor_probe = ProbeResult {
+            reachable: true,
+            status: Some(200),
+            ip: Some("198.51.100.77".into()),
+            country: None,
+            raw_region: Some("T1".into()),
+            ..ProbeResult::default()
+        };
+        assert_eq!(
+            evaluate_with_preset(&t, &tor_probe, PolicyPreset::StandardRegion).verdict,
+            PolicyVerdict::Fail
+        );
+        assert_eq!(
+            evaluate_with_preset(&t, &tor_probe, PolicyPreset::LooseAntiDirect).verdict,
             PolicyVerdict::Fail
         );
     }

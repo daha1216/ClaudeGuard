@@ -65,8 +65,24 @@ pub fn render_cleanroom_page(
     let scanning = ctrl_r.is_scope_busy(&ActionScope::CleanRoomScan);
     let executing = ctrl_r.is_scope_busy(&ActionScope::CleanRoomExecute);
     let purge_armed = ctrl_r.is_confirm_armed("cr-execute-purge");
+    let can_kill_procs = ctrl_r.can_kill_processes();
     let can_act = connected && !busy;
     let now = now_unix_secs();
+    let running_scoped_clients: Vec<String> = snap
+        .as_ref()
+        .map(|s| {
+            s.agents
+                .iter()
+                .filter(|a| a.running_count > 0)
+                .filter(|a| {
+                    (scope.claude && (a.id == "claude" || a.id == "claude-code"))
+                        || (scope.chatgpt_codex && (a.id == "chatgpt" || a.id == "codex"))
+                        || (scope.antigravity && a.id == "antigravity")
+                })
+                .map(|a| crate::views::shared::canonical_agent_label(&a.id, &a.name).to_string())
+                .collect()
+        })
+        .unwrap_or_default();
 
     // -------------------------------------------------------------------------
     // Step 1: Scope selection & Read-Only Deep Scan
@@ -493,7 +509,47 @@ pub fn render_cleanroom_page(
                         .gap(px(5.))
                         .when(!findings.is_empty(), |row| {
                             let all_ids_clone = all_finding_ids_header.clone();
-                            row.child(
+                            let high_risk_ids: Vec<String> = findings
+                                .iter()
+                                .filter(|f| {
+                                    f.risk_weight >= 20
+                                        || matches!(
+                                            f.vector,
+                                            crate::protocol::CleanRoomVector::WindowsCredentialManager
+                                                | crate::protocol::CleanRoomVector::ClaudeCodeState
+                                        )
+                                })
+                                .map(|f| f.id.clone())
+                                .collect();
+                            let has_high_risk = !high_risk_ids.is_empty();
+                            let ctrl_sel_high = ctrl.clone();
+                            row.when(has_high_risk, |r| {
+                                r.child(
+                                    action_button(
+                                        "cr-select-high-risk",
+                                        "仅选高危串号项",
+                                        ButtonKind::Secondary,
+                                        true,
+                                        p,
+                                    )
+                                    .h(px(24.))
+                                    .px(px(8.))
+                                    .text_size(px(10.5))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            let h_ids = high_risk_ids.clone();
+                                            ctrl_sel_high.update(cx, |c, cx| {
+                                                c.cleanroom_selection_initialized = true;
+                                                c.cleanroom_selected_ids =
+                                                    h_ids.into_iter().collect();
+                                                cx.notify();
+                                            });
+                                        }),
+                                    ),
+                                )
+                            })
+                            .child(
                                 action_button(
                                     "cr-select-all",
                                     "全选",
@@ -684,6 +740,62 @@ pub fn render_cleanroom_page(
                         .text_color(rgb(p.text_secondary))
                         .child("自动执行：① 关闭后台残留进程防回写 → ② 在本机加密保存清理前备份 → ③ 清理所选痕迹并自动复查确认。"),
                 )
+                .when(!running_scoped_clients.is_empty(), |box_d| {
+                    let ctrl_close_running = ctrl.clone();
+                    box_d.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.))
+                            .px(px(9.))
+                            .py(px(6.))
+                            .rounded(px(7.))
+                            .bg(rgba(p.badge_warn.bg))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(p.badge_warn.text))
+                                    .child(format!(
+                                        "运行中文件占用提醒：{} 正在运行，建议先一键退出防锁库",
+                                        running_scoped_clients.join(" / ")
+                                    )),
+                            )
+                            .child(
+                                action_button(
+                                    "cr-kill-running-before-purge",
+                                    "先退出客户端",
+                                    ButtonKind::Secondary,
+                                    can_kill_procs,
+                                    p,
+                                )
+                                .h(px(23.))
+                                .px(px(7.5))
+                                .text_size(px(10.))
+                                .when(can_kill_procs, |b| {
+                                    b.on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            ctrl_close_running.update(cx, |c, cx| {
+                                                c.send_request(
+                                                    crate::protocol::PipeRequest::ForceKillAgent {
+                                                        agent_id: None,
+                                                        include_cli: true,
+                                                    },
+                                                    Some("已关闭受管客户端，现在可无锁清理残留"),
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                    )
+                                }),
+                            ),
+                    )
+                })
                 .child(
                     spinning_action_button(
                         "cr-execute-purge",

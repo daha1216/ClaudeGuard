@@ -43,7 +43,9 @@ pub use hygiene_plan::{
 };
 pub use onboarding::{OnboardingChoice, apply_choice, recommend};
 pub use policy::{evaluate, evaluate_with_preset};
-pub use redact::{REDACTED, mask_ip, mask_snapshot, mask_text_ips, redact};
+pub use redact::{
+    REDACTED, mask_config_for_diagnostics, mask_ip, mask_snapshot, mask_text_ips, redact,
+};
 pub use risk_scorer::{
     DEFAULT_TELEPORT_COOLDOWN_MINS, EgressObservation, GeoVelocityEvaluation, RiskScoringInput,
     evaluate_geo_velocity, haversine_km, is_unsupported_region, score_egress_risk,

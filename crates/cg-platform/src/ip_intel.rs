@@ -1263,13 +1263,21 @@ pub fn parse_edns_resolver_country(json_body: &str) -> Option<String> {
 
 /// Check whether local OS DNS resolution for a monitored AI domain returns a TUN Fake-IP
 /// (`198.18.0.0/15` or `fdfe:dcba:9876::/48`), proving local DNS is intercepted by Clash/Mihomo/sing-box.
+/// Bounded to 800ms so a hung TUN DNS resolver can never stall daemon rounds for 15–22s.
 pub fn detect_local_fake_ip_dns() -> bool {
-    let Ok(addrs) = ("claude.ai", 443).to_socket_addrs() else {
-        return false;
-    };
-    addrs
-        .into_iter()
-        .any(|sa| crate::netwatch_win::is_fake_ip_addr(sa.ip()))
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let hit = ("claude.ai", 443)
+            .to_socket_addrs()
+            .ok()
+            .is_some_and(|addrs| {
+                addrs
+                    .into_iter()
+                    .any(|sa| crate::netwatch_win::is_fake_ip_addr(sa.ip()))
+            });
+        let _ = tx.send(hit);
+    });
+    rx.recv_timeout(Duration::from_millis(800)).unwrap_or(false)
 }
 
 /// Pure evaluator folding observed DNS resolver countries, expected proxy country, Fake-IP state,

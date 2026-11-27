@@ -2966,7 +2966,7 @@ pub fn installed_claude_desktop_version() -> Option<String> {
     best
 }
 
-/// Detect installed OpenAI Codex Desktop (`26.x`) version without mixing `1.2026.x` from `OpenAI.ChatGPT-Desktop_`.
+/// Detect installed OpenAI Codex Desktop (`26.x`) or Microsoft Store ChatGPT Desktop (`1.x`) version.
 pub fn installed_codex_desktop_version() -> Option<String> {
     if let Some(msix) = installed_msix_version("OpenAI.Codex_") {
         return Some(msix);
@@ -2991,6 +2991,27 @@ pub fn installed_codex_desktop_version() -> Option<String> {
                         pick_newer_version(&mut best, &v);
                     }
                 }
+            }
+        }
+    }
+    if best.is_some() {
+        return best;
+    }
+
+    // Fallback to Microsoft Store `OpenAI.ChatGPT-Desktop_` / `Programs\ChatGPT` (`1.x` epoch).
+    for prefix in ["OpenAI.ChatGPT-Desktop_", "OpenAI.ChatGPT_"] {
+        if let Some(msix) = installed_msix_version(prefix) {
+            return Some(msix);
+        }
+    }
+    for dir in per_user_local_app_subdirs(&[r"Programs\ChatGPT", r"Programs\ChatGPT Classic"]) {
+        for exe in [
+            dir.join("ChatGPT.exe"),
+            dir.join("app").join("ChatGPT.exe"),
+            dir.join("ChatGPT Classic.exe"),
+        ] {
+            if let Some(v) = read_pe_file_version(&exe) {
+                pick_newer_version(&mut best, &v);
             }
         }
     }
@@ -4886,10 +4907,32 @@ fn push_quoted_win32_arg(out: &mut String, arg: &str, force_quotes: bool) {
     out.push('"');
 }
 
-/// Pure `CommandLineToArgvW`-compliant Windows command line encoder.
+/// Pure `CommandLineToArgvW`-compliant Windows command line encoder (with raw `/d /s /k` & `/d /s /c`
+/// support for `cmd.exe`, which uses non-`CommandLineToArgvW` outer-quote stripping).
 pub(crate) fn format_windows_command_line(program: &Path, args: &[String]) -> String {
     let mut cmd = String::new();
     push_quoted_win32_arg(&mut cmd, &program.to_string_lossy(), true);
+    let is_cmd_exe = program
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("cmd.exe") || n.eq_ignore_ascii_case("cmd"));
+    if is_cmd_exe
+        && args.len() == 4
+        && args[0].eq_ignore_ascii_case("/d")
+        && args[1].eq_ignore_ascii_case("/s")
+        && (args[2].eq_ignore_ascii_case("/k") || args[2].eq_ignore_ascii_case("/c"))
+    {
+        cmd.push(' ');
+        cmd.push_str(&args[0]);
+        cmd.push(' ');
+        cmd.push_str(&args[1]);
+        cmd.push(' ');
+        cmd.push_str(&args[2]);
+        cmd.push_str(" \"");
+        cmd.push_str(&args[3]);
+        cmd.push('"');
+        return cmd;
+    }
     for arg in args {
         cmd.push(' ');
         push_quoted_win32_arg(&mut cmd, arg, false);
@@ -5229,6 +5272,8 @@ fn wrap_cli_in_interactive_shell(program: &Path, args: &[String]) -> (PathBuf, V
             vec![
                 "-NoLogo".to_string(),
                 "-NoExit".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
                 "-Command".to_string(),
                 ps_cmd,
             ],
@@ -5237,7 +5282,31 @@ fn wrap_cli_in_interactive_shell(program: &Path, args: &[String]) -> (PathBuf, V
 
     let cmd_exe = sys_root.join("System32").join("cmd.exe");
     let inner = format_windows_command_line(program, args);
-    (cmd_exe, vec!["/k".to_string(), format!("\"{inner}\"")])
+    (
+        cmd_exe,
+        vec!["/d".to_string(), "/s".to_string(), "/k".to_string(), inner],
+    )
+}
+
+fn is_windowsapps_container_path(path: &Path) -> bool {
+    let path_l = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    path_l.contains(r"\program files\windowsapps\") || path_l.contains(r"\windowsapps\")
+}
+
+fn build_cmd_start_appexeclink_invocation(alias: &Path, args: &[String]) -> (PathBuf, Vec<String>) {
+    let sys_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let cmd_exe = sys_root.join("System32").join("cmd.exe");
+    let mut inner = String::from("start \"\" ");
+    inner.push_str(&format_windows_command_line(alias, args));
+    (
+        cmd_exe,
+        vec!["/d".to_string(), "/s".to_string(), "/c".to_string(), inner],
+    )
 }
 
 fn resolve_msix_execution_alias_if_needed(program: &Path) -> Option<PathBuf> {
@@ -5347,7 +5416,7 @@ fn launch_from_session_zero(
     };
     let mut pi = PROCESS_INFORMATION::default();
 
-    unsafe {
+    let direct_res = unsafe {
         CreateProcessAsUserW(
             primary_tok,
             PCWSTR(prog_w.as_ptr()),
@@ -5361,17 +5430,59 @@ fn launch_from_session_zero(
             &si,
             &mut pi,
         )
-    }
-    .map_err(|e| {
-        PlatformError::Io(format!(
+    };
+    match direct_res {
+        Ok(()) => {
+            let _proc_guard = WinHandleGuard(pi.hProcess);
+            let _thread_guard = WinHandleGuard(pi.hThread);
+            Ok(())
+        }
+        Err(first_err) if !new_console && is_windowsapps_container_path(program) => {
+            // `CreateProcessAsUserW` cannot directly open `IO_REPARSE_TAG_APPEXECLINK` (`1920`);
+            // invoke `cmd.exe /d /s /c "start "" ..."` under the SAME non-elevated `primary_tok`
+            // with `CREATE_NO_WINDOW` so `ShellExecuteExW` activates MSIX identity cleanly.
+            const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
+            let alias = resolve_msix_execution_alias_if_needed(program)
+                .unwrap_or_else(|| program.to_path_buf());
+            let (shim_prog, shim_args) = build_cmd_start_appexeclink_invocation(&alias, args);
+            let shim_prog_w: Vec<u16> =
+                shim_prog.as_os_str().encode_wide().chain(Some(0)).collect();
+            let mut shim_cmd_w: Vec<u16> = format_windows_command_line(&shim_prog, &shim_args)
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            let shim_flags = flags | PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW_FLAG);
+            let mut shim_pi = PROCESS_INFORMATION::default();
+            unsafe {
+                CreateProcessAsUserW(
+                    primary_tok,
+                    PCWSTR(shim_prog_w.as_ptr()),
+                    PWSTR(shim_cmd_w.as_mut_ptr()),
+                    None,
+                    None,
+                    false,
+                    shim_flags,
+                    env_block.as_ref().map(|b| b.as_ptr().cast::<c_void>()),
+                    cwd_pcwstr,
+                    &si,
+                    &mut shim_pi,
+                )
+            }
+            .map_err(|_| {
+                PlatformError::Io(format!(
+                    "CreateProcessAsUserW failed for {}: {first_err}",
+                    program.display()
+                ))
+            })?;
+            let _proc_guard = WinHandleGuard(shim_pi.hProcess);
+            let _thread_guard = WinHandleGuard(shim_pi.hThread);
+            Ok(())
+        }
+        Err(e) => Err(PlatformError::Io(format!(
             "CreateProcessAsUserW failed for {}: {e}",
             program.display()
-        ))
-    })?;
-
-    let _proc_guard = WinHandleGuard(pi.hProcess);
-    let _thread_guard = WinHandleGuard(pi.hThread);
-    Ok(())
+        ))),
+    }
 }
 
 #[cfg(windows)]
@@ -5473,7 +5584,7 @@ fn try_launch_via_shell_token(
         };
         let mut pi = PROCESS_INFORMATION::default();
 
-        CreateProcessWithTokenW(
+        let direct_res = CreateProcessWithTokenW(
             primary_tok,
             LOGON_WITH_PROFILE,
             PCWSTR(prog_w.as_ptr()),
@@ -5483,12 +5594,47 @@ fn try_launch_via_shell_token(
             cwd_pcwstr,
             &si,
             &mut pi,
-        )
-        .map_err(|e| PlatformError::Io(format!("CreateProcessWithTokenW failed: {e}")))?;
-
-        let _child_proc = WinHandleGuard(pi.hProcess);
-        let _child_thread = WinHandleGuard(pi.hThread);
-        Ok(())
+        );
+        match direct_res {
+            Ok(()) => {
+                let _child_proc = WinHandleGuard(pi.hProcess);
+                let _child_thread = WinHandleGuard(pi.hThread);
+                Ok(())
+            }
+            Err(first_err) if !new_console && is_windowsapps_container_path(program) => {
+                const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
+                let alias = resolve_msix_execution_alias_if_needed(program)
+                    .unwrap_or_else(|| program.to_path_buf());
+                let (shim_prog, shim_args) = build_cmd_start_appexeclink_invocation(&alias, args);
+                let shim_prog_w: Vec<u16> =
+                    shim_prog.as_os_str().encode_wide().chain(Some(0)).collect();
+                let mut shim_cmd_w: Vec<u16> = format_windows_command_line(&shim_prog, &shim_args)
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .collect();
+                let mut shim_pi = PROCESS_INFORMATION::default();
+                CreateProcessWithTokenW(
+                    primary_tok,
+                    LOGON_WITH_PROFILE,
+                    PCWSTR(shim_prog_w.as_ptr()),
+                    PWSTR(shim_cmd_w.as_mut_ptr()),
+                    flags | PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW_FLAG),
+                    env_block.as_ref().map(|b| b.as_ptr().cast::<c_void>()),
+                    cwd_pcwstr,
+                    &si,
+                    &mut shim_pi,
+                )
+                .map_err(|_| {
+                    PlatformError::Io(format!("CreateProcessWithTokenW failed: {first_err}"))
+                })?;
+                let _child_proc = WinHandleGuard(shim_pi.hProcess);
+                let _child_thread = WinHandleGuard(shim_pi.hThread);
+                Ok(())
+            }
+            Err(e) => Err(PlatformError::Io(format!(
+                "CreateProcessWithTokenW failed: {e}"
+            ))),
+        }
     }
 }
 
@@ -5508,32 +5654,57 @@ pub fn launch_normal_privilege(target: &LaunchTarget) -> PlatformResult<()> {
     let (raw_program, raw_args) = build_launch_command(target)?;
     let empty_env = BTreeMap::new();
     let extra_env = target.extra_env().unwrap_or(&empty_env);
-    let cwd = match target {
+    let fallback_user_home = user_home_dirs().into_iter().find(|d| d.is_dir());
+    let cwd_owned: Option<PathBuf> = match target {
         LaunchTarget::Executable {
             path, working_dir, ..
         } => working_dir
             .as_deref()
-            .filter(|d| d.is_dir())
-            .or_else(|| path.parent().filter(|p| p.is_dir())),
+            .filter(|d| d.is_dir() && !is_windowsapps_container_path(d))
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                path.parent()
+                    .filter(|p| p.is_dir() && !is_windowsapps_container_path(p))
+                    .map(Path::to_path_buf)
+            })
+            .or(fallback_user_home),
         LaunchTarget::AppsFolder { .. } => None,
     };
+    let cwd = cwd_owned.as_deref();
 
     let is_cli = matches!(target, LaunchTarget::Executable { .. })
         && is_cli_or_script_launch_target(&raw_program);
+
+    // Resolve restricted `C:\Program Files\WindowsApps\...` MSIX paths to the user's
+    // `%LOCALAPPDATA%\Microsoft\WindowsApps\<exe>` execution alias upfront so normal-user launches
+    // preserve MSIX Package Identity and never hit `ERROR_ACCESS_DENIED`.
+    let effective_gui_program = if !is_cli && is_windowsapps_container_path(&raw_program) {
+        resolve_msix_execution_alias_if_needed(&raw_program).unwrap_or_else(|| raw_program.clone())
+    } else {
+        raw_program.clone()
+    };
+
     let (program, args) = if is_cli {
         wrap_cli_in_interactive_shell(&raw_program, &raw_args)
     } else {
-        (raw_program.clone(), raw_args.clone())
+        (effective_gui_program, raw_args.clone())
     };
 
     let run_once = |prog: &Path, prog_args: &[String]| -> PlatformResult<()> {
         if crate::access_win::is_session_zero() {
             return launch_from_session_zero(prog, prog_args, cwd, extra_env, is_cli);
         }
-        if crate::access_win::is_elevated().unwrap_or(false)
-            && try_launch_via_shell_token(prog, prog_args, cwd, extra_env, is_cli).is_ok()
-        {
-            return Ok(());
+        // SECURITY INVARIANT: NEVER fall back to spawning an AI client under an elevated
+        // Administrator token — doing so breaks the privilege boundary and stamps Admin ACLs
+        // onto Sovereign Vault `--user-data-dir` files!
+        if crate::access_win::is_elevated().unwrap_or(false) {
+            return try_launch_via_shell_token(prog, prog_args, cwd, extra_env, is_cli).map_err(
+                |e| {
+                    PlatformError::AccessDenied(format!(
+                        "无法降权至普通桌面用户身份启动客户端（已阻止管理员直启以保护隔离目录权限）：{e}"
+                    ))
+                },
+            );
         }
         let mut cmd = std::process::Command::new(prog);
         cmd.args(prog_args);
@@ -5556,7 +5727,7 @@ pub fn launch_normal_privilege(target: &LaunchTarget) -> PlatformResult<()> {
         Err(first_err) => {
             if !is_cli {
                 if let Some(alias) = resolve_msix_execution_alias_if_needed(&raw_program) {
-                    if run_once(&alias, &raw_args).is_ok() {
+                    if alias != program && run_once(&alias, &raw_args).is_ok() {
                         return Ok(());
                     }
                 }

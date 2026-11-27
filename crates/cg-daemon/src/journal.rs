@@ -75,7 +75,7 @@ fn normalize_path_cmp(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-fn is_default_programdata_claudeguard_dir(dir: &Path) -> bool {
+pub(crate) fn is_default_programdata_claudeguard_dir(dir: &Path) -> bool {
     let Some(pd) = non_empty_env("ProgramData").or_else(|| non_empty_env("PROGRAMDATA")) else {
         return false;
     };
@@ -1209,6 +1209,14 @@ fn heal_from_journal(
     }
     if restore_tz.is_none() {
         restore_tz = journal.baseline.timezone_key.clone();
+    }
+    if restore_loc.is_none()
+        && (journal.baseline.location_lat.is_some() || journal.baseline.location_lon.is_some())
+    {
+        restore_loc = Some((
+            journal.baseline.location_lat.clone(),
+            journal.baseline.location_lon.clone(),
+        ));
     }
 
     // Also include any orphaned managed firewall rules visible on the host.

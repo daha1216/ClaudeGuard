@@ -63,6 +63,7 @@ pub struct CredentialSummary {
 #[derive(Clone, Debug)]
 enum CleanTarget {
     SanitizeClaudeJson { path: PathBuf, home_root: PathBuf },
+    RotateIdeTelemetryJson { path: PathBuf, home_root: PathBuf },
     RemoveFile { path: PathBuf, home_root: PathBuf },
     RemoveDir { path: PathBuf, home_root: PathBuf },
     WindowsCredential { target_name: String, cred_type: u32 },
@@ -467,19 +468,34 @@ fn collect_cleanroom_plan(
             note,
             &mut plan,
         );
+        scan_chromium_root(
+            &home,
+            &roaming.join("Codex"),
+            "chatgpt",
+            "codex_exe",
+            note,
+            &mut plan,
+        );
         for msix_gpt in discover_msix_roaming_dirs(&local, "openai.", "ChatGPT") {
             scan_chromium_root(&home, &msix_gpt, "chatgpt", "msix", note, &mut plan);
         }
+        for msix_codex in discover_msix_roaming_dirs(&local, "openai.", "Codex") {
+            scan_chromium_root(&home, &msix_codex, "chatgpt", "codex_msix", note, &mut plan);
+        }
     }
     if scope.antigravity {
+        let ag_roaming = roaming.join("Antigravity");
+        let before_ag = plan.len();
         scan_chromium_root(
             &home,
-            &roaming.join("Antigravity"),
+            &ag_roaming,
             "antigravity",
             "ide",
             "保留 Antigravity 插件、settings.json 与代码工程",
             &mut plan,
         );
+        let ag_has_session_residue = plan.len() > before_ag;
+        scan_antigravity_telemetry_storage(&home, &ag_roaming, ag_has_session_residue, &mut plan);
     }
 
     // ---- Vector 3: Windows Credential Manager ----
@@ -709,6 +725,127 @@ fn scan_claude_code_vector(home: &Path, plan: &mut Vec<PlannedFinding>) {
     }
 }
 
+const IDE_TELEMETRY_ID_KEYS: &[&str] = &[
+    "telemetry.machineId",
+    "telemetry.macMachineId",
+    "telemetry.devDeviceId",
+    "telemetry.sqmId",
+];
+
+const IDE_PURGE_SESSION_KEYS: &[&str] = &["antigravityAuth", "google.antigravity"];
+
+fn scan_antigravity_telemetry_storage(
+    home: &Path,
+    ag_roaming: &Path,
+    ag_has_session_residue: bool,
+    plan: &mut Vec<PlannedFinding>,
+) {
+    let storage_path = ag_roaming
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+    if !is_safe_existing_file(&storage_path) {
+        return;
+    }
+    let Ok(raw) = std::fs::read(&storage_path) else {
+        return;
+    };
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(&raw) else {
+        return;
+    };
+
+    let mut present_id_keys = Vec::new();
+    let mut previews = Vec::new();
+    for &k in IDE_TELEMETRY_ID_KEYS {
+        if let Some(s) = map
+            .get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+        {
+            present_id_keys.push(k.to_string());
+            if k == "telemetry.machineId" {
+                previews.push(format!("machineId={}", mask_identifier(s)));
+            }
+        }
+    }
+    let has_auth_keys = IDE_PURGE_SESSION_KEYS.iter().any(|k| map.contains_key(*k));
+    if (ag_has_session_residue && !present_id_keys.is_empty()) || has_auth_keys {
+        for &ak in IDE_PURGE_SESSION_KEYS {
+            if map.contains_key(ak) {
+                present_id_keys.push(ak.to_string());
+            }
+        }
+        let preview = if previews.is_empty() {
+            format!("{} 项 IDE 设备遥测指纹键", present_id_keys.len())
+        } else {
+            previews.join(" · ")
+        };
+        plan.push(PlannedFinding {
+            finding: CleanRoomFinding {
+                id: "v2:antigravity:ide:telemetry_storage_json".into(),
+                client_id: "antigravity".into(),
+                vector: CleanRoomVector::DesktopChromiumAndCrashpad,
+                risk_weight: 14,
+                location_display: redact_user_path(&storage_path, home),
+                correlation_keys: present_id_keys,
+                masked_preview: preview,
+                bytes_size: raw.len() as u64,
+                preservation_note: "原地轮换 telemetry.machineId 等设备指纹，保留工作区与插件配置"
+                    .into(),
+            },
+            target: CleanTarget::RotateIdeTelemetryJson {
+                path: storage_path,
+                home_root: home.to_path_buf(),
+            },
+        });
+    }
+}
+
+/// Surgically rotates Antigravity / VS Code `telemetry.*` machine IDs inside `storage.json` while
+/// stripping stale auth tokens and preserving all user workspace/UI keys intact.
+pub fn rotate_ide_storage_json_value(val: &mut serde_json::Value) -> Result<Vec<String>, String> {
+    let Some(root) = val.as_object_mut() else {
+        return Ok(Vec::new());
+    };
+    let mut rotated = Vec::new();
+    for &ak in IDE_PURGE_SESSION_KEYS {
+        if root.remove(ak).is_some() {
+            rotated.push(ak.to_string());
+        }
+    }
+    root.insert(
+        "telemetry.machineId".into(),
+        serde_json::Value::String(crypto_win::random_hex(32)?),
+    );
+    rotated.push("telemetry.machineId".into());
+    root.insert(
+        "telemetry.macMachineId".into(),
+        serde_json::Value::String(crypto_win::random_hex(32)?),
+    );
+    rotated.push("telemetry.macMachineId".into());
+    root.insert(
+        "telemetry.devDeviceId".into(),
+        serde_json::Value::String(crypto_win::random_uuid_v4()?),
+    );
+    rotated.push("telemetry.devDeviceId".into());
+    let sqm = format!("{{{}}}", crypto_win::random_uuid_v4()?.to_ascii_uppercase());
+    root.insert("telemetry.sqmId".into(), serde_json::Value::String(sqm));
+    rotated.push("telemetry.sqmId".into());
+    Ok(rotated)
+}
+
+fn rotate_ide_storage_json_file(path: &Path) -> Result<(), String> {
+    ensure_no_reparse_points_chain(path)?;
+    let raw = std::fs::read(path)
+        .map_err(|e| format!("读取 IDE storage.json 失败（{}）：{e}", path.display()))?;
+    let mut val: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| format!("解析 IDE storage.json 失败（{}）：{e}", path.display()))?;
+    rotate_ide_storage_json_value(&mut val)?;
+    let updated = serde_json::to_vec_pretty(&val)
+        .map_err(|e| format!("序列化轮换后的 storage.json 失败：{e}"))?;
+    atomic_write_no_reparse(path, &updated)
+}
+
 fn scan_chromium_root(
     home: &Path,
     root: &Path,
@@ -724,8 +861,12 @@ fn scan_chromium_root(
     let file_targets: &[(&str, &str, u8)] = &[
         (r"Network\Cookies", "network_cookies", 12),
         (r"Network\Cookies-journal", "network_cookies_journal", 4),
+        (r"Network\Cookies-wal", "network_cookies_wal", 4),
+        (r"Network\Cookies-shm", "network_cookies_shm", 2),
         ("Cookies", "cookies", 12),
         ("Cookies-journal", "cookies_journal", 4),
+        ("Cookies-wal", "cookies_wal", 4),
+        ("Cookies-shm", "cookies_shm", 2),
         (
             r"Network\Network Persistent State",
             "network_persistent_state",
@@ -1230,6 +1371,7 @@ pub fn execute_cleanroom_with_backup(
         clients_included.insert(p.finding.client_id.clone());
         match &p.target {
             CleanTarget::SanitizeClaudeJson { path, home_root }
+            | CleanTarget::RotateIdeTelemetryJson { path, home_root }
             | CleanTarget::RemoveFile { path, home_root } => {
                 collect_file_for_backup(
                     path,
@@ -1302,26 +1444,37 @@ pub fn execute_cleanroom_with_backup(
 
     prune_old_backups(&backups_dir, MAX_RETAINED_BACKUPS);
 
-    // Step 2: Apply surgical sanitization & safe deletions.
-    for p in &active_plan {
-        match &p.target {
-            CleanTarget::SanitizeClaudeJson { path, .. } => {
-                sanitize_claude_json_file(path)?;
+    // Step 2: Apply surgical sanitization & safe deletions (attaching `backup_id` if any step fails).
+    let step2_res: Result<(), String> = (|| {
+        for p in &active_plan {
+            match &p.target {
+                CleanTarget::SanitizeClaudeJson { path, .. } => {
+                    sanitize_claude_json_file(path)?;
+                }
+                CleanTarget::RotateIdeTelemetryJson { path, .. } => {
+                    rotate_ide_storage_json_file(path)?;
+                }
+                CleanTarget::RemoveFile { path, home_root } => {
+                    safe_remove_under_anchor(home_root, path)?;
+                }
+                CleanTarget::RemoveDir { path, home_root } => {
+                    safe_remove_under_anchor(home_root, path)?;
+                }
+                CleanTarget::WindowsCredential {
+                    target_name,
+                    cred_type,
+                } => {
+                    delete_windows_credential(target_name, *cred_type)?;
+                }
+                CleanTarget::RunningProcess { .. } => {}
             }
-            CleanTarget::RemoveFile { path, home_root } => {
-                safe_remove_under_anchor(home_root, path)?;
-            }
-            CleanTarget::RemoveDir { path, home_root } => {
-                safe_remove_under_anchor(home_root, path)?;
-            }
-            CleanTarget::WindowsCredential {
-                target_name,
-                cred_type,
-            } => {
-                delete_windows_credential(target_name, *cred_type)?;
-            }
-            CleanTarget::RunningProcess { .. } => {}
         }
+        Ok(())
+    })();
+    if let Err(err) = step2_res {
+        return Err(format!(
+            "{err}（已生成加密备份 {backup_id}，可在净室备份历史中一键还原）"
+        ));
     }
 
     // Step 3: Post-clean readback verification.
@@ -1391,12 +1544,19 @@ fn collect_file_for_backup(
         return Ok(());
     }
     if meta.len() > MAX_SINGLE_BACKUP_FILE_BYTES {
-        return Ok(());
+        return Err(format!(
+            "安全拦截：待清理文件超出单文件加密备份上限（{} > 16 MiB），已拒绝无备份删除：{}",
+            meta.len(),
+            path.display()
+        ));
     }
     let data = std::fs::read(path)
         .map_err(|e| format!("读取待备份文件失败（{}）：{e}", path.display()))?;
     if total_uncompressed.saturating_add(data.len()) > MAX_BACKUP_UNCOMPRESSED_BYTES {
-        return Ok(());
+        return Err(format!(
+            "安全拦截：净室备份总容量超出 64 MiB 安全上限，已拒绝无备份删除（请分批选择清理项）：{}",
+            path.display()
+        ));
     }
     let rel = path
         .strip_prefix(home_root)
@@ -1684,15 +1844,18 @@ fn validate_allowed_cleanroom_rel_path(rel: &Path) -> Result<(), String> {
         .replace('\\', "/")
         .to_ascii_lowercase();
     let allowed = norm == ".claude.json"
+        || norm == ".codex/auth.json"
         || norm.starts_with(".claude.json.backup")
         || norm.starts_with(".claude.json.tmp")
         || norm.starts_with(".claude/")
         || norm.starts_with("appdata/roaming/claude/")
         || norm.starts_with("appdata/roaming/chatgpt/")
+        || norm.starts_with("appdata/roaming/codex/")
         || norm.starts_with("appdata/roaming/antigravity/")
         || (norm.starts_with("appdata/local/packages/")
             && (norm.contains("/localcache/roaming/claude/")
-                || norm.contains("/localcache/roaming/chatgpt/")));
+                || norm.contains("/localcache/roaming/chatgpt/")
+                || norm.contains("/localcache/roaming/codex/")));
     if !allowed {
         return Err(format!(
             "安全拦截：备份条目超出净室客户端状态白名单路径（{}）",
@@ -1760,12 +1923,63 @@ fn prune_old_backups(backups_dir: &Path, keep: usize) {
 }
 
 fn terminate_verified_pids(targets: &[(u32, String)]) {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_processes_specifics(sysinfo::ProcessRefreshKind::new());
-    for (pid, expected_exe) in targets {
-        if let Some(proc_) = sys.process(sysinfo::Pid::from_u32(*pid)) {
-            if proc_.name().eq_ignore_ascii_case(expected_exe) {
-                let _ = proc_.kill();
+    // 1. Kill full GUI process trees children-first with `(pid, start_time, exe_path)` verification
+    //    so `--type=utility` (NetworkService holding `Network\Cookies`), `language_server*.exe`,
+    //    and `resources\codex.exe` release file locks cleanly.
+    let mut agent_ids = BTreeSet::new();
+    for (_, exe_name) in targets {
+        let low = exe_name.trim().to_ascii_lowercase();
+        if matches!(low.as_str(), "claude.exe" | "cowork-svc.exe") {
+            agent_ids.insert("claude");
+        } else if matches!(
+            low.as_str(),
+            "chatgpt.exe" | "chatgpt classic.exe" | "codex.exe"
+        ) {
+            agent_ids.insert("chatgpt");
+        } else if matches!(low.as_str(), "antigravity.exe" | "antigravity ide.exe") {
+            agent_ids.insert("antigravity");
+        }
+    }
+
+    let mut killed_pids: Vec<u32> = Vec::new();
+    for aid in agent_ids {
+        for ident in crate::process_win::kill_gui_agent(aid) {
+            if !killed_pids.contains(&ident.pid) {
+                killed_pids.push(ident.pid);
+            }
+        }
+    }
+    for (pid, _) in targets {
+        if !killed_pids.contains(pid) {
+            killed_pids.push(*pid);
+        }
+    }
+
+    // 2. Wait briefly on `SYNCHRONIZE` handles so kernel handle rundown releases SQLite/LevelDB locks
+    //    before Step 1 backup & Step 2 file deletion execute.
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_ACCESS_RIGHTS,
+        };
+
+        const SYNCHRONIZE_RIGHT: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(0x0010_0000);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
+        for pid in killed_pids {
+            if pid == 0 {
+                continue;
+            }
+            let rem_ms = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .min(250) as u32;
+            if rem_ms == 0 {
+                break;
+            }
+            if let Ok(h) = unsafe { OpenProcess(SYNCHRONIZE_RIGHT, false, pid) } {
+                let _ = unsafe { WaitForSingleObject(h, rem_ms) };
+                let _ = unsafe { CloseHandle(h) };
             }
         }
     }
@@ -2235,6 +2449,87 @@ mod tests {
 
         // Read-only credential enumeration must succeed safely without exposing raw secrets.
         let _creds = enumerate_matching_credentials(&scope);
+
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
+    #[test]
+    fn surgical_ide_telemetry_rotation_cookies_wal_and_readonly_cleanup() {
+        let sandbox = temp_sandbox("cleanroom-wal-rot");
+        let fake_home = sandbox.join("home");
+        let data_dir = sandbox.join("data");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let ag_root = fake_home
+            .join("AppData")
+            .join("Roaming")
+            .join("Antigravity");
+        std::fs::create_dir_all(ag_root.join("Network")).unwrap();
+        std::fs::create_dir_all(ag_root.join("User").join("globalStorage")).unwrap();
+
+        let wal_path = ag_root.join("Network").join("Cookies-wal");
+        std::fs::write(&wal_path, b"wal-session-residue").unwrap();
+        // Mark Cookies-wal read-only to verify clear_readonly_if_needed!
+        let mut perms = std::fs::metadata(&wal_path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&wal_path, perms).unwrap();
+
+        let storage_path = ag_root
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json");
+        std::fs::write(
+            &storage_path,
+            r#"{"telemetry.machineId":"old_m","telemetry.sqmId":"{OLD}","workbench.colorTheme":"Solarized Dark"}"#,
+        )
+        .unwrap();
+
+        let codex_roaming = fake_home.join("AppData").join("Roaming").join("Codex");
+        std::fs::create_dir_all(codex_roaming.join("Local Storage").join("leveldb")).unwrap();
+        std::fs::write(
+            codex_roaming
+                .join("Local Storage")
+                .join("leveldb")
+                .join("000001.log"),
+            b"codex-session",
+        )
+        .unwrap();
+
+        let scope = CleanRoomScope {
+            claude: false,
+            chatgpt_codex: true,
+            antigravity: true,
+        };
+        let report = scan_cleanroom(&scope, Some(&fake_home), 1_700_000_500);
+        assert!(report.findings.iter().any(|f| f.id.contains("cookies_wal")));
+        assert!(report.findings.iter().any(|f| f.id.contains("codex_exe")));
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.id.contains("telemetry_storage_json")));
+
+        let selected: Vec<String> = report.findings.iter().map(|f| f.id.clone()).collect();
+        let (_meta, post) = execute_cleanroom_with_backup(
+            &data_dir,
+            &scope,
+            &selected,
+            Some(&fake_home),
+            1_700_000_501,
+        )
+        .expect("execute cleanroom with readonly wal & surgical storage.json rotation");
+        assert_eq!(post.pollution_score, 0);
+        assert!(!wal_path.exists());
+        assert!(
+            storage_path.is_file(),
+            "storage.json must be rotated in-place, not deleted"
+        );
+
+        let rotated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&storage_path).unwrap()).unwrap();
+        assert_eq!(rotated["workbench.colorTheme"], "Solarized Dark");
+        assert_ne!(rotated["telemetry.machineId"], "old_m");
+        assert_eq!(rotated["telemetry.machineId"].as_str().unwrap().len(), 64);
 
         let _ = std::fs::remove_dir_all(&sandbox);
     }

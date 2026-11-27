@@ -122,6 +122,13 @@ pub fn format_service_binary_path(exe_path: &Path) -> Result<String, String> {
     sanitize_service_exe_str(raw)
 }
 
+/// Returns true when `event_type` under `SERVICE_CONTROL_POWEREVENT` indicates OS suspend entry (`PBT_APMSUSPEND`).
+pub fn is_power_suspend_event(control_code: u32, event_type: u32) -> bool {
+    const CTRL_POWEREVENT: u32 = 0x0000_000D;
+    const PBT_APMSUSPEND: u32 = 0x0000_0004;
+    control_code == CTRL_POWEREVENT && event_type == PBT_APMSUSPEND
+}
+
 /// Returns true when `event_type` under `SERVICE_CONTROL_POWEREVENT` indicates OS sleep/hibernate wake.
 pub fn is_power_resume_event(control_code: u32, event_type: u32) -> bool {
     const CTRL_POWEREVENT: u32 = 0x0000_000D;
@@ -183,7 +190,7 @@ pub struct DaemonRuntime {
     coordinator: CoordinatorHandle,
     pipe_server: PipeServer,
     monitor: Option<BackgroundMonitorHandle>,
-    wsl_bridge: Option<crate::wsl_bridge::WslBridgeServer>,
+    wsl_bridge: crate::wsl_bridge::SharedWslBridge,
 }
 
 impl DaemonRuntime {
@@ -228,14 +235,15 @@ impl DaemonRuntime {
             }
         };
 
-        let wsl_bridge = if config.enable_background_loop {
+        let initial_wsl_srv = if config.enable_background_loop {
             let init_snap = coordinator.snapshot();
             if init_snap.config.wsl_bridge_enabled {
                 let token_dir = crate::hook_installer::resolve_interactive_user_home();
-                match crate::wsl_bridge::WslBridgeServer::start(
+                match crate::wsl_bridge::WslBridgeServer::start_with_mode(
                     coordinator.clone(),
                     token_dir.as_deref(),
                     init_snap.config.proxy_port,
+                    init_snap.config.hook_fail_mode,
                 ) {
                     Ok(srv) => {
                         coordinator.update_wsl_bridge_status(srv.status(Vec::new(), false));
@@ -269,6 +277,9 @@ impl DaemonRuntime {
         } else {
             None
         };
+        let wsl_bridge: crate::wsl_bridge::SharedWslBridge =
+            Arc::new(std::sync::Mutex::new(initial_wsl_srv));
+        coordinator.attach_wsl_runtime(wsl_bridge.clone(), config.enable_background_loop);
 
         let monitor = if config.enable_background_loop {
             Some(BackgroundMonitorHandle::start(
@@ -321,8 +332,10 @@ impl DaemonRuntime {
     /// - [`StopBehavior::PreserveFailClosed`]: Stops background loop, pipe server, and coordinator
     ///   while preserving active protection and WAL journal on disk for next-boot `heal_on_startup()`.
     pub fn shutdown_graceful(self, behavior: StopBehavior) -> Result<(), String> {
-        if let Some(wsl) = self.wsl_bridge {
-            wsl.shutdown();
+        if let Ok(mut guard) = self.wsl_bridge.lock() {
+            if let Some(wsl) = guard.take() {
+                wsl.shutdown();
+            }
         }
         if let Some(monitor) = self.monitor {
             monitor.shutdown();
@@ -343,9 +356,7 @@ impl DaemonRuntime {
                 Err(err) => Err(err),
             },
             StopBehavior::PreserveFailClosed => {
-                let _ = self
-                    .coordinator
-                    .dispatch(crate::protocol::PipeRequest::NotifySystemShutdown);
+                self.coordinator.notify_system_shutting_down();
                 Ok(())
             }
         };
@@ -541,7 +552,13 @@ mod win_service {
                 NO_ERROR.0
             }
             SERVICE_CONTROL_POWEREVENT => {
-                if is_power_resume_event(dwcontrol, dweventtype) {
+                if is_power_suspend_event(dwcontrol, dweventtype) {
+                    if let Ok(guard) = ctx.coordinator.lock() {
+                        if let Some(ref coord) = *guard {
+                            coord.notify_system_suspending();
+                        }
+                    }
+                } else if is_power_resume_event(dwcontrol, dweventtype) {
                     if let Ok(guard) = ctx.coordinator.lock() {
                         if let Some(ref coord) = *guard {
                             coord.notify_system_resumed();
@@ -956,7 +973,9 @@ mod tests {
         assert_eq!(deps, expected);
         assert_eq!(encode_service_dependencies(&[]), vec![0u16, 0u16]);
 
-        // Power resume event classification.
+        // Power suspend/resume event classification.
+        assert!(is_power_suspend_event(0x0D, 0x04));
+        assert!(!is_power_suspend_event(0x0D, 0x12));
         assert!(is_power_resume_event(0x0D, 0x12));
         assert!(is_power_resume_event(0x0D, 0x07));
         assert!(!is_power_resume_event(0x0D, 0x04)); // PBT_APMSUSPEND

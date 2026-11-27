@@ -236,6 +236,7 @@ impl DaemonClient {
             }
             PipeRequest::ProbeOnboarding => PipeResponse::OnboardingProbe {
                 probe: build_demo_onboarding_probe(true),
+                detected_local_ports: vec![7890, 7897, 10809],
             },
             PipeRequest::CompleteOnboarding { mut config } => {
                 config.first_run = false;
@@ -256,11 +257,20 @@ impl DaemonClient {
                     snapshot: Some(Box::new(snap.clone())),
                 }
             }
-            PipeRequest::QueryLogs { limit, query, .. } => {
+            PipeRequest::QueryLogs {
+                since_ts,
+                until_ts,
+                limit,
+                query,
+                level,
+            } => {
                 let needle = query.unwrap_or_default().to_ascii_lowercase();
                 let mut entries: Vec<_> = snap
                     .recent_logs
                     .iter()
+                    .filter(|item| since_ts.is_none_or(|s| item.timestamp >= s))
+                    .filter(|item| until_ts.is_none_or(|u| item.timestamp <= u))
+                    .filter(|item| level.is_none_or(|lvl| item.level == lvl))
                     .filter(|item| {
                         needle.is_empty()
                             || item.message.to_ascii_lowercase().contains(&needle)
@@ -550,16 +560,20 @@ impl DaemonClient {
                 }
             }
             PipeRequest::ExportDiagnostics => {
+                let demo_zip_path = std::env::temp_dir()
+                    .join("ClaudeGuard-Diagnostics-demo.zip")
+                    .to_string_lossy()
+                    .into_owned();
                 let receipt = OperationReceipt {
                     id: format!("diag-{now}"),
                     status: OperationStatus::Verified,
                     items: vec![OperationItemReceipt {
                         name: "diagnostics_zip".into(),
                         status: OperationStatus::Verified,
-                        detail: "已生成脱敏诊断包 ClaudeGuard-Diagnostics-demo.zip".into(),
+                        detail: format!("已生成脱敏诊断包 {demo_zip_path}"),
                     }],
                     error: None,
-                    verified_scope: "ClaudeGuard-Diagnostics-demo.zip".into(),
+                    verified_scope: demo_zip_path,
                     remaining: Vec::new(),
                 };
                 snap.last_receipt = Some(receipt.clone());
@@ -788,6 +802,9 @@ impl DaemonClient {
                         receipt: None,
                     };
                 };
+                let shortcuts_dir = std::env::var("USERPROFILE")
+                    .map(|u| format!(r"{u}\Desktop"))
+                    .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
                 let receipt = OperationReceipt {
                     id: format!("rcpt-vault-lnk-{now}"),
                     status: OperationStatus::Verified,
@@ -800,7 +817,7 @@ impl DaemonClient {
                         ),
                     }],
                     error: None,
-                    verified_scope: format!("ClaudeGuard-Vault-{vault_id}.lnk"),
+                    verified_scope: shortcuts_dir,
                     remaining: Vec::new(),
                 };
                 snap.last_receipt = Some(receipt.clone());
@@ -955,7 +972,7 @@ impl DaemonClient {
             } => {
                 snap.hooks.claude_code_hook_installed = install_claude_code;
                 snap.hooks.pwsh_profile_wrapped = install_pwsh_profile;
-                snap.hooks.vault_hooks_synced_count = if sync_all_vaults {
+                snap.hooks.vault_hooks_synced_count = if install_claude_code && sync_all_vaults {
                     snap.config.vaults.len()
                 } else {
                     0

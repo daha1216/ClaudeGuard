@@ -22,7 +22,12 @@
   #endif
 #endif
 #ifndef MyAppVersionStr
-  #define MyAppVersionStr GetVersionNumbersString(AddBackslash(BackendReleaseDir) + 'claudeguard-daemon.exe')
+  #define RawDaemonVer GetVersionNumbersString(AddBackslash(BackendReleaseDir) + 'claudeguard-daemon.exe')
+  #if Copy(RawDaemonVer, Len(RawDaemonVer) - 1, 2) == ".0"
+    #define MyAppVersionStr Copy(RawDaemonVer, 1, Len(RawDaemonVer) - 2)
+  #else
+    #define MyAppVersionStr RawDaemonVer
+  #endif
 #endif
 #define MyAppVersion MyAppVersionStr
 #define MyAppPublisher "daha1216"
@@ -86,58 +91,97 @@ Filename: "{app}\{#MyAppGuiExeName}"; Description: "{cm:LaunchProgram,{#StringCh
 Filename: "{app}\{#MyAppGuiExeName}"; Parameters: "--tray"; Tasks: autostart; Check: WizardSilent; Flags: nowait shellexec runasoriginaluser
 
 [Code]
+const
+  MOVEFILE_DELAY_UNTIL_REBOOT = $4;
+
 var
   ExecResultCode: Integer;
   RestoreResultCode: Integer;
 
+function MoveFileExW(lpExistingFileName: String; lpNewFileName: THandle; dwFlags: Cardinal): BOOL;
+  external 'MoveFileExW@kernel32.dll stdcall';
+
+procedure CleanupStagingPattern(const StagingDir, Pattern: String);
+var
+  FindRec: TFindRec;
+  FilePath: String;
+begin
+  if FindFirst(StagingDir + '\' + Pattern, FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then
+        begin
+          FilePath := StagingDir + '\' + FindRec.Name;
+          if not DeleteFile(FilePath) then
+            MoveFileExW(FilePath, 0, MOVEFILE_DELAY_UNTIL_REBOOT);
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
 procedure CleanupStagingWaiters();
 var
   StagingDir: String;
-  FindRec: TFindRec;
 begin
   StagingDir := ExpandConstant('{commonappdata}\ClaudeGuard\staging');
   if DirExists(StagingDir) then
   begin
-    if FindFirst(StagingDir + '\cg-v3-waiter-*.exe', FindRec) then
-    begin
-      try
-        repeat
-          if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then
-            DeleteFile(StagingDir + '\' + FindRec.Name);
-        until not FindNext(FindRec);
-      finally
-        FindClose(FindRec);
-      end;
-    end;
-    RemoveDir(StagingDir);
+    CleanupStagingPattern(StagingDir, 'cg-v3-waiter-*.exe');
+    CleanupStagingPattern(StagingDir, 'ClaudeGuard-*-setup*.exe');
+    if not RemoveDir(StagingDir) then
+      MoveFileExW(StagingDir, 0, MOVEFILE_DELAY_UNTIL_REBOOT);
+  end;
+end;
+
+procedure WaitProcessGone(const ImageName: String);
+var
+  Idx: Integer;
+begin
+  for Idx := 1 to 8 do
+  begin
+    Exec(ExpandConstant('{cmd}'), '/C tasklist /FI "IMAGENAME eq ' + ImageName + '" 2>nul | find /I "' + ImageName + '" >nul', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
+    if ExecResultCode <> 0 then
+      break;
+    Sleep(250);
   end;
 end;
 
 procedure StopLegacyAndCurrentProcesses();
 var
   WaitIdx: Integer;
+  ScStopLaunched: Boolean;
 begin
   // Stop Windows Service gracefully first so WAL / Flow B cleanup (up to 15s wait hint) runs before upgrade.
-  Exec(ExpandConstant('{sys}\sc.exe'), 'stop {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
-  for WaitIdx := 1 to 64 do
+  // Skip the 64x250ms poll loop immediately when service is absent (1060) or already stopped (1062).
+  ScStopLaunched := Exec(ExpandConstant('{sys}\sc.exe'), 'stop {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
+  if ScStopLaunched and (ExecResultCode <> 1060) and (ExecResultCode <> 1062) then
   begin
-    Exec(ExpandConstant('{cmd}'), '/C sc query {#MyServiceName} | findstr /C:"STOPPED" >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
-    if ExecResultCode = 0 then
-      break;
-    Sleep(250);
+    for WaitIdx := 1 to 64 do
+    begin
+      Exec(ExpandConstant('{cmd}'), '/C sc query {#MyServiceName} | findstr /C:"STOPPED" >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
+      if ExecResultCode = 0 then
+        break;
+      Sleep(250);
+    end;
   end;
 
-  // Stop legacy v3 single-exe process and any running v4 binaries before file replacement.
+  // Stop legacy v3 single-exe process and any running v4/v5 binaries before file replacement.
   Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM ClaudeGuard.exe >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
   Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM {#MyAppGuiExeName} >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
   Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM {#MyAppDaemonExeName} >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
   Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM {#MyAppCliExeName} >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
+  WaitProcessGone('{#MyAppGuiExeName}');
+  WaitProcessGone('{#MyAppDaemonExeName}');
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   StopLegacyAndCurrentProcesses();
-  // Clean up legacy v3 HKCU autostart key so v3->v4 upgrade does not double-launch missing v3 exe.
+  // Clean up legacy v3 HKCU autostart key so v3->v5 upgrade does not double-launch missing v3 exe.
   RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'ClaudeGuard');
   Result := '';
 end;
@@ -146,6 +190,8 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
+    if not WizardIsTaskSelected('autostart') then
+      RegDeleteValue(HKLM, 'Software\Microsoft\Windows\CurrentVersion\Run', 'ClaudeGuardGui');
     CleanupStagingWaiters();
   end;
 end;
@@ -161,6 +207,7 @@ begin
     // Close normal-privilege GUI first so it cannot re-trigger IPC calls while restoring.
     Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM {#MyAppGuiExeName} >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
     Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM ClaudeGuard.exe >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
+    WaitProcessGone('{#MyAppGuiExeName}');
 
     // R06: Restore all network/firewall/NIC/environment modifications BEFORE deleting binaries or service.
     // claudeguard-cli --restore contacts the live daemon via Named Pipe, or runs offline WAL recovery if stopped.
@@ -182,6 +229,10 @@ begin
         Abort;
     end;
 
+    // Unwire Claude Code Pre-Prompt hooks, PowerShell $PROFILE wrappers, and WSL2 gate shims before removing binaries.
+    if FileExists(CliPath) then
+      Exec(CliPath, '--unhook-all', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
+
     // Stop and unregister ClaudeGuardService via daemon helper (with sc.exe fallback).
     DaemonPath := ExpandConstant('{app}\{#MyAppDaemonExeName}');
     if FileExists(DaemonPath) then
@@ -189,10 +240,14 @@ begin
     Exec(ExpandConstant('{sys}\sc.exe'), 'stop {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
     Exec(ExpandConstant('{sys}\sc.exe'), 'delete {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
     Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM {#MyAppDaemonExeName} >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
+    WaitProcessGone('{#MyAppDaemonExeName}');
 
     // Run a final post-service-stop offline --restore sweep so no persistent boot/WFP/firewall rules survive.
     if FileExists(CliPath) then
+    begin
       Exec(CliPath, '--restore', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
+      Exec(CliPath, '--unhook-all', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ExecResultCode);
+    end;
 
     // Clean autostart & legacy v1/v3 registry keys while preserving %ProgramData%\ClaudeGuard & %APPDATA%\ClaudeGuard.
     RegDeleteValue(HKLM, 'Software\Microsoft\Windows\CurrentVersion\Run', 'ClaudeGuardGui');

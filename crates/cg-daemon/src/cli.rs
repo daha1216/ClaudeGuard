@@ -44,6 +44,7 @@ pub enum CliCommand {
     },
     CleanRoomScan,
     Restore,
+    UnhookAll,
     Status,
     Version,
     Help,
@@ -82,6 +83,7 @@ COMMANDS:
     --cleanroom-scan               Run 100% read-only local Clean-Room residue scan
     --check,   check               Verify egress compliance via daemon; exit 0=pass, 2=not passed
     --restore, restore             Disarm and restore network/firewall/WFP (live pipe or offline WAL fallback)
+    --unhook-all, unhook-all       Remove Claude Code, Sovereign Vault, PowerShell $PROFILE, and WSL2 hooks
     --status,  status              Print daemon, Windows Service, and WAL journal status JSON
     --version                      Print version
     --help, -h                     Print this help
@@ -153,6 +155,7 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, String> {
                 }
             }
             "--restore" | "restore" => mode = Some("restore"),
+            "--unhook-all" | "unhook-all" => mode = Some("unhook_all"),
             "--status" | "status" => mode = Some("status"),
             "--version" | "-V" => mode = Some("version"),
             "--help" | "-h" => mode = Some("help"),
@@ -230,6 +233,7 @@ pub fn parse_args(args: &[String]) -> Result<CliArgs, String> {
         }
         Some("cleanroom_scan") => CliCommand::CleanRoomScan,
         Some("restore") => CliCommand::Restore,
+        Some("unhook_all") => CliCommand::UnhookAll,
         Some("status") => CliCommand::Status,
         Some("version") => CliCommand::Version,
         Some("help") | None => CliCommand::Help,
@@ -323,21 +327,94 @@ pub fn run_cli_with_executor(
             vault_id,
             app,
             extra_args,
-        } => run_launch_vault(&pipe_name, parsed.timeout_ms, vault_id, app, extra_args),
-        CliCommand::CleanRoomScan => run_cleanroom_scan(&pipe_name, parsed.timeout_ms),
-        CliCommand::Check { recheck } => run_check(&pipe_name, parsed.timeout_ms, recheck),
+        } => {
+            let call_ms = if parsed.timeout_explicit {
+                parsed.timeout_ms
+            } else {
+                35_000
+            };
+            run_launch_vault(
+                &pipe_name,
+                parsed.timeout_ms,
+                call_ms,
+                vault_id,
+                app,
+                extra_args,
+            )
+        }
+        CliCommand::CleanRoomScan => {
+            let call_ms = if parsed.timeout_explicit {
+                parsed.timeout_ms
+            } else {
+                35_000
+            };
+            run_cleanroom_scan(&pipe_name, parsed.timeout_ms, call_ms)
+        }
+        CliCommand::Check { recheck } => {
+            let call_ms = if parsed.timeout_explicit {
+                parsed.timeout_ms
+            } else {
+                65_000
+            };
+            run_check(&pipe_name, parsed.timeout_ms, call_ms, recheck)
+        }
         CliCommand::Restore => {
             run_restore(&pipe_name, &data_dir, parsed.timeout_ms, offline_executor)
         }
+        CliCommand::UnhookAll => run_unhook_all(&pipe_name, &data_dir, parsed.timeout_ms),
         CliCommand::Status => run_status(&pipe_name, &data_dir, parsed.timeout_ms),
     }
 }
 
-fn read_configured_hook_fail_mode(data_dir: &Path) -> HookFailMode {
-    match ConfigStore::new(data_dir).load_readonly() {
-        LoadedConfig::Loaded(outcome) => outcome.config.hook_fail_mode,
-        _ => HookFailMode::FailClosed,
+fn read_offline_hook_policy_with_fallback(
+    data_dir: &Path,
+    public_policy_dir_override: Option<&Path>,
+) -> crate::hook_installer::PublicHookPolicy {
+    if let Ok(Some(_)) = disarm::read_disarmed(data_dir) {
+        return crate::hook_installer::PublicHookPolicy {
+            hook_fail_mode: HookFailMode::FailOpenWithWarn,
+            disarmed: true,
+        };
     }
+
+    let cfg_path = data_dir.join("config.json");
+    let permission_denied = std::fs::metadata(&cfg_path)
+        .err()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+
+    if !permission_denied {
+        return match ConfigStore::new(data_dir).load_readonly() {
+            LoadedConfig::Loaded(outcome) => crate::hook_installer::PublicHookPolicy {
+                hook_fail_mode: outcome.config.hook_fail_mode,
+                disarmed: false,
+            },
+            LoadedConfig::NotFound => {
+                if let Some(pol) = public_policy_dir_override
+                    .and_then(crate::hook_installer::read_public_hook_policy_in)
+                    .or_else(|| crate::hook_installer::read_public_hook_policy_in(data_dir))
+                {
+                    pol
+                } else {
+                    crate::hook_installer::PublicHookPolicy {
+                        hook_fail_mode: HookFailMode::FailClosed,
+                        disarmed: false,
+                    }
+                }
+            }
+            LoadedConfig::Corrupt { .. } => crate::hook_installer::PublicHookPolicy {
+                hook_fail_mode: HookFailMode::FailClosed,
+                disarmed: false,
+            },
+        };
+    }
+
+    public_policy_dir_override
+        .and_then(crate::hook_installer::read_public_hook_policy_in)
+        .or_else(crate::hook_installer::read_public_hook_policy)
+        .unwrap_or(crate::hook_installer::PublicHookPolicy {
+            hook_fail_mode: HookFailMode::FailClosed,
+            disarmed: false,
+        })
 }
 
 fn format_hook_block_output(
@@ -424,8 +501,16 @@ fn run_hook_gate(
             exit_code_block,
         ),
         Err(err) => {
-            let fail_mode = read_configured_hook_fail_mode(data_dir);
-            match fail_mode {
+            let offline_pol = read_offline_hook_policy_with_fallback(data_dir, None);
+            if offline_pol.disarmed {
+                return CliOutput {
+                    exit_code: 0,
+                    json: None,
+                    text: None,
+                    stderr: None,
+                };
+            }
+            match offline_pol.hook_fail_mode {
                 HookFailMode::FailOpenWithWarn => CliOutput {
                     exit_code: 0,
                     json: None,
@@ -449,12 +534,14 @@ fn run_hook_gate(
 
 fn run_launch_vault(
     pipe_name: &str,
-    timeout_ms: u32,
+    connect_timeout_ms: u32,
+    call_timeout_ms: u32,
     vault_id: String,
     app: VaultAppTarget,
     extra_args: Vec<String>,
 ) -> CliOutput {
-    let res = PipeClient::connect(pipe_name, timeout_ms).and_then(|mut c| {
+    let res = PipeClient::connect(pipe_name, connect_timeout_ms).and_then(|mut c| {
+        c.set_call_timeout_ms(call_timeout_ms.max(1));
         c.call(&PipeRequest::LaunchVault {
             vault_id: vault_id.clone(),
             app,
@@ -511,14 +598,16 @@ fn run_launch_vault(
     }
 }
 
-fn run_cleanroom_scan(pipe_name: &str, timeout_ms: u32) -> CliOutput {
+fn run_cleanroom_scan(pipe_name: &str, connect_timeout_ms: u32, call_timeout_ms: u32) -> CliOutput {
     let scope = CleanRoomScope {
         claude: true,
         chatgpt_codex: true,
         antigravity: true,
     };
-    let res = PipeClient::connect(pipe_name, timeout_ms)
-        .and_then(|mut c| c.call(&PipeRequest::ScanCleanRoom { scope }));
+    let res = PipeClient::connect(pipe_name, connect_timeout_ms).and_then(|mut c| {
+        c.set_call_timeout_ms(call_timeout_ms.max(1));
+        c.call(&PipeRequest::ScanCleanRoom { scope })
+    });
     match res {
         Ok(PipeResponse::CleanRoomScan { report }) => CliOutput {
             exit_code: 0,
@@ -557,9 +646,17 @@ fn run_cleanroom_scan(pipe_name: &str, timeout_ms: u32) -> CliOutput {
     }
 }
 
-fn run_check(pipe_name: &str, timeout_ms: u32, recheck: bool) -> CliOutput {
-    let mut client = match PipeClient::connect(pipe_name, timeout_ms) {
-        Ok(c) => c,
+fn run_check(
+    pipe_name: &str,
+    connect_timeout_ms: u32,
+    call_timeout_ms: u32,
+    recheck: bool,
+) -> CliOutput {
+    let mut client = match PipeClient::connect(pipe_name, connect_timeout_ms) {
+        Ok(mut c) => {
+            c.set_call_timeout_ms(call_timeout_ms.max(1));
+            c
+        }
         Err(err) => {
             return CliOutput {
                 exit_code: 2,
@@ -794,7 +891,14 @@ fn run_offline_restore(
 
     if report.ok && report.verified && env_rollback_err.is_none() {
         match disarm::mark_disarmed(data_dir, "claudeguard-cli --restore (offline)") {
-            Ok(()) => disarm_marked = true,
+            Ok(()) => {
+                disarm_marked = true;
+                let mode = match ConfigStore::new(data_dir).load_readonly() {
+                    LoadedConfig::Loaded(o) => o.config.hook_fail_mode,
+                    _ => HookFailMode::FailClosed,
+                };
+                crate::hook_installer::sync_public_hook_policy_for_data_dir(data_dir, mode, true);
+            }
             Err(err) => disarm_error = Some(err),
         }
     }
@@ -840,6 +944,45 @@ fn run_offline_restore(
         })),
         text: None,
         stderr,
+    }
+}
+
+fn run_unhook_all(pipe_name: &str, data_dir: &Path, timeout_ms: u32) -> CliOutput {
+    let mut vaults = Vec::new();
+    if let Ok(mut client) = PipeClient::connect(pipe_name, timeout_ms.min(1_000)) {
+        if let Ok(PipeResponse::Snapshot { snapshot }) = client.call(&PipeRequest::GetSnapshot) {
+            vaults = snapshot.config.vaults;
+        }
+        let _ = client.call(&PipeRequest::ConfigureCliHooks {
+            install_claude_code: false,
+            install_pwsh_profile: false,
+            sync_all_vaults: true,
+        });
+    }
+    if vaults.is_empty() {
+        if let LoadedConfig::Loaded(outcome) = ConfigStore::new(data_dir).load_readonly() {
+            vaults = outcome.config.vaults;
+        }
+    }
+    match crate::hook_installer::unhook_all_user_profiles(&vaults) {
+        Ok(profiles_cleaned) => CliOutput {
+            exit_code: 0,
+            json: Some(serde_json::json!({
+                "ok": true,
+                "profiles_cleaned": profiles_cleaned,
+            })),
+            text: None,
+            stderr: None,
+        },
+        Err(err) => CliOutput {
+            exit_code: 1,
+            json: Some(serde_json::json!({
+                "ok": false,
+                "error": err,
+            })),
+            text: None,
+            stderr: Some(err),
+        },
     }
 }
 
@@ -1388,5 +1531,49 @@ mod tests {
         assert!(disarm::read_disarmed(dir.path()).unwrap().is_some());
 
         rt.shutdown_graceful(StopBehavior::RunFlowBCleanup).unwrap();
+    }
+
+    #[test]
+    fn offline_hook_gate_respects_public_policy_fallback_and_unhook_all_flag() {
+        let parsed = parse_args(&["--unhook-all".into()]).unwrap();
+        assert_eq!(parsed.command, CliCommand::UnhookAll);
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+
+        // 1) Public policy fallback with FailOpenWithWarn allows offline hook-gate when data_dir has no config.
+        crate::hook_installer::sync_public_hook_policy_in(
+            home_dir.path(),
+            HookFailMode::FailOpenWithWarn,
+            false,
+        )
+        .unwrap();
+        let pol_open =
+            read_offline_hook_policy_with_fallback(data_dir.path(), Some(home_dir.path()));
+        assert_eq!(pol_open.hook_fail_mode, HookFailMode::FailOpenWithWarn);
+        assert!(!pol_open.disarmed);
+
+        // 2) Public policy disarmed=true allows immediately when daemon is offline.
+        crate::hook_installer::sync_public_hook_policy_in(
+            home_dir.path(),
+            HookFailMode::FailClosed,
+            true,
+        )
+        .unwrap();
+        let pol_disarmed =
+            read_offline_hook_policy_with_fallback(data_dir.path(), Some(home_dir.path()));
+        assert!(pol_disarmed.disarmed);
+
+        // 3) Readable disarm marker in data_dir overrides stale public policy.
+        crate::hook_installer::sync_public_hook_policy_in(
+            home_dir.path(),
+            HookFailMode::FailClosed,
+            false,
+        )
+        .unwrap();
+        disarm::mark_disarmed(data_dir.path(), "unit test disarm").unwrap();
+        let pol_marker =
+            read_offline_hook_policy_with_fallback(data_dir.path(), Some(home_dir.path()));
+        assert!(pol_marker.disarmed);
     }
 }

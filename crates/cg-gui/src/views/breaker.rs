@@ -347,7 +347,8 @@ pub fn render_breaker_page(
                                 .flex_wrap()
                                 .items_center()
                                 .gap(px(8.))
-                                .child(
+                                .child({
+                                    let can_lock = ctrl.read(cx).can_trigger_lockdown();
                                     action_button(
                                         "br-lock-toggle",
                                         if lockdown_manual {
@@ -364,10 +365,10 @@ pub fn render_breaker_page(
                                         } else {
                                             ButtonKind::DangerSoft
                                         },
-                                        can_act,
+                                        can_lock,
                                         p,
                                     )
-                                    .when(can_act, |b| {
+                                    .when(can_lock, |b| {
                                         b.on_mouse_up(
                                             MouseButton::Left,
                                             cx.listener(move |_, _, _, cx| {
@@ -391,8 +392,8 @@ pub fn render_breaker_page(
                                                 });
                                             }),
                                         )
-                                    }),
-                                )
+                                    })
+                                })
                                 .child(
                                     action_button(
                                         "br-disarm-all",
@@ -508,7 +509,7 @@ pub fn render_breaker_page(
             };
 
             let rules_card = div().w_full().flex().child(
-                bento_card_bloom(p, 17., 13., choreo.tile(1, 0))
+                bento_card_bloom(p, 17., 13., choreo.tile(2, 0))
                     .flex_1()
                     .gap(px(4.))
                     .child(
@@ -811,7 +812,7 @@ pub fn render_breaker_page(
                 )
                 .child(wfp_engine_card)
                 .child(rules_card)
-                .child(choreo.tile(1, 1).apply(guide))
+                .child(choreo.tile(3, 0).apply(guide))
         }
 
         BreakerSubTab::Live => {
@@ -1144,7 +1145,9 @@ pub fn render_breaker_page(
             let filter_chips = [
                 (None, "全部"),
                 (Some("claude"), "Claude"),
+                (Some("claude-code"), "Claude Code"),
                 (Some("chatgpt"), "ChatGPT"),
+                (Some("codex"), "Codex CLI"),
                 (Some("antigravity"), "Antigravity"),
             ]
             .into_iter()
@@ -1190,16 +1193,24 @@ pub fn render_breaker_page(
             });
 
             let ctrl_clear_wfp = ctrl.clone();
-            let wfp_rows: Vec<Div> = filtered_wfp
+            let wfp_rows: Vec<gpui::AnyElement> = filtered_wfp
                 .into_iter()
-                .map(|ev| {
+                .enumerate()
+                .map(|(row_idx, ev)| {
                     let ip_disp = mask_wfp_event_ip(ev, privacy_mask);
+                    let copy_endpoint = format!("{ip_disp}:{}", ev.remote_port);
                     let hm = format_unix_hm(ev.timestamp_ms / 1000);
                     let pid_str = ev
                         .pid
                         .map(|pid| format!("PID {pid}"))
                         .unwrap_or_else(|| "内核".into());
+                    let ctrl_copy_wfp = ctrl.clone();
+                    let row_hover = p.sidebar_hover_bg;
                     div()
+                        .id(gpui::ElementId::Name(
+                            format!("wfp-ev-{}-{row_idx}", ev.seq).into(),
+                        ))
+                        .cursor_pointer()
                         .flex()
                         .items_center()
                         .justify_between()
@@ -1210,6 +1221,16 @@ pub fn render_breaker_page(
                         .bg(rgb(p.inset_bg))
                         .border_1()
                         .border_color(rgb(p.card_border))
+                        .hover(move |s| s.bg(rgb(row_hover)))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                let endpoint = copy_endpoint.clone();
+                                ctrl_copy_wfp.update(cx, |c, cx| {
+                                    c.copy_to_clipboard(endpoint, "拦截远端地址", cx);
+                                });
+                            }),
+                        )
                         .child(
                             div()
                                 .flex()
@@ -1251,6 +1272,7 @@ pub fn render_breaker_page(
                             BadgeTone::Fail,
                             p,
                         ))
+                        .into_any_element()
                 })
                 .collect();
 

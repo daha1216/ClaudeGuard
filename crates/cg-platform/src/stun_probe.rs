@@ -109,50 +109,93 @@ pub fn decode_binding_response(buf: &[u8], expected_tx_id: &[u8; 12]) -> Option<
     fallback_mapped
 }
 
-fn resolve_endpoint_ipv4_bounded(
+fn resolve_endpoint_dual_stack_bounded(
     endpoint: &str,
     timeout: Duration,
-) -> Option<std::net::SocketAddr> {
+) -> (Option<std::net::SocketAddr>, Option<std::net::SocketAddr>) {
     if let Ok(sa) = endpoint.parse::<std::net::SocketAddr>() {
-        return sa.is_ipv4().then_some(sa);
+        return if sa.is_ipv4() {
+            (Some(sa), None)
+        } else {
+            (None, Some(sa))
+        };
     }
     if timeout.is_zero() {
-        return None;
+        return (None, None);
     }
     let owned = endpoint.to_string();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let found = owned
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut it| it.find(|a| a.is_ipv4()));
-        let _ = tx.send(found);
+        let mut v4 = None;
+        let mut v6 = None;
+        if let Ok(iter) = owned.to_socket_addrs() {
+            for addr in iter {
+                if addr.is_ipv4() && v4.is_none() {
+                    v4 = Some(addr);
+                } else if addr.is_ipv6() && v6.is_none() {
+                    v6 = Some(addr);
+                }
+                if v4.is_some() && v6.is_some() {
+                    break;
+                }
+            }
+        }
+        let _ = tx.send((v4, v6));
     });
-    rx.recv_timeout(timeout).ok().flatten()
+    rx.recv_timeout(timeout).ok().unwrap_or((None, None))
 }
 
-/// Execute a single non-intrusive UDP STUN reflection probe within a strict overall `timeout`
-/// wall-clock budget (including bounded DNS resolution across all fallback endpoints).
-pub fn probe_stun_reflexive_ip_with_timeout(tx_seed: u64, timeout: Duration) -> StunProbeOutcome {
+fn probe_single_stun_socket(
+    sock: &UdpSocket,
+    target: std::net::SocketAddr,
+    req: &[u8; 20],
+    tx_id: &[u8; 12],
+    io_budget: Duration,
+) -> Option<IpAddr> {
+    let _ = sock.set_read_timeout(Some(io_budget));
+    let _ = sock.set_write_timeout(Some(io_budget));
+    sock.send_to(req, target).ok()?;
+    let mut resp = [0u8; 512];
+    let (n, _) = sock.recv_from(&mut resp).ok()?;
+    decode_binding_response(&resp[..n], tx_id)
+}
+
+/// Probes both IPv4 (`0.0.0.0:0`) and IPv6 (`[::]:0`) STUN endpoints within a single bounded
+/// `timeout` budget so domestic dual-stack IPv6 WebRTC leaks are caught even when IPv4 is clean.
+pub fn probe_stun_dual_stack_with_timeout(
+    tx_seed: u64,
+    timeout: Duration,
+) -> (Option<IpAddr>, Option<IpAddr>) {
     let bounded_total = timeout.clamp(
         Duration::from_millis(MIN_STUN_TIMEOUT_MS),
         Duration::from_millis(MAX_STUN_TIMEOUT_MS),
     );
     let deadline = std::time::Instant::now() + bounded_total;
 
-    let mut tx_id = [0u8; 12];
-    tx_id[0..8].copy_from_slice(&tx_seed.to_le_bytes());
-    tx_id[8..12].copy_from_slice(&0xC6_05_53_89u32.to_be_bytes());
-    let req = encode_binding_request(tx_id);
+    let mut tx_v4 = [0u8; 12];
+    tx_v4[0..8].copy_from_slice(&tx_seed.to_le_bytes());
+    tx_v4[8..12].copy_from_slice(&0xC6_05_53_89u32.to_be_bytes());
+    let req_v4 = encode_binding_request(tx_v4);
 
-    let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
-        return StunProbeOutcome::BlockedOrUnreachable;
-    };
+    let mut tx_v6 = tx_v4;
+    tx_v6[11] ^= 0x66;
+    let req_v6 = encode_binding_request(tx_v6);
+
+    let sock_v4 = UdpSocket::bind("0.0.0.0:0").ok();
+    let sock_v6 = UdpSocket::bind("[::]:0").ok();
+    if sock_v4.is_none() && sock_v6.is_none() {
+        return (None, None);
+    }
+
+    let mut found_v4: Option<IpAddr> = None;
+    let mut found_v6: Option<IpAddr> = None;
 
     let total_eps = STUN_ENDPOINTS.len().max(1);
     for (idx, endpoint) in STUN_ENDPOINTS.iter().enumerate() {
-        let now = std::time::Instant::now();
-        let remaining = deadline.saturating_duration_since(now);
+        if found_v4.is_some() && (found_v6.is_some() || sock_v6.is_none()) {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             break;
         }
@@ -161,31 +204,43 @@ pub fn probe_stun_reflexive_ip_with_timeout(tx_seed: u64, timeout: Duration) -> 
             .max(Duration::from_millis(100))
             .min(remaining);
 
-        let Some(target) = resolve_endpoint_ipv4_bounded(endpoint, step_budget) else {
-            continue;
-        };
+        let (target_v4, target_v6) = resolve_endpoint_dual_stack_bounded(endpoint, step_budget);
 
         let after_dns = deadline.saturating_duration_since(std::time::Instant::now());
         if after_dns.is_zero() {
             break;
         }
-        let io_budget = (after_dns / eps_left)
+        let io_budget = (after_dns / (eps_left * 2).max(1))
             .max(Duration::from_millis(80))
             .min(after_dns);
-        let _ = sock.set_read_timeout(Some(io_budget));
-        let _ = sock.set_write_timeout(Some(io_budget));
 
-        if sock.send_to(&req, target).is_err() {
-            continue;
+        if found_v4.is_none() {
+            if let (Some(ref s4), Some(t4)) = (&sock_v4, target_v4) {
+                found_v4 = probe_single_stun_socket(s4, t4, &req_v4, &tx_v4, io_budget);
+            }
         }
-        let mut resp = [0u8; 512];
-        if let Ok((n, _)) = sock.recv_from(&mut resp) {
-            if let Some(ip) = decode_binding_response(&resp[..n], &tx_id) {
-                return StunProbeOutcome::ReflexiveIp(ip);
+        if found_v6.is_none() {
+            let rem6 = deadline.saturating_duration_since(std::time::Instant::now());
+            if !rem6.is_zero() {
+                let io6 = io_budget.min(rem6);
+                if let (Some(ref s6), Some(t6)) = (&sock_v6, target_v6) {
+                    found_v6 = probe_single_stun_socket(s6, t6, &req_v6, &tx_v6, io6);
+                }
             }
         }
     }
-    StunProbeOutcome::BlockedOrUnreachable
+
+    (found_v4, found_v6)
+}
+
+/// Execute a single non-intrusive UDP STUN reflection probe within a strict overall `timeout`
+/// wall-clock budget (including bounded dual-stack DNS resolution across all fallback endpoints).
+pub fn probe_stun_reflexive_ip_with_timeout(tx_seed: u64, timeout: Duration) -> StunProbeOutcome {
+    let (v4, v6) = probe_stun_dual_stack_with_timeout(tx_seed, timeout);
+    match v4.or(v6) {
+        Some(ip) => StunProbeOutcome::ReflexiveIp(ip),
+        None => StunProbeOutcome::BlockedOrUnreachable,
+    }
 }
 
 /// Execute a single non-intrusive UDP STUN reflection probe (1.2s per-endpoint timeout).
@@ -270,8 +325,8 @@ pub fn evaluate_stun_outcome(
     }
 }
 
-/// Probe direct UDP STUN reachability and evaluate whether WebRTC can expose a real ISP IP
-/// diverging from `expected_proxy_ip`.
+/// Probe direct dual-stack (IPv4 + IPv6) UDP STUN reachability and evaluate whether WebRTC can
+/// expose a real ISP IPv4 or native carrier IPv6 diverging from `expected_proxy_ip`.
 pub fn probe_webrtc_stun_leak(
     expected_proxy_ip: Option<&str>,
     timeout_ms: u64,
@@ -279,8 +334,43 @@ pub fn probe_webrtc_stun_leak(
 ) -> StunLeakReport {
     let clamped = timeout_ms.clamp(MIN_STUN_TIMEOUT_MS, MAX_STUN_TIMEOUT_MS);
     let seed = now_secs ^ 0x5389_A442_0000_0001;
-    let outcome = probe_stun_reflexive_ip_with_timeout(seed, Duration::from_millis(clamped));
-    evaluate_stun_outcome(outcome, expected_proxy_ip, now_secs)
+    let (v4_opt, v6_opt) = probe_stun_dual_stack_with_timeout(seed, Duration::from_millis(clamped));
+
+    if let Some(v4) = v4_opt {
+        let rep4 = evaluate_stun_outcome(
+            StunProbeOutcome::ReflexiveIp(v4),
+            expected_proxy_ip,
+            now_secs,
+        );
+        if rep4.leaked {
+            return rep4;
+        }
+        // IPv4 was clean/TUN-covered — check whether native IPv6 bypassed the IPv4 tunnel!
+        if let Some(v6) = v6_opt {
+            let rep6 = evaluate_stun_outcome(
+                StunProbeOutcome::ReflexiveIp(v6),
+                expected_proxy_ip,
+                now_secs,
+            );
+            if rep6.leaked {
+                return rep6;
+            }
+        }
+        return rep4;
+    }
+
+    match v6_opt {
+        Some(v6) => evaluate_stun_outcome(
+            StunProbeOutcome::ReflexiveIp(v6),
+            expected_proxy_ip,
+            now_secs,
+        ),
+        None => evaluate_stun_outcome(
+            StunProbeOutcome::BlockedOrUnreachable,
+            expected_proxy_ip,
+            now_secs,
+        ),
+    }
 }
 
 #[cfg(test)]

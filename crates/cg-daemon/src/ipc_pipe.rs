@@ -38,8 +38,7 @@ const MAX_REQUESTS_PER_CONNECTION: usize = 256;
 /// slow-pinging clients from pinning all `MAX_PIPE_INSTANCES` slots indefinitely.
 const MAX_CONNECTION_LIFETIME_SECS: u64 = 60;
 
-/// Returns true for read-only / non-mutating [`PipeRequest`] variants permitted across sessions
-/// (plus `NotifySystemShutdown` so shutdown/logoff session transitions never drop OS power hints).
+/// Returns true for strictly read-only / non-mutating [`PipeRequest`] variants permitted across sessions.
 pub fn is_readonly_pipe_request(req: &PipeRequest) -> bool {
     matches!(
         req,
@@ -50,7 +49,6 @@ pub fn is_readonly_pipe_request(req: &PipeRequest) -> bool {
             | PipeRequest::ListCleanRoomBackups
             | PipeRequest::BuildHealthCard { export_png: false }
             | PipeRequest::QueryLogs { .. }
-            | PipeRequest::NotifySystemShutdown
     )
 }
 
@@ -453,13 +451,27 @@ mod win_impl {
         }
     }
 
+    fn server_remaining_ms(deadline: Instant, op: &str) -> Result<u32, PipeError> {
+        let rem = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis();
+        if rem == 0 {
+            return Err(PipeError::BusyTimeout(format!(
+                "pipe {op} timed out after {PIPE_IO_TIMEOUT_MS}ms"
+            )));
+        }
+        Ok(rem.min(u128::from(u32::MAX - 1)) as u32)
+    }
+
     fn read_exact_overlapped(
         pipe: HANDLE,
         io_event: HANDLE,
         shutdown_event: HANDLE,
         mut dst: &mut [u8],
+        deadline: Instant,
     ) -> Result<(), PipeError> {
         while !dst.is_empty() {
+            let wait_ms = server_remaining_ms(deadline, "read")?;
             unsafe {
                 let _ = ResetEvent(io_event);
             }
@@ -477,8 +489,7 @@ mod win_impl {
                 }
                 Err(e) if win32_code(&e) == ERROR_IO_PENDING => {
                     let handles = [io_event, shutdown_event];
-                    let wait =
-                        unsafe { WaitForMultipleObjects(&handles, FALSE, PIPE_IO_TIMEOUT_MS) };
+                    let wait = unsafe { WaitForMultipleObjects(&handles, FALSE, wait_ms) };
                     if wait == WAIT_OBJECT_0 {
                         let mut n = 0u32;
                         unsafe { GetOverlappedResult(pipe, &overlapped, &mut n, FALSE) }
@@ -517,8 +528,10 @@ mod win_impl {
         io_event: HANDLE,
         shutdown_event: HANDLE,
         mut src: &[u8],
+        deadline: Instant,
     ) -> Result<(), PipeError> {
         while !src.is_empty() {
+            let wait_ms = server_remaining_ms(deadline, "write")?;
             unsafe {
                 let _ = ResetEvent(io_event);
             }
@@ -536,8 +549,7 @@ mod win_impl {
                 }
                 Err(e) if win32_code(&e) == ERROR_IO_PENDING => {
                     let handles = [io_event, shutdown_event];
-                    let wait =
-                        unsafe { WaitForMultipleObjects(&handles, FALSE, PIPE_IO_TIMEOUT_MS) };
+                    let wait = unsafe { WaitForMultipleObjects(&handles, FALSE, wait_ms) };
                     if wait == WAIT_OBJECT_0 {
                         let mut n = 0u32;
                         unsafe { GetOverlappedResult(pipe, &overlapped, &mut n, FALSE) }
@@ -601,13 +613,28 @@ mod win_impl {
         pipe: HANDLE,
         io_event: HANDLE,
         shutdown_event: HANDLE,
+        conn_deadline: Instant,
     ) -> Result<Vec<u8>, PipeError> {
+        let frame_deadline = (Instant::now()
+            + Duration::from_millis(u64::from(PIPE_IO_TIMEOUT_MS)))
+        .min(conn_deadline);
         let mut header = [0u8; 4];
-        read_exact_overlapped(pipe, io_event, shutdown_event, &mut header)?;
+        read_exact_overlapped(pipe, io_event, shutdown_event, &mut header, frame_deadline)?;
+        // Once the client starts sending a frame, bound the remaining payload bytes by a single
+        // per-frame deadline (`PIPE_IO_TIMEOUT_MS`) capped by `conn_deadline`.
+        let payload_deadline = (Instant::now()
+            + Duration::from_millis(u64::from(PIPE_IO_TIMEOUT_MS)))
+        .min(conn_deadline);
         let len = u32::from_le_bytes(header) as usize;
         validate_request_len(len)?;
         let mut payload = vec![0u8; len];
-        read_exact_overlapped(pipe, io_event, shutdown_event, &mut payload)?;
+        read_exact_overlapped(
+            pipe,
+            io_event,
+            shutdown_event,
+            &mut payload,
+            payload_deadline,
+        )?;
         Ok(payload)
     }
 
@@ -624,12 +651,13 @@ mod win_impl {
         };
         let in_session_zero = cg_platform::access_win::is_session_zero();
         let conn_started = std::time::Instant::now();
+        let conn_deadline = conn_started + Duration::from_secs(MAX_CONNECTION_LIFETIME_SECS);
         let mut served_requests = 0usize;
 
         loop {
             if shutdown_event.raw().is_invalid()
                 || served_requests >= MAX_REQUESTS_PER_CONNECTION
-                || conn_started.elapsed().as_secs() >= MAX_CONNECTION_LIFETIME_SECS
+                || Instant::now() >= conn_deadline
             {
                 break;
             }
@@ -637,6 +665,7 @@ mod win_impl {
                 pipe.raw(),
                 io_event.raw(),
                 shutdown_event.raw(),
+                conn_deadline,
             ) {
                 Ok(bytes) => bytes,
                 Err(_) => break,
@@ -680,8 +709,16 @@ mod win_impl {
                 }
             };
 
-            if write_all_overlapped(pipe.raw(), io_event.raw(), shutdown_event.raw(), &encoded)
-                .is_err()
+            let write_deadline =
+                Instant::now() + Duration::from_millis(u64::from(PIPE_IO_TIMEOUT_MS));
+            if write_all_overlapped(
+                pipe.raw(),
+                io_event.raw(),
+                shutdown_event.raw(),
+                &encoded,
+                write_deadline,
+            )
+            .is_err()
             {
                 break;
             }
@@ -898,6 +935,7 @@ mod win_impl {
         handle: OwnedHandle,
         io_event: SharedEvent,
         call_timeout_ms: u32,
+        poisoned: bool,
     }
 
     impl PipeClient {
@@ -930,6 +968,7 @@ mod win_impl {
                             handle: owned,
                             io_event,
                             call_timeout_ms: CLIENT_CALL_TIMEOUT_MS,
+                            poisoned: false,
                         });
                     }
                     Err(e) if win32_code(&e) == ERROR_PIPE_BUSY => {
@@ -958,20 +997,32 @@ mod win_impl {
         }
 
         /// Sends one [`PipeRequest`] and waits for its [`PipeResponse`] within `call_timeout_ms`.
+        ///
+        /// If any transport timeout, partial I/O, or framing error occurs after writing begins,
+        /// this connection is marked poisoned so a subsequent call can never read a delayed response
+        /// belonging to an earlier timed-out request.
         pub fn call(&mut self, req: &PipeRequest) -> Result<PipeResponse, PipeError> {
+            if self.poisoned {
+                return Err(PipeError::Disconnected);
+            }
             let encoded = encode_frame(req)?;
             let deadline =
                 Instant::now() + Duration::from_millis(u64::from(self.call_timeout_ms.max(1)));
-            self.write_all_overlapped(&encoded, deadline)?;
-
-            let mut header = [0u8; 4];
-            self.read_exact_overlapped(&mut header, deadline)?;
-            let len = u32::from_le_bytes(header) as usize;
-            validate_response_len(len)?;
-            let mut payload = vec![0u8; len];
-            self.read_exact_overlapped(&mut payload, deadline)?;
-            serde_json::from_slice(&payload)
-                .map_err(|e| PipeError::Frame(FrameError::DecodeFailed(e.to_string())))
+            let result = (|| -> Result<PipeResponse, PipeError> {
+                self.write_all_overlapped(&encoded, deadline)?;
+                let mut header = [0u8; 4];
+                self.read_exact_overlapped(&mut header, deadline)?;
+                let len = u32::from_le_bytes(header) as usize;
+                validate_response_len(len)?;
+                let mut payload = vec![0u8; len];
+                self.read_exact_overlapped(&mut payload, deadline)?;
+                serde_json::from_slice(&payload)
+                    .map_err(|e| PipeError::Frame(FrameError::DecodeFailed(e.to_string())))
+            })();
+            if result.is_err() {
+                self.poisoned = true;
+            }
+            result
         }
 
         fn remaining_ms(&self, deadline: Instant) -> Result<u32, PipeError> {
@@ -1327,8 +1378,11 @@ mod tests {
             until_ts: None,
             limit: None,
             query: None,
+            level: None,
         }));
-        assert!(is_readonly_pipe_request(&PipeRequest::NotifySystemShutdown));
+        assert!(!is_readonly_pipe_request(
+            &PipeRequest::NotifySystemShutdown
+        ));
         assert!(is_readonly_pipe_request(&PipeRequest::FastHookGate {
             agent_id: "claude-code".into(),
             vault_id: None,
@@ -1379,6 +1433,14 @@ mod tests {
             })
             .expect_err("must time out");
         assert!(matches!(timeout_err, PipeError::BusyTimeout(_)));
+        slow_client.set_call_timeout_ms(2_000);
+        assert!(
+            matches!(
+                slow_client.call(&PipeRequest::GetSnapshot),
+                Err(PipeError::Disconnected)
+            ),
+            "timed-out PipeClient must poison stream instead of reading stale delayed frames"
+        );
         drop(slow_client);
 
         // 2) Oversized request (> 256 KiB) is rejected and disconnected by PipeServer, while server stays alive.

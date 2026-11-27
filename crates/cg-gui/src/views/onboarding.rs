@@ -42,8 +42,11 @@ pub fn render_onboarding_modal(
     let busy = ctrl_r.busy_action;
     let start_svc_busy = ctrl_r.is_scope_busy(&crate::app::ActionScope::StartService);
     let proxy_off_sim = ctrl_r.onboarding_proxy_off_sim;
+    let detected_ports = ctrl_r.onboarding_detected_ports.clone();
+    let port_override_raw = ctrl_r.onboarding_port_override.trim().to_string();
     let cidr_in = ctrl_r.inputs.onboarding_cidr.clone();
     let reg_in = ctrl_r.inputs.onboarding_regions.clone();
+    let port_in = ctrl_r.inputs.onboarding_port.clone();
 
     let ctrl_skip = ctrl.clone();
     let ctrl_done = ctrl.clone();
@@ -51,12 +54,22 @@ pub fn render_onboarding_modal(
     let ctrl_reconn = ctrl.clone();
     let ctrl_reprobe = ctrl.clone();
     let ctrl_sim_toggle = ctrl.clone();
+    let ctrl_apply_port = ctrl.clone();
+
+    let active_port = port_override_raw
+        .parse::<u16>()
+        .ok()
+        .filter(|&pt| pt > 0)
+        .or_else(|| probe.as_ref().and_then(|pr| pr.detected_proxy_port));
+    let show_port_radar = !detected_ports.is_empty()
+        || probe
+            .as_ref()
+            .is_some_and(|pr| pr.detected_proxy_port.is_none() || pr.standby_notice.is_some());
 
     let access_summary = probe
         .as_ref()
         .map(|pr| {
-            let port = pr
-                .detected_proxy_port
+            let port = active_port
                 .map(|port| format!("本地代理 :{port}"))
                 .unwrap_or_else(|| pr.access.level.label().to_string());
             let apps = if pr.installed_agents.is_empty() {
@@ -301,6 +314,124 @@ pub fn render_onboarding_modal(
                             .child(standby),
                     )
                 })
+                .when(show_port_radar, |card| {
+                    let port_pills = detected_ports.into_iter().map(|pt| {
+                        let is_cur = active_port == Some(pt);
+                        let hint = match pt {
+                            7897 => "Clash Verge",
+                            7890 | 7891 => "Mihomo / Clash",
+                            10808 | 10809 => "v2rayN",
+                            2080 => "Sing-box / Neko",
+                            _ => "本机监听",
+                        };
+                        let ctrl_pt = ctrl.clone();
+                        let pill_hover = p.sidebar_hover_bg;
+                        div()
+                            .id(gpui::ElementId::Name(format!("onb-port-pill-{pt}").into()))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.))
+                            .px(px(9.))
+                            .py(px(4.))
+                            .rounded(px(8.))
+                            .bg(rgb(if is_cur { p.accent_soft_bg } else { p.card_bg }))
+                            .border_1()
+                            .border_color(rgb(if is_cur {
+                                p.accent_soft_border
+                            } else {
+                                p.card_border
+                            }))
+                            .hover(move |s| s.bg(rgb(pill_hover)))
+                            .text_size(px(11.))
+                            .font_weight(if is_cur {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::MEDIUM
+                            })
+                            .text_color(rgb(if is_cur {
+                                p.accent_soft_text
+                            } else {
+                                p.text_primary
+                            }))
+                            .child(status_dot(
+                                if is_cur {
+                                    p.badge_pass.dot
+                                } else {
+                                    p.primary_btn_bg
+                                },
+                                5.5,
+                            ))
+                            .child(if is_cur {
+                                format!(":{pt} ({hint}) · 已选")
+                            } else {
+                                format!("检测到 :{pt} ({hint}) · 采纳并测速")
+                            })
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, _, cx| {
+                                    ctrl_pt.update(cx, |c, cx| {
+                                        c.adopt_onboarding_proxy_port(pt, cx);
+                                    });
+                                }),
+                            )
+                    });
+                    card.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(7.))
+                            .p(px(11.))
+                            .rounded(px(10.))
+                            .bg(rgb(p.inset_bg))
+                            .border_1()
+                            .border_color(rgb(p.inset_border))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(p.text_primary))
+                                            .child("本机代理端口雷达（非 :7890 或 TUN 模式下可一键采纳）"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.))
+                                            .child(div().w(px(110.)).child(port_in))
+                                            .child(
+                                                action_button(
+                                                    "onb-apply-typed-port",
+                                                    "应用并测速",
+                                                    ButtonKind::Secondary,
+                                                    !loading && !submitting,
+                                                    p,
+                                                )
+                                                .h(px(30.))
+                                                .px(px(9.))
+                                                .text_size(px(11.))
+                                                .when(!loading && !submitting, |b| {
+                                                    b.on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |_, _, _, cx| {
+                                                            ctrl_apply_port.update(cx, |c, cx| {
+                                                                c.adopt_typed_onboarding_port(cx);
+                                                            });
+                                                        }),
+                                                    )
+                                                }),
+                                            ),
+                                    ),
+                            )
+                            .child(div().flex().flex_wrap().gap(px(6.)).children(port_pills)),
+                    )
+                })
                 .child(div().flex().flex_col().gap(px(8.)).children(radio_cards))
                 .when(selected == OnboardingStrategy::CustomCidrOrRegions, |card| {
                     card.child(
@@ -412,10 +543,10 @@ pub fn render_onboarding_modal(
                                         "onb-reconnect",
                                         "重连服务",
                                         ButtonKind::Secondary,
-                                        !busy,
+                                        !start_svc_busy,
                                         p,
                                     )
-                                    .when(!busy, |b| {
+                                    .when(!start_svc_busy, |b| {
                                         b.on_mouse_up(
                                             MouseButton::Left,
                                             cx.listener(move |_, _, _, cx| {
@@ -439,10 +570,10 @@ pub fn render_onboarding_modal(
                                             "启动守护服务"
                                         },
                                         ButtonKind::Primary,
-                                        !busy,
+                                        !start_svc_busy && !busy,
                                         p,
                                     )
-                                    .when(!busy, |b| {
+                                    .when(!start_svc_busy && !busy, |b| {
                                         b.on_mouse_up(
                                             MouseButton::Left,
                                             cx.listener(move |_, _, _, cx| {

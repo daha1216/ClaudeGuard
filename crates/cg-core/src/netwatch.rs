@@ -49,11 +49,66 @@ pub fn classify(remote: Ipv4Addr, port: u16, proxy_port: u16) -> RemoteKind {
     }
 }
 
+fn parse_proxy_v4_endpoint(raw: &str) -> Option<(Ipv4Addr, u16)> {
+    let trimmed = raw.trim();
+    let rest = match trimmed.find("://") {
+        Some(idx) => &trimmed[idx + 3..],
+        None => trimmed,
+    };
+    let rest = rest.trim().trim_end_matches('/');
+    let (host, port_str) = rest.split_once(':')?;
+    let port = port_str.trim().parse::<u16>().ok().filter(|&p| p > 0)?;
+    let host_trim = host.trim();
+    let ip = if host_trim.eq_ignore_ascii_case("localhost") {
+        Ipv4Addr::LOCALHOST
+    } else {
+        host_trim.parse::<Ipv4Addr>().ok()?
+    };
+    Some((ip, port))
+}
+
+fn classify_for_access(
+    remote: Ipv4Addr,
+    port: u16,
+    proxy_port: u16,
+    active_proxy: Option<(Ipv4Addr, u16)>,
+    extra_loopback_ports: &[u16],
+) -> RemoteKind {
+    if active_proxy == Some((remote, port)) {
+        return RemoteKind::Proxy;
+    }
+    if remote.is_loopback()
+        && (port == proxy_port
+            || extra_loopback_ports.contains(&port)
+            || active_proxy.is_some_and(|(ip, p)| ip.is_loopback() && p == port))
+    {
+        return RemoteKind::Proxy;
+    }
+    if is_local_v4(remote) || is_fake_ip_v4(remote) {
+        RemoteKind::Local
+    } else {
+        RemoteKind::Public
+    }
+}
+
 /// Folds raw ESTABLISHED TCP connections and guarded PID map into a [`LeakReport`].
 pub fn fold(
     conns: &[TcpConn],
     agents: &HashMap<u32, String>,
     proxy_port: u16,
+    access: &AccessEvidence,
+    now_secs: u64,
+) -> LeakReport {
+    fold_with_extra_proxy_ports(conns, agents, proxy_port, &[], access, now_secs)
+}
+
+/// Folds raw ESTABLISHED TCP connections into a [`LeakReport`], honoring `access.proxy_addr`
+/// (including LAN / CGNAT / remote proxy endpoints) and any additional dedicated Vault proxy ports.
+pub fn fold_with_extra_proxy_ports(
+    conns: &[TcpConn],
+    agents: &HashMap<u32, String>,
+    proxy_port: u16,
+    extra_proxy_ports: &[u16],
     access: &AccessEvidence,
     now_secs: u64,
 ) -> LeakReport {
@@ -69,6 +124,12 @@ pub fn fold(
         };
         return LeakReport::not_applicable(&mode, note, now_secs);
     }
+
+    let active_proxy = access
+        .proxy_addr
+        .as_deref()
+        .and_then(parse_proxy_v4_endpoint);
+    let display_port = active_proxy.map(|(_, p)| p).unwrap_or(proxy_port);
 
     let mut report = LeakReport {
         applicable: true,
@@ -90,7 +151,13 @@ pub fn fold(
         if is_fake_ip_v4(c.remote) {
             fake_ip += 1;
         }
-        match classify(c.remote, c.port, proxy_port) {
+        match classify_for_access(
+            c.remote,
+            c.port,
+            proxy_port,
+            active_proxy,
+            extra_proxy_ports,
+        ) {
             RemoteKind::Proxy => report.proxied += 1,
             RemoteKind::Local => report.local += 1,
             RemoteKind::Public => {
@@ -122,11 +189,18 @@ pub fn fold(
     }
     report.note = if report.direct_total > 0 {
         format!(
-            "发现 {} 条直连（未经本地代理端口 {}）",
-            report.direct_total, proxy_port
+            "发现 {} 条直连（未经代理端口 {}）",
+            report.direct_total, display_port
         )
     } else if report.agent_conns == 0 {
         "被守护应用当前没有已建立的连接".into()
+    } else if report.proxied == 0 && report.local > 0 {
+        format!(
+            "{} 条本地/内网连接（未命中代理端口 {}，无公网直连）",
+            report.local, display_port
+        )
+    } else if active_proxy.is_some_and(|(ip, _)| !ip.is_loopback()) {
+        format!("{} 条连接全部经配置代理转发", report.proxied)
     } else {
         format!("{} 条连接全部经本地代理", report.proxied)
     };
@@ -286,5 +360,28 @@ mod tests {
         assert!(report.applicable);
         assert_eq!(report.direct_total, 1);
         assert_eq!(report.direct[0].remote, "28.0.1.9");
+
+        // LAN proxy endpoint (e.g. 192.168.1.2:7897) and extra Vault ports count as proxied, not false leaks.
+        let lan_access = AccessEvidence {
+            level: AccessLevel::SystemProxy,
+            proxy_addr: Some("192.168.1.2:7897".into()),
+            ..AccessEvidence::default()
+        };
+        let lan_conns = vec![
+            TcpConn {
+                pid: 7,
+                remote: Ipv4Addr::new(192, 168, 1, 2),
+                port: 7897,
+            },
+            TcpConn {
+                pid: 7,
+                remote: Ipv4Addr::LOCALHOST,
+                port: 17890,
+            },
+        ];
+        let lan_report =
+            fold_with_extra_proxy_ports(&lan_conns, &agents, 7890, &[17890], &lan_access, 600);
+        assert!(!lan_report.leaked());
+        assert_eq!(lan_report.proxied, 2);
     }
 }

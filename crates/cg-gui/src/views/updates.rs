@@ -243,7 +243,7 @@ fn render_grid_card(
         .filter(|u| u.starts_with("https://"))
         .map(ToString::to_string)
         .or_else(|| spec.repo_url.map(ToString::to_string));
-    let link_label = if spec.repo_url.is_some() && !has_up {
+    let link_label = if spec.is_repo_track && !has_up {
         "仓库"
     } else if has_up {
         "下载"
@@ -541,7 +541,7 @@ pub fn render_updates_page(
             subtitle: "Anthropic 桌面端",
             source: "官方发布源",
             is_repo_track: false,
-            repo_url: None,
+            repo_url: Some("https://claude.ai/download"),
             has_plugins_btn: false,
             is_checking: checking_all
                 || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("claude_desktop".into())),
@@ -553,7 +553,7 @@ pub fn render_updates_page(
             subtitle: "@anthropic-ai/claude-code",
             source: "npm",
             is_repo_track: false,
-            repo_url: None,
+            repo_url: Some("https://www.npmjs.com/package/@anthropic-ai/claude-code"),
             has_plugins_btn: false,
             is_checking: checking_all
                 || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("claude_code".into())),
@@ -565,7 +565,7 @@ pub fn render_updates_page(
             subtitle: "OpenAI 桌面端",
             source: "官方发布源",
             is_repo_track: false,
-            repo_url: None,
+            repo_url: Some("https://openai.com/chatgpt/desktop/"),
             has_plugins_btn: false,
             is_checking: checking_all
                 || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("codex_desktop".into())),
@@ -577,7 +577,7 @@ pub fn render_updates_page(
             subtitle: "@openai/codex",
             source: "npm",
             is_repo_track: false,
-            repo_url: None,
+            repo_url: Some("https://www.npmjs.com/package/@openai/codex"),
             has_plugins_btn: false,
             is_checking: checking_all
                 || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("codex_cli".into())),
@@ -589,7 +589,7 @@ pub fn render_updates_page(
             subtitle: "Google 桌面端",
             source: "官方源",
             is_repo_track: false,
-            repo_url: None,
+            repo_url: Some("https://antigravity.google/download"),
             has_plugins_btn: true,
             is_checking: checking_all
                 || ctrl_r.is_scope_busy(&ActionScope::UpdatesComponent("antigravity_ide".into())),

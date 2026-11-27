@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,7 +21,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use cg_platform::{crypto_win, vault_win};
-use cg_protocol::{AccessLevel, HookDecision, PipeResponse, WslBridgeStatus};
+use cg_protocol::{AccessLevel, HookDecision, HookFailMode, PipeResponse, WslBridgeStatus};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
@@ -50,7 +50,12 @@ pub struct WslTokenFile {
     pub proxy_port: u16,
     pub secret_hex: String,
     pub boot_epoch: u64,
+    #[serde(default)]
+    pub fail_mode: HookFailMode,
 }
+
+/// Shared runtime handle allowing `RealEngineActor` to dynamically start/stop/refresh `WslBridgeServer`.
+pub type SharedWslBridge = Arc<Mutex<Option<WslBridgeServer>>>;
 
 /// Incoming single-line JSON request sent by WSL2 clients.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,41 +335,91 @@ pub fn evaluate_wsl_request(
     }
 }
 
-/// Live WSL2 loopback HMAC TCP server handle.
+/// Live WSL2 loopback + `vEthernet (WSL)` HMAC TCP server handle.
 pub struct WslBridgeServer {
     bound_addr: SocketAddr,
+    wsl_bound_addr: Option<SocketAddr>,
+    host_wsl_ip: String,
+    boot_epoch: u64,
     secret_hex: String,
-    token_path: Option<PathBuf>,
+    token_path: Mutex<Option<PathBuf>>,
     stop: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl WslBridgeServer {
-    /// Starts the loopback HMAC bridge on `127.0.0.1:0` and persists `.claudeguard-wsl-token`
-    /// inside `token_dir` (usually the interactive user home directory).
+    /// Starts the HMAC bridge on `127.0.0.1:0` (plus the host `vEthernet (WSL)` IPv4 when present
+    /// for default NAT-mode WSL2) and persists `.claudeguard-wsl-token` inside `token_dir`.
     pub fn start(
         coordinator: CoordinatorHandle,
         token_dir: Option<&Path>,
         proxy_port: u16,
     ) -> Result<Self, String> {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| format!("failed to bind WSL2 loopback bridge on 127.0.0.1:0: {e}"))?;
-        let bound_addr = listener
-            .local_addr()
-            .map_err(|e| format!("failed to inspect WSL2 bridge local_addr: {e}"))?;
+        let fail_mode = coordinator.snapshot().config.hook_fail_mode;
+        Self::start_with_mode(coordinator, token_dir, proxy_port, fail_mode)
+    }
+
+    /// Starts the HMAC bridge with an explicit offline `HookFailMode`.
+    pub fn start_with_mode(
+        coordinator: CoordinatorHandle,
+        token_dir: Option<&Path>,
+        proxy_port: u16,
+        fail_mode: HookFailMode,
+    ) -> Result<Self, String> {
+        let wsl_subnet =
+            cg_platform::access_win::detect_wsl_host_ipv4_and_prefix().filter(|(ip, pfx)| {
+                !ip.is_loopback() && is_private_wsl_ipv4(*ip) && (8..=30).contains(pfx)
+            });
+
+        let mut chosen_loopback: Option<(TcpListener, SocketAddr)> = None;
+        let mut chosen_wsl: Option<(TcpListener, SocketAddr)> = None;
+
+        for _ in 0..4 {
+            let lb = TcpListener::bind("127.0.0.1:0")
+                .map_err(|e| format!("failed to bind WSL2 loopback bridge on 127.0.0.1:0: {e}"))?;
+            let lb_addr = lb
+                .local_addr()
+                .map_err(|e| format!("failed to inspect WSL2 bridge local_addr: {e}"))?;
+            if let Some((wsl_ip, _)) = wsl_subnet {
+                if let Ok(wl) = TcpListener::bind(SocketAddr::from((wsl_ip, lb_addr.port()))) {
+                    if let Ok(wl_addr) = wl.local_addr() {
+                        chosen_loopback = Some((lb, lb_addr));
+                        chosen_wsl = Some((wl, wl_addr));
+                        break;
+                    }
+                }
+                chosen_loopback = Some((lb, lb_addr));
+            } else {
+                chosen_loopback = Some((lb, lb_addr));
+                break;
+            }
+        }
+
+        let (listener, bound_addr) = chosen_loopback
+            .ok_or_else(|| "failed to allocate WSL2 loopback listener".to_string())?;
         listener
             .set_nonblocking(true)
             .map_err(|e| format!("failed to configure non-blocking WSL2 listener: {e}"))?;
+        if let Some((ref wl, _)) = chosen_wsl {
+            let _ = wl.set_nonblocking(true);
+        }
+
+        let wsl_bound_addr = chosen_wsl.as_ref().map(|(_, a)| *a);
+        let host_wsl_ip = wsl_bound_addr
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
 
         let secret_hex = crypto_win::random_hex(32)?;
         let boot_epoch = now_unix_secs();
 
         let token_file = WslTokenFile {
             port: bound_addr.port(),
-            host_wsl_ip: "127.0.0.1".to_string(),
+            host_wsl_ip: host_wsl_ip.clone(),
             proxy_port,
             secret_hex: secret_hex.clone(),
             boot_epoch,
+            fail_mode,
         };
 
         let token_path = if let Some(dir) = token_dir {
@@ -378,6 +433,7 @@ impl WslBridgeServer {
         let stop = Arc::new(AtomicBool::new(false));
         let replay_cache = Arc::new(Mutex::new(NonceReplayCache::new(NONCE_CACHE_CAPACITY)));
         let active_workers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let workers: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         const MAX_WSL_BRIDGE_WORKERS: usize = 8;
 
         let t_stop = stop.clone();
@@ -385,54 +441,65 @@ impl WslBridgeServer {
         let t_cache = replay_cache.clone();
         let t_coord = coordinator;
         let t_workers = active_workers;
+        let t_handles = workers.clone();
+        let wsl_listener = chosen_wsl.map(|(wl, _)| wl);
 
         let handle = std::thread::Builder::new()
             .name("cg-wsl-bridge".to_string())
             .spawn(move || {
                 while !t_stop.load(Ordering::Acquire) {
-                    match listener.accept() {
-                        Ok((stream, peer)) => {
-                            if !is_allowed_peer_ip(peer.ip()) {
-                                let _ = stream.shutdown(std::net::Shutdown::Both);
-                                continue;
-                            }
-                            // Winsock `accept()` inherits non-blocking (`FIONBIO`) from `listener`;
-                            // restore blocking mode before bounded-timeout reads/writes!
-                            let _ = stream.set_nonblocking(false);
+                    let mut accepted_any = false;
+                    for candidate in std::iter::once(&listener).chain(wsl_listener.iter()) {
+                        match candidate.accept() {
+                            Ok((stream, peer)) => {
+                                accepted_any = true;
+                                if !is_allowed_peer_ip_with_wsl(peer.ip(), wsl_subnet) {
+                                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                                    continue;
+                                }
+                                // Winsock `accept()` inherits non-blocking (`FIONBIO`) from `listener`;
+                                // restore blocking mode before bounded-timeout reads/writes!
+                                let _ = stream.set_nonblocking(false);
 
-                            let prev = t_workers.fetch_add(1, Ordering::AcqRel);
-                            if prev >= MAX_WSL_BRIDGE_WORKERS {
-                                t_workers.fetch_sub(1, Ordering::AcqRel);
-                                let _ = stream.shutdown(std::net::Shutdown::Both);
-                                continue;
-                            }
-                            let w_secret = t_secret.clone();
-                            let w_cache = t_cache.clone();
-                            let w_coord = t_coord.clone();
-                            let w_counter = t_workers.clone();
-                            if std::thread::Builder::new()
-                                .name("cg-wsl-gate-conn".to_string())
-                                .spawn(move || {
-                                    struct WorkerSlotGuard(Arc<std::sync::atomic::AtomicUsize>);
-                                    impl Drop for WorkerSlotGuard {
-                                        fn drop(&mut self) {
-                                            self.0.fetch_sub(1, Ordering::AcqRel);
+                                let prev = t_workers.fetch_add(1, Ordering::AcqRel);
+                                if prev >= MAX_WSL_BRIDGE_WORKERS {
+                                    t_workers.fetch_sub(1, Ordering::AcqRel);
+                                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                                    continue;
+                                }
+                                let w_secret = t_secret.clone();
+                                let w_cache = t_cache.clone();
+                                let w_coord = t_coord.clone();
+                                let w_counter = t_workers.clone();
+                                match std::thread::Builder::new()
+                                    .name("cg-wsl-gate-conn".to_string())
+                                    .spawn(move || {
+                                        struct WorkerSlotGuard(Arc<std::sync::atomic::AtomicUsize>);
+                                        impl Drop for WorkerSlotGuard {
+                                            fn drop(&mut self) {
+                                                self.0.fetch_sub(1, Ordering::AcqRel);
+                                            }
+                                        }
+                                        let _slot = WorkerSlotGuard(w_counter);
+                                        handle_client_stream(stream, &w_secret, &w_cache, &w_coord);
+                                    }) {
+                                    Ok(jh) => {
+                                        if let Ok(mut list) = t_handles.lock() {
+                                            list.retain(|h| !h.is_finished());
+                                            list.push(jh);
                                         }
                                     }
-                                    let _slot = WorkerSlotGuard(w_counter);
-                                    handle_client_stream(stream, &w_secret, &w_cache, &w_coord);
-                                })
-                                .is_err()
-                            {
-                                t_workers.fetch_sub(1, Ordering::AcqRel);
+                                    Err(_) => {
+                                        t_workers.fetch_sub(1, Ordering::AcqRel);
+                                    }
+                                }
                             }
+                            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => {}
                         }
-                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(15));
-                        }
-                        Err(_) => {
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
+                    }
+                    if !accepted_any {
+                        std::thread::sleep(Duration::from_millis(15));
                     }
                 }
             })
@@ -440,10 +507,14 @@ impl WslBridgeServer {
 
         Ok(Self {
             bound_addr,
+            wsl_bound_addr,
+            host_wsl_ip,
+            boot_epoch,
             secret_hex,
-            token_path,
+            token_path: Mutex::new(token_path),
             stop,
             thread: Mutex::new(Some(handle)),
+            workers,
         })
     }
 
@@ -459,8 +530,46 @@ impl WslBridgeServer {
         &self.secret_hex
     }
 
-    pub fn token_path(&self) -> Option<&Path> {
-        self.token_path.as_deref()
+    pub fn token_path(&self) -> Option<PathBuf> {
+        self.token_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Re-materializes or updates `.claudeguard-wsl-token` on disk (e.g. after Session-0 post-boot
+    /// user logon or when `proxy_port` / `hook_fail_mode` changes in `SaveConfig`).
+    pub fn refresh_token(
+        &self,
+        token_dir: Option<&Path>,
+        proxy_port: u16,
+        fail_mode: HookFailMode,
+    ) -> Result<bool, String> {
+        let dir_opt = token_dir
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                self.token_path
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .and_then(|p| p.parent().map(Path::to_path_buf))
+            })
+            .or_else(hook_installer::resolve_interactive_user_home);
+        let Some(dir) = dir_opt else {
+            return Ok(false);
+        };
+        let p = dir.join(WSL_TOKEN_FILE);
+        let token_file = WslTokenFile {
+            port: self.bound_addr.port(),
+            host_wsl_ip: self.host_wsl_ip.clone(),
+            proxy_port,
+            secret_hex: self.secret_hex.clone(),
+            boot_epoch: self.boot_epoch,
+            fail_mode,
+        };
+        write_wsl_token_file(&p, &token_file)?;
+        *self.token_path.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+        Ok(true)
     }
 
     /// Builds a [`WslBridgeStatus`] reflecting this live bridge.
@@ -470,14 +579,23 @@ impl WslBridgeServer {
         proxy_desync_detected: bool,
     ) -> WslBridgeStatus {
         let port = self.bound_addr.port();
-        let token_ready = self.token_path.as_ref().is_some_and(|p| p.is_file());
+        let token_ready = self
+            .token_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|p| p.is_file());
+        let endpoint_desc = match self.wsl_bound_addr {
+            Some(wa) => format!("127.0.0.1:{port} + {wa}"),
+            None => format!("127.0.0.1:{port}"),
+        };
         let summary = if proxy_desync_detected {
-            format!("WSL2 桥接监听 127.0.0.1:{port}，检测到 WSL2 代理环境变量失步")
+            format!("WSL2 桥接监听 {endpoint_desc}，检测到 WSL2 代理环境变量失步")
         } else if synced_distros.is_empty() {
-            format!("WSL2 桥接就绪（127.0.0.1:{port}），等待同步发行版探针")
+            format!("WSL2 桥接就绪（{endpoint_desc}），等待同步发行版探针")
         } else {
             format!(
-                "WSL2 桥接就绪（127.0.0.1:{port}，已同步 {} 个发行版）",
+                "WSL2 桥接就绪（{endpoint_desc}，已同步 {} 个发行版）",
                 synced_distros.len()
             )
         };
@@ -492,7 +610,7 @@ impl WslBridgeServer {
         }
     }
 
-    /// Stops the listener thread cleanly (idempotent).
+    /// Stops the listener thread cleanly, joins active client workers, and removes `.claudeguard-wsl-token`.
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
         // Nudge accept loop cleanly.
@@ -500,6 +618,18 @@ impl WslBridgeServer {
         if let Ok(mut guard) = self.thread.lock() {
             if let Some(handle) = guard.take() {
                 let _ = handle.join();
+            }
+        }
+        if let Ok(mut list) = self.workers.lock() {
+            for jh in list.drain(..) {
+                let _ = jh.join();
+            }
+        }
+        if let Ok(mut tp) = self.token_path.lock() {
+            if let Some(path) = tp.take() {
+                if vault_win::ensure_no_reparse_points_chain(&path).is_ok() {
+                    let _ = std::fs::remove_file(&path);
+                }
             }
         }
     }
@@ -511,9 +641,46 @@ impl Drop for WslBridgeServer {
     }
 }
 
-/// Strictly permits loopback peers only (zero LAN exposure).
+fn is_private_wsl_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 10
+        || (o[0] == 172 && (16..=31).contains(&o[1]))
+        || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+}
+
+fn ipv4_in_cidr(ip: Ipv4Addr, net_ip: Ipv4Addr, prefix_len: u8) -> bool {
+    if prefix_len == 0 {
+        return false;
+    }
+    if prefix_len >= 32 {
+        return ip == net_ip;
+    }
+    let mask = u32::MAX << (32 - prefix_len);
+    (u32::from(ip) & mask) == (u32::from(net_ip) & mask)
+}
+
+/// Permits loopback peers plus peers inside an active private `vEthernet (WSL)` Hyper-V NAT subnet.
+pub fn is_allowed_peer_ip_with_wsl(ip: IpAddr, wsl_subnet: Option<(Ipv4Addr, u8)>) -> bool {
+    if ip.is_loopback() {
+        return true;
+    }
+    match (ip, wsl_subnet) {
+        (IpAddr::V4(v4), Some((host_v4, pfx)))
+            if is_private_wsl_ipv4(v4)
+                && is_private_wsl_ipv4(host_v4)
+                && (8..=30).contains(&pfx) =>
+        {
+            ipv4_in_cidr(v4, host_v4, pfx)
+        }
+        _ => false,
+    }
+}
+
+/// Permits loopback peers and peers on the host's `vEthernet (WSL)` NAT subnet (zero Wi-Fi/LAN exposure).
 pub fn is_allowed_peer_ip(ip: IpAddr) -> bool {
-    ip.is_loopback()
+    let wsl_subnet = cg_platform::access_win::detect_wsl_host_ipv4_and_prefix();
+    is_allowed_peer_ip_with_wsl(ip, wsl_subnet)
 }
 
 fn handle_client_stream(
@@ -829,19 +996,36 @@ def main():\n\
     except Exception as e:\n\
         print(json.dumps({{'decision': 'block', 'reason': f'ClaudeGuard WSL2 token unavailable: {{e}}'}}))\n\
         return 0\n\
+    fail_mode = str(tok.get('fail_mode', 'fail_closed')).strip().lower()\n\
     ts = int(time.time())\n\
     nonce = secrets.token_hex(12)\n\
     proxy_env = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy') or os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy') or ''\n\
     msg = f'{{ts}}:{{nonce}}:{{agent}}:{{vault}}:{{proxy_env}}' if proxy_env else f'{{ts}}:{{nonce}}:{{agent}}:{{vault}}'\n\
     sig = hmac.new(tok['secret_hex'].encode('utf-8'), msg.encode('utf-8'), hashlib.sha256).hexdigest()\n\
     req = {{'ts': ts, 'nonce': nonce, 'agent': agent, 'vault': vault, 'hook_event': hook_event, 'wsl_proxy_env': proxy_env, 'hmac': sig}}\n\
-    try:\n\
-        with socket.create_connection((tok.get('host_wsl_ip', '127.0.0.1'), int(tok['port'])), timeout=1.5) as s:\n\
-            s.sendall((json.dumps(req) + '\\n').encode('utf-8'))\n\
-            data = s.recv(4096).decode('utf-8').strip()\n\
-        resp = json.loads(data)\n\
-    except Exception as e:\n\
-        print(json.dumps({{'decision': 'block', 'reason': f'ClaudeGuard WSL2 bridge unreachable: {{e}}'}}))\n\
+    port = int(tok['port'])\n\
+    hosts = ['127.0.0.1']\n\
+    host_wsl = str(tok.get('host_wsl_ip', '')).strip()\n\
+    if host_wsl and host_wsl not in hosts:\n\
+        hosts.append(host_wsl)\n\
+    resp = None\n\
+    last_err = None\n\
+    for h in hosts:\n\
+        try:\n\
+            with socket.create_connection((h, port), timeout=1.0) as s:\n\
+                s.settimeout(6.5)\n\
+                s.sendall((json.dumps(req) + '\\n').encode('utf-8'))\n\
+                with s.makefile('r', encoding='utf-8') as rf:\n\
+                    data = rf.readline(65536).strip()\n\
+            resp = json.loads(data)\n\
+            break\n\
+        except Exception as e:\n\
+            last_err = e\n\
+    if resp is None:\n\
+        if fail_mode == 'fail_open_with_warn':\n\
+            sys.stderr.write(f'[ClaudeGuard WSL2 警告] 守护桥接暂不可达 ({{last_err}})，已按 FailOpenWithWarn 放行\\n')\n\
+            return 0\n\
+        print(json.dumps({{'decision': 'block', 'reason': f'ClaudeGuard WSL2 bridge unreachable: {{last_err}}'}}))\n\
         return 0\n\
     if not resp.get('allowed', False):\n\
         print(json.dumps({{'decision': 'block', 'reason': resp.get('reason', 'Blocked by ClaudeGuard')}}))\n\
@@ -921,7 +1105,12 @@ pub fn sync_wsl_distro_home(linux_home: &Path, win_token_path: &Path) -> Result<
             return Err("WSL2 settings.json 根节点不是 JSON 对象，已中止写入".into());
         }
         let bak_path = settings_dir.join("settings.json.cg-bak");
-        atomic_write_wsl_file(&settings_dir, &bak_path, &raw_bytes)?;
+        let already_managed = raw_text
+            .to_ascii_lowercase()
+            .contains("claudeguard-wsl-gate");
+        if !bak_path.exists() || !already_managed {
+            atomic_write_wsl_file(&settings_dir, &bak_path, &raw_bytes)?;
+        }
         parsed
     } else {
         serde_json::Value::Object(serde_json::Map::new())
@@ -1001,8 +1190,106 @@ pub fn discover_wsl_distro_names() -> Vec<String> {
     Vec::new()
 }
 
-/// Synchronizes `~/.local/bin/claudeguard-wsl-gate` across all accessible installed WSL2 distros
-/// and returns an updated [`WslBridgeStatus`].
+/// Cleanly strips `claudeguard-wsl-gate` hook entries from `<linux_home>/.claude/settings.json`
+/// and deletes `~/.local/bin/claudeguard-wsl-gate` without touching user hooks or corrupt JSON.
+pub fn unsync_wsl_distro_home(linux_home: &Path) -> Result<bool, String> {
+    vault_win::ensure_no_reparse_points_chain(linux_home)?;
+    let mut changed = false;
+
+    let shim_path = linux_home
+        .join(".local")
+        .join("bin")
+        .join("claudeguard-wsl-gate");
+    if shim_path.is_file()
+        && vault_win::ensure_no_reparse_points_chain(&shim_path).is_ok()
+        && std::fs::remove_file(&shim_path).is_ok()
+    {
+        changed = true;
+    }
+
+    let settings_dir = linux_home.join(".claude");
+    let settings_path = settings_dir.join("settings.json");
+    if !settings_path.is_file() {
+        return Ok(changed);
+    }
+    vault_win::ensure_no_reparse_points_chain(&settings_path)?;
+    let raw_bytes =
+        std::fs::read(&settings_path).map_err(|e| format!("读取 WSL2 settings.json 失败：{e}"))?;
+    let raw_text = String::from_utf8(raw_bytes.clone())
+        .map_err(|e| format!("WSL2 settings.json 非有效 UTF-8：{e}"))?;
+    if !raw_text
+        .to_ascii_lowercase()
+        .contains("claudeguard-wsl-gate")
+    {
+        return Ok(changed);
+    }
+    let mut root: serde_json::Value = serde_json::from_str(raw_text.trim())
+        .map_err(|e| format!("WSL2 settings.json 语法错误，已跳过卸载：{e}"))?;
+    let Some(hobj) = root
+        .as_object_mut()
+        .and_then(|o| o.get_mut("hooks"))
+        .and_then(|h| h.as_object_mut())
+    else {
+        return Ok(changed);
+    };
+    for key in ["UserPromptSubmit", "PreToolUse"] {
+        if let Some(list) = hobj.get_mut(key).and_then(|v| v.as_array_mut()) {
+            let before = list.len();
+            list.retain(|item| {
+                !item
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("claudeguard-wsl-gate")
+            });
+            if list.len() != before {
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let bak_path = settings_dir.join("settings.json.cg-bak");
+        if !bak_path.exists() {
+            let _ = atomic_write_wsl_file(&settings_dir, &bak_path, &raw_bytes);
+        }
+        let text = serde_json::to_string_pretty(&root)
+            .map_err(|e| format!("序列化 WSL2 settings.json 失败：{e}"))?;
+        let payload = format!("{text}\n");
+        atomic_write_wsl_file(&settings_dir, &settings_path, payload.as_bytes())?;
+    }
+    Ok(changed)
+}
+
+/// Removes WSL2 gate shims and `settings.json` hook entries across all accessible WSL distros.
+pub fn unsync_all_wsl_distros() -> usize {
+    let _imp_guard =
+        cg_platform::access_win::ImpersonateInteractiveUserGuard::impersonate_if_session_zero()
+            .ok();
+    let distros = discover_wsl_distro_names();
+    let mut cleaned = 0usize;
+    for distro in &distros {
+        if !is_valid_wsl_distro_name(distro) {
+            continue;
+        }
+        let home_root = PathBuf::from(format!(r"\\wsl.localhost\{distro}\home"));
+        let Ok(entries) = std::fs::read_dir(&home_root) else {
+            continue;
+        };
+        let mut distro_cleaned = false;
+        for entry in entries.flatten() {
+            let candidate = entry.path();
+            if candidate.is_dir() && unsync_wsl_distro_home(&candidate).unwrap_or(false) {
+                distro_cleaned = true;
+            }
+        }
+        if distro_cleaned {
+            cleaned += 1;
+        }
+    }
+    cleaned
+}
+
+/// Synchronizes (or when `!enabled`, cleanly uninstalls) `~/.local/bin/claudeguard-wsl-gate`
+/// across all accessible installed WSL2 distros and returns an updated [`WslBridgeStatus`].
 pub fn sync_wsl_distros(
     enabled: bool,
     bound_port: Option<u16>,
@@ -1012,6 +1299,29 @@ pub fn sync_wsl_distros(
     let win_token_path = hook_installer::resolve_interactive_user_home()
         .map(|h| h.join(WSL_TOKEN_FILE))
         .unwrap_or_else(|| PathBuf::from(r"C:\Users\User").join(WSL_TOKEN_FILE));
+
+    if !enabled {
+        if win_token_path.is_file()
+            && vault_win::ensure_no_reparse_points_chain(&win_token_path).is_ok()
+        {
+            let _ = std::fs::remove_file(&win_token_path);
+        }
+        let cleaned = unsync_all_wsl_distros();
+        let summary = if cleaned > 0 {
+            format!("WSL2 跨子系统桥接已关闭（已从 {cleaned} 个发行版移除门禁探针）")
+        } else {
+            "WSL2 跨子系统桥接已在设置中关闭".to_string()
+        };
+        return WslBridgeStatus {
+            enabled: false,
+            listening: false,
+            bound_port: None,
+            token_ready: false,
+            synced_distros: Vec::new(),
+            proxy_desync_detected: false,
+            summary,
+        };
+    }
 
     #[cfg(windows)]
     if win_token_path.is_file()
@@ -1051,9 +1361,7 @@ pub fn sync_wsl_distros(
     }
 
     let listening = enabled && bound_port.is_some();
-    let summary = if !enabled {
-        "WSL2 跨子系统桥接已在设置中关闭".to_string()
-    } else if distros.is_empty() {
+    let summary = if distros.is_empty() {
         match bound_port {
             Some(p) => format!("WSL2 回环桥接监听 127.0.0.1:{p}（未检测到已安装的 WSL 发行版）"),
             None => "未检测到已安装的 WSL 发行版".to_string(),
@@ -1289,9 +1597,19 @@ mod tests {
         assert!(ok_resp.allowed);
         assert!(!coord.wsl_proxy_desync());
 
-        // 7) Non-loopback peer IP rejected by allowlist helper.
-        assert!(is_allowed_peer_ip("127.0.0.1".parse().unwrap()));
-        assert!(!is_allowed_peer_ip("192.168.1.50".parse().unwrap()));
+        // 7) Non-loopback peer IP rejected unless inside private WSL Hyper-V NAT subnet.
+        assert!(is_allowed_peer_ip_with_wsl(
+            "127.0.0.1".parse().unwrap(),
+            None
+        ));
+        assert!(!is_allowed_peer_ip_with_wsl(
+            "192.168.1.50".parse().unwrap(),
+            Some((Ipv4Addr::new(172, 24, 240, 1), 20))
+        ));
+        assert!(is_allowed_peer_ip_with_wsl(
+            "172.24.245.99".parse().unwrap(),
+            Some((Ipv4Addr::new(172, 24, 240, 1), 20))
+        ));
 
         // 8) WSL distro shim deployment uses pure LF newlines, dynamic /mnt/<drive> path,
         //    python3 invocation (9p safe without chmod +x), .cg-bak backup, and error propagation.
@@ -1320,6 +1638,13 @@ mod tests {
         assert!(wsl_settings.contains("echo hi"));
         assert!(wsl_claude_dir.join("settings.json.cg-bak").is_file());
 
+        // Unsync cleanly removes claudeguard-wsl-gate while keeping user hook intact!
+        assert!(unsync_wsl_distro_home(&fake_linux_home).unwrap());
+        assert!(!shim.exists());
+        let after_unsync = std::fs::read_to_string(wsl_claude_dir.join("settings.json")).unwrap();
+        assert!(!after_unsync.contains("claudeguard-wsl-gate"));
+        assert!(after_unsync.contains("echo hi"));
+
         // Corrupt settings.json aborts cleanly without clobbering file.
         let bad_home = dir.path().join("wsl_bad_home");
         std::fs::create_dir_all(bad_home.join(".claude")).unwrap();
@@ -1330,7 +1655,13 @@ mod tests {
             "{broken"
         );
 
+        let tok_disk = dir.path().join(WSL_TOKEN_FILE);
+        assert!(tok_disk.is_file());
         bridge.shutdown();
+        assert!(
+            !tok_disk.exists(),
+            "clean WslBridgeServer::shutdown must remove stale .claudeguard-wsl-token"
+        );
         coord.shutdown();
     }
 }

@@ -85,7 +85,28 @@ pub struct PortEgressObservation {
     pub observed_at: u64,
 }
 
+/// Panic-safe single-flight atomic guard. Moving this guard into `CoordinatorEvent::*Finished`
+/// guarantees the in-flight flag stays held until the coordinator commits state (while still
+/// releasing automatically via `Drop` if a worker thread panics or disconnects).
+#[derive(Debug)]
+pub struct InFlightGuard(Arc<AtomicBool>);
+
+impl InFlightGuard {
+    pub fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag.clone()))
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Result produced by the off-thread `LaunchVault` worker.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum VaultLaunchWorkerOutcome {
     Launched {
@@ -95,11 +116,8 @@ pub enum VaultLaunchWorkerOutcome {
         lat_tenths: Option<i16>,
         lon_tenths: Option<i16>,
         port_obs: Option<PortEgressObservation>,
+        global_probe_round: Option<(AccessEvidence, Vec<(String, ProbeResult)>)>,
         discovered_sessions: Vec<(ProcessIdentity, String)>,
-    },
-    AutoAlignedMihomo {
-        node: String,
-        detail: String,
     },
     Failed {
         code: ErrorCode,
@@ -317,23 +335,9 @@ pub fn evaluate_fast_hook_gate_with_ports_at(
         return allow("ClaudeGuard 临时暂停中，门禁放行".to_string());
     }
 
-    // 3. Snapshot freshness, Pending state, non-tripped Uncovered/Fail, and dedicated-port cache
-    //    checks BEFORE mutating BurstGuardTracker so NeedsSyncProbe never double-counts prompts.
+    // 3. Dedicated-port Vault lookup FIRST so a fresh valid dedicated-port egress probe is
+    //    never falsely rejected when global `snap.checked_at` is stale (`#88` [CRIT-4]).
     let ttl = snap.config.hook_freshness_ttl_secs.clamp(10, 300);
-    let is_fresh = snap
-        .checked_at
-        .is_some_and(|ts| now_secs.saturating_sub(ts) <= ttl);
-    if !is_fresh || snap.protection == ProtectionState::Pending {
-        return FastGateOutcome::NeedsSyncProbe;
-    }
-
-    if snap.protection != ProtectionState::Monitoring {
-        return block(format!(
-            "🛡️ [ClaudeGuard 状态拦截] 当前保护状态为 {:?}，暂不允许发送提示词",
-            snap.protection
-        ));
-    }
-
     let normalized_vault = vault_id.map(str::trim).filter(|s| !s.is_empty());
     let mut dedicated_egress: Option<&PortEgressObservation> = None;
     let mut uses_dedicated_port = false;
@@ -351,8 +355,20 @@ pub fn evaluate_fast_hook_gate_with_ports_at(
                     .filter(|&p| p > 0 && p != snap.config.proxy_port)
                 {
                     uses_dedicated_port = true;
+                    if !matches!(
+                        snap.protection,
+                        ProtectionState::Monitoring | ProtectionState::Pending
+                    ) {
+                        return block(format!(
+                            "🛡️ [ClaudeGuard 状态拦截] 当前保护状态为 {:?}，暂不允许发送提示词",
+                            snap.protection
+                        ));
+                    }
                     match port_egress.get(&port) {
-                        Some(obs) if now_secs.saturating_sub(obs.observed_at) <= ttl => {
+                        Some(obs)
+                            if obs.ip.is_some()
+                                && now_secs.saturating_sub(obs.observed_at) <= ttl =>
+                        {
                             dedicated_egress = Some(obs);
                         }
                         _ => return FastGateOutcome::NeedsSyncProbe,
@@ -362,11 +378,23 @@ pub fn evaluate_fast_hook_gate_with_ports_at(
         }
     }
 
-    if !uses_dedicated_port
-        && ((snap.config.enforce_access_path && !snap.access.is_known())
-            || !snap.all_enabled_pass())
-    {
-        return FastGateOutcome::NeedsSyncProbe;
+    if !uses_dedicated_port {
+        let is_fresh = snap
+            .checked_at
+            .is_some_and(|ts| now_secs.saturating_sub(ts) <= ttl);
+        if !is_fresh || snap.protection == ProtectionState::Pending {
+            return FastGateOutcome::NeedsSyncProbe;
+        }
+        if snap.protection != ProtectionState::Monitoring {
+            return block(format!(
+                "🛡️ [ClaudeGuard 状态拦截] 当前保护状态为 {:?}，暂不允许发送提示词",
+                snap.protection
+            ));
+        }
+        if (snap.config.enforce_access_path && !snap.access.is_known()) || !snap.all_enabled_pass()
+        {
+            return FastGateOutcome::NeedsSyncProbe;
+        }
     }
 
     // 4. BurstGuard sliding-window rate & robotic cadence check (O(1) in-memory).
@@ -558,8 +586,14 @@ pub enum CoordinatorEvent {
         reply: SyncSender<PipeResponse>,
     },
     Tick,
+    SystemSuspending,
     SystemResumed,
     SystemShuttingDown,
+    AttachWslRuntime {
+        coord: CoordinatorHandle,
+        wsl_bridge: crate::wsl_bridge::SharedWslBridge,
+        manage_runtime: bool,
+    },
     RoundFinished {
         cfg_rev: u64,
         runtime_epoch: u64,
@@ -575,16 +609,19 @@ pub enum CoordinatorEvent {
         access: AccessEvidence,
         probe: ProbeResult,
         now_secs: u64,
+        in_flight: Option<InFlightGuard>,
         reply: SyncSender<PipeResponse>,
     },
     FeishuTestFinished {
         result: Result<FeishuStatus, String>,
         now_secs: u64,
+        in_flight: Option<InFlightGuard>,
         reply: SyncSender<PipeResponse>,
     },
     AntigravityRepairFinished {
         result: Result<String, String>,
         now_secs: u64,
+        in_flight: Option<InFlightGuard>,
         reply: SyncSender<PipeResponse>,
     },
     /// Background re-injection of `version.dll` after Antigravity overwrote it (no pipe reply).
@@ -599,6 +636,7 @@ pub enum CoordinatorEvent {
         result: Result<String, String>,
         mihomo: MihomoStatus,
         now_secs: u64,
+        in_flight: Option<InFlightGuard>,
         reply: SyncSender<PipeResponse>,
     },
     Telemetry(Box<TelemetryBundle>),
@@ -606,16 +644,19 @@ pub enum CoordinatorEvent {
         summary: Box<UpdateSummary>,
         component: Option<String>,
         now_secs: u64,
+        in_flight: Option<InFlightGuard>,
         reply: Option<SyncSender<PipeResponse>>,
     },
     DeepRiskAuditFinished {
         assessment: Box<RiskAssessment>,
         now_secs: u64,
+        in_flight: Option<InFlightGuard>,
         reply: Option<SyncSender<PipeResponse>>,
     },
     WslBridgeSynced {
         status: Box<WslBridgeStatus>,
         now_secs: u64,
+        in_flight: Option<InFlightGuard>,
         reply: Option<SyncSender<PipeResponse>>,
     },
     UpdateWslBridgeStatus {
@@ -624,41 +665,49 @@ pub enum CoordinatorEvent {
     ExportDiagnosticsFinished {
         result: Result<PathBuf, String>,
         now_secs: u64,
+        in_flight: Option<InFlightGuard>,
         reply: SyncSender<PipeResponse>,
     },
     HealthCardBuilt {
-        card: Box<SanitizedHealthCard>,
+        result: Result<Box<SanitizedHealthCard>, String>,
         export_png: bool,
         now_secs: u64,
+        in_flight: Option<InFlightGuard>,
         reply: SyncSender<PipeResponse>,
     },
     CleanRoomScanned {
         report: Box<CleanRoomReport>,
         backup_count: usize,
         now_secs: u64,
+        in_flight: Option<InFlightGuard>,
         reply: SyncSender<PipeResponse>,
     },
     CleanRoomExecuted {
         result: Result<(CleanRoomBackupMeta, CleanRoomReport, usize), String>,
         now_secs: u64,
+        in_flight: Option<InFlightGuard>,
         reply: SyncSender<PipeResponse>,
     },
     CleanRoomRestored {
         backup_id: String,
         result: Result<usize, String>,
         now_secs: u64,
+        in_flight: Option<InFlightGuard>,
         reply: SyncSender<PipeResponse>,
     },
     VaultShortcutsGenerated {
         vault_id: String,
         vault_name: String,
+        target_dir: PathBuf,
         result: Result<usize, String>,
         now_secs: u64,
+        in_flight: Option<InFlightGuard>,
         reply: SyncSender<PipeResponse>,
     },
     CliHooksConfigured {
         result: Result<HookIntegrationStatus, String>,
         now_secs: u64,
+        in_flight: Option<InFlightGuard>,
         reply: SyncSender<PipeResponse>,
     },
     VaultLaunchFinished {
@@ -666,6 +715,7 @@ pub enum CoordinatorEvent {
         app: VaultAppTarget,
         outcome: Box<VaultLaunchWorkerOutcome>,
         now_secs: u64,
+        in_flight: Option<InFlightGuard>,
         reply: SyncSender<PipeResponse>,
     },
     PortEgressProbed {
@@ -777,8 +827,13 @@ impl CoordinatorHandle {
     }
 
     /// Publishes background dedicated-port egress observations into the shared cache and coordinator.
+    /// Failed probes (`ip: None`) are never cached so transient hiccups do not poison `FastHookGate`.
     pub fn publish_port_egress(&self, observations: Vec<PortEgressObservation>, now_secs: u64) {
-        if observations.is_empty() {
+        let valid: Vec<PortEgressObservation> = observations
+            .into_iter()
+            .filter(|obs| obs.ip.is_some())
+            .collect();
+        if valid.is_empty() {
             return;
         }
         {
@@ -786,13 +841,13 @@ impl CoordinatorHandle {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            for obs in &observations {
+            for obs in &valid {
                 guard.insert(obs.port, obs.clone());
             }
         }
         if !self.stopped.load(Ordering::Acquire) {
             let _ = self.tx.try_send(CoordinatorEvent::PortEgressProbed {
-                observations,
+                observations: valid,
                 now_secs,
             });
         }
@@ -903,10 +958,33 @@ impl CoordinatorHandle {
         }
     }
 
+    /// Notifies the coordinator that Windows is entering sleep/hibernate (`PBT_APMSUSPEND`).
+    pub fn notify_system_suspending(&self) {
+        if !self.stopped.load(Ordering::Acquire) {
+            let _ = self.tx.try_send(CoordinatorEvent::SystemSuspending);
+        }
+    }
+
     /// Notifies the coordinator that Windows resumed from sleep/hibernate (`PBT_APMRESUME*`).
     pub fn notify_system_resumed(&self) {
         if !self.stopped.load(Ordering::Acquire) {
             let _ = self.tx.try_send(CoordinatorEvent::SystemResumed);
+        }
+    }
+
+    /// Attaches the shared runtime `WslBridgeServer` slot so `SaveConfig` / `CompleteOnboarding`
+    /// can dynamically start, stop, or refresh `.claudeguard-wsl-token` without restarting the service.
+    pub fn attach_wsl_runtime(
+        &self,
+        wsl_bridge: crate::wsl_bridge::SharedWslBridge,
+        manage_runtime: bool,
+    ) {
+        if !self.stopped.load(Ordering::Acquire) {
+            let _ = self.tx.try_send(CoordinatorEvent::AttachWslRuntime {
+                coord: self.clone(),
+                wsl_bridge,
+                manage_runtime,
+            });
         }
     }
 

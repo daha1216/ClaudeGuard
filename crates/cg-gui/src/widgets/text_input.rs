@@ -31,6 +31,7 @@ actions!([
     DraftBackspace,
     DraftDelete,
     DraftDeleteWordBack,
+    DraftDeleteWordForward,
     DraftLeft,
     DraftRight,
     DraftWordLeft,
@@ -66,6 +67,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             "ctrl-backspace",
             DraftDeleteWordBack,
+            Some("DraftTextInput"),
+        ),
+        KeyBinding::new(
+            "ctrl-delete",
+            DraftDeleteWordForward,
             Some("DraftTextInput"),
         ),
         KeyBinding::new("left", DraftLeft, Some("DraftTextInput")),
@@ -147,6 +153,52 @@ fn word_range_at(text: &str, utf16_offset: usize) -> Range<usize> {
     let mut end_byte = byte;
     for (rel_idx, ch) in text[byte..].char_indices() {
         if classify_char(ch) == target_class {
+            end_byte = byte + rel_idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    utf16_index_from_byte(text, start_byte)..utf16_index_from_byte(text, end_byte)
+}
+
+fn is_network_token_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '.' | ':' | '/' | '-' | '_' | '[' | ']')
+}
+
+/// Returns the UTF-16 range of a contiguous network/config token (`203.0.113.0/24`,
+/// `127.0.0.1:7897`, `:7897`, `work-claude-max`) for double-click selection.
+fn token_range_at(text: &str, utf16_offset: usize) -> Range<usize> {
+    if text.is_empty() {
+        return 0..0;
+    }
+
+    let mut byte = byte_index_from_utf16(text, utf16_offset).min(text.len());
+    let anchor_ch = if let Some(ch) = text[byte..].chars().next() {
+        ch
+    } else if let Some((prev_idx, ch)) = text[..byte].char_indices().next_back() {
+        byte = prev_idx;
+        ch
+    } else {
+        return 0..0;
+    };
+
+    if !is_network_token_char(anchor_ch) {
+        return word_range_at(text, utf16_offset);
+    }
+
+    let mut start_byte = byte;
+    for (idx, ch) in text[..byte].char_indices().rev() {
+        if is_network_token_char(ch) {
+            start_byte = idx;
+        } else {
+            break;
+        }
+    }
+
+    let mut end_byte = byte;
+    for (rel_idx, ch) in text[byte..].char_indices() {
+        if is_network_token_char(ch) {
             end_byte = byte + rel_idx + ch.len_utf8();
         } else {
             break;
@@ -505,6 +557,35 @@ impl DraftTextInput {
         }
     }
 
+    fn on_delete_word_forward(
+        &mut self,
+        _: &DraftDeleteWordForward,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.state.selected_range().is_empty() {
+            self.state.replace_text_in_range(None, "");
+            self.selection_anchor = Some(self.state.cursor());
+            self.changed(window, cx);
+            return;
+        }
+        let cursor = self.state.cursor();
+        let total = utf16_len(self.state.text());
+        if cursor >= total {
+            return;
+        }
+        let end = if self.masked {
+            total
+        } else {
+            next_word_boundary(self.state.text(), cursor)
+        };
+        if end > cursor {
+            self.state.replace_text_in_range(Some(cursor..end), "");
+            self.selection_anchor = Some(self.state.cursor());
+            self.changed(window, cx);
+        }
+    }
+
     fn on_left(&mut self, _: &DraftLeft, window: &mut Window, cx: &mut Context<Self>) {
         self.move_cursor(|s| s.move_left(false), window, cx);
     }
@@ -651,7 +732,7 @@ impl DraftTextInput {
                 self.state.select_all();
                 self.selection_anchor = Some(0);
             } else {
-                let range = word_range_at(self.state.text(), index);
+                let range = token_range_at(self.state.text(), index);
                 self.selection_anchor = Some(range.start);
                 self.state.select_range(range);
             }
@@ -1217,6 +1298,7 @@ impl Render for DraftTextInput {
             .on_action(cx.listener(Self::on_backspace))
             .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_delete_word_back))
+            .on_action(cx.listener(Self::on_delete_word_forward))
             .on_action(cx.listener(Self::on_left))
             .on_action(cx.listener(Self::on_right))
             .on_action(cx.listener(Self::on_word_left))
@@ -1302,5 +1384,21 @@ mod tests {
 
         // Caret at 0 snaps back to 0.0
         assert_eq!(compute_horizontal_scroll(s3, 0.0, 420.0, 200.0), 0.0);
+    }
+
+    #[test]
+    fn token_range_selects_full_cidr_endpoint_and_vault_id_tokens() {
+        let cidr = "203.0.113.0/24, [::1]:7897 work-claude-max";
+        let r_cidr = token_range_at(cidr, 7);
+        assert_eq!(&cidr[r_cidr.start..r_cidr.end], "203.0.113.0/24");
+
+        let r_v6 = token_range_at(cidr, 20);
+        assert_eq!(&cidr[r_v6.start..r_v6.end], "[::1]:7897");
+
+        let r_vid = token_range_at(cidr, 30);
+        assert_eq!(&cidr[r_vid.start..r_vid.end], "work-claude-max");
+
+        let fwd = next_word_boundary("7897 10809", 0);
+        assert_eq!(fwd, 4);
     }
 }

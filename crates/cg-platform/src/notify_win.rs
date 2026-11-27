@@ -78,11 +78,20 @@ pub fn ensure_identity() -> PlatformResult<()> {
 #[cfg(windows)]
 pub fn send_toast(title: &str, body: &str) -> PlatformResult<()> {
     use crate::com::{map_win_err, ComGuard};
+    use std::sync::OnceLock;
     use windows::core::HSTRING;
     use windows::Data::Xml::Dom::XmlDocument;
     use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
 
-    ensure_identity()?;
+    if crate::access_win::is_session_zero() {
+        return Ok(());
+    }
+
+    static AUMID_READY: OnceLock<()> = OnceLock::new();
+    if AUMID_READY.get().is_none() {
+        ensure_identity()?;
+        let _ = AUMID_READY.set(());
+    }
     let _com = ComGuard::init_mta()?;
 
     let xml_doc = XmlDocument::new().map_err(|e| map_win_err(e, "XmlDocument::new"))?;

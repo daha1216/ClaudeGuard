@@ -837,7 +837,47 @@ impl GuardEngine {
                 requires_recheck: false,
             };
         }
-        let failing: Vec<&str> = enabled
+
+        let canonical_agent = agent_id.map(str::trim).and_then(|raw| {
+            if raw.eq_ignore_ascii_case("claude") || raw.eq_ignore_ascii_case("claude-code") {
+                Some("claude")
+            } else if raw.eq_ignore_ascii_case("chatgpt") || raw.eq_ignore_ascii_case("codex") {
+                Some("chatgpt")
+            } else if raw.eq_ignore_ascii_case("antigravity") {
+                Some("antigravity")
+            } else {
+                None
+            }
+        });
+
+        let relevant: Vec<&TargetStatus> = match canonical_agent {
+            None => enabled,
+            Some(aid) => enabled
+                .into_iter()
+                .filter(|st| {
+                    state
+                        .config
+                        .target(&st.id)
+                        .and_then(|cfg_t| cfg_t.bind_agent.as_deref())
+                        .is_none_or(|bound| bound.eq_ignore_ascii_case(aid))
+                })
+                .collect(),
+        };
+
+        if relevant.is_empty()
+            || (matches!(canonical_agent, Some("claude" | "chatgpt"))
+                && relevant
+                    .iter()
+                    .all(|s| s.anchor_kind == AnchorKind::Reachability))
+        {
+            return LaunchDecision {
+                allowed: false,
+                reason: "当前客户端对应的出口地区/IP 校验目标未启用，禁止放行".into(),
+                requires_recheck: false,
+            };
+        }
+
+        let failing: Vec<&str> = relevant
             .iter()
             .filter(|s| s.state == TargetState::Fail)
             .map(|s| s.name.as_str())
@@ -849,7 +889,7 @@ impl GuardEngine {
                 requires_recheck: true,
             };
         }
-        let unverified: Vec<&str> = enabled
+        let unverified: Vec<&str> = relevant
             .iter()
             .filter(|s| s.state != TargetState::Pass)
             .map(|s| s.name.as_str())
@@ -1038,6 +1078,40 @@ fn handle_wfp_updated(
         );
     }
     state.wfp = status;
+}
+
+fn invalidate_stale_risk_assessment_if_needed(
+    state: &mut EngineState,
+    statuses: &[TargetStatus],
+    access_bad: bool,
+) {
+    if state.risk_assessment.evaluated_at == 0 {
+        return;
+    }
+    if access_bad {
+        state.risk_assessment = RiskAssessment::default();
+        return;
+    }
+    if let Some(assessed_ip) = state
+        .risk_assessment
+        .ip_purity
+        .ip
+        .as_deref()
+        .and_then(normalize_ip)
+    {
+        let ip_changed = statuses.iter().any(|st| {
+            st.state != TargetState::Disabled
+                && st.anchor_kind != AnchorKind::Reachability
+                && st
+                    .ip
+                    .as_deref()
+                    .and_then(normalize_ip)
+                    .is_some_and(|obs_ip| obs_ip != assessed_ip)
+        });
+        if ip_changed {
+            state.risk_assessment = RiskAssessment::default();
+        }
+    }
 }
 
 fn initial_target_statuses(cfg: &Config) -> Vec<TargetStatus> {
@@ -1326,8 +1400,19 @@ fn handle_abort_false_shutdown_trip(
     cmds: &mut Vec<EffectCommand>,
 ) {
     state.system_shutting_down = true;
-    state.last_auto_uncovered_action_at = None;
     state.access_streak = 0;
+    if state.last_auto_uncovered_action_at.is_none() || state.wal_pending {
+        log_both(
+            state,
+            now_secs,
+            LogLevel::Info,
+            "power",
+            "收到关机竞态回滚请求，但当前隔离并非未覆盖竞态所致（或存在待恢复 WAL），保留现有隔离状态",
+            cmds,
+        );
+        return;
+    }
+    state.last_auto_uncovered_action_at = None;
     state.tripped = None;
     state.pending_tx = None;
     if !state.lockdown_manual {
@@ -1352,7 +1437,18 @@ fn handle_wal_healed(state: &mut EngineState, now_secs: u64, cmds: &mut Vec<Effe
     if state.wal_pending {
         state.wal_pending = false;
         state.last_error.clear();
-        if state.protection == ProtectionState::Degraded {
+        if state.config.first_run
+            && !matches!(
+                state.lifecycle,
+                Lifecycle::Disarmed | Lifecycle::Stopping | Lifecycle::Maintenance
+            )
+            && !state.protection.is_isolated()
+        {
+            state.lifecycle = Lifecycle::Unconfigured;
+            state.protection = ProtectionState::Pending;
+            state.checked_at = None;
+            state.launch_error = "尚未完成配置：请先在向导中设置监控目标与白名单".into();
+        } else if state.protection == ProtectionState::Degraded {
             if state.lifecycle == Lifecycle::Disarmed {
                 state.protection = ProtectionState::Monitoring;
             } else {
@@ -1534,6 +1630,8 @@ fn handle_round_completed(
         slot.apply_at(&probe, &eval, streak, now_secs);
         next_statuses.push(slot);
     }
+
+    invalidate_stale_risk_assessment_if_needed(state, &next_statuses, access_bad);
 
     let failing_ids: Vec<String> = next_statuses
         .iter()
@@ -1846,6 +1944,7 @@ fn handle_target_rechecked(
         .unwrap_or(0);
 
     let mut slot = TargetStatus::from_target(&target, TargetState::Pending);
+    let mut pass_ip_to_record: Option<String> = None;
     let eval = if access_bad {
         slot.state = TargetState::Unverified;
         slot.reason = if access_unknown {
@@ -1871,7 +1970,7 @@ fn handle_target_rechecked(
             && target.anchor_kind != AnchorKind::Reachability
             && let Some(norm_ip) = probe.ip.as_deref().and_then(normalize_ip)
         {
-            state.last_pass_ips.insert(target.id.clone(), norm_ip);
+            pass_ip_to_record = Some(norm_ip);
         }
         slot.apply_at(&probe, &ev, streak, now_secs);
         Some(ev)
@@ -1881,6 +1980,18 @@ fn handle_target_rechecked(
         *existing = slot.clone();
     } else {
         state.target_statuses.push(slot.clone());
+    }
+
+    invalidate_stale_risk_assessment_if_needed(state, &state.target_statuses.clone(), access_bad);
+
+    let ip_unchanged_hold = egress_ip_unchanged_summary(
+        state,
+        &state.target_statuses,
+        access_uncovered,
+        access_unknown,
+    );
+    if let Some(norm_ip) = pass_ip_to_record {
+        state.last_pass_ips.insert(target.id.clone(), norm_ip);
     }
 
     let enabled_count = state
@@ -1899,6 +2010,78 @@ fn handle_target_rechecked(
         state.resume_grace_until = None;
     }
     let in_resume_grace = state.is_in_resume_grace(now_secs);
+
+    if state.network_isolation_supported && armed {
+        let want_auto = !state.system_shutting_down
+            && !state.config.monitor_only
+            && !(in_resume_grace && state.lockdown_applied != Some(true))
+            && access_uncovered
+            && state.config.lockdown_on_uncovered;
+        let want = want_auto || state.lockdown_manual;
+        let allowed = !(paused && want && state.lockdown_applied != Some(true))
+            && !(state.system_shutting_down && !want && !state.lockdown_manual);
+        if allowed && state.lockdown_applied != Some(want) {
+            if want_auto && !state.lockdown_manual && access_uncovered {
+                state.last_auto_uncovered_action_at = Some(now_secs);
+            }
+            cmds.push(EffectCommand::SyncLockdown {
+                want,
+                manual: state.lockdown_manual,
+                agents: state.config.guarded_agents.clone(),
+            });
+        }
+    }
+
+    if armed
+        && !paused
+        && !state.system_shutting_down
+        && !in_resume_grace
+        && !state.config.monitor_only
+        && ip_unchanged_hold.is_none()
+        && !state.protection.is_isolated()
+        && state.config.trip_threshold > 1
+        && slot.state == TargetState::Fail
+        && slot.fail_streak == state.config.trip_threshold - 1
+    {
+        let msg = format!(
+            "{} 出口第 {} 次连续失败，再失败一次将熔断。",
+            slot.name, slot.fail_streak
+        );
+        log_both(state, now_secs, LogLevel::Warn, "probe", &msg, cmds);
+        cmds.push(EffectCommand::Notify {
+            class: "warning".into(),
+            title: "ClaudeGuard 检查未通过".into(),
+            body: msg,
+        });
+    }
+
+    if armed {
+        if access_uncovered {
+            if !paused && !state.system_shutting_down {
+                state.access_streak = state.access_streak.saturating_add(1);
+            }
+            if !paused
+                && !state.system_shutting_down
+                && !in_resume_grace
+                && !state.config.monitor_only
+                && !state.protection.is_isolated()
+                && state.config.trip_threshold > 1
+                && state.access_streak == state.config.trip_threshold - 1
+            {
+                let msg = "系统代理未开启且无 TUN 网卡，下一轮将熔断。";
+                log_both(state, now_secs, LogLevel::Warn, "access", msg, cmds);
+                cmds.push(EffectCommand::Notify {
+                    class: "warning".into(),
+                    title: "ClaudeGuard 检查未通过".into(),
+                    body: msg.into(),
+                });
+            }
+        } else {
+            state.access_streak = 0;
+        }
+    } else {
+        state.access_streak = 0;
+    }
 
     let verdict_opt = eval
         .as_ref()
@@ -1957,13 +2140,34 @@ fn handle_target_rechecked(
         return;
     }
 
-    if !paused
-        && matches!(
-            state.protection,
-            ProtectionState::Pending | ProtectionState::Monitoring
-        )
-    {
-        if slot.state == TargetState::Fail && slot.fail_streak >= state.config.trip_threshold {
+    if matches!(
+        state.protection,
+        ProtectionState::Pending | ProtectionState::Monitoring
+    ) {
+        let failing_ids: Vec<String> = state
+            .target_statuses
+            .iter()
+            .filter(|s| s.state == TargetState::Fail)
+            .map(|s| s.id.clone())
+            .collect();
+        let fail_reason = format_failing_reason(&state.target_statuses, access_uncovered);
+        let target_trip =
+            slot.state == TargetState::Fail && slot.fail_streak >= state.config.trip_threshold;
+        let access_trip = access_uncovered && state.access_streak >= state.config.trip_threshold;
+
+        if !paused
+            && !state.system_shutting_down
+            && !in_resume_grace
+            && !state.config.monitor_only
+            && access_trip
+        {
+            if failing_ids.is_empty() {
+                state.last_auto_uncovered_action_at = Some(now_secs);
+            } else {
+                state.last_auto_uncovered_action_at = None;
+            }
+            begin_isolation(state, fail_reason, failing_ids, now_secs, cmds);
+        } else if !paused && target_trip {
             let reason = format_failing_reason(&[slot.clone()], false);
             if state.config.monitor_only {
                 state.protection = ProtectionState::Monitoring;
@@ -1971,27 +2175,21 @@ fn handle_target_rechecked(
             } else if state.system_shutting_down || in_resume_grace {
                 state.protection = ProtectionState::Monitoring;
                 state.launch_error = reason;
-            } else if let Some(stable_ips) = egress_ip_unchanged_summary(
-                state,
-                &state.target_statuses,
-                access_uncovered,
-                access_unknown,
-            ) {
+            } else if let Some(stable_ips) = ip_unchanged_hold {
                 state.protection = ProtectionState::Monitoring;
                 state.launch_error =
                     format!("{reason}（出口 IP {stable_ips} 未变，已按策略暂不熔断）");
                 if !state.ip_unchanged_hold_notified {
                     state.ip_unchanged_hold_notified = true;
-                    log_both(
-                        state,
-                        now_secs,
-                        LogLevel::Warn,
-                        "probe",
-                        format!(
-                            "{reason}，但当前出口 IP（{stable_ips}）未变化，已按策略跳过熔断。"
-                        ),
-                        cmds,
+                    let msg = format!(
+                        "{reason}，但当前出口 IP（{stable_ips}）未变化，已按策略跳过熔断。"
                     );
+                    log_both(state, now_secs, LogLevel::Warn, "probe", &msg, cmds);
+                    cmds.push(EffectCommand::Notify {
+                        class: "warning".into(),
+                        title: "ClaudeGuard 出口波动（IP 未变，未熔断）".into(),
+                        body: msg,
+                    });
                 }
             } else {
                 state.last_auto_uncovered_action_at = None;
@@ -2003,6 +2201,19 @@ fn handle_target_rechecked(
             state.ip_unchanged_hold_notified = false;
             state.monitor_only_warn_notified = false;
             state.last_auto_uncovered_action_at = None;
+        } else {
+            state.protection = ProtectionState::Monitoring;
+            if !failing_ids.is_empty() || access_uncovered {
+                state.launch_error = if state.config.monitor_only {
+                    format!("{fail_reason}（仅监测模式，已跳过自动熔断）")
+                } else {
+                    fail_reason
+                };
+            } else if access_unknown {
+                state.launch_error = format!("无法确认应用接入路径：{}", access.note);
+            } else {
+                state.launch_error = "部分目标无法确认，暂不允许启动".into();
+            }
         }
     }
 }
@@ -2268,10 +2479,13 @@ fn handle_set_manual_lockdown(
         });
         return;
     }
-    if state.lifecycle == Lifecycle::Stopping {
+    if state.lifecycle != Lifecycle::Armed {
         cmds.push(EffectCommand::RequestRejected {
             code: ErrorCode::IllegalState,
-            reason: "正在停止退出，拒绝新的封锁请求".into(),
+            reason: format!(
+                "当前生命周期（{}）不允许手动封锁，仅已布防状态可用",
+                state.lifecycle.label()
+            ),
         });
         return;
     }
@@ -2551,18 +2765,9 @@ fn handle_disarm_flow_b(
         return;
     }
     if state.lifecycle == Lifecycle::Unconfigured {
-        state.lifecycle = Lifecycle::Disarmed;
-        state.protection = ProtectionState::Monitoring;
-        state.disarmed_reason = reason.to_string();
-        log_both(
-            state,
-            now_secs,
-            LogLevel::Audit,
-            "disarm",
-            format!("未配置状态已撤防：{reason}"),
-            cmds,
-        );
-        return;
+        // Transition through Maintenance + Recovering (§2.4 legal) so `--restore` executes Flow B
+        // hardware/WFP/firewall cleanup verification even before first-run onboarding completes.
+        state.lifecycle = Lifecycle::Maintenance;
     }
     if state.lifecycle == Lifecycle::Disarmed && state.protection == ProtectionState::Monitoring {
         // Still execute idempotent cleanup verification so `--restore` always verifies 0 rules.
@@ -2617,6 +2822,7 @@ fn handle_flow_b_completed(
         state.access_streak = 0;
         state.wal_pending = false;
         state.last_auto_uncovered_action_at = None;
+        state.risk_assessment = RiskAssessment::default();
         clear_compliant_ip_baseline(state);
         for st in &mut state.target_statuses {
             st.fail_streak = 0;
@@ -2698,6 +2904,7 @@ fn handle_rearm_persisted(
     state.checked_at = None;
     state.disarmed_reason.clear();
     state.last_error.clear();
+    state.risk_assessment = RiskAssessment::default();
     clear_compliant_ip_baseline(state);
     state.runtime_epoch = state.runtime_epoch.saturating_add(1);
     log_both(
@@ -2840,6 +3047,28 @@ fn handle_config_persisted(
         return;
     };
     let was_unconfigured = state.lifecycle == Lifecycle::Unconfigured;
+    if !was_unconfigured && is_metadata_only_config_change(&state.config, &cfg) {
+        state.config = cfg;
+        state.cfg_rev = state.cfg_rev.saturating_add(1);
+        state.last_error.clear();
+        if state.checking {
+            state.checking = false;
+            state.active_round = None;
+        }
+        log_both(
+            state,
+            now_secs,
+            LogLevel::Info,
+            "config",
+            format!(
+                "界面或元数据偏好已更新（cfg_rev={}），保持当前探测稳态",
+                state.cfg_rev
+            ),
+            cmds,
+        );
+        return;
+    }
+
     let prev_monitor_only = state.config.monitor_only;
     let prev_guarded_agents = state.config.guarded_agents.clone();
     let prev_lockdown_applied = state.lockdown_applied;
@@ -2853,6 +3082,7 @@ fn handle_config_persisted(
     state.target_statuses = initial_target_statuses(&state.config);
     state.checked_at = None;
     state.access_streak = 0;
+    state.risk_assessment = RiskAssessment::default();
     clear_compliant_ip_baseline(state);
     state.checking = false;
     state.active_round = None;
@@ -2946,6 +3176,25 @@ fn handle_config_persisted(
     }
 }
 
+fn is_metadata_only_config_change(prev: &Config, next: &Config) -> bool {
+    if prev == next || prev.first_run != next.first_run {
+        return false;
+    }
+    let mut normalized_next = next.clone();
+    normalized_next.last_seen_antigravity_version = prev.last_seen_antigravity_version.clone();
+    normalized_next.theme_mode = prev.theme_mode;
+    normalized_next.privacy_mask_ip = prev.privacy_mask_ip;
+    normalized_next.notify = prev.notify;
+    normalized_next.close_to_tray = prev.close_to_tray;
+    normalized_next.auto_start_with_system = prev.auto_start_with_system;
+    normalized_next.auto_upd_check = prev.auto_upd_check;
+    normalized_next.cli_warn = prev.cli_warn;
+    normalized_next.global_hotkeys_enabled = prev.global_hotkeys_enabled;
+    normalized_next.hotkey_panic_lockdown = prev.hotkey_panic_lockdown.clone();
+    normalized_next.hotkey_quick_hud = prev.hotkey_quick_hud.clone();
+    *prev == normalized_next
+}
+
 fn handle_enter_maintenance(
     state: &mut EngineState,
     reason: &str,
@@ -3007,11 +3256,17 @@ fn handle_exit_maintenance(
     if state.lifecycle != Lifecycle::Maintenance {
         return;
     }
-    state.lifecycle = Lifecycle::Armed;
     if ok {
-        if !state.protection.is_isolated() {
+        if state.config.first_run && !state.protection.is_isolated() {
+            state.lifecycle = Lifecycle::Unconfigured;
             state.protection = ProtectionState::Pending;
             state.checked_at = None;
+        } else {
+            state.lifecycle = Lifecycle::Armed;
+            if !state.protection.is_isolated() {
+                state.protection = ProtectionState::Pending;
+                state.checked_at = None;
+            }
         }
         clear_compliant_ip_baseline(state);
         state.last_error.clear();
@@ -3024,6 +3279,7 @@ fn handle_exit_maintenance(
             cmds,
         );
     } else {
+        state.lifecycle = Lifecycle::Armed;
         state.protection = ProtectionState::Degraded;
         state.last_error = error.unwrap_or_else(|| "维护事务失败，进入降级态".into());
         log_both(
@@ -3181,7 +3437,12 @@ fn handle_antigravity_proxy_updated(
         );
 
         if status.version_changed_from.is_some() {
-            if !state.config.first_run && state.lifecycle != Lifecycle::Unconfigured {
+            if !state.config.first_run
+                && !matches!(
+                    state.lifecycle,
+                    Lifecycle::Unconfigured | Lifecycle::Stopping | Lifecycle::Maintenance
+                )
+            {
                 // CONTRACT §3.6 & R11: stage updated version via PersistConfig without mutating
                 // state.config or state.cfg_rev until ConfigPersisted succeeds!
                 let mut next_cfg = state.config.clone();
@@ -3191,8 +3452,7 @@ fn handle_antigravity_proxy_updated(
                     target_cfg_rev: state.cfg_rev.saturating_add(1),
                 });
             } else {
-                // Before onboarding completes (first_run == true), cache in memory only so empty
-                // built-in target allowlists never fail ConfigStore::save_verified.
+                // Before onboarding completes or during Stopping/Maintenance, cache in memory only.
                 state.config.last_seen_antigravity_version = status.antigravity_version.clone();
             }
             cmds.push(EffectCommand::Notify {
@@ -6530,6 +6790,156 @@ mod tests {
         assert!(
             GuardEngine::evaluate_launch_gate_for_agent(&state_tp_off, Some("claude"), 2_000)
                 .allowed
+        );
+    }
+
+    #[test]
+    fn wave2_state_machine_invariants_unconfigured_wal_risk_invalidation_and_bind_agent_gate() {
+        // 1) first_run + wal_pending heals back to Lifecycle::Unconfigured (never Armed!)
+        let first_run_cfg = Config::default();
+        assert!(first_run_cfg.first_run);
+        let booted_wal = EngineState::new(first_run_cfg, true, true, 100);
+        let (healed_state, _) = GuardEngine::step(booted_wal, EngineEvent::WalHealed, 105);
+        assert_eq!(healed_state.lifecycle, Lifecycle::Unconfigured);
+        assert_eq!(healed_state.protection, ProtectionState::Pending);
+
+        // 2) DisarmAndRestoreFlowB from Unconfigured executes FlowB cleanup verification
+        let (_, disarm_cmds) = GuardEngine::step(
+            healed_state,
+            EngineEvent::DisarmAndRestoreFlowB {
+                reason: "cli restore".into(),
+            },
+            106,
+        );
+        assert!(
+            disarm_cmds
+                .iter()
+                .any(|c| matches!(c, EffectCommand::ExecuteFlowBDisarmRestore { .. }))
+        );
+
+        // 3) SetManualLockdown is rejected in Disarmed & Maintenance, and AbortFalseShutdownTrip preserves real leaks
+        let mut cfg = armed_config();
+        cfg.trip_threshold = 1;
+        let state = EngineState::new(cfg.clone(), true, true, 100);
+        let (iso, _) = GuardEngine::step(
+            state,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: 1,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: fail_probes(),
+            },
+            110,
+        );
+        let tx_ep = iso.runtime_epoch;
+        let (quar, _) = GuardEngine::step(
+            iso,
+            EngineEvent::IsolationCompleted {
+                runtime_epoch: tx_ep,
+                receipt: verified_receipt("iso"),
+                killed: 1,
+                cli_killed: 0,
+                firewall_rules: 2,
+                quarantined_agents: vec!["claude".into()],
+                network_cut_applied: CutMode::Off,
+                network_note: String::new(),
+            },
+            111,
+        );
+        let (after_abort, _) = GuardEngine::step(quar, EngineEvent::AbortFalseShutdownTrip, 112);
+        assert_eq!(
+            after_abort.protection,
+            ProtectionState::Quarantined,
+            "genuine CN-leak quarantine must survive AbortFalseShutdownTrip"
+        );
+
+        let mut disarmed_state = EngineState::new(cfg.clone(), true, false, 100);
+        disarmed_state.lifecycle = Lifecycle::Disarmed;
+        disarmed_state.protection = ProtectionState::Monitoring;
+        let (_, rej_cmds) = GuardEngine::step(
+            disarmed_state,
+            EngineEvent::SetManualLockdown { on: true },
+            115,
+        );
+        assert!(matches!(
+            rej_cmds.as_slice(),
+            [EffectCommand::RequestRejected {
+                code: ErrorCode::IllegalState,
+                ..
+            }]
+        ));
+
+        // 4) bind_agent-scoped launch gate + metadata-only ConfigPersisted + IP-change risk invalidation
+        let ready_init = EngineState::new(cfg.clone(), true, false, 200);
+        let init_epoch = ready_init.runtime_epoch;
+        let mut partial_probes = pass_probes();
+        partial_probes.retain(|(id, _)| id != "antigravity");
+        partial_probes.push(("antigravity".into(), ProbeResult::failed("503")));
+        let (mut ready, _) = GuardEngine::step(
+            ready_init,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: init_epoch,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: partial_probes,
+            },
+            205,
+        );
+        // Antigravity 503 blocks Antigravity & generic gate, while Claude ("claude" / "claude-code") stays allowed!
+        assert!(GuardEngine::evaluate_launch_gate_for_agent(&ready, Some("claude"), 206).allowed);
+        assert!(
+            GuardEngine::evaluate_launch_gate_for_agent(&ready, Some("claude-code"), 206).allowed
+        );
+        assert!(
+            !GuardEngine::evaluate_launch_gate_for_agent(&ready, Some("antigravity"), 206).allowed
+        );
+        assert!(!GuardEngine::evaluate_launch_gate(&ready, 206).allowed);
+
+        // Metadata-only ConfigPersisted preserves checked_at & target_statuses
+        let mut meta_cfg = ready.config.clone();
+        meta_cfg.privacy_mask_ip = !meta_cfg.privacy_mask_ip;
+        let (after_meta, _) = GuardEngine::step(
+            ready.clone(),
+            EngineEvent::ConfigPersisted {
+                ok: true,
+                config: Some(meta_cfg),
+                error: None,
+            },
+            207,
+        );
+        assert!(after_meta.checked_at.is_some());
+        assert!(
+            GuardEngine::evaluate_launch_gate_for_agent(&after_meta, Some("claude"), 208).allowed
+        );
+
+        // Risk assessment for old IP is invalidated when observed IP changes
+        ready.risk_assessment = RiskAssessment {
+            score: 20,
+            grade: SafetyGrade::F,
+            evaluated_at: 205,
+            ip_purity: cg_protocol::IpPurityReport {
+                ip: Some("203.0.113.9".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!GuardEngine::evaluate_launch_gate_for_agent(&ready, Some("claude"), 208).allowed);
+        let (after_ip_hop, _) = GuardEngine::step(
+            ready,
+            EngineEvent::RoundCompleted {
+                cfg_rev: 0,
+                runtime_epoch: init_epoch,
+                purpose: CheckPurpose::Monitor,
+                access: covered_access(),
+                probes: pass_probes(),
+            },
+            210,
+        );
+        assert_eq!(after_ip_hop.risk_assessment.evaluated_at, 0);
+        assert!(
+            GuardEngine::evaluate_launch_gate_for_agent(&after_ip_hop, Some("claude"), 211).allowed
         );
     }
 }

@@ -214,6 +214,19 @@ pub fn safe_create_dir_all_no_reparse(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Clears `FILE_ATTRIBUTE_READONLY` on a verified non-reparse file or directory so Clean-Room
+/// sanitization and atomic writes never abort halfway with `PermissionDenied`.
+pub(crate) fn clear_readonly_if_needed(path: &Path) {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !is_reparse_or_symlink(&meta) && meta.permissions().readonly() {
+            let mut perms = meta.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+}
+
 /// Safely removes a file or directory tree without EVER recursing through NTFS junctions or symlinks.
 pub fn safe_remove_path_no_reparse(path: &Path) -> Result<(), String> {
     ensure_no_reparse_points_chain(path.parent().unwrap_or(path))?;
@@ -229,11 +242,13 @@ pub fn safe_remove_path_no_reparse(path: &Path) -> Result<(), String> {
         ));
     }
     if meta.is_file() {
+        clear_readonly_if_needed(path);
         std::fs::remove_file(path)
             .map_err(|e| format!("删除文件失败（{}）：{e}", path.display()))?;
         return Ok(());
     }
     if meta.is_dir() {
+        clear_readonly_if_needed(path);
         let entries = std::fs::read_dir(path)
             .map_err(|e| format!("读取目录失败（{}）：{e}", path.display()))?;
         for entry_res in entries {
@@ -252,6 +267,7 @@ pub fn safe_remove_path_no_reparse(path: &Path) -> Result<(), String> {
             } else if cmeta.is_dir() {
                 safe_remove_path_no_reparse(&child)?;
             } else {
+                clear_readonly_if_needed(&child);
                 std::fs::remove_file(&child)
                     .map_err(|e| format!("删除子文件失败（{}）：{e}", child.display()))?;
             }
@@ -278,37 +294,92 @@ pub(crate) fn is_reparse_or_symlink(meta: &std::fs::Metadata) -> bool {
     }
 }
 
-/// Atomically writes `bytes` to `target_path` using a randomized temp file in the same directory
-/// after verifying zero reparse points along the entire ancestor chain.
+/// Atomically writes `bytes` to `target_path` using a `create_new(true)` CSPRNG temp file in the
+/// same directory and `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` after verifying zero reparse points.
 pub(crate) fn atomic_write_no_reparse(target_path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
     let parent = target_path
         .parent()
         .ok_or_else(|| format!("目标路径缺少父目录：{}", target_path.display()))?;
     safe_create_dir_all_no_reparse(parent)?;
     ensure_no_reparse_points_chain(target_path)?;
 
-    let suffix = crypto_win::random_hex(6).unwrap_or_else(|_| "tmp".into());
     let file_name = target_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("file");
-    let tmp_path = parent.join(format!(".{file_name}.cg-tmp-{suffix}"));
-    ensure_no_reparse_points_chain(&tmp_path)?;
 
-    std::fs::write(&tmp_path, bytes)
-        .map_err(|e| format!("写入临时文件失败（{}）：{e}", tmp_path.display()))?;
+    let mut tmp_opt = None;
+    for _ in 0..8 {
+        let suffix =
+            crypto_win::random_hex(8).unwrap_or_else(|_| format!("{}", std::process::id()));
+        let cand = parent.join(format!(".{file_name}.cg-tmp-{suffix}"));
+        ensure_no_reparse_points_chain(&cand)?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&cand)
+        {
+            Ok(f) => {
+                tmp_opt = Some((cand, f));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("创建临时文件失败（{}）：{e}", cand.display())),
+        }
+    }
+    let Some((tmp_path, mut tmp_file)) = tmp_opt else {
+        return Err(format!("创建独占临时文件失败：{}", target_path.display()));
+    };
+
+    if let Err(e) = tmp_file.write_all(bytes).and_then(|()| tmp_file.sync_all()) {
+        drop(tmp_file);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("写入临时文件失败（{}）：{e}", tmp_path.display()));
+    }
+    drop(tmp_file);
 
     // Re-check target path before replacing without following symlinks.
     ensure_no_reparse_points_chain(target_path)?;
-    if std::fs::symlink_metadata(target_path).is_ok() {
-        let _ = std::fs::remove_file(target_path);
+    clear_readonly_if_needed(target_path);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        let src_w: Vec<u16> = tmp_path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let dst_w: Vec<u16> = target_path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        if let Err(e) = unsafe {
+            MoveFileExW(
+                PCWSTR(src_w.as_ptr()),
+                PCWSTR(dst_w.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!(
+                "原子替换文件失败（{}）：{e}",
+                target_path.display()
+            ));
+        }
     }
-    if let Err(e) = std::fs::rename(&tmp_path, target_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!(
-            "原子替换文件失败（{}）：{e}",
-            target_path.display()
-        ));
+    #[cfg(not(windows))]
+    {
+        if let Err(e) = std::fs::rename(&tmp_path, target_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!(
+                "原子替换文件失败（{}）：{e}",
+                target_path.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -416,8 +487,19 @@ pub fn ensure_vault_layout_in(
     // Seed unique randomized machine IDs for Antigravity IDE (idempotent: preserves existing IDs).
     seed_isolated_ide_telemetry_ids(&paths.antigravity_ide)?;
 
-    // Seed a fresh uncorrelated anonymousId in Claude Code isolated home if not yet initialized.
-    seed_isolated_claude_code_state(&paths.claude_code_home)?;
+    // Seed a fresh uncorrelated anonymousId (and sanitized `mcpServers`-only from host `.claude.json`
+    // when available) in Claude Code isolated home, without ever copying `oauthAccount` / `userID`.
+    let host_claude_json = infer_user_home_from_vaults_root(vaults_root)
+        .map(|h| h.join(".claude.json"))
+        .filter(|p| p.is_file());
+    seed_isolated_claude_code_state_with_host(
+        &paths.claude_code_home,
+        host_claude_json.as_deref(),
+    )?;
+
+    // Seed `<codex_home>\config.toml` with `cli_auth_credentials_store = "file"` so Codex CLI
+    // never shares Windows Credential Manager tokens across Sovereign Vaults.
+    seed_isolated_codex_config(&paths.codex_home)?;
 
     // Persist vault metadata atomically.
     let meta = VaultDiskMeta {
@@ -501,21 +583,118 @@ pub fn seed_isolated_ide_telemetry_ids(ide_user_data_dir: &Path) -> Result<PathB
     Ok(storage_path)
 }
 
-fn seed_isolated_claude_code_state(claude_code_home: &Path) -> Result<PathBuf, String> {
+fn infer_user_home_from_vaults_root(vaults_root: &Path) -> Option<PathBuf> {
+    // `<home>\AppData\Local\ClaudeGuard\Vaults` -> `<home>`
+    let cg = vaults_root.parent()?;
+    if !cg
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("claudeguard"))
+    {
+        return None;
+    }
+    let local = cg.parent()?;
+    let appdata = local.parent()?;
+    if !local
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("local"))
+        || !appdata
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("appdata"))
+    {
+        return None;
+    }
+    appdata.parent().map(Path::to_path_buf)
+}
+
+/// Seeds `<claude_code_home>\.claude.json` with a fresh CSPRNG `anonymousId` and, when
+/// `host_claude_json` is present, copies ONLY `mcpServers` (never `oauthAccount`, `userID`,
+/// `projects`, or telemetry caches).
+pub fn seed_isolated_claude_code_state_with_host(
+    claude_code_home: &Path,
+    host_claude_json: Option<&Path>,
+) -> Result<PathBuf, String> {
     safe_create_dir_all_no_reparse(claude_code_home)?;
     let state_path = claude_code_home.join(".claude.json");
     ensure_no_reparse_points_chain(&state_path)?;
+
+    let host_mcp = host_claude_json
+        .filter(|p| ensure_no_reparse_points_chain(p).is_ok() && p.is_file())
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+        .and_then(|val| val.get("mcpServers").cloned())
+        .filter(|mcp| mcp.as_object().is_some_and(|o| !o.is_empty()));
+
     if !state_path.exists() {
         let mut obj = serde_json::Map::new();
         obj.insert(
             "anonymousId".into(),
             serde_json::Value::String(crypto_win::random_uuid_v4()?),
         );
+        if let Some(mcp) = host_mcp {
+            obj.insert("mcpServers".into(), mcp);
+        }
         let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(obj))
             .map_err(|e| format!("序列化仓内 .claude.json 失败：{e}"))?;
         atomic_write_no_reparse(&state_path, &bytes)?;
+    } else if let Some(mcp) = host_mcp {
+        if let Ok(raw) = std::fs::read(&state_path) {
+            if let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice(&raw) {
+                if !obj.contains_key("mcpServers") {
+                    obj.insert("mcpServers".into(), mcp);
+                    let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(obj))
+                        .map_err(|e| format!("更新仓内 .claude.json mcpServers 失败：{e}"))?;
+                    atomic_write_no_reparse(&state_path, &bytes)?;
+                }
+            }
+        }
     }
     Ok(state_path)
+}
+
+/// Seeds `<codex_home>\config.toml` with `cli_auth_credentials_store = "file"` while preserving
+/// all existing TOML keys and sections, preventing OS keyring cross-vault token bleed.
+pub fn seed_isolated_codex_config(codex_home: &Path) -> Result<PathBuf, String> {
+    safe_create_dir_all_no_reparse(codex_home)?;
+    let cfg_path = codex_home.join("config.toml");
+    ensure_no_reparse_points_chain(&cfg_path)?;
+
+    if !cfg_path.exists() {
+        atomic_write_no_reparse(&cfg_path, b"cli_auth_credentials_store = \"file\"\n")?;
+        return Ok(cfg_path);
+    }
+
+    let existing = std::fs::read_to_string(&cfg_path).map_err(|e| {
+        format!(
+            "读取仓内 Codex config.toml 失败（{}）：{e}",
+            cfg_path.display()
+        )
+    })?;
+    let mut in_table = false;
+    let mut has_store_key = false;
+    for raw_line in existing.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            in_table = true;
+            continue;
+        }
+        if !in_table {
+            if let Some((k, _)) = trimmed.split_once('=') {
+                if k.trim() == "cli_auth_credentials_store" {
+                    has_store_key = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if !has_store_key {
+        let updated = format!("cli_auth_credentials_store = \"file\"\n{existing}");
+        atomic_write_no_reparse(&cfg_path, updated.as_bytes())?;
+    }
+    Ok(cfg_path)
 }
 
 fn has_non_empty_str(map: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
@@ -586,8 +765,13 @@ pub fn plan_vault_launch_env_and_args_in(
     env.insert("CG_VAULT_ID".into(), vault.id.clone());
 
     if !host.is_empty() && effective_proxy_port > 0 {
-        let http_proxy = format!("http://{host}:{effective_proxy_port}");
-        let socks_proxy = format!("socks5h://{host}:{effective_proxy_port}");
+        let url_host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        let http_proxy = format!("http://{url_host}:{effective_proxy_port}");
+        let socks_proxy = format!("socks5h://{url_host}:{effective_proxy_port}");
         env.insert("HTTP_PROXY".into(), http_proxy.clone());
         env.insert("HTTPS_PROXY".into(), http_proxy.clone());
         env.insert("http_proxy".into(), http_proxy.clone());
@@ -627,7 +811,7 @@ pub fn plan_vault_launch_env_and_args_in(
                 "chatgpt",
                 &paths.chatgpt_desktop,
                 vault.msix_isolation_mode,
-                r"Packages\OpenAI.ChatGPT-Desktop_*\LocalCache\Roaming\ChatGPT",
+                r"Packages\OpenAI.Codex_* | OpenAI.ChatGPT-Desktop_*\LocalCache\Roaming",
             );
         }
         VaultAppTarget::AntigravityIde => {
@@ -752,14 +936,53 @@ pub fn verify_vault_lockfile_active(user_data_dir: &Path) -> bool {
     false
 }
 
+fn is_gui_agent_currently_running(agent_id: &str) -> bool {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes_specifics(sysinfo::ProcessRefreshKind::new());
+    let aid = agent_id.trim().to_ascii_lowercase();
+    sys.processes().values().any(|p| {
+        let name = p.name().to_ascii_lowercase();
+        match aid.as_str() {
+            "claude" => name == "claude.exe",
+            "chatgpt" => {
+                matches!(
+                    name.as_str(),
+                    "chatgpt.exe" | "chatgpt classic.exe" | "codex.exe"
+                )
+            }
+            "antigravity" => matches!(name.as_str(), "antigravity.exe" | "antigravity ide.exe"),
+            _ => false,
+        }
+    })
+}
+
 /// Acquires an exclusive single-instance MSIX lock for `(agent_id, vault_id)`.
-/// Rejects launch if another vault currently owns the active MSIX container.
+/// Rejects launch if another vault currently owns a live MSIX container; automatically expires
+/// stale locks left behind after normal client exit or crash once past the 15s startup grace.
 pub fn acquire_msix_exclusive_lock(
     vaults_root: &Path,
     agent_id: &str,
     vault_id: &str,
     now_secs: u64,
 ) -> Result<PathBuf, String> {
+    acquire_msix_exclusive_lock_with_liveness(
+        vaults_root,
+        agent_id,
+        vault_id,
+        now_secs,
+        is_gui_agent_currently_running,
+    )
+}
+
+pub fn acquire_msix_exclusive_lock_with_liveness(
+    vaults_root: &Path,
+    agent_id: &str,
+    vault_id: &str,
+    now_secs: u64,
+    is_agent_alive: impl FnOnce(&str) -> bool,
+) -> Result<PathBuf, String> {
+    const STARTUP_LOCK_GRACE_SECS: u64 = 15;
+
     validate_vault_id(vault_id)?;
     let safe_agent = sanitize_filename_component(agent_id);
     if safe_agent.is_empty() {
@@ -771,11 +994,21 @@ pub fn acquire_msix_exclusive_lock(
 
     if lock_path.exists() {
         let raw = std::fs::read_to_string(&lock_path).unwrap_or_default();
-        if let Some(holder) = raw.lines().next().map(str::trim).filter(|s| !s.is_empty()) {
+        let mut lines = raw.lines();
+        let holder = lines.next().map(str::trim).filter(|s| !s.is_empty());
+        let lock_ts = lines
+            .next()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if let Some(holder) = holder {
             if holder != vault_id {
-                return Err(format!(
-                    "检测到 MSIX 版客户端受系统沙箱单实例限制，当前由账号仓 `{holder}` 独占运行，请先关闭后再启动 `{vault_id}`"
-                ));
+                let past_startup_grace =
+                    now_secs >= lock_ts.saturating_add(STARTUP_LOCK_GRACE_SECS);
+                if !past_startup_grace || is_agent_alive(&safe_agent) {
+                    return Err(format!(
+                        "检测到 MSIX 版客户端受系统沙箱单实例限制，当前由账号仓 `{holder}` 独占运行，请先关闭后再启动 `{vault_id}`"
+                    ));
+                }
             }
         }
     }
@@ -846,13 +1079,52 @@ pub fn generate_vault_shortcuts_in(
     let mut generated = Vec::new();
 
     // 1. PowerShell 7 / Windows PowerShell 5.1 compatible vault environment init script (UTF-8 BOM + CRLF).
+    // Always export HTTP_PROXY / HTTPS_PROXY / ALL_PROXY so CLI tools never bypass SystemProxy when TUN is off.
     let ps1_path = paths.shortcuts_dir.join("vault-shell-init.ps1");
-    let proxy_line = match vault.dedicated_proxy_port.filter(|&p| p > 0) {
-        Some(port) => format!(
-            "$env:HTTP_PROXY = 'http://127.0.0.1:{port}'\r\n$env:HTTPS_PROXY = 'http://127.0.0.1:{port}'\r\n$env:ALL_PROXY = 'socks5h://127.0.0.1:{port}'\r\n$env:NO_PROXY = 'localhost,127.0.0.1,::1'\r\n"
-        ),
-        None => String::new(),
+    let (shell_proxy_host, shell_proxy_port) = match vault.dedicated_proxy_port.filter(|&p| p > 0) {
+        Some(port) => ("127.0.0.1".to_string(), port),
+        None => {
+            let sys_ev = crate::access_win::read_proxy_evidence();
+            if sys_ev.enable {
+                if let crate::access_win::ProxyParse::Http(addr) =
+                    crate::access_win::parse_proxy_server(sys_ev.server.as_deref())
+                {
+                    if let Some((h, p_str)) = addr.rsplit_once(':') {
+                        if let Ok(p) = p_str.parse::<u16>() {
+                            if p > 0 {
+                                (h.to_string(), p)
+                            } else {
+                                ("127.0.0.1".to_string(), 7890)
+                            }
+                        } else {
+                            ("127.0.0.1".to_string(), 7890)
+                        }
+                    } else {
+                        ("127.0.0.1".to_string(), 7890)
+                    }
+                } else {
+                    let p = crate::mihomo_win::discover_local_proxy_ports()
+                        .into_iter()
+                        .next()
+                        .unwrap_or(7890);
+                    ("127.0.0.1".to_string(), p)
+                }
+            } else {
+                let p = crate::mihomo_win::discover_local_proxy_ports()
+                    .into_iter()
+                    .next()
+                    .unwrap_or(7890);
+                ("127.0.0.1".to_string(), p)
+            }
+        }
     };
+    let ps_host = escape_ps_single_quoted(&shell_proxy_host);
+    let proxy_line = format!(
+        "$env:HTTP_PROXY = 'http://{ps_host}:{shell_proxy_port}'\r\n\
+         $env:HTTPS_PROXY = 'http://{ps_host}:{shell_proxy_port}'\r\n\
+         $env:ALL_PROXY = 'socks5h://{ps_host}:{shell_proxy_port}'\r\n\
+         $env:NO_PROXY = 'localhost,127.0.0.1,::1'\r\n"
+    );
     let ps1_body = format!(
         "# ClaudeGuard v5 主权账号仓终端环境脚本\r\n\
          # Vault: {id} ({name})\r\n\
@@ -890,23 +1162,85 @@ pub fn generate_vault_shortcuts_in(
     atomic_write_no_reparse(&shim_cmd_path, shim_cmd.as_bytes())?;
     generated.push(shim_cmd_path);
 
-    // 3. Desktop direct-launch shortcuts (.lnk via Win32 COM IShellLinkW, or .cmd fallback).
-    let targets = [
-        ("Claude", "claude_desktop", "启动 Claude Desktop 主权隔离仓"),
+    // 3. Desktop direct-launch shortcuts (.lnk via Win32 COM IShellLinkW with original app icons, or .cmd fallback)
+    //    covering all installed apps in the 5-core suite (always emitting Claude & Claude Code baseline).
+    let claude_exe = crate::process_win::discover_agent_exes("claude")
+        .into_iter()
+        .next();
+    let claude_code_exe = crate::process_win::discover_cli_exes("claude-code")
+        .into_iter()
+        .next();
+    let chatgpt_exe = crate::process_win::discover_agent_exes("chatgpt")
+        .into_iter()
+        .next();
+    let codex_exe = crate::process_win::discover_cli_exes("codex")
+        .into_iter()
+        .next();
+    let antigravity_exe = crate::process_win::discover_agent_exes("antigravity")
+        .into_iter()
+        .next();
+
+    let suite = [
+        (
+            "Claude",
+            "claude_desktop",
+            "启动 Claude Desktop 主权隔离仓",
+            claude_exe,
+            true,
+        ),
         (
             "Claude Code",
             "claude_code_cli",
             "启动 Claude Code 主权隔离仓",
+            claude_code_exe,
+            true,
+        ),
+        (
+            "ChatGPT",
+            "chatgpt_desktop",
+            "启动 ChatGPT Desktop 主权隔离仓",
+            chatgpt_exe,
+            false,
+        ),
+        (
+            "Codex CLI",
+            "codex_cli",
+            "启动 Codex CLI 主权隔离仓",
+            codex_exe,
+            false,
+        ),
+        (
+            "Antigravity",
+            "antigravity_ide",
+            "启动 Antigravity 主权隔离仓",
+            antigravity_exe,
+            false,
         ),
     ];
-    for (prefix, app_flag, desc) in targets {
+
+    for (prefix, app_flag, desc, discovered_exe, baseline) in suite {
+        if !baseline && discovered_exe.is_none() {
+            continue;
+        }
+        let icon_exe = discovered_exe.as_deref().filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+        });
         let base_name = format!("{prefix} ({safe_label})");
         let lnk_path = desktop_dir.join(format!("{base_name}.lnk"));
         let args = format!("vault launch --vault {} --app {}", vault.id, app_flag);
         let full_desc = format!("ClaudeGuard - {desc} ({})", vault.id);
 
         ensure_no_reparse_points_chain(&lnk_path)?;
-        match create_windows_shell_link(&lnk_path, cli_exe, &args, &paths.vault_root, &full_desc) {
+        match create_windows_shell_link(
+            &lnk_path,
+            cli_exe,
+            &args,
+            &paths.vault_root,
+            icon_exe,
+            &full_desc,
+        ) {
             Ok(()) => {
                 generated.push(lnk_path);
             }
@@ -932,6 +1266,7 @@ fn create_windows_shell_link(
     target_exe: &Path,
     arguments: &str,
     working_dir: &Path,
+    icon_exe: Option<&Path>,
     description: &str,
 ) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
@@ -940,6 +1275,7 @@ fn create_windows_shell_link(
     use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
 
     ensure_no_reparse_points_chain(lnk_path)?;
+    let _imp = crate::access_win::ImpersonateInteractiveUserGuard::impersonate_if_session_zero()?;
     let _com = crate::com::ComGuard::init_mta().map_err(|e| e.to_string())?;
 
     let to_wide = |s: &std::ffi::OsStr| -> Vec<u16> { s.encode_wide().chain(Some(0)).collect() };
@@ -948,6 +1284,7 @@ fn create_windows_shell_link(
     let wide_wd = to_wide(working_dir.as_os_str());
     let wide_desc = to_wide(std::ffi::OsStr::new(description));
     let wide_lnk = to_wide(lnk_path.as_os_str());
+    let wide_icon = icon_exe.map(|p| to_wide(p.as_os_str()));
 
     unsafe {
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
@@ -960,6 +1297,9 @@ fn create_windows_shell_link(
             .map_err(|e| format!("IShellLinkW::SetWorkingDirectory failed: {e}"))?;
         link.SetDescription(PCWSTR::from_raw(wide_desc.as_ptr()))
             .map_err(|e| format!("IShellLinkW::SetDescription failed: {e}"))?;
+        if let Some(ref ic) = wide_icon {
+            let _ = link.SetIconLocation(PCWSTR::from_raw(ic.as_ptr()), 0);
+        }
 
         let persist: IPersistFile = link
             .cast()
@@ -977,6 +1317,7 @@ fn create_windows_shell_link(
     _target_exe: &Path,
     _arguments: &str,
     _working_dir: &Path,
+    _icon_exe: Option<&Path>,
     _description: &str,
 ) -> Result<(), String> {
     Err("IShellLinkW shortcuts are only available on Windows".into())
@@ -1355,5 +1696,68 @@ mod tests {
         assert!(!root.join("temp-purge").exists());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_file_store_sanitized_claude_seed_ipv6_proxy_and_stale_lock_expiry() {
+        let sandbox = temp_test_dir("seed-ipv6-lock");
+        let fake_home = sandbox.join("host_home");
+        let root = fake_home
+            .join("AppData")
+            .join("Local")
+            .join("ClaudeGuard")
+            .join("Vaults");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            fake_home.join(".claude.json"),
+            r#"{"userID":"host-secret-id","oauthAccount":{"email":"a@b.com"},"mcpServers":{"fs":{"command":"node"}}}"#,
+        )
+        .unwrap();
+
+        let v = sample_vault("dev-v6", "Dev IPv6");
+        let plan = plan_vault_launch_env_and_args_in(
+            &root,
+            Some(&fake_home),
+            &v,
+            VaultAppTarget::ClaudeCodeCli,
+            "::1",
+            7890,
+            &[],
+        )
+        .expect("plan ipv6 vault");
+        assert_eq!(
+            plan.env.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://[::1]:7890")
+        );
+
+        let vp = ensure_vault_layout_in(&root, &v).expect("vault paths");
+        let codex_toml = std::fs::read_to_string(vp.codex_home.join("config.toml")).unwrap();
+        assert!(codex_toml.contains(r#"cli_auth_credentials_store = "file""#));
+
+        let seeded_claude: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(vp.claude_code_home.join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(seeded_claude["mcpServers"]["fs"]["command"], "node");
+        assert!(seeded_claude.get("userID").is_none());
+        assert!(seeded_claude.get("oauthAccount").is_none());
+
+        // Stale MSIX lock auto-expires after 15s when zero live processes are running.
+        acquire_msix_exclusive_lock_with_liveness(&root, "claude", "vault-a", 1000, |_| false)
+            .expect("vault-a lock");
+        assert!(
+            acquire_msix_exclusive_lock_with_liveness(&root, "claude", "vault-b", 1010, |_| false)
+                .is_err(),
+            "within 15s grace must still block"
+        );
+        assert!(
+            acquire_msix_exclusive_lock_with_liveness(&root, "claude", "vault-b", 1020, |_| true)
+                .is_err(),
+            "live process must still block even past 15s"
+        );
+        acquire_msix_exclusive_lock_with_liveness(&root, "claude", "vault-b", 1020, |_| false)
+            .expect("stale lock >= 15s with no live process must auto-expire");
+
+        let _ = std::fs::remove_dir_all(&sandbox);
     }
 }

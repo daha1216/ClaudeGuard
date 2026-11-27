@@ -33,6 +33,7 @@ pub const VETO_CAP_CF_WAF_CHALLENGE: u8 = 20;
 pub const VETO_CAP_TOR_EXIT: u8 = 25;
 pub const VETO_CAP_IPV6_DUAL_STACK_SPLIT: u8 = 30;
 pub const VETO_CAP_IMPOSSIBLE_TRAVEL: u8 = 35;
+pub const VETO_CAP_UNVERIFIED_EGRESS: u8 = 35;
 pub const VETO_CAP_DOMESTIC_DNS_LEAK: u8 = 45;
 
 /// ISO 3166-1 alpha-2 country/region codes blocked by Anthropic / OpenAI terms of service.
@@ -251,7 +252,19 @@ pub fn evaluate_geo_velocity(
             countries_24h.insert(item.country.trim().to_ascii_uppercase());
         }
 
-        if !same_subnet_or_ip(item, current) {
+        let has_curr_identity =
+            !current.subnet_hmac_hex.is_empty() || !current.ip_hmac_hex.is_empty();
+        let diff_candidate = if has_curr_identity {
+            !same_subnet_or_ip(item, current)
+        } else {
+            !item.country.trim().is_empty()
+                && !current.country.trim().is_empty()
+                && !item
+                    .country
+                    .trim()
+                    .eq_ignore_ascii_case(current.country.trim())
+        };
+        if diff_candidate {
             let replace = match prev_diff {
                 None => true,
                 Some(best) => item.observed_at >= best.observed_at,
@@ -704,8 +717,17 @@ pub fn score_egress_risk(input: &RiskScoringInput) -> RiskAssessment {
     // ---- D4: Geo-Velocity & 7-Day Subnet Churn (15 pts) ----
     let current_obs = input.current_observation.clone().or_else(|| {
         let country = purity.country.clone()?;
+        let history_uses_hmac = input.history_7d.iter().any(|h| {
+            !h.subnet_hmac_hex.is_empty()
+                || (h.ip_hmac_hex.len() == 64
+                    && h.ip_hmac_hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        });
         Some(EgressObservation {
-            ip_hmac_hex: purity.ip.clone().unwrap_or_default(),
+            ip_hmac_hex: if history_uses_hmac {
+                String::new()
+            } else {
+                purity.ip.clone().unwrap_or_default()
+            },
             subnet_hmac_hex: String::new(),
             country,
             city_or_colo: purity.city.clone().unwrap_or_default(),
@@ -753,7 +775,19 @@ pub fn score_egress_risk(input: &RiskScoringInput) -> RiskAssessment {
     });
 
     // ---- D5: Edge Trace Status & Supported Region (8 pts) ----
+    let v4_ip_present = purity
+        .ip
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
     let v4_country = purity.country.as_deref().map(str::trim).unwrap_or("");
+    if !v4_ip_present && v4_country.is_empty() {
+        active_vetoes.push(("出口尚未核验", VETO_CAP_UNVERIFIED_EGRESS));
+        push_unique_rec(
+            &mut recommendations,
+            "尚未获取有效出口 IP 与地区，请先执行一次合规链路探测后再启动客户端",
+        );
+    }
     let unsupported_v4 = !v4_country.is_empty() && is_unsupported_region(v4_country);
     let (d5_penalty, d5_detail, d5_rem) = if unsupported_v4 {
         active_vetoes.push(("受限地区出口红线", VETO_CAP_UNSUPPORTED_REGION));
@@ -815,8 +849,7 @@ pub fn score_egress_risk(input: &RiskScoringInput) -> RiskAssessment {
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let v6_split_critical =
-        !unsupported_v4 && !v4_country.is_empty() && v6_country.is_some_and(is_unsupported_region);
+    let v6_split_critical = !unsupported_v4 && v6_country.is_some_and(is_unsupported_region);
     let v6_country_mismatch = !v6_split_critical
         && (purity.dual_stack_split_detected
             || (!v4_country.is_empty()
@@ -829,7 +862,7 @@ pub fn score_egress_risk(input: &RiskScoringInput) -> RiskAssessment {
             format!(
                 "检测到 IPv4/IPv6 双栈脑裂（IPv4={}，IPv6={}，触发红线封顶 <= 30）",
                 if v4_country.is_empty() {
-                    "海外代理"
+                    "未知/未核验"
                 } else {
                     v4_country
                 },
@@ -842,7 +875,11 @@ pub fn score_egress_risk(input: &RiskScoringInput) -> RiskAssessment {
             3,
             format!(
                 "IPv4 ({}) 与 IPv6 ({}) 出口国家不一致",
-                v4_country,
+                if v4_country.is_empty() {
+                    "未知"
+                } else {
+                    v4_country
+                },
                 v6_country.unwrap_or("未知")
             ),
             Some("建议开启 IPv6 护盾或统一代理节点的双栈出口国家".to_string()),
@@ -1469,5 +1506,45 @@ mod tests {
         let res_v6 = score_egress_risk(&us_ca_v6);
         assert_eq!(res_v6.score, 97);
         assert_eq!(res_v6.grade, SafetyGrade::S);
+    }
+
+    #[test]
+    fn unprobed_default_egress_caps_at_grade_f_and_empty_v4_with_cn_ipv6_triggers_split_veto() {
+        // 1) Unprobed RiskScoringInput::default() must NEVER score Grade S/A!
+        let unprobed = score_egress_risk(&RiskScoringInput::new(10_000));
+        assert!(
+            unprobed.score <= VETO_CAP_UNVERIFIED_EGRESS,
+            "unprobed score was {}",
+            unprobed.score
+        );
+        assert_eq!(unprobed.grade, SafetyGrade::F);
+        assert!(unprobed.headline.contains("出口尚未核验"));
+
+        // 2) Empty v4 country + unsupported IPv6 country ("CN") triggers VETO_CAP_IPV6_DUAL_STACK_SPLIT (<= 30)
+        let mut v6_only_cn = pristine_input(10_000);
+        v6_only_cn.ip_purity.country = None;
+        v6_only_cn.ip_purity.ipv6_egress_country = Some("CN".into());
+        let r_v6_cn = score_egress_risk(&v6_only_cn);
+        assert!(r_v6_cn.score <= VETO_CAP_IPV6_DUAL_STACK_SPLIT);
+        assert_eq!(r_v6_cn.grade, SafetyGrade::F);
+
+        // 3) HMAC history + missing current_observation must NOT false-penalize same-country IP as subnet churn
+        let mut hmac_hist = pristine_input(10_000);
+        hmac_hist.current_observation = None;
+        hmac_hist.history_7d.push(EgressObservation {
+            ip_hmac_hex: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            subnet_hmac_hex: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+                .into(),
+            country: "US".into(),
+            city_or_colo: "New York".into(),
+            lat_tenths: Some(407),
+            lon_tenths: Some(-740),
+            observed_at: 9_940,
+            vault_id: None,
+        });
+        let r_hmac = score_egress_risk(&hmac_hist);
+        assert!(r_hmac.geo_velocity_alert.is_none());
+        assert_eq!(r_hmac.distinct_subnets_1h, 1);
+        assert_eq!(r_hmac.score, 100);
     }
 }

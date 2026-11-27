@@ -1376,9 +1376,21 @@ pub fn project_hud(
                             .preferred_mihomo_node
                             .as_deref()
                             .is_some_and(|n| !n.trim().is_empty());
-                    let can_launch = cfg_v.enabled
+                    let has_dedicated_port = cfg_v
+                        .dedicated_proxy_port
+                        .is_some_and(|pt| pt > 0 && pt != s.config.proxy_port);
+                    let guard_posture_allows_vault = connected
+                        && s.lifecycle == Lifecycle::Armed
+                        && !s.is_tripped()
+                        && !s.lockdown
+                        && !hero.is_paused
+                        && s.protection != ProtectionState::Degraded;
+                    let can_launch = guard_posture_allows_vault
+                        && cfg_v.enabled
                         && state != VaultRuntimeState::CoolingDown
-                        && (state != VaultRuntimeState::EgressMismatch || mihomo_can_align);
+                        && (has_dedicated_port
+                            || mihomo_can_align
+                            || (hero.can_launch && state != VaultRuntimeState::EgressMismatch));
                     let region_tag = cfg_v
                         .pinned_regions
                         .first()
@@ -2185,6 +2197,23 @@ pub fn build_onboarding_config(
     Ok(cfg)
 }
 
+/// Applies onboarding selection with an optional explicit local proxy port override from the
+/// Onboarding Local Proxy Port Radar (`detected_local_ports` pill or inline port input).
+pub fn build_onboarding_config_with_port(
+    base: &Config,
+    probe: &OnboardingProbeResult,
+    strategy: OnboardingStrategy,
+    custom_cidr: &str,
+    custom_regions: &str,
+    port_override: Option<u16>,
+) -> Result<Config, String> {
+    let mut cfg = build_onboarding_config(base, probe, strategy, custom_cidr, custom_regions)?;
+    if let Some(port) = port_override.filter(|&p| p > 0) {
+        cfg.proxy_port = port;
+    }
+    Ok(cfg)
+}
+
 #[allow(dead_code)]
 fn _log_level_order(level: LogLevel) -> u8 {
     match level {
@@ -2249,16 +2278,18 @@ mod tests {
         assert!(diag.expected_summary.contains("198.51.*.*"));
         assert_eq!(diag.firewall_rules, 6);
 
-        // Disarmed state uses DisarmedOrPaused hero tone and disallows Safe Launch.
+        // Disarmed state uses DisarmedOrPaused hero tone and disallows Safe Launch & Vault Launch.
         let disarmed_snap = build_demo_snapshot(DemoScenario::Disarmed);
         let disarmed_hud = project_hud(Some(&disarmed_snap), true, None, false);
         assert_eq!(disarmed_hud.hero.tone, HeroTone::DisarmedOrPaused);
         assert!(!disarmed_hud.hero.can_launch);
+        assert!(disarmed_hud.vaults.iter().all(|v| !v.can_launch));
 
         // Disconnected state must fail closed: cannot launch even if stale Pass snapshot exists.
         let offline_hud = project_hud(Some(&pass_snap), false, Some("pipe down"), false);
         assert!(!offline_hud.connected);
         assert!(!offline_hud.hero.can_launch);
+        assert!(offline_hud.vaults.iter().all(|v| !v.can_launch));
         assert_eq!(offline_hud.hero.tone, HeroTone::DisarmedOrPaused);
     }
 

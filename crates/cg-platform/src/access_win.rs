@@ -251,6 +251,7 @@ fn is_tun_excluded(name: &str) -> bool {
 
 fn has_bounded_tun_token(lower: &str) -> bool {
     lower == "tun"
+        || lower == "tunnel"
         || lower.ends_with("-tun")
         || lower.ends_with("_tun")
         || lower.ends_with(" tun")
@@ -260,13 +261,23 @@ fn has_bounded_tun_token(lower: &str) -> bool {
         })
 }
 
+fn is_numbered_meta_adapter(lower: &str) -> bool {
+    lower
+        .strip_prefix("meta")
+        .map(|s| s.trim_start_matches([' ', '-', '_', '#']))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn has_valid_meta_tun_token(lower: &str) -> bool {
     lower == "meta"
+        || lower == "meta tunnel"
+        || is_numbered_meta_adapter(lower)
         || (has_standalone_ascii_word(lower, "meta")
             && (lower.contains("clash")
                 || lower.contains("mihomo")
                 || lower.contains("wintun")
                 || has_standalone_ascii_word(lower, "tun")
+                || has_standalone_ascii_word(lower, "tunnel")
                 || has_bounded_tun_token(lower)))
 }
 
@@ -599,6 +610,9 @@ pub fn verdict(
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
+        if let Some(adapter) = tun_adapter {
+            return AccessPath::Tun { adapter };
+        }
         return AccessPath::Unknown {
             reason: format!("检测到 PAC 自动配置（{pac}），无法确认应用实际出口"),
         };
@@ -1306,7 +1320,7 @@ pub(crate) fn is_usable_tun_unicast_ip(ip: std::net::IpAddr) -> bool {
 }
 
 #[cfg(windows)]
-unsafe fn adapter_has_usable_unicast(
+pub(crate) unsafe fn adapter_has_usable_unicast(
     mut cur: *mut windows::Win32::NetworkManagement::IpHelper::IP_ADAPTER_UNICAST_ADDRESS_LH,
 ) -> bool {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -1369,11 +1383,49 @@ fn best_interface_for_ipv4(ip: std::net::Ipv4Addr) -> Option<u32> {
     }
 }
 
-/// Detect active Up TUN adapter verified to carry default public IPv4 routing (`104.18.0.1` & `1.1.1.1`)
-/// with at least one usable unicast IP using `IpHelper::GetAdaptersAddresses` + `GetBestInterfaceEx`.
+/// Multi-target route probe state for distinguishing real full-tunnel / Fake-IP TUN adapters
+/// from split-tunnel VPNs even when `1.1.1.1/32` is in `route-exclude-address`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TunRouteProbe {
+    pub best_104_18: Option<u32>,
+    pub best_160_79: Option<u32>,
+    pub best_1_1_1_1: Option<u32>,
+    pub best_8_8_8_8: Option<u32>,
+    pub best_fake_ip: Option<u32>,
+}
+
+impl TunRouteProbe {
+    #[cfg(windows)]
+    pub(crate) fn query_os() -> Self {
+        use std::net::Ipv4Addr;
+        Self {
+            best_104_18: best_interface_for_ipv4(Ipv4Addr::new(104, 18, 0, 1)),
+            best_160_79: best_interface_for_ipv4(Ipv4Addr::new(160, 79, 104, 10)),
+            best_1_1_1_1: best_interface_for_ipv4(Ipv4Addr::new(1, 1, 1, 1)),
+            best_8_8_8_8: best_interface_for_ipv4(Ipv4Addr::new(8, 8, 8, 8)),
+            best_fake_ip: best_interface_for_ipv4(Ipv4Addr::new(198, 18, 0, 1)),
+        }
+    }
+
+    pub(crate) fn carries_ai_or_fakeip_route(&self, if_index: u32) -> bool {
+        if if_index == 0 {
+            return false;
+        }
+        let target = Some(if_index);
+        (self.best_104_18 == target
+            && (self.best_160_79 == target
+                || self.best_1_1_1_1 == target
+                || self.best_8_8_8_8 == target))
+            || (self.best_fake_ip == target && self.best_104_18 == target)
+            || (self.best_fake_ip == target && self.best_160_79 == target)
+            || (self.best_fake_ip == target && self.best_104_18.is_none())
+    }
+}
+
+/// Detect active Up TUN adapter verified to carry AI public IPv4 routing (`104.18.0.1` + `160.79.104.10`
+/// / `1.1.1.1` / `8.8.8.8` / `198.18.0.1` Fake-IP) with at least one usable unicast IP.
 #[cfg(windows)]
 pub fn detect_tun_adapter() -> Option<String> {
-    use std::net::Ipv4Addr;
     use windows::Win32::NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
         GAA_FLAG_SKIP_MULTICAST, GET_ADAPTERS_ADDRESSES_FLAGS, IP_ADAPTER_ADDRESSES_LH,
@@ -1383,8 +1435,7 @@ pub fn detect_tun_adapter() -> Option<String> {
     const FAMILY_UNSPEC: u32 = 0;
     const ERROR_BUFFER_OVERFLOW: u32 = 111;
 
-    let best_if_104 = best_interface_for_ipv4(Ipv4Addr::new(104, 18, 0, 1));
-    let best_if_111 = best_interface_for_ipv4(Ipv4Addr::new(1, 1, 1, 1));
+    let probe = TunRouteProbe::query_os();
 
     let flags = GET_ADAPTERS_ADDRESSES_FLAGS(
         GAA_FLAG_SKIP_ANYCAST.0 | GAA_FLAG_SKIP_MULTICAST.0 | GAA_FLAG_SKIP_DNS_SERVER.0,
@@ -1411,8 +1462,7 @@ pub fn detect_tun_adapter() -> Option<String> {
                 let friendly = wide_to_string(&unsafe { pwstr_units(adapter.FriendlyName) });
                 let is_up = adapter.OperStatus == IfOperStatusUp
                     && unsafe { adapter_has_usable_unicast(adapter.FirstUnicastAddress) };
-                let carries_default_route =
-                    if_index != 0 && best_if_104 == Some(if_index) && best_if_111 == Some(if_index);
+                let carries_default_route = probe.carries_ai_or_fakeip_route(if_index);
                 candidates.push((desc, friendly, is_up, carries_default_route));
                 current = adapter.Next;
             }
@@ -1427,6 +1477,90 @@ pub fn detect_tun_adapter() -> Option<String> {
 
 #[cfg(not(windows))]
 pub fn detect_tun_adapter() -> Option<String> {
+    None
+}
+
+/// Resolves the host-side IPv4 address and CIDR prefix length (`(host_ipv4, prefix_len)`, e.g.
+/// `(172.24.16.1, 20)`) of the active `vEthernet (WSL)` Hyper-V virtual bridge so default NAT-mode
+/// WSL2 distributions can reach `WslBridgeServer` without requiring `networkingMode=mirrored`.
+#[cfg(windows)]
+pub fn detect_wsl_host_ipv4_and_prefix() -> Option<(std::net::Ipv4Addr, u8)> {
+    use std::net::Ipv4Addr;
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+        GAA_FLAG_SKIP_MULTICAST, GET_ADAPTERS_ADDRESSES_FLAGS, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows::Win32::Networking::WinSock::AF_INET;
+
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+
+    let flags = GET_ADAPTERS_ADDRESSES_FLAGS(
+        GAA_FLAG_SKIP_ANYCAST.0 | GAA_FLAG_SKIP_MULTICAST.0 | GAA_FLAG_SKIP_DNS_SERVER.0,
+    );
+    let mut size: u32 = 32 * 1024;
+    for _ in 0..4 {
+        let mut buffer: Vec<u64> = vec![0; (size as usize).div_ceil(8)];
+        let rc = unsafe {
+            GetAdaptersAddresses(
+                AF_INET.0 as u32,
+                flags,
+                None,
+                Some(buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>()),
+                &mut size,
+            )
+        };
+        if rc == 0 {
+            let mut current = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+            while !current.is_null() {
+                let adapter = unsafe { &*current };
+                if adapter.OperStatus == IfOperStatusUp {
+                    let desc = wide_to_string(&unsafe { pwstr_units(adapter.Description) });
+                    let friendly = wide_to_string(&unsafe { pwstr_units(adapter.FriendlyName) });
+                    if crate::wfp_win::is_wsl_virtual_adapter_name(&desc, &friendly) {
+                        let mut ua_ptr = adapter.FirstUnicastAddress;
+                        let mut guard = 0usize;
+                        while !ua_ptr.is_null() && guard < 64 {
+                            guard += 1;
+                            let ua = unsafe { &*ua_ptr };
+                            let ptr = ua.Address.lpSockaddr.cast::<u8>();
+                            let len = ua.Address.iSockaddrLength as usize;
+                            if !ptr.is_null() && len >= 8 {
+                                let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+                                let family = u16::from_ne_bytes([bytes[0], bytes[1]]);
+                                if family == AF_INET.0 {
+                                    let v4 = Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
+                                    if !v4.is_unspecified()
+                                        && !v4.is_loopback()
+                                        && !v4.is_link_local()
+                                        && !v4.is_multicast()
+                                    {
+                                        let prefix = if (1..=32).contains(&ua.OnLinkPrefixLength) {
+                                            ua.OnLinkPrefixLength
+                                        } else {
+                                            20
+                                        };
+                                        return Some((v4, prefix));
+                                    }
+                                }
+                            }
+                            ua_ptr = ua.Next;
+                        }
+                    }
+                }
+                current = adapter.Next;
+            }
+            return None;
+        }
+        if rc != ERROR_BUFFER_OVERFLOW {
+            return None;
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub fn detect_wsl_host_ipv4_and_prefix() -> Option<(std::net::Ipv4Addr, u8)> {
     None
 }
 
@@ -1530,7 +1664,7 @@ mod tests {
     }
 
     #[test]
-    fn pac_forces_unknown_regardless_of_proxy_enable() {
+    fn pac_forces_unknown_without_tun_and_yields_to_verified_tun() {
         let mut e = ev(true, Some("127.0.0.1:7890"));
         e.autoconfig = Some("http://127.0.0.1:7890/pac".into());
         assert!(matches!(
@@ -1541,9 +1675,15 @@ mod tests {
         let mut off = ev(false, None);
         off.autoconfig = Some("http://127.0.0.1:7890/pac".into());
         assert!(matches!(
-            verdict(&off, Some("Mihomo".into()), &hosts()),
+            verdict(&off, None, &hosts()),
             AccessPath::Unknown { .. }
         ));
+        assert_eq!(
+            verdict(&off, Some("Mihomo".into()), &hosts()),
+            AccessPath::Tun {
+                adapter: "Mihomo".into()
+            }
+        );
     }
 
     #[test]
@@ -1622,8 +1762,11 @@ mod tests {
         assert!(is_tun_name("tun"));
         assert!(!is_tun_name("iTunes"));
 
-        // Meta Quest / Meta Virtual / split-tunnel / game accelerators rejected; Clash Meta / exact Meta accepted
+        // Meta Quest / Meta Virtual / split-tunnel / game accelerators rejected; Clash Meta / numbered Meta / Meta Tunnel accepted
         assert!(is_tun_name("Meta"));
+        assert!(is_tun_name("Meta 2"));
+        assert!(is_tun_name("Meta #3"));
+        assert!(is_tun_name("Meta Tunnel"));
         assert!(is_tun_name("Clash Meta TUN"));
         assert!(is_tun_name("Meta Wintun"));
         assert!(!is_tun_name("Meta Quest Remote Desktop"));

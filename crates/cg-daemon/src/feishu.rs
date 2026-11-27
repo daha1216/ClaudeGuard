@@ -37,6 +37,8 @@ const LARKOFFICE_PREFIX: &str = "https://open.larkoffice.com/open-apis/bot/v2/ho
 struct StoredFeishu {
     enabled: bool,
     webhook_enc: String,
+    #[serde(skip)]
+    webhook_masked_cache: String,
     secret_enc: String,
     queue: VecDeque<QueuedEvent>,
     failed: VecDeque<FailedEvent>,
@@ -249,10 +251,11 @@ pub struct FeishuNotifier {
 impl FeishuNotifier {
     pub fn load(data_dir: &Path) -> Self {
         let path = data_dir.join("feishu.json");
-        let stored = fs::read_to_string(&path)
+        let mut stored = fs::read_to_string(&path)
             .ok()
             .and_then(|raw| serde_json::from_str::<StoredFeishu>(&raw).ok())
             .unwrap_or_default();
+        stored.webhook_masked_cache = mask_webhook_url(&decrypt_opt(&stored.webhook_enc));
         Self {
             path,
             state: Mutex::new(stored),
@@ -280,14 +283,22 @@ impl FeishuNotifier {
         Ok(())
     }
 
-    /// Returns credential-free public status for [`cg_protocol::GuardSnapshot`].
+    /// Lightweight lock-only queue length check without DPAPI calls.
+    pub fn queued_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .queue
+            .len()
+    }
+
+    /// Returns credential-free public status for [`cg_protocol::GuardSnapshot`] without invoking DPAPI.
     pub fn status(&self) -> FeishuStatus {
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let plain_url = decrypt_opt(&st.webhook_enc);
         FeishuStatus {
             enabled: st.enabled,
             has_webhook: !st.webhook_enc.is_empty(),
-            webhook_masked: mask_webhook_url(&plain_url),
+            webhook_masked: st.webhook_masked_cache.clone(),
             has_secret: !st.secret_enc.is_empty(),
             queued: st.queue.len(),
             failed: st.failed.len(),
@@ -313,10 +324,12 @@ impl FeishuNotifier {
                 // Allow clearing only if user explicitly passed an empty string while disabling.
                 if !enabled {
                     st.webhook_enc.clear();
+                    st.webhook_masked_cache.clear();
                 }
             } else {
                 validate_webhook_url(trimmed)?;
                 st.webhook_enc = encrypt_opt(trimmed)?;
+                st.webhook_masked_cache = mask_webhook_url(trimmed);
             }
         }
 
@@ -337,11 +350,10 @@ impl FeishuNotifier {
         st.last_error.clear();
         self.persist_locked(&st)?;
 
-        let plain_url = decrypt_opt(&st.webhook_enc);
         Ok(FeishuStatus {
             enabled: st.enabled,
             has_webhook: !st.webhook_enc.is_empty(),
-            webhook_masked: mask_webhook_url(&plain_url),
+            webhook_masked: st.webhook_masked_cache.clone(),
             has_secret: !st.secret_enc.is_empty(),
             queued: st.queue.len(),
             failed: st.failed.len(),
@@ -506,11 +518,10 @@ impl FeishuNotifier {
                 st.last_sent_at = Some(now);
                 st.last_error.clear();
                 let _ = self.persist_locked(&st);
-                let plain_url = decrypt_opt(&st.webhook_enc);
                 Ok(FeishuStatus {
                     enabled: st.enabled,
                     has_webhook: !st.webhook_enc.is_empty(),
-                    webhook_masked: mask_webhook_url(&plain_url),
+                    webhook_masked: st.webhook_masked_cache.clone(),
                     has_secret: !st.secret_enc.is_empty(),
                     queued: st.queue.len(),
                     failed: st.failed.len(),

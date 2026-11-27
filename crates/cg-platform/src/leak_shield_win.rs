@@ -50,7 +50,13 @@ fn build_shield_specs(
 ) -> Vec<ShieldRuleSpec> {
     let mut specs = Vec::new();
     for (idx, raw_exe) in app_paths.iter().enumerate() {
+        if crate::wfp_win::is_non_pe_script_shim(raw_exe) {
+            continue;
+        }
         let exe = crate::firewall_com::resolve_program_path_for_firewall(raw_exe);
+        if crate::wfp_win::is_non_pe_script_shim(&exe) {
+            continue;
+        }
         let stem = exe.file_stem().and_then(|s| s.to_str()).unwrap_or("app");
         let tag = format!("{stem}-{idx}");
         if block_quic {
@@ -252,19 +258,12 @@ pub fn clear_leak_shield() -> PlatformResult<usize> {
     use windows::Win32::NetworkManagement::WindowsFirewall::{INetFwPolicy2, NetFwPolicy2};
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
-    use crate::com::ComGuard;
-    use crate::traits::PlatformError;
+    use crate::com::{map_win_err, ComGuard};
 
     let _com = ComGuard::init_mta()?;
     let policy: INetFwPolicy2 = unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_ALL) }
-        .map_err(|e| PlatformError::Com {
-            code: e.code().0,
-            context: format!("创建 INetFwPolicy2 失败：{e}"),
-        })?;
-    let rules = unsafe { policy.Rules() }.map_err(|e| PlatformError::Com {
-        code: e.code().0,
-        context: format!("获取防火墙规则集合失败：{e}"),
-    })?;
+        .map_err(|e| map_win_err(e, "CoCreateInstance(NetFwPolicy2)"))?;
+    let rules = unsafe { policy.Rules() }.map_err(|e| map_win_err(e, "INetFwPolicy2::Rules"))?;
     Ok(remove_shield_rules_with_collection(&rules))
 }
 

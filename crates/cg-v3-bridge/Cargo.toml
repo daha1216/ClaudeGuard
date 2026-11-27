@@ -3,7 +3,7 @@ name = "cg-v3-bridge"
 version = "5.0.0"
 edition = "2021"
 license = "MIT"
-description = "ClaudeGuard v3 to v4 seamless self-update bridge bootstrapper"
+description = "ClaudeGuard v3 to v5 seamless self-update bridge bootstrapper"
 
 [workspace]
 

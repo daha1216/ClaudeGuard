@@ -1696,6 +1696,21 @@ fn ensure_component_defaults(summary: &mut UpdateSummary, cg_version: &str) {
     );
 }
 
+fn versions_share_compatible_epoch(component_id: &str, a: &str, b: &str) -> bool {
+    if component_id != "codex_desktop" {
+        return true;
+    }
+    let Some(pa) = parse_semver_parts(a) else {
+        return true;
+    };
+    let Some(pb) = parse_semver_parts(b) else {
+        return true;
+    };
+    let maj_a = pa.0.first().copied().unwrap_or(0);
+    let maj_b = pb.0.first().copied().unwrap_or(0);
+    // `OpenAI.Codex` uses `26.x` while `OpenAI.ChatGPT-Desktop` / Homebrew cask uses `1.2026.x`.
+    (maj_a >= 20) == (maj_b >= 20)
+}
 fn apply_client_update_check<F>(
     prev: &ComponentUpdateStatus,
     id: &str,
@@ -1750,6 +1765,13 @@ where
                         next.note =
                             format!("已安装汉化补丁 ({ins})，官方最新标签 v{}", remote.version);
                     }
+                }
+                Some(ins) if !versions_share_compatible_epoch(id, &remote.version, ins) => {
+                    next.phase = UpdateCheckPhase::UpToDate;
+                    next.note = format!(
+                        "当前已安装 v{ins}（另一分发渠道最新版本为 v{}）",
+                        remote.version
+                    );
                 }
                 Some(ins) if is_version_newer(&remote.version, ins) => {
                     next.phase = UpdateCheckPhase::UpdateAvailable;
@@ -1841,10 +1863,17 @@ where
             next.release_url = (!rel.html_url.is_empty()).then_some(rel.html_url);
             next.asset_url = rel.asset_url;
 
-            if !ag_proxy.dll_valid {
+            if !ag_proxy.dll_valid && ag_proxy.state != cg_protocol::AntigravityProxyState::Healthy
+            {
                 next.phase = UpdateCheckPhase::UpdateAvailable;
                 next.note = format!(
                     "当前未注入或 version.dll 已被覆盖，仓库最新版为 v{}",
+                    rel.version
+                );
+            } else if !ag_proxy.dll_valid {
+                next.phase = UpdateCheckPhase::UpToDate;
+                next.note = format!(
+                    "当前由外部代理启动器受控运行（无需注入 version.dll，仓库最新 v{}）",
                     rel.version
                 );
             } else if let Some(ins) = installed_ver.as_deref() {

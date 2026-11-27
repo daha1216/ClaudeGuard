@@ -462,6 +462,8 @@ pub fn render_overview(
     } else {
         let ctrl_chk = ctrl.clone();
         let ctrl_pause = ctrl.clone();
+        let can_recheck_hero = connected && !recheck_all_busy;
+        let can_pause_hero = ctrl_r.can_toggle_pause();
 
         div()
             .flex()
@@ -478,11 +480,11 @@ pub fn render_overview(
                         "立即核验"
                     },
                     ButtonKind::Primary,
-                    can_act,
+                    can_recheck_hero,
                     recheck_all_busy,
                     p,
                 )
-                .when(can_act, |b| {
+                .when(can_recheck_hero, |b| {
                     b.on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |_, _, _, cx| {
@@ -506,10 +508,10 @@ pub fn render_overview(
                         "暂停 30m"
                     },
                     ButtonKind::Secondary,
-                    can_act,
+                    can_pause_hero,
                     p,
                 )
-                .when(can_act, |b| {
+                .when(can_pause_hero, |b| {
                     b.on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |_, _, _, cx| {
@@ -1230,7 +1232,8 @@ pub fn render_overview(
             row_pose.apply(row)
         });
 
-    let kill_all_enabled = can_act && (total_running > 0 || total_orphans > 0);
+    let kill_all_enabled =
+        ctrl.read(cx).can_kill_processes() && (total_running > 0 || total_orphans > 0);
     let procs_pose = choreo.tile(1, 0);
     let col_procs = bento_card_bloom(p, 15.0, 14.0, procs_pose)
         .flex_1()
@@ -2031,8 +2034,12 @@ pub fn render_overview(
                     )
                     .into_any_element(),
             )
-        } else if hooks_unconfigured && lifecycle == Lifecycle::Armed {
+        } else if hooks_unconfigured
+            && lifecycle == Lifecycle::Armed
+            && ctrl.read(cx).dismissed_overview_banner_key.as_deref() != Some("hooks-unconfigured")
+        {
             let ctrl_hook_fix = ctrl.clone();
+            let ctrl_hook_dismiss = ctrl.clone();
             Some(
                 inset_box(p)
                     .flex_row()
@@ -2060,40 +2067,69 @@ pub fn render_overview(
                             ),
                     )
                     .child(
-                        spinning_action_button(
-                            "ov-oneclick-cli-hooks",
-                            "icons/ui/shield.svg",
-                            if configuring_hooks {
-                                "正在保护…"
-                            } else {
-                                "一键保护终端"
-                            },
-                            ButtonKind::Primary,
-                            can_act && !configuring_hooks,
-                            configuring_hooks,
-                            p,
-                        )
-                        .h(px(25.))
-                        .px(px(10.))
-                        .text_size(px(11.))
-                        .when(can_act && !configuring_hooks, |b| {
-                            b.on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |_, _, _, cx| {
-                                    ctrl_hook_fix.update(cx, |c, cx| {
-                                        c.send_request(
-                                            PipeRequest::ConfigureCliHooks {
-                                                install_claude_code: true,
-                                                install_pwsh_profile: true,
-                                                sync_all_vaults: true,
-                                            },
-                                            Some("已为终端 Claude Code 与 PowerShell 开启防封保护"),
-                                            cx,
-                                        );
-                                    });
+                        div()
+                            .flex()
+                            .items_center()
+                            .flex_shrink_0()
+                            .gap(px(6.))
+                            .child(
+                                spinning_action_button(
+                                    "ov-oneclick-cli-hooks",
+                                    "icons/ui/shield.svg",
+                                    if configuring_hooks {
+                                        "正在保护…"
+                                    } else {
+                                        "一键保护终端"
+                                    },
+                                    ButtonKind::Primary,
+                                    can_act && !configuring_hooks,
+                                    configuring_hooks,
+                                    p,
+                                )
+                                .h(px(25.))
+                                .px(px(10.))
+                                .text_size(px(11.))
+                                .when(can_act && !configuring_hooks, |b| {
+                                    b.on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            ctrl_hook_fix.update(cx, |c, cx| {
+                                                c.send_request(
+                                                    PipeRequest::ConfigureCliHooks {
+                                                        install_claude_code: true,
+                                                        install_pwsh_profile: true,
+                                                        sync_all_vaults: true,
+                                                    },
+                                                    Some("已为终端 Claude Code 与 PowerShell 开启防封保护"),
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                    )
                                 }),
                             )
-                        }),
+                            .child(
+                                action_button(
+                                    "ov-dismiss-cli-hooks-banner",
+                                    "× 已知晓",
+                                    ButtonKind::Ghost,
+                                    true,
+                                    p,
+                                )
+                                .h(px(25.))
+                                .px(px(7.5))
+                                .text_size(px(10.5))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |_, _, _, cx| {
+                                        ctrl_hook_dismiss.update(cx, |c, cx| {
+                                            c.dismissed_overview_banner_key =
+                                                Some("hooks-unconfigured".into());
+                                            cx.notify();
+                                        });
+                                    }),
+                                ),
+                            ),
                     )
                     .into_any_element(),
             )

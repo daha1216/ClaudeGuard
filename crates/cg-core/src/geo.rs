@@ -993,11 +993,13 @@ pub fn by_city(city_name: &str, country: Option<&str>) -> Option<&'static Place>
         .filter(|p| country_norm.is_none_or(|cc| p.country.eq_ignore_ascii_case(cc)))
 }
 
-/// Resolves geographic metadata preferring `colo` IATA code, then city name, then single-timezone country fallback.
+/// Resolves geographic metadata preferring `colo` IATA code (when matching `country`), then city name, then single-timezone country fallback.
 pub fn resolve(colo: Option<&str>, country: Option<&str>) -> Option<&'static Place> {
+    let country_norm = country.map(str::trim).filter(|s| !s.is_empty());
     colo.and_then(by_colo)
+        .filter(|p| country_norm.is_none_or(|cc| p.country.eq_ignore_ascii_case(cc)))
         .or_else(|| colo.and_then(|c| by_city(c, country)))
-        .or_else(|| country.and_then(by_country))
+        .or_else(|| country_norm.and_then(by_country))
 }
 
 /// Formats latitude/longitude coordinate to 4 decimal places.

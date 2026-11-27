@@ -72,11 +72,19 @@ pub struct OffsetPane {
     child: Option<AnyElement>,
 }
 
-/// Wraps `child` in a zero-Taffy-reflow pure horizontal [`OffsetPane`] (`dy == 0.0` strictly).
+/// Wraps `child` in a zero-Taffy-reflow pure horizontal [`OffsetPane`] (`dy == 0.0` strictly),
+/// with 1px horizontal and 4px bottom breathing room so parent `.overflow_hidden()` containers
+/// never slice card hairline borders or ambient drop shadows.
 pub fn offset_pane(dx: f32, child: impl IntoElement) -> OffsetPane {
+    let padded = div()
+        .w_full()
+        .min_w(px(0.))
+        .px(px(1.))
+        .pb(px(4.))
+        .child(child);
     OffsetPane {
         dx,
-        child: Some(child.into_any_element()),
+        child: Some(padded.into_any_element()),
     }
 }
 

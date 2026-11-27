@@ -1,7 +1,7 @@
 //! Named Pipe wire protocol (`PipeRequest` / `PipeResponse`) and 4-byte LE framing.
 
 use crate::config::Config;
-use crate::model::{LogEntry, OnboardingProbeResult, PolicyPreset};
+use crate::model::{LogEntry, LogLevel, OnboardingProbeResult, PolicyPreset};
 use crate::snapshot::GuardSnapshot;
 use crate::state::OperationReceipt;
 use crate::v5::{
@@ -81,6 +81,8 @@ pub enum PipeRequest {
         limit: Option<usize>,
         #[serde(default)]
         query: Option<String>,
+        #[serde(default)]
+        level: Option<LogLevel>,
     },
     CheckUpdates {
         #[serde(default)]
@@ -221,6 +223,8 @@ pub enum PipeResponse {
     },
     OnboardingProbe {
         probe: OnboardingProbeResult,
+        #[serde(default)]
+        detected_local_ports: Vec<u16>,
     },
     Logs {
         entries: Vec<LogEntry>,
@@ -491,6 +495,7 @@ mod tests {
                 until_ts: Some(200),
                 limit: Some(50),
                 query: Some("trip".into()),
+                level: Some(LogLevel::Error),
             },
             PipeRequest::CheckUpdates {
                 component: Some("antigravity_proxy".into()),
@@ -545,6 +550,7 @@ mod tests {
                 detected_proxy_port: Some(7890),
                 ..OnboardingProbeResult::default()
             },
+            detected_local_ports: vec![7890, 7897],
         };
         let mut buf = encode_frame(&resp).expect("encode");
         let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
@@ -611,6 +617,7 @@ mod tests {
             },
             PipeResponse::OnboardingProbe {
                 probe: OnboardingProbeResult::default(),
+                detected_local_ports: Vec::new(),
             },
             PipeResponse::Logs {
                 entries: vec![LogEntry::default()],

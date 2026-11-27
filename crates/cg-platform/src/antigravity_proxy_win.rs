@@ -186,6 +186,345 @@ fn is_process_still_alive(_pid: u32) -> bool {
     false
 }
 
+/// Returns `true` when `configured_port` in `config.json` satisfies `expected_proxy_port`,
+/// including v2rayN (`10808` SOCKS5 <-> `10809` HTTP) and Clash (`7891` SOCKS5 <-> `7890` HTTP)
+/// dual-port sibling pairs when the configured `proxy.type` matches the sibling protocol.
+pub fn are_compatible_proxy_ports(
+    configured_type: Option<&str>,
+    configured_port: u16,
+    expected_proxy_port: u16,
+) -> bool {
+    if expected_proxy_port == 0 || configured_port == expected_proxy_port {
+        return true;
+    }
+    let t_low = configured_type
+        .unwrap_or("socks5")
+        .trim()
+        .to_ascii_lowercase();
+    (configured_port == 10808 && expected_proxy_port == 10809 && t_low == "socks5")
+        || (configured_port == 10809 && expected_proxy_port == 10808 && t_low == "http")
+        || (configured_port == 7891 && expected_proxy_port == 7890 && t_low == "socks5")
+}
+
+/// Selects `"http"` vs `"socks5"` for `yuaotian/antigravity-proxy`'s `config.json` so HTTP-only
+/// ports (such as v2rayN's `:10809`) are never configured with `"type": "socks5"`.
+pub fn select_antigravity_proxy_scheme(
+    port: u16,
+    route_addr: Option<&str>,
+    existing_type: Option<&str>,
+) -> &'static str {
+    if let Some(raw) = route_addr.map(str::trim) {
+        let low = raw.to_ascii_lowercase();
+        if low.starts_with("socks5://") || low.starts_with("socks5h://") {
+            return "socks5";
+        }
+    }
+    if matches!(port, 10809 | 3128 | 8080 | 8118 | 8888) {
+        return "http";
+    }
+    if matches!(port, 10808 | 1080 | 7891) {
+        return "socks5";
+    }
+    if let Some(ex) = existing_type.map(str::trim) {
+        if ex.eq_ignore_ascii_case("http") {
+            return "http";
+        }
+        if ex.eq_ignore_ascii_case("socks5") {
+            return "socks5";
+        }
+    }
+    "socks5"
+}
+
+fn strip_ipv6_brackets(host: &str) -> &str {
+    let t = host.trim();
+    t.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(t)
+}
+
+/// Checks whether the user previously opted into `yuaotian/antigravity-proxy` (`version.dll`),
+/// preventing unsolicited first-run `version.dll` injection on `Ikaros-521/antigravity-launcher`
+/// or pure TUN setups while still auto-healing `version.dll` wiped by an Antigravity self-update.
+pub fn has_prior_antigravity_proxy_opt_in(install_dir: &Path, data_dir: &Path) -> bool {
+    let dll_path = install_dir.join("version.dll");
+    let dll_ok = std::fs::metadata(&dll_path)
+        .ok()
+        .filter(|m| {
+            m.is_file() && (MIN_PROXY_DLL_BYTES as u64..=MAX_PROXY_DLL_BYTES).contains(&m.len())
+        })
+        .and_then(|_| std::fs::read(&dll_path).ok())
+        .is_some_and(|b| validate_antigravity_proxy_dll_bytes(&b));
+    if dll_ok {
+        return true;
+    }
+
+    let cfg_path = install_dir.join("config.json");
+    let cfg_ok = cfg_path
+        .is_file()
+        .then(|| std::fs::read_to_string(&cfg_path).ok())
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .is_some_and(|val| {
+            val.get("child_injection").is_some()
+                || val.get("proxy").is_some()
+                || val.get("_version").is_some()
+        });
+    if cfg_ok {
+        return true;
+    }
+
+    read_verified_cached_proxy_dll(data_dir).is_some()
+        || read_verified_cached_proxy_dll(&data_dir.join("antigravity-proxy")).is_some()
+}
+
+/// Aligns `<install_dir>\config.json` (`proxy.host`, `proxy.port`, `proxy.type`, `child_injection`)
+/// with a Sovereign Vault's `effective_proxy_port` prior to launching `Antigravity.exe`.
+///
+/// Fails closed if another Antigravity instance is currently running with a different `config.json`
+/// port so a global `version.dll` mutation can NEVER contaminate a live session or bleed traffic.
+pub fn align_antigravity_proxy_config_for_launch(
+    install_dir: &Path,
+    desired_host: &str,
+    desired_port: u16,
+    any_antigravity_running: bool,
+) -> Result<(), String> {
+    if !install_dir.is_dir() {
+        return Ok(());
+    }
+    ensure_no_reparse_points(install_dir)?;
+
+    let dll_path = install_dir.join("version.dll");
+    let dll_valid = std::fs::metadata(&dll_path)
+        .ok()
+        .filter(|m| {
+            m.is_file() && (MIN_PROXY_DLL_BYTES as u64..=MAX_PROXY_DLL_BYTES).contains(&m.len())
+        })
+        .and_then(|_| std::fs::read(&dll_path).ok())
+        .is_some_and(|b| validate_antigravity_proxy_dll_bytes(&b));
+    let cfg_path = install_dir.join("config.json");
+
+    // When neither `version.dll` nor `config.json` is present (e.g. pure TUN or antigravity-launcher),
+    // do not create an unsolicited `config.json`.
+    if !dll_valid && !cfg_path.is_file() {
+        return Ok(());
+    }
+    if desired_port == 0 {
+        return Err("目标代理端口无效 (0)，已拒绝启动反重力客户端".into());
+    }
+    let clean_host = {
+        let h = strip_ipv6_brackets(desired_host);
+        if h.is_empty() {
+            "127.0.0.1"
+        } else {
+            h
+        }
+    };
+    if clean_host.contains(['\0', '\r', '\n']) {
+        return Err("目标代理主机包含非法控制字符".into());
+    }
+
+    ensure_no_reparse_points(&cfg_path)?;
+    let mut cfg_val: serde_json::Value = std::fs::read_to_string(&cfg_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .filter(|v: &serde_json::Value| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let cur_type = cfg_val
+        .pointer("/proxy/type")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let cur_host = cfg_val
+        .pointer("/proxy/host")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    let cur_port = cfg_val
+        .pointer("/proxy/port")
+        .and_then(|v| {
+            v.as_u64()
+                .and_then(|n| u16::try_from(n).ok())
+                .or_else(|| v.as_str()?.trim().parse::<u16>().ok())
+        })
+        .filter(|&p| p > 0);
+    let cur_child = cfg_val.get("child_injection").and_then(|v| v.as_bool());
+    let desired_scheme = select_antigravity_proxy_scheme(desired_port, None, cur_type.as_deref());
+
+    if cur_port == Some(desired_port)
+        && cur_host.eq_ignore_ascii_case(clean_host)
+        && cur_child == Some(true)
+        && cur_type
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case(desired_scheme))
+    {
+        return Ok(());
+    }
+
+    if any_antigravity_running {
+        if let Some(cp) = cur_port {
+            if cp != desired_port {
+                return Err(format!(
+                    "安全拦截：检测到已有 Antigravity 实例正在使用代理端口 :{cp} 运行，无法同时切换全局 version.dll 配置至独立端口 :{desired_port}（请先关闭正在运行的 Antigravity 以防跨号串流）"
+                ));
+            }
+        }
+    }
+
+    if let Some(obj) = cfg_val.as_object_mut() {
+        obj.insert("child_injection".into(), serde_json::Value::Bool(true));
+        let proxy_entry = obj
+            .entry("proxy".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !proxy_entry.is_object() {
+            *proxy_entry = serde_json::json!({});
+        }
+        if let Some(pobj) = proxy_entry.as_object_mut() {
+            pobj.insert(
+                "type".into(),
+                serde_json::Value::String(desired_scheme.into()),
+            );
+            pobj.insert("host".into(), serde_json::Value::String(clean_host.into()));
+            pobj.insert(
+                "port".into(),
+                serde_json::Value::Number(serde_json::Number::from(desired_port)),
+            );
+        }
+    }
+    let cfg_bytes =
+        serde_json::to_vec_pretty(&cfg_val).map_err(|e| format!("序列化 config.json 失败：{e}"))?;
+    atomic_write_verified_file(install_dir, "config.json", &cfg_bytes)?;
+    Ok(())
+}
+
+fn detect_external_antigravity_launcher(
+    install_dir: &Path,
+    homes: &[PathBuf],
+    procs: &[ProcInfo],
+    main_pids: &[u32],
+    expected_proxy_port: u16,
+    now_secs: u64,
+    antigravity_version: Option<String>,
+) -> Option<AntigravityProxyStatus> {
+    let mut launcher_exe_found = install_dir.join("AntigravityProxy.exe").is_file();
+    let mut launcher_cfg_port: Option<u16> = None;
+    let mut launcher_cfg_host: Option<String> = None;
+
+    for home in homes {
+        let local = home.join("AppData").join("Local");
+        let roaming = home.join("AppData").join("Roaming");
+        for cand in [
+            local
+                .join("AntigravityLauncher")
+                .join("AntigravityProxy.exe"),
+            local
+                .join("Programs")
+                .join("AntigravityLauncher")
+                .join("AntigravityProxy.exe"),
+        ] {
+            if cand.is_file() {
+                launcher_exe_found = true;
+            }
+        }
+        for cfg in [
+            roaming.join("antigravity-launcher").join("config.json"),
+            local.join("AntigravityLauncher").join("config.json"),
+        ] {
+            if let Ok(raw) = std::fs::read_to_string(&cfg) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    launcher_exe_found = true;
+                    if let Some(proxy_str) = val
+                        .get("proxy")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| val.get("proxyUrl").and_then(|v| v.as_str()))
+                        .or_else(|| val.get("proxy_url").and_then(|v| v.as_str()))
+                    {
+                        let (h, p) = parse_proxy_route_addr(proxy_str, 0);
+                        if p > 0 {
+                            launcher_cfg_port = Some(p);
+                            launcher_cfg_host = Some(h.to_string());
+                        }
+                    } else if let Some(p) = val
+                        .pointer("/proxy/port")
+                        .or_else(|| val.get("port"))
+                        .and_then(|v| v.as_u64())
+                        .and_then(|n| u16::try_from(n).ok())
+                        .filter(|&p| p > 0)
+                    {
+                        launcher_cfg_port = Some(p);
+                    }
+                }
+            }
+        }
+    }
+
+    let launcher_proc_running = procs
+        .iter()
+        .any(|p| p.name_l == "antigravityproxy.exe" || p.cmd_l.contains("antigravityproxy.exe"));
+    let mut live_cmdline_proxy = false;
+    for &pid in main_pids {
+        if procs
+            .iter()
+            .find(|p| p.pid == pid)
+            .is_some_and(|p| p.cmd_l.contains("--proxy-server="))
+            || crate::hygiene_win::query_process_command_line_fast(pid)
+                .ok()
+                .is_some_and(|c| c.to_ascii_lowercase().contains("--proxy-server="))
+        {
+            live_cmdline_proxy = true;
+            break;
+        }
+    }
+
+    if !launcher_exe_found && !launcher_proc_running && !live_cmdline_proxy {
+        return None;
+    }
+
+    let runtime_running = !main_pids.is_empty();
+    let port_ok = launcher_cfg_port
+        .is_none_or(|cp| are_compatible_proxy_ports(None, cp, expected_proxy_port));
+    let state = if port_ok {
+        AntigravityProxyState::Healthy
+    } else {
+        AntigravityProxyState::PortMismatch
+    };
+    let summary = if state == AntigravityProxyState::PortMismatch {
+        format!(
+            "antigravity-launcher 代理端口 ({}) 与守护端口 ({}) 不一致",
+            launcher_cfg_port.unwrap_or(0),
+            expected_proxy_port
+        )
+    } else if live_cmdline_proxy {
+        "反重力已通过 --proxy-server 外部代理参数受控运行".to_string()
+    } else {
+        "检测到 antigravity-launcher 外部代理启动器生效（无需重复注入 version.dll）".to_string()
+    };
+
+    Some(AntigravityProxyStatus {
+        state,
+        installed: true,
+        antigravity_dir: Some(install_dir.to_string_lossy().to_string()),
+        antigravity_version,
+        dll_present: false,
+        dll_valid: false,
+        dll_size: 0,
+        config_present: launcher_cfg_port.is_some(),
+        injector_version: Some("antigravity-launcher".into()),
+        proxy_type: Some("launcher".into()),
+        proxy_host: launcher_cfg_host.or_else(|| Some("127.0.0.1".into())),
+        proxy_port: launcher_cfg_port
+            .or_else(|| (expected_proxy_port > 0).then_some(expected_proxy_port)),
+        port_matches_guard: port_ok,
+        child_injection: Some(true),
+        runtime_running,
+        runtime_dll_loaded_main: live_cmdline_proxy,
+        runtime_dll_loaded_ls: false,
+        version_changed_from: None,
+        checked_at: now_secs,
+        summary,
+    })
+}
+
 /// Pure, deterministic inspector for an explicit Antigravity installation directory.
 pub fn inspect_antigravity_proxy_in_dir(
     dir: &Path,
@@ -283,8 +622,8 @@ pub fn inspect_antigravity_proxy_in_dir(
             .filter(|s| !s.is_empty());
     }
 
-    let port_matches_guard =
-        proxy_port.is_some_and(|p| expected_proxy_port == 0 || p == expected_proxy_port);
+    let port_matches_guard = proxy_port
+        .is_some_and(|p| are_compatible_proxy_ports(proxy_type.as_deref(), p, expected_proxy_port));
 
     let runtime_running = !runtime_main_pids.is_empty() || !runtime_ls_pids.is_empty();
     let runtime_dll_loaded_main = runtime_main_pids
@@ -453,7 +792,7 @@ pub fn inspect_antigravity_proxy(
         .filter(|&pid| is_process_still_alive(pid))
         .collect();
 
-    inspect_antigravity_proxy_in_dir(
+    let status = inspect_antigravity_proxy_in_dir(
         dir,
         expected_proxy_port,
         last_seen_version,
@@ -461,7 +800,29 @@ pub fn inspect_antigravity_proxy(
         &ls_pids,
         is_module_loaded_in_process,
         now_secs,
-    )
+    );
+
+    // If `version.dll` is not installed (and was not just wiped from an active `version.dll` setup
+    // leaving `<dir>\config.json`), recognize `Ikaros-521/antigravity-launcher` or live
+    // `--proxy-server=` command-line coverage as valid external proxy protection.
+    if status.state == AntigravityProxyState::MissingDll
+        && !status.config_present
+        && status.version_changed_from.is_none()
+    {
+        let homes = process_win::user_home_dirs();
+        if let Some(ext_status) = detect_external_antigravity_launcher(
+            dir,
+            &homes,
+            &snap.procs,
+            &main_pids,
+            expected_proxy_port,
+            now_secs,
+            status.antigravity_version.clone(),
+        ) {
+            return ext_status;
+        }
+    }
+    status
 }
 
 /// Outcome of one-click verified `yuaotian/antigravity-proxy` hot re-injection.
@@ -742,6 +1103,28 @@ pub fn install_verified_proxy_bytes_into_dir(
     proxy_port: u16,
     release_tag: &str,
 ) -> Result<AntigravityRepairReport, String> {
+    install_verified_proxy_bytes_into_dir_with_host(
+        dir,
+        raw_bytes,
+        is_zip,
+        "127.0.0.1",
+        proxy_port,
+        None,
+        release_tag,
+    )
+}
+
+/// Host- and scheme-aware variant of [`install_verified_proxy_bytes_into_dir`], overwriting stale
+/// `proxy.host` and aligning `"http"` vs `"socks5"` with `proxy_port` / `route_addr`.
+pub fn install_verified_proxy_bytes_into_dir_with_host(
+    dir: &Path,
+    raw_bytes: &[u8],
+    is_zip: bool,
+    proxy_host: &str,
+    proxy_port: u16,
+    route_addr: Option<&str>,
+    release_tag: &str,
+) -> Result<AntigravityRepairReport, String> {
     ensure_no_reparse_points(dir)?;
 
     let dll_bytes = if is_zip {
@@ -820,10 +1203,22 @@ pub fn install_verified_proxy_bytes_into_dir(
             *proxy_entry = serde_json::json!({});
         }
         if let Some(pobj) = proxy_entry.as_object_mut() {
-            pobj.entry("type".to_string())
-                .or_insert_with(|| serde_json::Value::String("socks5".into()));
-            pobj.entry("host".to_string())
-                .or_insert_with(|| serde_json::Value::String("127.0.0.1".into()));
+            let existing_type = pobj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let scheme =
+                select_antigravity_proxy_scheme(proxy_port, route_addr, existing_type.as_deref());
+            let clean_host = {
+                let h = strip_ipv6_brackets(proxy_host);
+                if h.is_empty() {
+                    "127.0.0.1"
+                } else {
+                    h
+                }
+            };
+            pobj.insert("type".into(), serde_json::Value::String(scheme.into()));
+            pobj.insert("host".into(), serde_json::Value::String(clean_host.into()));
             pobj.insert(
                 "port".into(),
                 serde_json::Value::Number(serde_json::Number::from(proxy_port)),
@@ -948,12 +1343,23 @@ pub fn repair_antigravity_proxy(
 ) -> Result<AntigravityRepairReport, String> {
     let dir = resolve_antigravity_dir(explicit_dir)?;
 
-    let policy = match route {
+    let (policy, effective_host, effective_port, route_hint) = match route {
         crate::probe_http::ProbeRoute::Proxy(addr) => {
             let (host, port) = parse_proxy_route_addr(addr, proxy_port);
-            crate::probe_http::NetworkPolicy::with_proxy(host, port)
+            let chosen_port = if proxy_port > 0 { proxy_port } else { port };
+            (
+                crate::probe_http::NetworkPolicy::with_proxy(host, port),
+                host,
+                chosen_port,
+                Some(addr.as_str()),
+            )
         }
-        crate::probe_http::ProbeRoute::Direct => crate::probe_http::NetworkPolicy::direct(),
+        crate::probe_http::ProbeRoute::Direct => (
+            crate::probe_http::NetworkPolicy::direct(),
+            "127.0.0.1",
+            proxy_port,
+            None,
+        ),
         crate::probe_http::ProbeRoute::Skip(reason) => {
             return Err(format!("当前代理通道不可用，已阻止直连下载：{reason}"));
         }
@@ -987,7 +1393,15 @@ pub fn repair_antigravity_proxy(
 
     let is_zip =
         asset_url.to_ascii_lowercase().ends_with(".zip") || downloaded.starts_with(b"PK\x03\x04");
-    install_verified_proxy_bytes_into_dir(&dir, &downloaded, is_zip, proxy_port, &release.version)
+    install_verified_proxy_bytes_into_dir_with_host(
+        &dir,
+        &downloaded,
+        is_zip,
+        effective_host,
+        effective_port,
+        route_hint,
+        &release.version,
+    )
 }
 
 /// Cache file holding the last verified antigravity-proxy DLL.
@@ -1036,15 +1450,53 @@ pub fn repair_antigravity_proxy_cached(
     cache_dir: &Path,
 ) -> Result<AntigravityRepairReport, String> {
     let dir = resolve_antigravity_dir(explicit_dir)?;
+    let (route_host, route_hint) = match route {
+        crate::probe_http::ProbeRoute::Proxy(addr) => {
+            let (h, _) = parse_proxy_route_addr(addr, proxy_port);
+            (h, Some(addr.as_str()))
+        }
+        _ => ("127.0.0.1", None),
+    };
+
     if let Some(bytes) = read_verified_cached_proxy_dll(cache_dir) {
-        let tag = std::fs::read_to_string(cache_dir.join("release_tag.txt"))
+        let cached_tag = std::fs::read_to_string(cache_dir.join("release_tag.txt"))
             .map(|s| s.trim().to_string())
             .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "cache".to_string());
-        // A validated cache entry is byte-identical to what a download would yield, so a
-        // failed install means the target is locked; retrying over the network cannot help.
-        return install_verified_proxy_bytes_into_dir(&dir, &bytes, false, proxy_port, &tag);
+            .filter(|s| !s.is_empty());
+
+        // When network route is active, check upstream release tag so cached DLLs never pin
+        // outdated injector versions forever; fall back to verified cache when up-to-date or offline.
+        let mut newer_upstream_available = false;
+        if !matches!(route, crate::probe_http::ProbeRoute::Skip(_)) {
+            if let Ok(rel) = crate::update_check::fetch_github_latest_release(
+                route,
+                crate::update_check::ANTIGRAVITY_PROXY_REPO,
+                &[".zip", ".dll"],
+                std::time::Duration::from_secs(8),
+            ) {
+                match cached_tag.as_deref() {
+                    Some(ct) => {
+                        newer_upstream_available =
+                            crate::update_check::is_version_newer(&rel.version, ct);
+                    }
+                    None => {
+                        newer_upstream_available = true;
+                    }
+                }
+            }
+        }
+
+        if newer_upstream_available {
+            if let Ok(report) = repair_antigravity_proxy(route, proxy_port, Some(&dir)) {
+                let _ = cache_proxy_dll_from_dir(&dir, cache_dir, &report.release_tag);
+                return Ok(report);
+            }
+        }
+
+        let tag = cached_tag.unwrap_or_else(|| "cache".to_string());
+        return install_verified_proxy_bytes_into_dir_with_host(
+            &dir, &bytes, false, route_host, proxy_port, route_hint, &tag,
+        );
     }
 
     let report = repair_antigravity_proxy(route, proxy_port, Some(&dir))?;
@@ -1627,5 +2079,54 @@ mod tests {
 
         drop(lock_invalid);
         std::fs::remove_dir_all(&invalid_dir).unwrap();
+    }
+
+    #[test]
+    fn align_launch_config_opt_in_and_compatible_ports_work() {
+        assert!(are_compatible_proxy_ports(Some("socks5"), 10808, 10809));
+        assert!(are_compatible_proxy_ports(Some("http"), 10809, 10808));
+        assert!(are_compatible_proxy_ports(Some("socks5"), 7891, 7890));
+        assert!(!are_compatible_proxy_ports(Some("socks5"), 7890, 7897));
+
+        let install_dir = unique_temp_dir("align-launch-install");
+        let data_dir = unique_temp_dir("align-launch-data");
+
+        // Bare directory: zero opt-in, align is a clean no-op without writing config.json.
+        assert!(!has_prior_antigravity_proxy_opt_in(&install_dir, &data_dir));
+        align_antigravity_proxy_config_for_launch(&install_dir, "127.0.0.1", 7892, false)
+            .expect("bare install no-op");
+        assert!(!install_dir.join("config.json").exists());
+
+        // Opt-in present (`version.dll` + `config.json` on :7890):
+        std::fs::write(install_dir.join("version.dll"), synthetic_proxy_dll_bytes()).unwrap();
+        std::fs::write(
+            install_dir.join("config.json"),
+            valid_config_json(7890, true),
+        )
+        .unwrap();
+        assert!(has_prior_antigravity_proxy_opt_in(&install_dir, &data_dir));
+
+        // Running client with conflicting port -> fail closed!
+        assert!(
+            align_antigravity_proxy_config_for_launch(&install_dir, "127.0.0.1", 7892, true)
+                .is_err()
+        );
+        // Running client with matching port -> succeeds without clobbering.
+        align_antigravity_proxy_config_for_launch(&install_dir, "127.0.0.1", 7890, true)
+            .expect("matching port while running is ok");
+
+        // Stopped client -> atomically rewrites host, port, and HTTP scheme on :10809.
+        align_antigravity_proxy_config_for_launch(&install_dir, "192.168.50.2", 10809, false)
+            .expect("align stopped client");
+        let cfg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(install_dir.join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg["proxy"]["host"], serde_json::json!("192.168.50.2"));
+        assert_eq!(cfg["proxy"]["port"], serde_json::json!(10809));
+        assert_eq!(cfg["proxy"]["type"], serde_json::json!("http"));
+
+        let _ = std::fs::remove_dir_all(&install_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

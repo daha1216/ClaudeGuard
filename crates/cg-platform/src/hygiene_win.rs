@@ -365,8 +365,30 @@ impl Default for ShortcutHygieneBackupFile {
     }
 }
 
+fn collect_subdirs_bounded(root: &Path, max_depth: usize, out: &mut Vec<PathBuf>) {
+    if !root.is_dir() || has_reparse_point_in_chain(root) {
+        return;
+    }
+    if !out.contains(&root.to_path_buf()) {
+        out.push(root.to_path_buf());
+    }
+    if max_depth == 0 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() && !has_reparse_point_in_chain(&p) {
+            collect_subdirs_bounded(&p, max_depth - 1, out);
+        }
+    }
+}
+
 /// Return standard per-user shortcut directories scanned for hygiene patching:
-/// Desktop, Start Menu Programs, Taskbar User Pinned, and `%APPDATA%\TuckPane`.
+/// Desktop, Start Menu Programs, Taskbar User Pinned, `%USERPROFILE%\TuckPane` (2-level),
+/// and `%APPDATA%\TuckPane` (2-level).
 pub fn default_shortcut_scan_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for home in crate::process_win::user_home_dirs() {
@@ -384,14 +406,62 @@ pub fn default_shortcut_scan_dirs() -> Vec<PathBuf> {
                 .join("Quick Launch")
                 .join("User Pinned")
                 .join("TaskBar"),
-            roaming.join("TuckPane"),
         ] {
-            if cand.is_dir() && !dirs.contains(&cand) {
+            if cand.is_dir() && !has_reparse_point_in_chain(&cand) && !dirs.contains(&cand) {
                 dirs.push(cand);
             }
         }
+        collect_subdirs_bounded(&home.join("TuckPane"), 2, &mut dirs);
+        collect_subdirs_bounded(&roaming.join("TuckPane"), 2, &mut dirs);
     }
     dirs
+}
+
+/// Returns `true` when a shortcut's target executable already delegates to an external proxy
+/// launcher (`AntigravityProxy.exe`), which must NEVER be overwritten so Taskbar `AppUserModelID`
+/// pinning and proxy launcher injection remain intact.
+pub fn should_skip_shortcut_hygiene_target(target_path: &str) -> bool {
+    let norm = target_path.trim().trim_matches('"').replace('/', "\\");
+    let lower = norm.to_ascii_lowercase();
+    if lower.contains(r"\antigravity-launcher\") {
+        return true;
+    }
+    Path::new(&norm)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("antigravityproxy.exe"))
+}
+
+/// Extracts benign user flags that must survive Safe Launch shortcut wrapping (currently
+/// `--remote-debugging-port=<u16>`, preserving `DevToolsActivePort` for CDP plugins/capsules).
+pub fn extract_preserved_shortcut_flags(original_args: &str) -> Vec<String> {
+    let mut preserved = Vec::new();
+    let tokens: Vec<&str> = original_args.split_whitespace().collect();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let tok = tokens[i].trim_matches(['"', '\'']);
+        let low = tok.to_ascii_lowercase();
+        if let Some(val) = low.strip_prefix("--remote-debugging-port=") {
+            if let Ok(port) = val.parse::<u16>() {
+                let flag = format!("--remote-debugging-port={port}");
+                if !preserved.contains(&flag) {
+                    preserved.push(flag);
+                }
+            }
+        } else if low == "--remote-debugging-port" {
+            if let Some(next_tok) = tokens.get(i + 1) {
+                if let Ok(port) = next_tok.trim_matches(['"', '\'']).parse::<u16>() {
+                    let flag = format!("--remote-debugging-port={port}");
+                    if !preserved.contains(&flag) {
+                        preserved.push(flag);
+                    }
+                    i += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    preserved
 }
 
 #[cfg(windows)]
@@ -488,11 +558,8 @@ pub fn create_shortcut_lnk(
         ensure_no_reparse_point_in_ancestors(parent)?;
     }
 
-    let _imp = if crate::access_win::is_session_zero() {
-        crate::access_win::ImpersonateInteractiveUserGuard::enter().ok()
-    } else {
-        None
-    };
+    let _imp = crate::access_win::ImpersonateInteractiveUserGuard::impersonate_if_session_zero()
+        .map_err(PlatformError::AccessDenied)?;
     let _com = crate::com::ComGuard::init_mta()?;
     let target_w: Vec<u16> = target_exe
         .as_os_str()
@@ -551,6 +618,8 @@ pub fn create_shortcut_lnk(
 }
 
 fn atomic_write_bytes(dest: &Path, bytes: &[u8]) -> PlatformResult<()> {
+    use std::io::Write;
+
     ensure_no_reparse_point_in_ancestors(dest)?;
     let parent = dest
         .parent()
@@ -566,19 +635,82 @@ fn atomic_write_bytes(dest: &Path, bytes: &[u8]) -> PlatformResult<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "tmp".to_string());
-    let tmp = parent.join(format!(".{file_name}.cg-tmp-{}", std::process::id()));
-    std::fs::write(&tmp, bytes)
-        .map_err(|e| PlatformError::Io(format!("写入临时文件失败：{} ({e})", tmp.display())))?;
-    if let Err(rename_err) = std::fs::rename(&tmp, dest) {
-        // On Windows `rename` fails if destination already exists; fall back to overwrite then clean temp.
-        let write_res = std::fs::write(dest, bytes);
+
+    let mut tmp_opt = None;
+    for _ in 0..8 {
+        let nonce =
+            crate::crypto_win::random_hex(8).unwrap_or_else(|_| format!("{}", std::process::id()));
+        let cand = parent.join(format!(".{file_name}.cg-tmp-{nonce}"));
+        ensure_no_reparse_point_in_ancestors(&cand)?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&cand)
+        {
+            Ok(f) => {
+                tmp_opt = Some((cand, f));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(PlatformError::Io(format!(
+                    "创建临时文件失败：{} ({e})",
+                    cand.display()
+                )))
+            }
+        }
+    }
+    let Some((tmp, mut f)) = tmp_opt else {
+        return Err(PlatformError::Io(format!(
+            "创建独占临时文件失败：{}",
+            dest.display()
+        )));
+    };
+    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+        drop(f);
         let _ = std::fs::remove_file(&tmp);
-        write_res.map_err(|e| {
-            PlatformError::Io(format!(
-                "原子替换文件失败：{} (rename={rename_err}, write={e})",
+        return Err(PlatformError::Io(format!(
+            "写入临时文件失败：{} ({e})",
+            tmp.display()
+        )));
+    }
+    drop(f);
+
+    ensure_no_reparse_point_in_ancestors(dest)?;
+    crate::vault_win::clear_readonly_if_needed(dest);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        let src_w: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+        let dst_w: Vec<u16> = dest.as_os_str().encode_wide().chain(Some(0)).collect();
+        if let Err(e) = unsafe {
+            MoveFileExW(
+                PCWSTR(src_w.as_ptr()),
+                PCWSTR(dst_w.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(PlatformError::Io(format!(
+                "原子替换文件失败：{} ({e})",
                 dest.display()
-            ))
-        })?;
+            )));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Err(e) = std::fs::rename(&tmp, dest) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(PlatformError::Io(format!(
+                "原子替换文件失败：{} ({e})",
+                dest.display()
+            )));
+        }
     }
     Ok(())
 }
@@ -647,6 +779,9 @@ pub fn patch_shortcut_for_safe_launch(
     }
     ensure_no_reparse_point_in_ancestors(lnk_path)?;
     ensure_no_reparse_point_in_ancestors(backup_json_path)?;
+
+    let _imp = crate::access_win::ImpersonateInteractiveUserGuard::impersonate_if_session_zero()
+        .map_err(PlatformError::AccessDenied)?;
     if !lnk_path.is_file() {
         return Err(PlatformError::InvalidInput(format!(
             "快捷方式不存在：{}",
@@ -659,6 +794,12 @@ pub fn patch_shortcut_for_safe_launch(
     let sha256 = compute_sha256_hex(&raw_bytes);
     let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_bytes);
     let meta = read_lnk_metadata(lnk_path)?;
+    if should_skip_shortcut_hygiene_target(&meta.target_path) {
+        return Err(PlatformError::InvalidInput(format!(
+            "跳过外部代理启动器快捷方式（已由外部封装保护）：{}",
+            lnk_path.display()
+        )));
+    }
 
     let lnk_key = lnk_path.to_string_lossy().into_owned();
     let mut backup_file = load_backup_file(backup_json_path)?;
@@ -687,11 +828,6 @@ pub fn patch_shortcut_for_safe_launch(
         rec
     };
 
-    let _imp = if crate::access_win::is_session_zero() {
-        crate::access_win::ImpersonateInteractiveUserGuard::enter().ok()
-    } else {
-        None
-    };
     let _com = crate::com::ComGuard::init_mta()?;
     let lnk_w: Vec<u16> = lnk_path.as_os_str().encode_wide().chain(Some(0)).collect();
     let launcher_w: Vec<u16> = launcher_exe
@@ -699,7 +835,16 @@ pub fn patch_shortcut_for_safe_launch(
         .encode_wide()
         .chain(Some(0))
         .collect();
-    let args_w = to_wide_z(&format!("--safe-launch {clean_agent}"));
+    let preserved_flags = extract_preserved_shortcut_flags(&record.original_args);
+    let safe_launch_args = if preserved_flags.is_empty() {
+        format!("--safe-launch {clean_agent}")
+    } else {
+        format!(
+            "--safe-launch {clean_agent} -- {}",
+            preserved_flags.join(" ")
+        )
+    };
+    let args_w = to_wide_z(&safe_launch_args);
     let icon_src = if !record.original_icon_path.trim().is_empty() {
         record.original_icon_path.clone()
     } else {
@@ -797,11 +942,9 @@ pub fn restore_shortcut_from_backup(
         }
 
         {
-            let _imp = if crate::access_win::is_session_zero() {
-                crate::access_win::ImpersonateInteractiveUserGuard::enter().ok()
-            } else {
-                None
-            };
+            let _imp =
+                crate::access_win::ImpersonateInteractiveUserGuard::impersonate_if_session_zero()
+                    .map_err(PlatformError::AccessDenied)?;
             atomic_write_bytes(&target_path, &decoded)?;
         }
         restored += 1;
@@ -936,5 +1079,53 @@ mod tests {
     #[test]
     fn reparse_guard_rejects_parent_traversal() {
         assert!(ensure_no_reparse_point_in_ancestors(Path::new(r"C:\foo\..\bar.lnk")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shortcut_patch_preserves_cdp_flag_and_skips_proxy_launcher_target() {
+        assert_eq!(
+            extract_preserved_shortcut_flags("--remote-debugging-port=0 --other-flag"),
+            vec!["--remote-debugging-port=0"]
+        );
+        assert_eq!(
+            extract_preserved_shortcut_flags("--remote-debugging-port 9222"),
+            vec!["--remote-debugging-port=9222"]
+        );
+        assert!(should_skip_shortcut_hygiene_target(
+            r"C:\Tools\AntigravityProxy.exe"
+        ));
+        assert!(should_skip_shortcut_hygiene_target(
+            r"C:\Tools\antigravity-launcher\launcher.exe"
+        ));
+        assert!(!should_skip_shortcut_hygiene_target(
+            r"C:\Users\mjq\AppData\Local\Programs\Antigravity\Antigravity.exe"
+        ));
+
+        let dir = unique_temp_dir("lnk-cdp");
+        let lnk = dir.join("Antigravity CDP.lnk");
+        let backup = dir.join("hygiene_cdp_backup.json");
+        let orig_target = PathBuf::from(r"C:\Windows\System32\notepad.exe");
+        let launcher = PathBuf::from(r"C:\Windows\System32\cmd.exe");
+
+        create_shortcut_lnk(
+            &lnk,
+            &orig_target,
+            "--remote-debugging-port=0 --unity-launch",
+            None,
+            0,
+            "Antigravity CDP Shortcut",
+        )
+        .expect("create cdp .lnk");
+
+        patch_shortcut_for_safe_launch(&lnk, "antigravity", &launcher, &backup, 7777)
+            .expect("patch cdp shortcut");
+        let patched_meta = read_lnk_metadata(&lnk).expect("read patched cdp .lnk");
+        assert_eq!(
+            patched_meta.arguments,
+            "--safe-launch antigravity -- --remote-debugging-port=0"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -6,12 +6,13 @@
 
 use crate::app::{AppController, EnvSubTab, HudWindowView, open_console_window};
 use crate::assets::{brand_icon, ui_icon};
-use crate::protocol::{Lifecycle, PipeRequest, VaultAppTarget, VaultRuntimeState};
+use crate::protocol::{Lifecycle, PipeRequest, VaultRuntimeState};
 use crate::state::{HudProjection, NavSection, safety_grade_tone};
 use crate::theme::{BadgeTone, HeroTone, ThemePalette};
 use crate::views::shared::canonical_agent_label;
 use crate::widgets::controls::{
-    ButtonKind, action_button, inset_box, mono_tabular, pulse_status_dot, status_dot, tone_tag,
+    ButtonKind, action_button, inset_box, mono_tabular, pulse_status_dot, spinning_ui_icon,
+    status_dot, tone_tag,
 };
 use gpui::{
     Context, Div, Entity, FontWeight, MouseButton, WindowControlArea, div, prelude::*, px, rgb,
@@ -46,7 +47,6 @@ pub fn render_hud(
     cx: &mut Context<HudWindowView>,
 ) -> Div {
     let connected = proj.connected;
-    let can_act = connected && !busy;
     let ctrl_r = ctrl.read(cx);
     let is_demo = ctrl_r.client.is_demo();
     let start_svc_busy = ctrl_r.is_scope_busy(&crate::app::ActionScope::StartService);
@@ -64,7 +64,12 @@ pub fn render_hud(
         .map(|s| s.agents.iter().map(|a| a.running_count).sum())
         .unwrap_or(0);
     let kill_all_armed = ctrl_r.is_confirm_armed("hud-kill-all");
-    let kill_all_enabled = can_act && (total_running > 0 || proj.total_orphans > 0);
+    let kill_all_enabled =
+        ctrl_r.can_kill_processes() && (total_running > 0 || proj.total_orphans > 0);
+    let panic_enabled = ctrl_r.can_trigger_lockdown();
+    let footer_flow_ready = !ctrl_r.is_scope_busy(&crate::app::ActionScope::RecheckAll)
+        && !ctrl_r.is_scope_busy(&crate::app::ActionScope::Flow)
+        && !ctrl_r.is_scope_busy(&crate::app::ActionScope::PauseGuard);
     let panic_armed = ctrl_r.is_confirm_armed("hud-panic-lockdown");
     let ctrl_panic = ctrl.clone();
     let hud_score_tone = if proj.safety_evaluated {
@@ -438,7 +443,10 @@ pub fn render_hud(
                 let ctrl_vl = ctrl.clone();
                 let is_running = v.state == VaultRuntimeState::ActiveRunning;
                 let is_mismatch = v.state == VaultRuntimeState::EgressMismatch;
-                let clickable = can_act && v.can_launch;
+                let vault_launching = ctrl
+                    .read(cx)
+                    .is_scope_busy(&crate::app::ActionScope::VaultOp(v.vault_id.clone()));
+                let clickable = connected && v.can_launch && !vault_launching;
                 let dot_c = if is_running {
                     p.badge_pass.dot
                 } else if is_mismatch {
@@ -478,22 +486,12 @@ pub fn render_hud(
                             .hover(move |s| s.bg(rgb(hover_close)).border_color(rgb(p.line_strong)))
                             .on_mouse_up(
                                 MouseButton::Left,
-                                cx.listener(move |_, _, window, cx| {
+                                cx.listener(move |_, _, _, cx| {
                                     let id = vid.clone();
                                     let nm = vname.clone();
                                     ctrl_vl.update(cx, |c, cx| {
-                                        c.send_request_msg(
-                                            PipeRequest::LaunchVault {
-                                                vault_id: id,
-                                                app: VaultAppTarget::ClaudeDesktop,
-                                                extra_args: Vec::new(),
-                                            },
-                                            Some(format!("已在账号仓「{nm}」启动 Claude")),
-                                            cx,
-                                        );
-                                        c.hud_window = None;
+                                        c.launch_vault_from_hud(id, nm, cx);
                                     });
-                                    window.remove_window();
                                 }),
                             )
                     })
@@ -515,7 +513,17 @@ pub fn render_hud(
                                     .child(format!("{}·{}", v.region_tag, v.name)),
                             ),
                     )
-                    .child(ui_icon("icons/ui/play.svg", 9.0, p.accent_soft_text))
+                    .child(if vault_launching {
+                        spinning_ui_icon(
+                            gpui::ElementId::Name(format!("hud-vault-spin-{}", v.vault_id).into()),
+                            "icons/ui/refresh.svg",
+                            9.5,
+                            p.accent_soft_text,
+                            true,
+                        )
+                    } else {
+                        ui_icon("icons/ui/play.svg", 9.0, p.accent_soft_text).into_any_element()
+                    })
             })
             .collect();
 
@@ -655,91 +663,92 @@ pub fn render_hud(
         .justify_between()
         .size_full()
         .p(px(15.))
-        .gap(px(10.))
+        .gap(px(9.))
+        // Pinned Draggable Header
         .child(
             div()
                 .flex()
-                .flex_col()
-                .gap(px(10.))
-                // Draggable Header
+                .flex_shrink_0()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .justify_between()
                         .gap(px(8.))
+                        .child(pulse_status_dot(
+                            "hud-status-pulse",
+                            dot_rgb,
+                            8.0,
+                            connected && (proj.hero.tone == HeroTone::Healthy || really_tripped),
+                        ))
                         .child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .child(pulse_status_dot(
-                                    "hud-status-pulse",
-                                    dot_rgb,
-                                    8.0,
-                                    connected
-                                        && (proj.hero.tone == HeroTone::Healthy || really_tripped),
-                                ))
-                                .child(
-                                    div()
-                                        .text_size(px(14.5))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(p.text_primary))
-                                        .child(title_text),
-                                )
-                                .child(tone_tag(hud_score_label, hud_score_tone, p)),
+                                .text_size(px(14.5))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(p.text_primary))
+                                .child(title_text),
+                        )
+                        .child(tone_tag(hud_score_label, hud_score_tone, p)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(32.))
+                        .h(px(24.))
+                        .window_control_area(WindowControlArea::Drag),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .min_w(px(0.))
+                        .gap(px(7.))
+                        .child(
+                            mono_tabular(right_metric)
+                                .max_w(px(126.))
+                                .truncate()
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(right_metric_color)),
                         )
                         .child(
                             div()
-                                .flex_1()
-                                .min_w(px(32.))
-                                .h(px(24.))
-                                .window_control_area(WindowControlArea::Drag),
-                        )
-                        .child(
-                            div()
+                                .id("hud-close-btn")
                                 .flex()
                                 .items_center()
-                                .min_w(px(0.))
-                                .gap(px(7.))
-                                .child(
-                                    mono_tabular(right_metric)
-                                        .max_w(px(126.))
-                                        .truncate()
-                                        .text_size(px(11.5))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(right_metric_color)),
-                                )
-                                .child(
-                                    div()
-                                        .id("hud-close-btn")
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .w(px(22.))
-                                        .h(px(22.))
-                                        .rounded(px(999.))
-                                        .bg(rgb(p.card_bg))
-                                        .border_1()
-                                        .border_color(rgb(p.card_border))
-                                        .cursor_pointer()
-                                        .hover(move |s| s.bg(rgb(hover_close)))
-                                        .active(|s| s.opacity(0.85))
-                                        .child(ui_icon(
-                                            "icons/ui/close.svg",
-                                            11.0,
-                                            p.text_secondary,
-                                        ))
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(move |_, _, window, cx| {
-                                                ctrl_close.update(cx, |c, _| c.hud_window = None);
-                                                window.remove_window();
-                                            }),
-                                        ),
+                                .justify_center()
+                                .w(px(22.))
+                                .h(px(22.))
+                                .rounded(px(999.))
+                                .bg(rgb(p.card_bg))
+                                .border_1()
+                                .border_color(rgb(p.card_border))
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(rgb(hover_close)))
+                                .active(|s| s.opacity(0.85))
+                                .child(ui_icon("icons/ui/close.svg", 11.0, p.text_secondary))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |_, _, window, cx| {
+                                        ctrl_close.update(cx, |c, _| c.hud_window = None);
+                                        window.remove_window();
+                                    }),
                                 ),
                         ),
-                )
+                ),
+        )
+        // High-DPI Resilient Scrollable Middle Stack
+        .child(
+            div()
+                .id("hud-body-scroll")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .gap(px(9.))
                 // IP + Proxy Port row
                 .child(
                     div()
@@ -773,21 +782,22 @@ pub fn render_hud(
                 // Fixed-height health / clickable warning strip
                 .child(bottom_strip),
         )
-        // Footer
+        // Pinned Emergency Footer (never clips on high-DPI displays)
         .child(
             div()
                 .flex()
+                .flex_shrink_0()
                 .items_center()
                 .justify_between()
-                .pt(px(9.))
+                .pt(px(8.))
                 .border_t_1()
                 .border_color(rgb(p.card_border))
-                .gap(px(7.))
+                .gap(px(5.))
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(5.))
+                        .gap(px(4.5))
                         .child(
                             action_button(
                                 "hud-panic-lockdown",
@@ -801,13 +811,13 @@ pub fn render_hud(
                                 } else {
                                     ButtonKind::DangerSoft
                                 },
-                                can_act,
+                                panic_enabled,
                                 p,
                             )
                             .h(px(28.))
-                            .px(px(8.5))
+                            .px(px(8.))
                             .text_size(px(10.5))
-                            .when(can_act, |b| {
+                            .when(panic_enabled, |b| {
                                 b.on_mouse_up(
                                     MouseButton::Left,
                                     cx.listener(move |_, _, _, cx| {
@@ -841,7 +851,7 @@ pub fn render_hud(
                                 p,
                             )
                             .h(px(28.))
-                            .px(px(8.5))
+                            .px(px(7.5))
                             .text_size(px(10.5))
                             .when(kill_all_enabled, |b| {
                                 b.on_mouse_up(
@@ -868,7 +878,7 @@ pub fn render_hud(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(6.))
+                        .gap(px(5.))
                         .when(!connected && !is_demo, |row| {
                             row.child(
                                 action_button(
@@ -876,16 +886,16 @@ pub fn render_hud(
                                     if start_svc_busy {
                                         "启动中…"
                                     } else {
-                                        "启动守护服务"
+                                        "启动服务"
                                     },
                                     ButtonKind::Primary,
-                                    !busy,
+                                    !start_svc_busy,
                                     p,
                                 )
                                 .h(px(28.))
-                                .px(px(9.))
-                                .text_size(px(11.))
-                                .when(!busy, |b| {
+                                .px(px(8.))
+                                .text_size(px(10.5))
+                                .when(!start_svc_busy, |b| {
                                     b.on_mouse_up(
                                         MouseButton::Left,
                                         cx.listener(move |_, _, _, cx| {
@@ -901,13 +911,13 @@ pub fn render_hud(
                                 "hud-recheck-or-recover",
                                 primary_footer_label,
                                 ButtonKind::Secondary,
-                                !busy,
+                                footer_flow_ready,
                                 p,
                             )
                             .h(px(28.))
-                            .px(px(10.))
-                            .text_size(px(11.5))
-                            .when(!busy, |b| {
+                            .px(px(8.5))
+                            .text_size(px(11.))
+                            .when(footer_flow_ready, |b| {
                                 let is_paused = proj.hero.is_paused;
                                 b.on_mouse_up(
                                     MouseButton::Left,

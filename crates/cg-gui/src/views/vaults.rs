@@ -89,7 +89,10 @@ pub fn render_vaults_page(
     let privacy_mask = ctrl_r.privacy_mask;
     let show_drawer = ctrl_r.show_vault_drawer;
     let draft = ctrl_r.drafts.vault_draft.clone();
+    let vault_dirty = ctrl_r.drafts.vault_dirty;
+    let discard_armed = ctrl_r.is_confirm_armed("vault-discard-draft");
     let validation_err = ctrl_r.drafts.vault_validation_error.clone();
+    let mihomo = snap.as_ref().map(|s| s.mihomo.clone()).unwrap_or_default();
     let can_act = connected && !busy;
     let now = now_unix_secs();
 
@@ -299,13 +302,22 @@ pub fn render_vaults_page(
                             .gap(px(2.))
                             .child(
                                 div()
-                                    .text_size(px(13.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(p.text_primary))
-                                    .child(if draft.editing_existing {
-                                        "编辑账号防封空间"
-                                    } else {
-                                        "新建账号防封空间"
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(p.text_primary))
+                                            .child(if draft.editing_existing {
+                                                "编辑账号防封空间"
+                                            } else {
+                                                "新建账号防封空间"
+                                            }),
+                                    )
+                                    .when(vault_dirty, |row| {
+                                        row.child(tone_tag("未保存", BadgeTone::Warn, p))
                                     }),
                             )
                             .child(
@@ -419,6 +431,170 @@ pub fn render_vaults_page(
                     .child(labeled_field("偏好 Mihomo 节点（可选）", in_node, p))
                     .child(labeled_field("最低安全分 (0-100)", in_score, p))
                     .child(labeled_field("换 IP 冷却秒数", in_cool, p)),
+            )
+            .when(
+                mihomo.available
+                    || !mihomo.candidates.is_empty()
+                    || !mihomo.active_group.is_empty(),
+                |card| {
+                    let active_grp = mihomo.active_group.trim().to_string();
+                    let active_nd = mihomo.active_node.trim().to_string();
+                    let can_adopt_cur = !active_grp.is_empty() || !active_nd.is_empty();
+                    let ctrl_adopt_mh = ctrl.clone();
+                    let grp_for_cur = (!active_grp.is_empty()).then(|| active_grp.clone());
+                    let nd_for_cur = (!active_nd.is_empty()).then(|| active_nd.clone());
+
+                    let node_chips =
+                        mihomo
+                            .candidates
+                            .iter()
+                            .take(12)
+                            .enumerate()
+                            .map(|(n_idx, cand)| {
+                                let selected_node =
+                                    draft.preferred_mihomo_node.trim() == cand.name.trim();
+                                let cname = cand.name.clone();
+                                let grp_auto = (!active_grp.is_empty()
+                                    && draft.preferred_mihomo_group.trim().is_empty())
+                                .then(|| active_grp.clone());
+                                let ctrl_chip = ctrl.clone();
+                                let chip_hover = p.sidebar_hover_bg;
+                                let (delay_txt, delay_col) = match cand.delay_ms.filter(|&d| d > 0)
+                                {
+                                    None => ("--".to_string(), p.text_muted),
+                                    Some(d) if d <= 200 => (format!("{d}ms"), p.badge_pass.text),
+                                    Some(d) if d <= 450 => (format!("{d}ms"), p.badge_warn.text),
+                                    Some(d) => (format!("{d}ms"), p.badge_fail.text),
+                                };
+                                div()
+                                    .id(gpui::ElementId::Name(
+                                        format!("vault-mh-node-{n_idx}").into(),
+                                    ))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.5))
+                                    .px(px(8.))
+                                    .py(px(3.5))
+                                    .rounded(px(7.))
+                                    .bg(rgb(if selected_node {
+                                        p.accent_soft_bg
+                                    } else {
+                                        p.card_bg
+                                    }))
+                                    .border_1()
+                                    .border_color(rgb(if selected_node {
+                                        p.accent_soft_border
+                                    } else {
+                                        p.card_border
+                                    }))
+                                    .hover(move |s| s.bg(rgb(chip_hover)))
+                                    .text_size(px(10.5))
+                                    .font_weight(if selected_node {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::MEDIUM
+                                    })
+                                    .text_color(rgb(if selected_node {
+                                        p.accent_soft_text
+                                    } else {
+                                        p.text_primary
+                                    }))
+                                    .child(cand.name.clone())
+                                    .child(
+                                        mono_tabular(delay_txt)
+                                            .text_size(px(9.5))
+                                            .text_color(rgb(delay_col)),
+                                    )
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            let g = grp_auto.clone();
+                                            let n = cname.clone();
+                                            ctrl_chip.update(cx, |c, cx| {
+                                                c.set_vault_mihomo_selection(g, Some(n), cx);
+                                            });
+                                        }),
+                                    )
+                            });
+
+                    card.child(
+                        inset_box(p)
+                            .px(px(11.))
+                            .py(px(8.))
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.))
+                                            .min_w(px(0.))
+                                            .flex_1()
+                                            .child(status_dot(p.badge_pass.dot, 5.5))
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .text_size(px(11.))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(rgb(p.text_secondary))
+                                                    .child(format!(
+                                                        "Mihomo 点选（免手输 Emoji 节点名）· 当前 {} → {}",
+                                                        if active_grp.is_empty() {
+                                                            "策略组"
+                                                        } else {
+                                                            &active_grp
+                                                        },
+                                                        if active_nd.is_empty() {
+                                                            "未识别"
+                                                        } else {
+                                                            &active_nd
+                                                        }
+                                                    )),
+                                            ),
+                                    )
+                                    .when(can_adopt_cur, |row| {
+                                        row.child(
+                                            action_button(
+                                                "vault-adopt-mihomo-cur",
+                                                "采纳当前节点",
+                                                ButtonKind::Secondary,
+                                                true,
+                                                p,
+                                            )
+                                            .h(px(24.))
+                                            .px(px(8.5))
+                                            .text_size(px(10.5))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |_, _, _, cx| {
+                                                    let g = grp_for_cur.clone();
+                                                    let n = nd_for_cur.clone();
+                                                    ctrl_adopt_mh.update(cx, |c, cx| {
+                                                        c.set_vault_mihomo_selection(g, n, cx);
+                                                        c.set_toast(
+                                                            "已采纳当前 Mihomo 策略组与活跃节点",
+                                                            true,
+                                                            cx,
+                                                        );
+                                                    });
+                                                }),
+                                            ),
+                                        )
+                                    }),
+                            )
+                            .when(!mihomo.candidates.is_empty(), |box_d| {
+                                box_d.child(
+                                    div().flex().flex_wrap().gap(px(5.5)).children(node_chips),
+                                )
+                            }),
+                    )
+                },
             )
             .child(
                 div()
@@ -540,13 +716,27 @@ pub fn render_vaults_page(
                     .justify_end()
                     .gap(px(8.))
                     .child(
-                        action_button("vault-cancel-btn", "取消", ButtonKind::Secondary, true, p)
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |_, _, _, cx| {
-                                    ctrl_cancel.update(cx, |c, cx| c.close_vault_drawer(cx));
-                                }),
-                            ),
+                        action_button(
+                            "vault-cancel-btn",
+                            if vault_dirty && discard_armed {
+                                "确认放弃修改"
+                            } else {
+                                "取消"
+                            },
+                            if vault_dirty && discard_armed {
+                                ButtonKind::DangerSoft
+                            } else {
+                                ButtonKind::Secondary
+                            },
+                            true,
+                            p,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                ctrl_cancel.update(cx, |c, cx| c.close_vault_drawer(cx));
+                            }),
+                        ),
                     )
                     .child(
                         action_button(
@@ -1047,6 +1237,31 @@ pub fn render_vaults_page(
                                         )
                                     }),
                                 )
+                                .child({
+                                    let ctrl_dir = ctrl.clone();
+                                    let vdir = format!(r"%LOCALAPPDATA%\ClaudeGuard\Vaults\{}", v.id);
+                                    action_button(
+                                        gpui::ElementId::Name(
+                                            format!("vault-open-dir-{}", v.id).into(),
+                                        ),
+                                        "打开隔离目录",
+                                        ButtonKind::Ghost,
+                                        true,
+                                        p,
+                                    )
+                                    .h(px(26.))
+                                    .px(px(8.5))
+                                    .text_size(px(11.))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            let d = vdir.clone();
+                                            ctrl_dir.update(cx, |c, cx| {
+                                                c.open_path_in_explorer_async(d, cx);
+                                            });
+                                        }),
+                                    )
+                                })
                                 .child(
                                     action_button(
                                         gpui::ElementId::Name(

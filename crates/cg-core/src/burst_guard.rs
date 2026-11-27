@@ -180,6 +180,10 @@ impl BurstGuardTracker {
     }
 
     /// Records a new prompt submission at `now_ms` and returns the BurstGuard verdict & status.
+    ///
+    /// Blocked attempts (`HookDecision::Block` under [`BurstGuardMode::ThrottleGate`]) are NOT
+    /// committed into the sliding window so local retries while throttled never cause a
+    /// self-extending 15-minute lockout.
     pub fn record_and_evaluate(
         &mut self,
         agent_id: &str,
@@ -188,24 +192,33 @@ impl BurstGuardTracker {
         cfg: &BurstGuardConfig,
     ) -> BurstEvaluation {
         let key = bucket_key(agent_id, vault_id);
-        let q = self.buckets.entry(key).or_default();
+        let stamped = {
+            let q = self.buckets.entry(key.clone()).or_default();
+            let cutoff_15m = now_ms.saturating_sub(WINDOW_15M_MS);
+            while let Some(&front) = q.front() {
+                if front < cutoff_15m {
+                    q.pop_front();
+                } else {
+                    break;
+                }
+            }
+            // Guard against minor backward wall-clock jumps while keeping monotonic intervals.
+            let ts = q.back().copied().map_or(now_ms, |last| now_ms.max(last));
+            q.push_back(ts);
+            ts
+        };
 
-        let cutoff_15m = now_ms.saturating_sub(WINDOW_15M_MS);
-        while let Some(&front) = q.front() {
-            if front < cutoff_15m {
-                q.pop_front();
+        let eval = self.evaluate_bucket(agent_id, vault_id, stamped, cfg);
+        if let Some(q) = self.buckets.get_mut(&key) {
+            if eval.hook_decision == HookDecision::Block {
+                q.pop_back();
             } else {
-                break;
+                while q.len() > BURST_RING_CAPACITY {
+                    q.pop_front();
+                }
             }
         }
-        if q.len() >= BURST_RING_CAPACITY {
-            q.pop_front();
-        }
-        // Guard against minor backward wall-clock jumps while keeping monotonic intervals.
-        let stamped = q.back().copied().map_or(now_ms, |last| now_ms.max(last));
-        q.push_back(stamped);
-
-        self.evaluate_bucket(agent_id, vault_id, stamped, cfg)
+        eval
     }
 
     /// Evaluates the current bucket state without recording a new prompt submission.
@@ -287,7 +300,16 @@ impl BurstGuardTracker {
                 "BurstGuard 已关闭".to_string(),
             ),
             BurstGuardMode::WarnOnly => {
-                if exceeds_1m_throttle || exceeds_15m_cap {
+                if unauthorized_oauth_client_detected {
+                    (
+                        BurstVerdict::Warn,
+                        HookDecision::Allow,
+                        format!(
+                            "检测到疑似非官方进程复用 OAuth 凭据（{}），仅预警模式放行，请核查未知第三方工具",
+                            self.suspicious_processes.join("、")
+                        ),
+                    )
+                } else if exceeds_1m_throttle || exceeds_15m_cap {
                     (
                         BurstVerdict::Warn,
                         HookDecision::Allow,
@@ -323,7 +345,16 @@ impl BurstGuardTracker {
                 }
             }
             BurstGuardMode::ThrottleGate => {
-                if exceeds_1m_throttle {
+                if unauthorized_oauth_client_detected {
+                    (
+                        BurstVerdict::Throttle,
+                        HookDecision::Block,
+                        format!(
+                            "BurstGuard 凭据防盗用拦截：检测到非官方进程疑似复用 OAuth 凭据（{}），已阻断提交",
+                            self.suspicious_processes.join("、")
+                        ),
+                    )
+                } else if exceeds_1m_throttle {
                     (
                         BurstVerdict::Throttle,
                         HookDecision::Block,
@@ -502,11 +533,22 @@ mod tests {
             }
         }
 
-        // 31st prompt exceeds throttle_rpm=30 -> Throttle + Block!
+        // 31st prompt exceeds throttle_rpm=30 -> Throttle + Block without polluting window!
         let eval31 = tracker.record_and_evaluate("claude-code", None, ts + 500, &cfg_throttle);
         assert_eq!(eval31.verdict, BurstVerdict::Throttle);
         assert_eq!(eval31.hook_decision, HookDecision::Block);
         assert_eq!(eval31.status.prompts_last_1m, 31);
+
+        // Even 200 rapid blocked retries must NOT inflate the 15m window into a self-extending lockout.
+        for retry in 1..=200 {
+            let blocked_retry = tracker.record_and_evaluate(
+                "claude-code",
+                None,
+                ts + 500 + retry * 10,
+                &cfg_throttle,
+            );
+            assert_eq!(blocked_retry.hook_decision, HookDecision::Block);
+        }
 
         // Same bucket under WarnOnly allows (non-blocking)
         let cfg_warn = BurstGuardConfig {
@@ -526,10 +568,10 @@ mod tests {
         assert_eq!(eval_off.verdict, BurstVerdict::Allow);
         assert_eq!(eval_off.hook_decision, HookDecision::Allow);
 
-        // After 61s, 1m window expires cleanly
+        // After 61s, 1m window expires cleanly with only the 30 permitted prompts retained
         let eval_after = tracker.evaluate_only("claude-code", None, ts + 65_000, &cfg_throttle);
         assert_eq!(eval_after.status.prompts_last_1m, 0);
-        assert_eq!(eval_after.status.prompts_last_15m, 31);
+        assert_eq!(eval_after.status.prompts_last_15m, 30);
         assert_eq!(eval_after.hook_decision, HookDecision::Allow);
     }
 
@@ -542,7 +584,6 @@ mod tests {
             max_15m_prompts: 40,
         };
         let mut tracker = BurstGuardTracker::new();
-        tracker.set_suspicious_oauth_processes(vec!["rogue-proxy.exe".into()]);
 
         // Spread 41 prompts over 10 minutes (well below 1m rpm, exceeds 15m cap=40)
         let mut ts = 10_000_000u64;
@@ -554,11 +595,29 @@ mod tests {
         let blocked = tracker.record_and_evaluate("claude-code", None, ts + 12_000, &cfg);
         assert_eq!(blocked.verdict, BurstVerdict::Throttle);
         assert_eq!(blocked.hook_decision, HookDecision::Block);
-        assert!(blocked.status.unauthorized_oauth_client_detected);
-        assert_eq!(blocked.status.suspicious_processes, vec!["rogue-proxy.exe"]);
+
+        // Unauthorized OAuth client processes block under ThrottleGate and warn under WarnOnly.
+        tracker.set_suspicious_oauth_processes(vec!["rogue-proxy.exe".into()]);
+        let oauth_blocked = tracker.evaluate_only("claude-code", None, ts + 15_000, &cfg);
+        assert_eq!(oauth_blocked.verdict, BurstVerdict::Throttle);
+        assert_eq!(oauth_blocked.hook_decision, HookDecision::Block);
+        assert!(oauth_blocked.status.unauthorized_oauth_client_detected);
+        assert_eq!(
+            oauth_blocked.status.suspicious_processes,
+            vec!["rogue-proxy.exe"]
+        );
+
+        let cfg_warn = BurstGuardConfig {
+            mode: BurstGuardMode::WarnOnly,
+            ..cfg.clone()
+        };
+        let oauth_warn = tracker.evaluate_only("claude-code", None, ts + 15_000, &cfg_warn);
+        assert_eq!(oauth_warn.verdict, BurstVerdict::Warn);
+        assert_eq!(oauth_warn.hook_decision, HookDecision::Allow);
+        assert!(oauth_warn.status.unauthorized_oauth_client_detected);
 
         let agg = tracker.overall_status(ts + 12_000, &cfg);
-        assert_eq!(agg.prompts_last_15m, 41);
+        assert_eq!(agg.prompts_last_15m, 40);
         assert!(agg.unauthorized_oauth_client_detected);
 
         tracker.prune(ts + WINDOW_15M_MS + 60_000);

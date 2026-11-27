@@ -44,7 +44,7 @@ use crate::config_store::{validate_targets_for_config, ConfigStore, LoadedConfig
 use crate::coordinator::{
     check_vault_egress_contract, current_primary_egress, evaluate_fast_hook_gate_with_ports_at,
     ActorControl, CoordinatorActor, CoordinatorContext, CoordinatorEvent, CoordinatorHandle,
-    FastGateOutcome, HookGateMetrics, PortEgressObservation, TelemetryBundle,
+    FastGateOutcome, HookGateMetrics, InFlightGuard, PortEgressObservation, TelemetryBundle,
     VaultLaunchWorkerOutcome,
 };
 use crate::diagnostics;
@@ -74,22 +74,14 @@ const DEFAULT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(10);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 const AUTO_UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(20 * 60);
 const WAKE_GRACE_DURATION: Duration = Duration::from_secs(20);
+const PIPE_SHUTDOWN_HINT_TTL: Duration = Duration::from_secs(30);
 
-struct InFlightGuard(Arc<AtomicBool>);
-
-impl InFlightGuard {
-    fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
-        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Self(flag.clone()))
-    }
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
+type HookPortWaiter = (
+    String,
+    Option<String>,
+    Option<String>,
+    SyncSender<PipeResponse>,
+);
 
 fn fallback_proxy_route(cfg: &Config) -> ProbeRoute {
     let policy = NetworkPolicy::with_proxy(&cfg.proxy_host, cfg.proxy_port);
@@ -596,10 +588,12 @@ pub struct RealEngineActor {
     mutation_error: Option<String>,
     pause_deadline: Option<Instant>,
     wake_grace_until: Option<Instant>,
-    wake_timer_active: Arc<AtomicBool>,
+    wake_timer_gen: Arc<AtomicU64>,
+    pipe_shutdown_hint_until: Option<Instant>,
     stopping_ready: bool,
     feishu: Arc<FeishuNotifier>,
     feishu_flush_in_flight: Arc<AtomicBool>,
+    toast_in_flight: Arc<AtomicBool>,
     single_recheck_in_flight: Arc<AtomicBool>,
     onboarding_probe_in_flight: Arc<AtomicBool>,
     update_check_in_flight: Arc<AtomicBool>,
@@ -614,6 +608,10 @@ pub struct RealEngineActor {
     vault_launch_in_flight: Arc<AtomicBool>,
     vault_shortcuts_in_flight: Arc<AtomicBool>,
     cli_hooks_in_flight: Arc<AtomicBool>,
+    hook_port_probe_waiters: Arc<Mutex<HashMap<u16, Vec<HookPortWaiter>>>>,
+    coord_handle_ref: Option<CoordinatorHandle>,
+    shared_wsl_bridge: Option<wsl_bridge::SharedWslBridge>,
+    manage_wsl_runtime: bool,
     recent_toasts: VecDeque<ToastNotificationEvent>,
     toast_seq: u64,
     leak_shield: LeakShieldStatus,
@@ -868,10 +866,12 @@ impl RealEngineActor {
             mutation_error: None,
             pause_deadline: None,
             wake_grace_until: None,
-            wake_timer_active: Arc::new(AtomicBool::new(false)),
+            wake_timer_gen: Arc::new(AtomicU64::new(0)),
+            pipe_shutdown_hint_until: None,
             stopping_ready: false,
             feishu,
             feishu_flush_in_flight: Arc::new(AtomicBool::new(false)),
+            toast_in_flight: Arc::new(AtomicBool::new(false)),
             single_recheck_in_flight: Arc::new(AtomicBool::new(false)),
             onboarding_probe_in_flight: Arc::new(AtomicBool::new(false)),
             update_check_in_flight: Arc::new(AtomicBool::new(false)),
@@ -886,6 +886,10 @@ impl RealEngineActor {
             vault_launch_in_flight: Arc::new(AtomicBool::new(false)),
             vault_shortcuts_in_flight: Arc::new(AtomicBool::new(false)),
             cli_hooks_in_flight: Arc::new(AtomicBool::new(false)),
+            hook_port_probe_waiters: Arc::new(Mutex::new(HashMap::new())),
+            coord_handle_ref: None,
+            shared_wsl_bridge: None,
+            manage_wsl_runtime: false,
             recent_toasts: VecDeque::new(),
             toast_seq: 0,
             leak_shield: init_shield,
@@ -959,6 +963,11 @@ impl RealEngineActor {
                 );
             }
         }
+        hook_installer::sync_public_hook_policy_for_data_dir(
+            &actor.data_dir,
+            actor.engine.config.hook_fail_mode,
+            actor.engine.lifecycle == Lifecycle::Disarmed,
+        );
         actor.flush_pending_daemon_logs();
         let initial_snapshot = actor.build_snapshot(now);
 
@@ -1033,6 +1042,13 @@ impl RealEngineActor {
                     ) {
                         if hybrid.sync_boot_guard(true, &exes).is_ok() {
                             let _ = self.journal.commit_tx(&mut tx);
+                        } else {
+                            let _ = self.journal.retain_active_layers(
+                                self.engine.runtime_epoch,
+                                self.engine.lockdown_applied == Some(true),
+                                self.engine.protection.is_isolated(),
+                                false,
+                            );
                         }
                     }
                 } else {
@@ -1103,18 +1119,23 @@ impl RealEngineActor {
                 None => (None, None),
             };
 
-        let strict_tunnel_only = self.engine.config.enforce_access_path
-            && match self.engine.access.level {
-                AccessLevel::SystemProxy => true,
-                AccessLevel::Tun => active_tun_luid.is_some(),
-                _ => false,
-            };
+        // Hold physical-NIC outbound packets in WFP whenever Armed & !paused & enforce_access_path
+        // & !monitor_only — including during the 20s post-sleep wake grace or while TUN is reconnecting —
+        // so Electron/CLI heartbeats can never leak domestic ISP IPs (`#85` #1 + `#88` [CRIT-2]).
+        let strict_tunnel_only =
+            self.engine.config.enforce_access_path && !self.engine.config.monitor_only;
+        let active_proxy_endpoint = parse_non_loopback_proxy_endpoint(
+            self.engine.access.proxy_addr.as_deref(),
+            &self.engine.config.proxy_host,
+            self.engine.config.proxy_port,
+        );
 
         let spec = wfp_win::WfpRuntimePostureSpec {
             guarded_apps,
             strict_tunnel_only,
             active_tun_luid,
             active_tun_name,
+            active_proxy_endpoint,
             block_quic_udp443: self.engine.config.leak_shield_quic,
             block_direct_dns_doh: self.engine.config.leak_shield_dns_doh,
             block_global_ipv6: self.engine.config.leak_shield_ipv6,
@@ -1241,14 +1262,17 @@ impl RealEngineActor {
         });
 
         if !access_win::is_session_zero() {
-            let drv = self.driver.clone();
-            let t_title = title.to_string();
-            let t_body = safe_body.clone();
-            let _ = std::thread::Builder::new()
-                .name("cg-toast".to_string())
-                .spawn(move || {
-                    let _ = drv.send_toast(&t_title, &t_body);
-                });
+            if let Some(guard) = InFlightGuard::try_acquire(&self.toast_in_flight) {
+                let drv = self.driver.clone();
+                let t_title = title.to_string();
+                let t_body = safe_body.clone();
+                let _ = std::thread::Builder::new()
+                    .name("cg-toast".to_string())
+                    .spawn(move || {
+                        let _guard = guard;
+                        let _ = drv.send_toast(&t_title, &t_body);
+                    });
+            }
         }
 
         if self.feishu.enqueue(class, title, &safe_body) {
@@ -1421,6 +1445,9 @@ impl RealEngineActor {
     }
 
     fn record_port_egress(&self, obs: PortEgressObservation) {
+        if obs.ip.is_none() {
+            return;
+        }
         if let Some(ref cell) = self.port_egress_ref {
             let mut g = match cell.write() {
                 Ok(g) => g,
@@ -1625,7 +1652,138 @@ impl RealEngineActor {
         snap
     }
 
-    fn on_system_shutting_down(&mut self, now: u64) {
+    fn sync_public_hook_policy(&self) {
+        hook_installer::sync_public_hook_policy_for_data_dir(
+            &self.data_dir,
+            self.engine.config.hook_fail_mode,
+            self.engine.lifecycle == Lifecycle::Disarmed,
+        );
+    }
+
+    fn reconcile_wsl_bridge_runtime(&mut self, now: u64) {
+        if !self.manage_wsl_runtime {
+            self.wsl_bridge.enabled = self.engine.config.wsl_bridge_enabled;
+            return;
+        }
+        let Some(shared) = self.shared_wsl_bridge.clone() else {
+            return;
+        };
+        let Some(coord) = self.coord_handle_ref.clone() else {
+            return;
+        };
+        let enabled = self.engine.config.wsl_bridge_enabled;
+        let proxy_port = self.engine.config.proxy_port;
+        let fail_mode = self.engine.config.hook_fail_mode;
+        let token_dir = self.effective_user_home();
+        let desync = self
+            .hook_metrics_ref
+            .as_ref()
+            .is_some_and(|m| m.wsl_proxy_desync.load(Ordering::Relaxed));
+
+        if enabled {
+            let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref srv) = *guard {
+                let _ = srv.refresh_token(token_dir.as_deref(), proxy_port, fail_mode);
+                self.wsl_bridge = srv.status(self.wsl_bridge.synced_distros.clone(), desync);
+            } else {
+                match wsl_bridge::WslBridgeServer::start_with_mode(
+                    coord,
+                    token_dir.as_deref(),
+                    proxy_port,
+                    fail_mode,
+                ) {
+                    Ok(srv) => {
+                        self.wsl_bridge =
+                            srv.status(self.wsl_bridge.synced_distros.clone(), desync);
+                        *guard = Some(srv);
+                    }
+                    Err(err) => {
+                        self.wsl_bridge = WslBridgeStatus {
+                            enabled: true,
+                            listening: false,
+                            bound_port: None,
+                            token_ready: false,
+                            synced_distros: Vec::new(),
+                            proxy_desync_detected: desync,
+                            summary: format!("WSL2 回环桥接启动失败：{err}"),
+                        };
+                    }
+                }
+            }
+        } else {
+            if let Some(srv) = shared.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                srv.shutdown();
+            }
+            self.wsl_bridge = WslBridgeStatus {
+                enabled: false,
+                listening: false,
+                bound_port: None,
+                token_ready: false,
+                synced_distros: Vec::new(),
+                proxy_desync_detected: false,
+                summary: "WSL2 跨子系统桥接已在设置中关闭".into(),
+            };
+            let event_tx = self.event_tx.clone();
+            let _ = std::thread::Builder::new()
+                .name("cg-wsl-unsync".to_string())
+                .spawn(move || {
+                    let status = wsl_bridge::sync_wsl_distros(false, None, false, false);
+                    let _ = event_tx.try_send(CoordinatorEvent::WslBridgeSynced {
+                        status: Box::new(status),
+                        now_secs: now_unix_secs(),
+                        in_flight: None,
+                        reply: None,
+                    });
+                });
+        }
+        let _ = now;
+    }
+
+    fn poll_pipe_shutdown_hint_expiry(&mut self) {
+        let Some(until) = self.pipe_shutdown_hint_until else {
+            return;
+        };
+        if Instant::now() >= until && !access_win::is_system_shutting_down() {
+            self.pipe_shutdown_hint_until = None;
+            self.engine.system_shutting_down = false;
+        }
+    }
+
+    fn arm_wake_grace_and_invalidate(&mut self, now: u64, log_detail: Option<&str>) {
+        self.wake_grace_until = Some(Instant::now() + WAKE_GRACE_DURATION);
+        self.engine.notify_system_resumed(now);
+        // Force O(1) `FastHookGate` into `NeedsSyncProbe` across brief sleeps (<45s TTL).
+        self.engine.checked_at = None;
+        if let Some(msg) = log_detail {
+            self.engine.push_log(now, LogLevel::Info, "power", msg);
+        }
+        if self.engine.lifecycle == Lifecycle::Armed && self.driver.capabilities().app_quarantine {
+            self.sync_wfp_runtime_posture(now);
+        }
+
+        let gen = self.wake_timer_gen.fetch_add(1, Ordering::AcqRel) + 1;
+        let gen_ref = self.wake_timer_gen.clone();
+        let tx = self.event_tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("cg-wake-grace".to_string())
+            .spawn(move || {
+                std::thread::sleep(WAKE_GRACE_DURATION + Duration::from_millis(50));
+                if gen_ref.load(Ordering::Acquire) == gen {
+                    let _ = tx.try_send(CoordinatorEvent::Tick);
+                }
+            });
+    }
+
+    fn on_system_shutting_down(&mut self, now: u64, authoritative_scm: bool) {
+        let os_shutting_down = authoritative_scm || access_win::is_system_shutting_down();
+        if os_shutting_down {
+            self.pipe_shutdown_hint_until = None;
+        } else {
+            // Non-SCM pipe notification (e.g. GUI `WM_QUERYENDSESSION`/`WM_ENDSESSION` before
+            // `SM_SHUTTINGDOWN` flips): bound suppression to a 30s monotonic TTL so a cancelled
+            // shutdown never leaves `system_shutting_down` stuck true permanently.
+            self.pipe_shutdown_hint_until = Some(Instant::now() + PIPE_SHUTDOWN_HINT_TTL);
+        }
         let recent_false_uncovered_trip = !self.engine.lockdown_manual
             && self
                 .engine
@@ -2804,7 +2962,6 @@ impl RealEngineActor {
                     if std::thread::Builder::new()
                         .name("cg-single-recheck".to_string())
                         .spawn(move || {
-                            let _guard = in_flight;
                             let ts = now_unix_secs();
                             let (access, probes) = runner.inspect_and_probe(
                                 &*driver,
@@ -2828,6 +2985,7 @@ impl RealEngineActor {
                                     access,
                                     probe,
                                     now_secs: now_unix_secs(),
+                                    in_flight: Some(in_flight),
                                     reply: tx,
                                 });
                             }
@@ -2929,6 +3087,10 @@ impl RealEngineActor {
                 {
                     self.sync_wfp_runtime_posture(now);
                 }
+                if self.last_rejected.is_none() && self.mutation_error.is_none() {
+                    self.sync_public_hook_policy();
+                    self.reconcile_wsl_bridge_runtime(now);
+                }
                 let snap = self.publish_snapshot(snapshot_store, now);
                 self.flush_superseded_waiters(&snap);
                 self.send_mutation_reply(reply, snap);
@@ -2980,6 +3142,9 @@ impl RealEngineActor {
                         self.mutation_error = Some(err);
                     }
                 }
+                if self.last_rejected.is_none() && self.mutation_error.is_none() {
+                    self.sync_public_hook_policy();
+                }
                 let snap = self.publish_snapshot(snapshot_store, now);
                 self.flush_superseded_waiters(&snap);
                 self.send_mutation_reply(reply, snap);
@@ -2990,6 +3155,8 @@ impl RealEngineActor {
                     && self.mutation_error.is_none()
                     && self.engine.lifecycle == Lifecycle::Armed
                 {
+                    self.sync_public_hook_policy();
+                    self.reconcile_wsl_bridge_runtime(now);
                     if self.driver.capabilities().app_quarantine {
                         self.sync_wfp_config(now);
                         self.sync_wfp_runtime_posture(now);
@@ -3165,7 +3332,7 @@ impl RealEngineActor {
                     .name("cg-onboarding-probe".to_string())
                     .spawn(move || {
                         let _guard = in_flight;
-                        let probe = probe_onboarding_with(
+                        let (probe, detected_local_ports) = probe_onboarding_with(
                             &*driver,
                             &*probe_runner,
                             &cfg,
@@ -3174,7 +3341,10 @@ impl RealEngineActor {
                         );
                         if let Ok(mut g) = worker_reply.lock() {
                             if let Some(tx) = g.take() {
-                                let _ = tx.send(PipeResponse::OnboardingProbe { probe });
+                                let _ = tx.send(PipeResponse::OnboardingProbe {
+                                    probe,
+                                    detected_local_ports,
+                                });
                             }
                         }
                     })
@@ -3196,6 +3366,8 @@ impl RealEngineActor {
                 let rejected = self.last_rejected.is_some();
                 let persisted_ok = self.mutation_error.is_none();
                 if !rejected && persisted_ok && self.engine.lifecycle == Lifecycle::Armed {
+                    self.sync_public_hook_policy();
+                    self.reconcile_wsl_bridge_runtime(now);
                     self.sync_wfp_config(now);
                     if self.driver.capabilities().app_quarantine {
                         self.sync_wfp_runtime_posture(now);
@@ -3229,6 +3401,7 @@ impl RealEngineActor {
                 until_ts,
                 limit,
                 query,
+                level,
             } => {
                 let needle = query
                     .as_deref()
@@ -3241,6 +3414,7 @@ impl RealEngineActor {
                     .iter()
                     .filter(|entry| since_ts.is_none_or(|s| entry.timestamp >= s))
                     .filter(|entry| until_ts.is_none_or(|u| entry.timestamp <= u))
+                    .filter(|entry| level.is_none_or(|lvl| entry.level == lvl))
                     .filter(|entry| {
                         needle.as_ref().is_none_or(|q| {
                             entry.category.to_ascii_lowercase().contains(q)
@@ -3301,7 +3475,6 @@ impl RealEngineActor {
                 if std::thread::Builder::new()
                     .name("cg-update-check".to_string())
                     .spawn(move || {
-                        let _guard = in_flight;
                         let ts = now_unix_secs();
                         let (_access, route) = resolve_access_and_route(
                             &*driver,
@@ -3334,6 +3507,7 @@ impl RealEngineActor {
                             summary: Box::new(summary),
                             component: normalized_component,
                             now_secs: now_unix_secs(),
+                            in_flight: Some(in_flight),
                             reply: tx_opt,
                         });
                     })
@@ -3540,13 +3714,13 @@ impl RealEngineActor {
                 if std::thread::Builder::new()
                     .name("cg-feishu-test".to_string())
                     .spawn(move || {
-                        let _guard = in_flight;
                         let result =
                             feishu.send_test(&policy, webhook.as_deref(), secret.as_deref());
                         if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
                             let _ = event_tx.send(CoordinatorEvent::FeishuTestFinished {
                                 result,
                                 now_secs: now_unix_secs(),
+                                in_flight: Some(in_flight),
                                 reply: tx,
                             });
                         }
@@ -3611,7 +3785,6 @@ impl RealEngineActor {
                 if std::thread::Builder::new()
                     .name("cg-mihomo-switch".to_string())
                     .spawn(move || {
-                        let _guard = in_flight;
                         let result =
                             mihomo_win::switch_mihomo_node(&group, &node, close_connections);
                         let mihomo = mihomo_win::inspect_mihomo();
@@ -3622,6 +3795,7 @@ impl RealEngineActor {
                                 result,
                                 mihomo,
                                 now_secs: now_unix_secs(),
+                                in_flight: Some(in_flight),
                                 reply: tx,
                             });
                         }
@@ -3672,7 +3846,6 @@ impl RealEngineActor {
                 if std::thread::Builder::new()
                     .name("cg-ag-repair".to_string())
                     .spawn(move || {
-                        let _guard = in_flight;
                         // The manual button always re-downloads the latest release, then seeds
                         // the verified-DLL cache the background auto re-injection relies on.
                         let res = antigravity_proxy_win::repair_antigravity_proxy(
@@ -3692,6 +3865,7 @@ impl RealEngineActor {
                             let _ = event_tx.send(CoordinatorEvent::AntigravityRepairFinished {
                                 result: res,
                                 now_secs: now_unix_secs(),
+                                in_flight: Some(in_flight),
                                 reply: tx,
                             });
                         }
@@ -3846,7 +4020,6 @@ impl RealEngineActor {
                 if std::thread::Builder::new()
                     .name("cg-diag-export".to_string())
                     .spawn(move || {
-                        let _guard = in_flight;
                         let ts = now_unix_secs();
                         let result = diagnostics::export_redacted_diagnostics_zip(
                             &data_dir, &snap, ts, None,
@@ -3855,6 +4028,7 @@ impl RealEngineActor {
                             let _ = event_tx.send(CoordinatorEvent::ExportDiagnosticsFinished {
                                 result,
                                 now_secs: now_unix_secs(),
+                                in_flight: Some(in_flight),
                                 reply: tx,
                             });
                         }
@@ -3871,7 +4045,7 @@ impl RealEngineActor {
                 }
             }
             PipeRequest::NotifySystemShutdown => {
-                self.on_system_shutting_down(now);
+                self.on_system_shutting_down(now, false);
                 let snap = self.publish_snapshot(snapshot_store, now);
                 let _ = reply.send(PipeResponse::Ack {
                     receipt: None,
@@ -3886,7 +4060,7 @@ impl RealEngineActor {
             } => {
                 self.sync_monotonic_pause(now);
                 // If targeting an enabled vault with a dedicated proxy port whose cache is missing/stale,
-                // probe that dedicated port off-thread before deciding!
+                // coalesce concurrent probes per port onto a single off-thread worker!
                 let dedicated_port_needed = vault_id
                     .as_deref()
                     .map(str::trim)
@@ -3905,72 +4079,147 @@ impl RealEngineActor {
                     .filter(|port| {
                         let ttl = self.engine.config.hook_freshness_ttl_secs.clamp(10, 300);
                         let map = self.current_port_egress_map();
-                        !map.get(port)
-                            .is_some_and(|obs| now.saturating_sub(obs.observed_at) <= ttl)
+                        !map.get(port).is_some_and(|obs| {
+                            obs.ip.is_some() && now.saturating_sub(obs.observed_at) <= ttl
+                        })
                     });
 
                 let cur_snap = self.build_snapshot(now);
                 if let Some(port) = dedicated_port_needed {
-                    let proxy_host = self.engine.config.proxy_host.clone();
-                    let event_tx = self.event_tx.clone();
-                    let burst = self.burst_guard_ref.clone();
-                    let port_cell = self.port_egress_ref.clone();
-                    let snap_clone = cur_snap;
-                    let _ = std::thread::Builder::new()
-                        .name("cg-hook-port-probe".to_string())
-                        .spawn(move || {
-                            let ts = now_unix_secs();
-                            let obs = probe_dedicated_proxy_port(&proxy_host, port, ts);
-                            if let Some(ref cell) = port_cell {
-                                if let Ok(mut g) = cell.write() {
-                                    g.insert(port, obs.clone());
+                    let should_spawn = {
+                        let mut map = self
+                            .hook_port_probe_waiters
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let list = map.entry(port).or_default();
+                        let first = list.is_empty();
+                        list.push((agent_id, vault_id, hook_event, reply));
+                        first
+                    };
+                    if should_spawn {
+                        let proxy_host = self.engine.config.proxy_host.clone();
+                        let event_tx = self.event_tx.clone();
+                        let burst = self.burst_guard_ref.clone();
+                        let port_cell = self.port_egress_ref.clone();
+                        let waiters_map = self.hook_port_probe_waiters.clone();
+                        let waiters_on_err = waiters_map.clone();
+                        let snap_clone = cur_snap;
+                        if std::thread::Builder::new()
+                            .name("cg-hook-port-probe".to_string())
+                            .spawn(move || {
+                                struct DrainGuard {
+                                    port: u16,
+                                    waiters: Arc<Mutex<HashMap<u16, Vec<HookPortWaiter>>>>,
+                                    armed: bool,
                                 }
+                                impl Drop for DrainGuard {
+                                    fn drop(&mut self) {
+                                        if !self.armed {
+                                            return;
+                                        }
+                                        if let Ok(mut g) = self.waiters.lock() {
+                                            if let Some(pending) = g.remove(&self.port) {
+                                                for (_, _, _, tx) in pending {
+                                                    let _ = tx.send(PipeResponse::Error {
+                                                        code: ErrorCode::Internal,
+                                                        message:
+                                                            "独立端口门禁探测线程异常中止".into(),
+                                                        receipt: None,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                let mut drain_guard = DrainGuard {
+                                    port,
+                                    waiters: waiters_map.clone(),
+                                    armed: true,
+                                };
+                                let ts = now_unix_secs();
+                                let obs = probe_dedicated_proxy_port(&proxy_host, port, ts);
+                                if obs.ip.is_some() {
+                                    if let Some(ref cell) = port_cell {
+                                        if let Ok(mut g) = cell.write() {
+                                            g.insert(port, obs.clone());
+                                        }
+                                    }
+                                    let _ = event_tx.try_send(CoordinatorEvent::PortEgressProbed {
+                                        observations: vec![obs.clone()],
+                                        now_secs: ts,
+                                    });
+                                }
+                                let mut map = HashMap::new();
+                                if obs.ip.is_some() {
+                                    map.insert(port, obs);
+                                }
+                                let pending = waiters_map
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .remove(&port)
+                                    .unwrap_or_default();
+                                drain_guard.armed = false;
+                                let fallback_tracker = Mutex::new(BurstGuardTracker::new());
+                                let tracker_ref: &Mutex<BurstGuardTracker> =
+                                    burst.as_deref().unwrap_or(&fallback_tracker);
+                                for (w_agent, w_vault, w_ev, tx) in pending {
+                                    let resp = match evaluate_fast_hook_gate_with_ports_at(
+                                        &snap_clone,
+                                        tracker_ref,
+                                        &map,
+                                        &w_agent,
+                                        w_vault.as_deref(),
+                                        w_ev.as_deref(),
+                                        ts,
+                                        now_unix_millis(),
+                                    ) {
+                                        FastGateOutcome::Immediate(
+                                            PipeResponse::FastGateVerdict {
+                                                allowed,
+                                                decision,
+                                                safety_score,
+                                                reason,
+                                                ..
+                                            },
+                                        ) => PipeResponse::FastGateVerdict {
+                                            allowed,
+                                            decision,
+                                            safety_score,
+                                            reason,
+                                            latency_path: "dedicated_port_probe".into(),
+                                        },
+                                        FastGateOutcome::Immediate(other) => other,
+                                        FastGateOutcome::NeedsSyncProbe => {
+                                            PipeResponse::FastGateVerdict {
+                                                allowed: false,
+                                                decision: HookDecision::Block,
+                                                safety_score: snap_clone.risk_assessment.score,
+                                                reason: format!(
+                                                    "🛡️ [ClaudeGuard 独立端口探测失败] 无法通过独立代理端口 {port} 验证出口合规性"
+                                                ),
+                                                latency_path: "dedicated_port_probe".into(),
+                                            }
+                                        }
+                                    };
+                                    let _ = tx.send(resp);
+                                }
+                            })
+                            .is_err()
+                        {
+                            let drained = waiters_on_err
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&port)
+                                .unwrap_or_default();
+                            for (_, _, _, tx) in drained {
+                                let _ = tx.send(PipeResponse::Error {
+                                    code: ErrorCode::Busy,
+                                    message: "创建独立端口探测工作线程失败，请稍后重试".into(),
+                                    receipt: None,
+                                });
                             }
-                            let _ = event_tx.try_send(CoordinatorEvent::PortEgressProbed {
-                                observations: vec![obs.clone()],
-                                now_secs: ts,
-                            });
-                            let mut map = HashMap::new();
-                            map.insert(port, obs);
-                            let fallback_tracker = Mutex::new(BurstGuardTracker::new());
-                            let tracker_ref: &Mutex<BurstGuardTracker> =
-                                burst.as_deref().unwrap_or(&fallback_tracker);
-                            let resp = match evaluate_fast_hook_gate_with_ports_at(
-                                &snap_clone,
-                                tracker_ref,
-                                &map,
-                                &agent_id,
-                                vault_id.as_deref(),
-                                hook_event.as_deref(),
-                                ts,
-                                now_unix_millis(),
-                            ) {
-                                FastGateOutcome::Immediate(PipeResponse::FastGateVerdict {
-                                    allowed,
-                                    decision,
-                                    safety_score,
-                                    reason,
-                                    ..
-                                }) => PipeResponse::FastGateVerdict {
-                                    allowed,
-                                    decision,
-                                    safety_score,
-                                    reason,
-                                    latency_path: "dedicated_port_probe".into(),
-                                },
-                                FastGateOutcome::Immediate(other) => other,
-                                FastGateOutcome::NeedsSyncProbe => PipeResponse::FastGateVerdict {
-                                    allowed: false,
-                                    decision: HookDecision::Block,
-                                    safety_score: snap_clone.risk_assessment.score,
-                                    reason: format!(
-                                        "🛡️ [ClaudeGuard 独立端口探测失败] 无法通过独立代理端口 {port} 验证出口合规性"
-                                    ),
-                                    latency_path: "dedicated_port_probe".into(),
-                                },
-                            };
-                            let _ = reply.send(resp);
-                        });
+                        }
+                    }
                     return;
                 }
 
@@ -4014,22 +4263,45 @@ impl RealEngineActor {
                     self.fast_hook_waiters
                         .push((agent_id, vault_id, hook_event, reply));
                 } else {
-                    let decision = GuardEngine::evaluate_launch_gate_for_agent(
-                        &self.engine,
-                        Some(agent_id.as_str()),
+                    let fallback_tracker2 = Mutex::new(BurstGuardTracker::new());
+                    let tracker_ref2: &Mutex<BurstGuardTracker> = self
+                        .burst_guard_ref
+                        .as_deref()
+                        .unwrap_or(&fallback_tracker2);
+                    let resp = match evaluate_fast_hook_gate_with_ports_at(
+                        &snap,
+                        tracker_ref2,
+                        &port_map,
+                        &agent_id,
+                        vault_id.as_deref(),
+                        hook_event.as_deref(),
                         now,
-                    );
-                    let _ = reply.send(PipeResponse::FastGateVerdict {
-                        allowed: decision.allowed,
-                        decision: if decision.allowed {
-                            HookDecision::Allow
-                        } else {
-                            HookDecision::Block
+                        now_unix_millis(),
+                    ) {
+                        FastGateOutcome::Immediate(PipeResponse::FastGateVerdict {
+                            allowed,
+                            decision,
+                            safety_score,
+                            reason,
+                            ..
+                        }) => PipeResponse::FastGateVerdict {
+                            allowed,
+                            decision,
+                            safety_score,
+                            reason,
+                            latency_path: "sync_probe_fallback".into(),
                         },
-                        safety_score: snap.risk_assessment.score,
-                        reason: decision.reason,
-                        latency_path: "sync_probe_fallback".into(),
-                    });
+                        FastGateOutcome::Immediate(other) => other,
+                        FastGateOutcome::NeedsSyncProbe => PipeResponse::FastGateVerdict {
+                            allowed: false,
+                            decision: HookDecision::Block,
+                            safety_score: snap.risk_assessment.score,
+                            reason: "🛡️ [ClaudeGuard 门禁拦截] 当前未能启动或完成实时出口合规复核"
+                                .into(),
+                            latency_path: "sync_probe_fallback".into(),
+                        },
+                    };
+                    let _ = reply.send(resp);
                 }
             }
             PipeRequest::UpsertVault { mut vault } => {
@@ -4280,16 +4552,34 @@ impl RealEngineActor {
                     && self.engine.antigravity_proxy.installed
                     && !self.engine.antigravity_proxy.is_ready_for_launch()
                 {
-                    let _ = reply.send(PipeResponse::Error {
-                        code: ErrorCode::IllegalState,
-                        message: format!(
-                            "反重力透明代理未就绪（{}）：{}",
-                            self.engine.antigravity_proxy.state.label_zh(),
-                            self.engine.antigravity_proxy.summary
-                        ),
-                        receipt: None,
-                    });
-                    return;
+                    let prior_dll_opt_in =
+                        self.engine.config.last_seen_antigravity_version.is_some()
+                            || self.engine.antigravity_proxy.config_present
+                            || self
+                                .engine
+                                .antigravity_proxy
+                                .antigravity_dir
+                                .as_deref()
+                                .is_some_and(|dir| {
+                                    antigravity_proxy_win::has_prior_antigravity_proxy_opt_in(
+                                        std::path::Path::new(dir),
+                                        &self.data_dir,
+                                    )
+                                });
+                    let pure_tun_covered =
+                        self.engine.access.level == AccessLevel::Tun && !prior_dll_opt_in;
+                    if !pure_tun_covered {
+                        let _ = reply.send(PipeResponse::Error {
+                            code: ErrorCode::IllegalState,
+                            message: format!(
+                                "反重力透明代理未就绪（{}）：{}",
+                                self.engine.antigravity_proxy.state.label_zh(),
+                                self.engine.antigravity_proxy.summary
+                            ),
+                            receipt: None,
+                        });
+                        return;
+                    }
                 }
                 if self.engine.lifecycle != Lifecycle::Armed {
                     let _ = reply.send(PipeResponse::Error {
@@ -4395,7 +4685,14 @@ impl RealEngineActor {
 
                 let snap = self.build_snapshot(now);
                 let user_home = self.effective_user_home();
-                let ag_healthy = self.engine.antigravity_proxy.state.is_healthy();
+                let ag_healthy = self.engine.antigravity_proxy.dll_present
+                    && self.engine.antigravity_proxy.dll_valid;
+                let ag_dir_opt = self
+                    .engine
+                    .antigravity_proxy
+                    .antigravity_dir
+                    .as_ref()
+                    .map(PathBuf::from);
                 let driver = self.driver.clone();
                 let probe_runner = self.probe_runner.clone();
                 let scanner = self.process_scanner.clone();
@@ -4408,7 +4705,6 @@ impl RealEngineActor {
                 if std::thread::Builder::new()
                     .name("cg-vault-launch".to_string())
                     .spawn(move || {
-                        let _guard = in_flight;
                         let outcome = execute_vault_launch_off_thread(
                             &*driver,
                             &*probe_runner,
@@ -4420,6 +4716,7 @@ impl RealEngineActor {
                             &vaults_root,
                             user_home.as_deref(),
                             ag_healthy,
+                            ag_dir_opt.as_deref(),
                             dedicated_port,
                             needs_live_global_probe,
                         );
@@ -4429,6 +4726,7 @@ impl RealEngineActor {
                                 app,
                                 outcome: Box::new(outcome),
                                 now_secs: now_unix_secs(),
+                                in_flight: Some(in_flight),
                                 reply: tx,
                             });
                         }
@@ -4538,7 +4836,6 @@ impl RealEngineActor {
                 if std::thread::Builder::new()
                     .name("cg-vault-shortcuts".to_string())
                     .spawn(move || {
-                        let _guard = in_flight;
                         let result = vault_win::generate_vault_shortcuts_in(
                             &vaults_root,
                             &vault,
@@ -4550,8 +4847,10 @@ impl RealEngineActor {
                             let _ = event_tx.send(CoordinatorEvent::VaultShortcutsGenerated {
                                 vault_id: norm_id,
                                 vault_name: v_name,
+                                target_dir: desktop_dir,
                                 result,
                                 now_secs: now_unix_secs(),
+                                in_flight: Some(in_flight),
                                 reply: tx,
                             });
                         }
@@ -4585,7 +4884,6 @@ impl RealEngineActor {
                 if std::thread::Builder::new()
                     .name("cg-cleanroom-scan".to_string())
                     .spawn(move || {
-                        let _guard = in_flight;
                         let ts = now_unix_secs();
                         let report =
                             cleanroom_win::scan_cleanroom(&scope, user_home.as_deref(), ts);
@@ -4595,6 +4893,7 @@ impl RealEngineActor {
                                 report: Box::new(report),
                                 backup_count,
                                 now_secs: now_unix_secs(),
+                                in_flight: Some(in_flight),
                                 reply: tx,
                             });
                         }
@@ -4631,7 +4930,6 @@ impl RealEngineActor {
                 if std::thread::Builder::new()
                     .name("cg-cleanroom-exec".to_string())
                     .spawn(move || {
-                        let _guard = in_flight;
                         let ts = now_unix_secs();
                         let result = cleanroom_win::execute_cleanroom_with_backup(
                             &data_dir,
@@ -4648,6 +4946,7 @@ impl RealEngineActor {
                             let _ = event_tx.send(CoordinatorEvent::CleanRoomExecuted {
                                 result,
                                 now_secs: now_unix_secs(),
+                                in_flight: Some(in_flight),
                                 reply: tx,
                             });
                         }
@@ -4686,13 +4985,13 @@ impl RealEngineActor {
                 if std::thread::Builder::new()
                     .name("cg-cleanroom-restore".to_string())
                     .spawn(move || {
-                        let _guard = in_flight;
                         let result = cleanroom_win::restore_cleanroom_backup(&data_dir, &backup_id);
                         if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
                             let _ = event_tx.send(CoordinatorEvent::CleanRoomRestored {
                                 backup_id,
                                 result,
                                 now_secs: now_unix_secs(),
+                                in_flight: Some(in_flight),
                                 reply: tx,
                             });
                         }
@@ -4748,7 +5047,6 @@ impl RealEngineActor {
                 if std::thread::Builder::new()
                     .name("cg-cli-hooks".to_string())
                     .spawn(move || {
-                        let _guard = in_flight;
                         let result = hook_installer::configure_cli_hooks_in(
                             &user_home,
                             Some(&vaults_root),
@@ -4762,6 +5060,7 @@ impl RealEngineActor {
                             let _ = event_tx.send(CoordinatorEvent::CliHooksConfigured {
                                 result,
                                 now_secs: now_unix_secs(),
+                                in_flight: Some(in_flight),
                                 reply: tx,
                             });
                         }
@@ -4787,6 +5086,9 @@ impl RealEngineActor {
                     return;
                 };
                 let enabled = self.engine.config.wsl_bridge_enabled;
+                if enabled {
+                    self.reconcile_wsl_bridge_runtime(now);
+                }
                 let bound_port = self.wsl_bridge.bound_port;
                 let token_ready = self.wsl_bridge.token_ready;
                 let desync = self
@@ -4799,13 +5101,13 @@ impl RealEngineActor {
                 if std::thread::Builder::new()
                     .name("cg-wsl-sync".to_string())
                     .spawn(move || {
-                        let _guard = in_flight;
                         let status =
                             wsl_bridge::sync_wsl_distros(enabled, bound_port, token_ready, desync);
                         if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
                             let _ = event_tx.send(CoordinatorEvent::WslBridgeSynced {
                                 status: Box::new(status),
                                 now_secs: now_unix_secs(),
+                                in_flight: Some(in_flight),
                                 reply: Some(tx),
                             });
                         }
@@ -4925,7 +5227,6 @@ impl RealEngineActor {
                 if std::thread::Builder::new()
                     .name("cg-deep-risk-audit".to_string())
                     .spawn(move || {
-                        let _guard = in_flight;
                         ip_intel::clear_ip_intel_cache();
                         let procs = if has_process_guard {
                             scanner.refresh()
@@ -4946,6 +5247,7 @@ impl RealEngineActor {
                             let _ = event_tx.send(CoordinatorEvent::DeepRiskAuditFinished {
                                 assessment: Box::new(assessment),
                                 now_secs: now_unix_secs(),
+                                in_flight: Some(in_flight),
                                 reply: Some(tx),
                             });
                         }
@@ -5076,15 +5378,17 @@ impl RealEngineActor {
                 if std::thread::Builder::new()
                     .name("cg-health-card".to_string())
                     .spawn(move || {
-                        let _guard = in_flight;
                         let ts = now_unix_secs();
-                        let card =
-                            diagnostics::build_sanitized_health_card(&snap, &data_dir, ts, true);
+                        let result = diagnostics::try_build_sanitized_health_card(
+                            &snap, &data_dir, ts, true,
+                        )
+                        .map(Box::new);
                         if let Some(tx) = worker_reply.lock().ok().and_then(|mut g| g.take()) {
                             let _ = event_tx.send(CoordinatorEvent::HealthCardBuilt {
-                                card: Box::new(card),
+                                result,
                                 export_png: true,
                                 now_secs: now_unix_secs(),
+                                in_flight: Some(in_flight),
                                 reply: tx,
                             });
                         }
@@ -5195,7 +5499,33 @@ impl RealEngineActor {
             self.engine.cfg_rev,
             now,
         )
+        .0
     }
+}
+
+fn parse_non_loopback_proxy_endpoint(
+    access_proxy_addr: Option<&str>,
+    cfg_proxy_host: &str,
+    cfg_proxy_port: u16,
+) -> Option<(std::net::IpAddr, u16)> {
+    if let Some(addr) = access_proxy_addr.map(str::trim).filter(|s| !s.is_empty()) {
+        let stripped = clean_proxy_host_authority(addr);
+        let after_at = stripped.rsplit_once('@').map_or(stripped, |(_, r)| r);
+        if let Ok(sock) = after_at.parse::<std::net::SocketAddr>() {
+            if !sock.ip().is_loopback() && sock.port() > 0 {
+                return Some((sock.ip(), sock.port()));
+            }
+        }
+    }
+    let host_clean = clean_proxy_host_authority(cfg_proxy_host);
+    let after_at = host_clean.rsplit_once('@').map_or(host_clean, |(_, r)| r);
+    let trimmed_ip = after_at.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = trimmed_ip.parse::<std::net::IpAddr>() {
+        if !ip.is_loopback() && cfg_proxy_port > 0 {
+            return Some((ip, cfg_proxy_port));
+        }
+    }
+    None
 }
 
 fn format_wfp_persistent_sublayer_guid() -> String {
@@ -5270,6 +5600,7 @@ fn execute_vault_launch_off_thread(
     vaults_root: &std::path::Path,
     user_home: Option<&std::path::Path>,
     antigravity_dll_healthy: bool,
+    antigravity_dir: Option<&std::path::Path>,
     dedicated_port: Option<u16>,
     needs_live_global_probe: bool,
 ) -> VaultLaunchWorkerOutcome {
@@ -5282,6 +5613,8 @@ fn execute_vault_launch_off_thread(
     let mut obs_lat = snap.risk_assessment.ip_purity.lat_tenths;
     let mut obs_lon = snap.risk_assessment.ip_purity.lon_tenths;
     let mut port_obs_out: Option<PortEgressObservation> = None;
+    let mut global_probe_round: Option<(AccessEvidence, Vec<(String, ProbeResult)>)> = None;
+    let mut switched_mihomo_global = false;
 
     if let Some(port) = dedicated_port {
         let probed = probe_dedicated_proxy_port(&snap.config.proxy_host, port, now);
@@ -5318,7 +5651,11 @@ fn execute_vault_launch_off_thread(
                 .map(|(_, p)| p.clone())
                 .unwrap_or_else(|| ProbeResult::failed("未返回探测结果"));
             let eval = policy::evaluate_with_preset(target, &p, snap.config.preset);
-            if eval.verdict != crate::protocol::PolicyVerdict::Pass {
+            if eval.verdict != crate::protocol::PolicyVerdict::Pass
+                && !(vault.auto_align_mihomo_on_vault_launch
+                    && vault.preferred_mihomo_group.is_some()
+                    && vault.preferred_mihomo_node.is_some())
+            {
                 return VaultLaunchWorkerOutcome::Failed {
                     code: ErrorCode::IllegalState,
                     message: format!("出口核验未通过（{}）：{}", target.name, eval.reason),
@@ -5332,6 +5669,7 @@ fn execute_vault_launch_off_thread(
         obs_ip = first_geo.and_then(|p| p.ip.clone());
         obs_country = first_geo.and_then(|p| p.country.clone());
         obs_asn = snap.risk_assessment.ip_purity.asn;
+        global_probe_round = Some((access, probes));
     } else {
         let primary = current_primary_egress(snap);
         obs_ip = primary.0;
@@ -5348,35 +5686,117 @@ fn execute_vault_launch_off_thread(
                 vault.preferred_mihomo_node.as_deref(),
             ) {
                 match mihomo_win::switch_mihomo_node(group, node, true) {
-                    Ok(msg) => {
+                    Ok(_msg) => {
+                        std::thread::sleep(Duration::from_millis(350));
+                        let ts_after = now_unix_secs();
                         if let Some(port) = dedicated_port {
                             let re_probed =
-                                probe_dedicated_proxy_port(&snap.config.proxy_host, port, now);
-                            if check_vault_egress_contract(
+                                probe_dedicated_proxy_port(&snap.config.proxy_host, port, ts_after);
+                            if let Err(re_err) = check_vault_egress_contract(
                                 vault,
                                 re_probed.ip.as_deref(),
                                 re_probed.country.as_deref(),
                                 re_probed.asn,
-                            )
-                            .is_ok()
-                            {
-                                obs_ip = re_probed.ip.clone();
-                                obs_country = re_probed.country.clone();
-                                obs_city = re_probed.city.clone();
-                                obs_lat = re_probed.lat_tenths;
-                                obs_lon = re_probed.lon_tenths;
-                                port_obs_out = Some(re_probed);
-                            } else {
-                                return VaultLaunchWorkerOutcome::AutoAlignedMihomo {
-                                    node: node.to_string(),
-                                    detail: msg,
+                            ) {
+                                return VaultLaunchWorkerOutcome::Failed {
+                                    code: ErrorCode::IllegalState,
+                                    message: format!(
+                                        "已自动请求 Mihomo 切换至 `{node}`，但复检仍未满足保险箱契约：{re_err}"
+                                    ),
                                 };
                             }
+                            obs_ip = re_probed.ip.clone();
+                            obs_country = re_probed.country.clone();
+                            obs_city = re_probed.city.clone();
+                            obs_lat = re_probed.lat_tenths;
+                            obs_lon = re_probed.lon_tenths;
+                            port_obs_out = Some(re_probed);
                         } else {
-                            return VaultLaunchWorkerOutcome::AutoAlignedMihomo {
-                                node: node.to_string(),
-                                detail: msg,
+                            let (access, probes) = probe_runner.inspect_and_probe(
+                                driver,
+                                &snap.config,
+                                snap.cfg_rev,
+                                &snap.config.targets,
+                                snap.config.enforce_access_path,
+                                false,
+                                ts_after,
+                            );
+                            if snap.config.enforce_access_path
+                                && driver.capabilities().app_quarantine
+                                && !access.is_known()
+                            {
+                                return VaultLaunchWorkerOutcome::Failed {
+                                    code: ErrorCode::IllegalState,
+                                    message: format!(
+                                        "已切换至 `{node}`，但未检测到有效代理接入路径：{}",
+                                        access.note
+                                    ),
+                                };
+                            }
+                            for target in snap.config.targets.iter().filter(|t| t.enabled) {
+                                let p = probes
+                                    .iter()
+                                    .find(|(id, _)| id == &target.id)
+                                    .map(|(_, p)| p.clone())
+                                    .unwrap_or_else(|| ProbeResult::failed("未返回探测结果"));
+                                let eval =
+                                    policy::evaluate_with_preset(target, &p, snap.config.preset);
+                                if eval.verdict != crate::protocol::PolicyVerdict::Pass {
+                                    return VaultLaunchWorkerOutcome::Failed {
+                                        code: ErrorCode::IllegalState,
+                                        message: format!(
+                                            "已自动切换至 `{node}`，但目标「{}」核验未通过：{}",
+                                            target.name, eval.reason
+                                        ),
+                                    };
+                                }
+                            }
+                            let first_geo = probes
+                                .iter()
+                                .map(|(_, p)| p)
+                                .find(|p| p.ip.is_some() || p.country.is_some());
+                            let re_ip = first_geo.and_then(|p| p.ip.clone());
+                            let re_country = first_geo.and_then(|p| p.country.clone());
+                            let re_city = first_geo.and_then(|p| p.city.clone());
+                            let re_asn = if vault.pinned_asn.is_some() {
+                                let (_ev, route) = resolve_access_and_route(
+                                    driver,
+                                    &snap.config,
+                                    snap.cfg_rev,
+                                    &snap.config.targets,
+                                    snap.config.enforce_access_path,
+                                    ts_after,
+                                );
+                                ip_intel::fetch_ip_purity_via_route(
+                                    &route,
+                                    re_ip.as_deref(),
+                                    re_country.as_deref(),
+                                    ts_after,
+                                )
+                                .asn
+                            } else {
+                                None
                             };
+                            if let Err(re_err) = check_vault_egress_contract(
+                                vault,
+                                re_ip.as_deref(),
+                                re_country.as_deref(),
+                                re_asn,
+                            ) {
+                                return VaultLaunchWorkerOutcome::Failed {
+                                    code: ErrorCode::IllegalState,
+                                    message: format!(
+                                        "已自动切换至 `{node}`，但复检仍未满足保险箱契约：{re_err}"
+                                    ),
+                                };
+                            }
+                            obs_ip = re_ip;
+                            obs_country = re_country;
+                            obs_city = re_city;
+                            obs_lat = None;
+                            obs_lon = None;
+                            switched_mihomo_global = true;
+                            global_probe_round = Some((access, probes));
                         }
                     }
                     Err(err) => {
@@ -5405,6 +5825,7 @@ fn execute_vault_launch_off_thread(
     }
 
     if dedicated_port.is_none()
+        && !switched_mihomo_global
         && snap.risk_assessment.evaluated_at > 0
         && snap.risk_assessment.score < vault.min_safety_score
     {
@@ -5442,14 +5863,78 @@ fn execute_vault_launch_off_thread(
         }
     };
 
-    if let vault_win::MsixLaunchStrategy::ExclusiveSwapLock { .. } = &spec.msix_strategy {
-        if let Err(err) =
-            vault_win::acquire_msix_exclusive_lock(vaults_root, app.agent_id(), &vault.id, now)
-        {
-            return VaultLaunchWorkerOutcome::Failed {
-                code: ErrorCode::IllegalState,
-                message: err,
+    struct MsixLockRollbackGuard<'a> {
+        vaults_root: &'a std::path::Path,
+        agent_id: &'a str,
+        vault_id: &'a str,
+        armed: bool,
+    }
+    impl Drop for MsixLockRollbackGuard<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = vault_win::release_msix_exclusive_lock(
+                    self.vaults_root,
+                    self.agent_id,
+                    self.vault_id,
+                );
+            }
+        }
+    }
+
+    let mut msix_lock_guard =
+        if let vault_win::MsixLaunchStrategy::ExclusiveSwapLock { .. } = &spec.msix_strategy {
+            if let Err(err) =
+                vault_win::acquire_msix_exclusive_lock(vaults_root, app.agent_id(), &vault.id, now)
+            {
+                return VaultLaunchWorkerOutcome::Failed {
+                    code: ErrorCode::IllegalState,
+                    message: err,
+                };
+            }
+            Some(MsixLockRollbackGuard {
+                vaults_root,
+                agent_id: app.agent_id(),
+                vault_id: &vault.id,
+                armed: true,
+            })
+        } else {
+            None
+        };
+
+    let has_process_guard = driver.capabilities().process_guard;
+    let proc_snapshot = if has_process_guard {
+        Some(process_scanner.refresh())
+    } else {
+        None
+    };
+
+    if app == VaultAppTarget::AntigravityIde && antigravity_dll_healthy {
+        let resolved_ag_dir = antigravity_dir
+            .map(PathBuf::from)
+            .or_else(|| antigravity_proxy_win::resolve_antigravity_dir(None).ok());
+        if let Some(ref ag_dir) = resolved_ag_dir {
+            let any_ag_running = proc_snapshot
+                .as_ref()
+                .and_then(|s| s.gui_counts.get("antigravity").copied())
+                .unwrap_or(0)
+                > 0;
+            let clean_host = clean_proxy_host_authority(&snap.config.proxy_host);
+            let desired_host = if clean_host.is_empty() {
+                "127.0.0.1"
+            } else {
+                clean_host
             };
+            if let Err(err) = antigravity_proxy_win::align_antigravity_proxy_config_for_launch(
+                ag_dir,
+                desired_host,
+                spec.effective_proxy_port,
+                any_ag_running,
+            ) {
+                return VaultLaunchWorkerOutcome::Failed {
+                    code: ErrorCode::IllegalState,
+                    message: err,
+                };
+            }
         }
     }
 
@@ -5491,20 +5976,16 @@ fn execute_vault_launch_off_thread(
     };
 
     let target = LaunchTarget::executable_with_env(exe_path, spec.args, spec.env, spec.working_dir);
-    let has_process_guard = driver.capabilities().process_guard;
-    let before_pids: std::collections::HashSet<u32> = if has_process_guard {
-        process_scanner
-            .refresh()
-            .procs
-            .iter()
-            .map(|p| p.pid)
-            .collect()
-    } else {
-        std::collections::HashSet::new()
-    };
+    let before_pids: std::collections::HashSet<u32> = proc_snapshot
+        .as_ref()
+        .map(|s| s.procs.iter().map(|p| p.pid).collect())
+        .unwrap_or_default();
 
     match driver.launch_app_normal_privilege(&target) {
         Ok(()) => {
+            if let Some(ref mut g) = msix_lock_guard {
+                g.armed = false;
+            }
             let mut discovered_sessions = Vec::new();
             if has_process_guard {
                 discovered_sessions = discover_launched_vault_identities(
@@ -5532,6 +6013,7 @@ fn execute_vault_launch_off_thread(
                 lat_tenths: obs_lat,
                 lon_tenths: obs_lon,
                 port_obs: port_obs_out,
+                global_probe_round,
                 discovered_sessions,
             }
         }
@@ -6196,7 +6678,7 @@ fn probe_onboarding_with(
     cfg: &Config,
     cfg_rev: u64,
     now: u64,
-) -> OnboardingProbeResult {
+) -> (OnboardingProbeResult, Vec<u16>) {
     let hosts = cg_core::access::monitored_hosts(cfg);
     let (access_ev, probe_route) = match driver.inspect_access_path(&hosts) {
         Ok((path, _)) => (
@@ -6221,8 +6703,9 @@ fn probe_onboarding_with(
         .and_then(|addr| addr.rsplit_once(':'))
         .and_then(|(_, p)| p.trim_end_matches('/').parse::<u16>().ok())
         .filter(|&p| p > 0);
+    let detected_local_ports = mihomo_win::discover_local_proxy_ports();
 
-    let claude_target = cfg.target("claude").cloned().unwrap_or_else(|| {
+    let mut claude_target = cfg.target("claude").cloned().unwrap_or_else(|| {
         cg_protocol::default_builtin_targets(&[], &[])
             .into_iter()
             .find(|t| t.id == "claude")
@@ -6235,10 +6718,11 @@ fn probe_onboarding_with(
                 anchor_kind: crate::protocol::AnchorKind::Trace,
                 expect_ips: Vec::new(),
                 expect_regions: Vec::new(),
-                timeout_secs: 12,
+                timeout_secs: 8,
                 bind_agent: Some("claude".into()),
             })
     });
+    claude_target.timeout_secs = claude_target.timeout_secs.clamp(3, 8);
 
     let probe = if access_ev.is_known() && !matches!(probe_route, ProbeRoute::Skip(_)) {
         let mut chatgpt_fallback = claude_target.clone();
@@ -6256,43 +6740,48 @@ fn probe_onboarding_with(
         let mut claude_probe = claude_target;
         claude_probe.enabled = true;
 
+        // Probe all 3 onboarding candidates concurrently via a single `inspect_and_probe` batch
+        // capped at `<= 8s` so slow/blocked anchors never exceed IPC client timeouts (`#88` [HIGH-4]).
         let candidates = [claude_probe, chatgpt_fallback, cloudflare_fallback];
+        let (_ev, list) = probe_runner.inspect_and_probe(
+            driver,
+            cfg,
+            cfg_rev,
+            &candidates,
+            cfg.enforce_access_path,
+            false,
+            now,
+        );
+
         let mut best_cn: Option<ProbeResult> = None;
         let mut best_reachable: Option<ProbeResult> = None;
         let mut first_failed: Option<ProbeResult> = None;
         let mut selected: Option<ProbeResult> = None;
 
-        for candidate in candidates {
-            let (_ev, mut list) = probe_runner.inspect_and_probe(
-                driver,
-                cfg,
-                cfg_rev,
-                &[candidate],
-                cfg.enforce_access_path,
-                false,
-                now,
-            );
-            if let Some((_, res)) = list.pop() {
-                if is_non_cn_geo_probe(&res) {
-                    selected = Some(res);
-                    break;
+        for wanted_id in ["claude", "chatgpt", "cloudflare"] {
+            let Some((_, res)) = list.iter().find(|(id, _)| id == wanted_id) else {
+                continue;
+            };
+            let res = res.clone();
+            if is_non_cn_geo_probe(&res) {
+                selected = Some(res);
+                break;
+            }
+            if res.reachable
+                && res
+                    .country
+                    .as_deref()
+                    .is_some_and(|c| c.trim().eq_ignore_ascii_case("CN"))
+            {
+                if best_cn.is_none() {
+                    best_cn = Some(res);
                 }
-                if res.reachable
-                    && res
-                        .country
-                        .as_deref()
-                        .is_some_and(|c| c.trim().eq_ignore_ascii_case("CN"))
-                {
-                    if best_cn.is_none() {
-                        best_cn = Some(res);
-                    }
-                } else if res.reachable && res.ip.is_some() {
-                    if best_reachable.is_none() {
-                        best_reachable = Some(res);
-                    }
-                } else if first_failed.is_none() {
-                    first_failed = Some(res);
+            } else if res.reachable && res.ip.is_some() {
+                if best_reachable.is_none() {
+                    best_reachable = Some(res);
                 }
+            } else if first_failed.is_none() {
+                first_failed = Some(res);
             }
         }
 
@@ -6312,11 +6801,14 @@ fn probe_onboarding_with(
         }
     }
 
-    onboarding::recommend(
-        &access_ev,
-        probe.as_ref(),
-        detected_proxy_port,
-        installed_agents,
+    (
+        onboarding::recommend(
+            &access_ev,
+            probe.as_ref(),
+            detected_proxy_port,
+            installed_agents,
+        ),
+        detected_local_ports,
     )
 }
 
@@ -6339,34 +6831,51 @@ impl CoordinatorActor for RealEngineActor {
             }
             CoordinatorEvent::Tick => {
                 let now = now_unix_secs();
-                let _ = self.poll_wake_grace_expiry(now);
+                self.poll_pipe_shutdown_hint_expiry();
+                let grace_expired = self.poll_wake_grace_expiry(now);
                 self.step_and_run(EngineEvent::Tick, now);
-                if self.feishu.status().queued > 0 {
+                if grace_expired
+                    && self.engine.lifecycle == Lifecycle::Armed
+                    && !self.engine.checking
+                {
+                    self.step_and_run(
+                        EngineEvent::StartRound {
+                            purpose: CheckPurpose::Monitor,
+                        },
+                        now,
+                    );
+                }
+                if self.feishu.queued_count() > 0 {
                     self.spawn_feishu_flush_if_idle();
                 }
                 let _ = self.publish_snapshot(ctx.snapshot, now);
             }
+            CoordinatorEvent::SystemSuspending => {
+                let now = now_unix_secs();
+                self.arm_wake_grace_and_invalidate(
+                    now,
+                    Some("检测到系统进入睡眠/休眠，已预置唤醒宽限保护并锁定物理网卡直连"),
+                );
+                let _ = self.publish_snapshot(ctx.snapshot, now);
+            }
             CoordinatorEvent::SystemResumed => {
                 let now = now_unix_secs();
-                self.wake_grace_until = Some(Instant::now() + WAKE_GRACE_DURATION);
-                self.engine.notify_system_resumed(now);
+                self.arm_wake_grace_and_invalidate(now, None);
                 let _ = self.publish_snapshot(ctx.snapshot, now);
-
-                if let Some(guard) = InFlightGuard::try_acquire(&self.wake_timer_active) {
-                    let tx = self.event_tx.clone();
-                    let _ = std::thread::Builder::new()
-                        .name("cg-wake-grace".to_string())
-                        .spawn(move || {
-                            let _guard = guard;
-                            std::thread::sleep(WAKE_GRACE_DURATION + Duration::from_millis(50));
-                            let _ = tx.try_send(CoordinatorEvent::Tick);
-                        });
-                }
             }
             CoordinatorEvent::SystemShuttingDown => {
                 let now = now_unix_secs();
-                self.on_system_shutting_down(now);
+                self.on_system_shutting_down(now, true);
                 let _ = self.publish_snapshot(ctx.snapshot, now);
+            }
+            CoordinatorEvent::AttachWslRuntime {
+                coord,
+                wsl_bridge,
+                manage_runtime,
+            } => {
+                self.coord_handle_ref = Some(coord);
+                self.shared_wsl_bridge = Some(wsl_bridge);
+                self.manage_wsl_runtime = manage_runtime;
             }
             CoordinatorEvent::SingleTargetProbed {
                 cfg_rev,
@@ -6375,6 +6884,7 @@ impl CoordinatorActor for RealEngineActor {
                 access,
                 probe,
                 now_secs,
+                in_flight: _in_flight,
                 reply,
             } => {
                 self.step_and_run(
@@ -6414,6 +6924,7 @@ impl CoordinatorActor for RealEngineActor {
             CoordinatorEvent::FeishuTestFinished {
                 result,
                 now_secs,
+                in_flight: _in_flight,
                 reply,
             } => match result {
                 Ok(_) => {
@@ -6458,6 +6969,7 @@ impl CoordinatorActor for RealEngineActor {
             CoordinatorEvent::AntigravityRepairFinished {
                 result,
                 now_secs,
+                in_flight: _in_flight,
                 reply,
             } => match result {
                 Ok(summary) => {
@@ -6559,6 +7071,7 @@ impl CoordinatorActor for RealEngineActor {
                 result,
                 mihomo,
                 now_secs,
+                in_flight: _in_flight,
                 reply,
             } => {
                 self.mihomo = mihomo;
@@ -6574,6 +7087,7 @@ impl CoordinatorActor for RealEngineActor {
                         receipt.push_item("mihomo_node", OperationStatus::Verified, detail.clone());
                         self.engine
                             .push_log(now_secs, LogLevel::Audit, "mihomo", &detail);
+                        let mut started_live_round = false;
                         if !stale {
                             if self.engine.is_tripped() {
                                 self.step_and_run(EngineEvent::RecoverSafeFlowA, now_secs);
@@ -6584,6 +7098,7 @@ impl CoordinatorActor for RealEngineActor {
                                     },
                                     now_secs,
                                 );
+                                started_live_round = self.engine.checking;
                             }
                         } else {
                             self.engine.push_log(
@@ -6595,10 +7110,14 @@ impl CoordinatorActor for RealEngineActor {
                         }
                         self.engine.last_receipt = Some(receipt.clone());
                         let snap = self.publish_snapshot(ctx.snapshot, now_secs);
-                        let _ = reply.send(PipeResponse::Ack {
-                            receipt: Some(receipt),
-                            snapshot: Some(Box::new(snap)),
-                        });
+                        if started_live_round {
+                            self.recheck_waiters.push(reply);
+                        } else {
+                            let _ = reply.send(PipeResponse::Ack {
+                                receipt: Some(receipt),
+                                snapshot: Some(Box::new(snap)),
+                            });
+                        }
                     }
                     Err(msg) => {
                         self.engine.push_log(
@@ -6624,8 +7143,9 @@ impl CoordinatorActor for RealEngineActor {
                 mut probes,
                 now_secs,
             } => {
+                self.poll_pipe_shutdown_hint_expiry();
                 if cg_platform::access_win::is_system_shutting_down() {
-                    self.on_system_shutting_down(now_secs);
+                    self.on_system_shutting_down(now_secs, true);
                 }
                 let _ = self.poll_wake_grace_expiry(now_secs);
                 let accepted_round =
@@ -6678,8 +7198,9 @@ impl CoordinatorActor for RealEngineActor {
                 }
             }
             CoordinatorEvent::Telemetry(bundle) => {
+                self.poll_pipe_shutdown_hint_expiry();
                 if cg_platform::access_win::is_system_shutting_down() {
-                    self.on_system_shutting_down(bundle.now_secs);
+                    self.on_system_shutting_down(bundle.now_secs, true);
                 }
                 let _ = self.poll_wake_grace_expiry(bundle.now_secs);
                 self.resync_guarded_agents_on_path_change(&bundle.agents, bundle.now_secs);
@@ -6803,6 +7324,7 @@ impl CoordinatorActor for RealEngineActor {
                 summary,
                 component,
                 now_secs,
+                in_flight: _in_flight,
                 reply,
             } => {
                 if self.engine.is_tripped() {
@@ -7005,6 +7527,7 @@ impl CoordinatorActor for RealEngineActor {
             CoordinatorEvent::DeepRiskAuditFinished {
                 assessment,
                 now_secs,
+                in_flight: _in_flight,
                 reply,
             } => {
                 let headline = assessment.headline.clone();
@@ -7038,6 +7561,7 @@ impl CoordinatorActor for RealEngineActor {
             CoordinatorEvent::WslBridgeSynced {
                 status,
                 now_secs,
+                in_flight: _in_flight,
                 reply,
             } => {
                 let summary = status.summary.clone();
@@ -7066,6 +7590,7 @@ impl CoordinatorActor for RealEngineActor {
             CoordinatorEvent::ExportDiagnosticsFinished {
                 result,
                 now_secs,
+                in_flight: _in_flight,
                 reply,
             } => match result {
                 Ok(path) => {
@@ -7102,26 +7627,44 @@ impl CoordinatorActor for RealEngineActor {
                 }
             },
             CoordinatorEvent::HealthCardBuilt {
-                card,
+                result,
                 export_png,
                 now_secs,
+                in_flight: _in_flight,
                 reply,
-            } => {
-                if export_png {
+            } => match result {
+                Ok(card) => {
+                    if export_png {
+                        self.engine.push_log(
+                            now_secs,
+                            LogLevel::Audit,
+                            "diagnostics",
+                            "已导出脱敏防封健康体检卡 PNG",
+                        );
+                        let _ = self.publish_snapshot(ctx.snapshot, now_secs);
+                    }
+                    let _ = reply.send(PipeResponse::HealthCard { card });
+                }
+                Err(msg) => {
                     self.engine.push_log(
                         now_secs,
-                        LogLevel::Audit,
+                        LogLevel::Warn,
                         "diagnostics",
-                        "已导出脱敏防封健康体检卡 PNG",
+                        &format!("导出防封健康体检卡 PNG 失败：{msg}"),
                     );
                     let _ = self.publish_snapshot(ctx.snapshot, now_secs);
+                    let _ = reply.send(PipeResponse::Error {
+                        code: ErrorCode::IoFailed,
+                        message: msg,
+                        receipt: None,
+                    });
                 }
-                let _ = reply.send(PipeResponse::HealthCard { card });
-            }
+            },
             CoordinatorEvent::CleanRoomScanned {
                 report,
                 backup_count,
                 now_secs,
+                in_flight: _in_flight,
                 reply,
             } => {
                 self.last_cleanroom_report = Some((*report).clone());
@@ -7132,6 +7675,7 @@ impl CoordinatorActor for RealEngineActor {
             CoordinatorEvent::CleanRoomExecuted {
                 result,
                 now_secs,
+                in_flight: _in_flight,
                 reply,
             } => match result {
                 Ok((meta, post_report, backup_count)) => {
@@ -7178,6 +7722,7 @@ impl CoordinatorActor for RealEngineActor {
                 backup_id,
                 result,
                 now_secs,
+                in_flight: _in_flight,
                 reply,
             } => match result {
                 Ok(restored) => {
@@ -7215,26 +7760,31 @@ impl CoordinatorActor for RealEngineActor {
             CoordinatorEvent::VaultShortcutsGenerated {
                 vault_id,
                 vault_name,
+                target_dir,
                 result,
                 now_secs,
+                in_flight: _in_flight,
                 reply,
             } => match result {
                 Ok(created_count) => {
+                    let dir_s = target_dir.to_string_lossy().to_string();
                     let mut receipt = OperationReceipt::new(
                         format!("vault-shortcuts-{vault_id}-{now_secs}"),
                         OperationStatus::Verified,
                     );
-                    receipt.verified_scope = format!("created={created_count}");
+                    receipt.verified_scope = dir_s.clone();
                     receipt.push_item(
                         "vault_shortcuts",
                         OperationStatus::Verified,
-                        format!("已生成 {created_count} 个直启快捷方式与终端环境脚本"),
+                        format!("已生成 {created_count} 个直启快捷方式与终端环境脚本（{dir_s}）"),
                     );
                     self.engine.push_log(
                         now_secs,
                         LogLevel::Audit,
                         "vault",
-                        &format!("已为保险箱「{vault_name}」生成 {created_count} 个快捷方式"),
+                        &format!(
+                            "已为保险箱「{vault_name}」生成 {created_count} 个快捷方式（{dir_s}）"
+                        ),
                     );
                     self.engine.last_receipt = Some(receipt.clone());
                     let snap = self.publish_snapshot(ctx.snapshot, now_secs);
@@ -7254,9 +7804,16 @@ impl CoordinatorActor for RealEngineActor {
             CoordinatorEvent::CliHooksConfigured {
                 result,
                 now_secs,
+                in_flight: _in_flight,
                 reply,
             } => match result {
-                Ok(status) => {
+                Ok(mut status) => {
+                    if let Some(ref metrics) = self.hook_metrics_ref {
+                        let (checks, blocks, latency_us) = metrics.snapshot_counts();
+                        status.total_gate_checks = checks;
+                        status.total_gate_blocks = blocks;
+                        status.last_gate_latency_us = latency_us;
+                    }
                     let summary = status.summary.clone();
                     self.hooks = status;
                     let mut receipt = OperationReceipt::new(
@@ -7287,6 +7844,7 @@ impl CoordinatorActor for RealEngineActor {
                 app,
                 outcome,
                 now_secs,
+                in_flight: _in_flight,
                 reply,
             } => match *outcome {
                 VaultLaunchWorkerOutcome::Launched {
@@ -7296,10 +7854,23 @@ impl CoordinatorActor for RealEngineActor {
                     lat_tenths,
                     lon_tenths,
                     port_obs,
+                    global_probe_round,
                     discovered_sessions,
                 } => {
                     if let Some(obs) = port_obs {
                         self.record_port_egress(obs);
+                    }
+                    if let Some((access, probes)) = global_probe_round {
+                        self.step_and_run(
+                            EngineEvent::RoundCompleted {
+                                cfg_rev: self.engine.cfg_rev,
+                                runtime_epoch: self.engine.runtime_epoch,
+                                purpose: CheckPurpose::Launch,
+                                access,
+                                probes,
+                            },
+                            now_secs,
+                        );
                     }
                     if !discovered_sessions.is_empty() {
                         merge_vault_session_identities(
@@ -7338,31 +7909,6 @@ impl CoordinatorActor for RealEngineActor {
                     let _ = reply.send(PipeResponse::Ack {
                         receipt: Some(receipt),
                         snapshot: Some(Box::new(next_snap)),
-                    });
-                }
-                VaultLaunchWorkerOutcome::AutoAlignedMihomo { node, detail } => {
-                    self.engine.push_log(
-                        now_secs,
-                        LogLevel::Audit,
-                        "vault",
-                        &format!(
-                            "保险箱「{}」自动对齐 Mihomo 节点（{detail}），触发复检等待核验",
-                            vault.name
-                        ),
-                    );
-                    self.step_and_run(
-                        EngineEvent::StartRound {
-                            purpose: CheckPurpose::Manual,
-                        },
-                        now_secs,
-                    );
-                    let _ = self.publish_snapshot(ctx.snapshot, now_secs);
-                    let _ = reply.send(PipeResponse::Error {
-                        code: ErrorCode::IllegalState,
-                        message: format!(
-                            "出口不匹配，已自动请求 Mihomo 切换至 `{node}` 并发起出口复检，请等待 2 秒核验通过后再次启动"
-                        ),
-                        receipt: None,
                     });
                 }
                 VaultLaunchWorkerOutcome::Failed { code, message } => {
@@ -7532,12 +8078,27 @@ pub fn build_defense_self_check(
             format!("存在未提交事务 {}", j.tx_id),
             SelfCheckStatus::Degraded,
         ),
-        LoadedJournal::Committed(j) => (
-            false,
-            Some(j.tx_id.clone()),
-            format!("存在生效隔离事务 {}", j.tx_id),
-            SelfCheckStatus::Degraded,
-        ),
+        LoadedJournal::Committed(j) => {
+            let persistent_only = !j.planned_steps.is_empty()
+                && j.planned_steps
+                    .iter()
+                    .all(journal::is_persistent_guard_step);
+            if persistent_only {
+                (
+                    true,
+                    None,
+                    "账本就绪（含常驻内核启动护盾/快捷方式保护记录）".to_string(),
+                    SelfCheckStatus::Healthy,
+                )
+            } else {
+                (
+                    false,
+                    Some(j.tx_id.clone()),
+                    format!("存在生效隔离事务 {}", j.tx_id),
+                    SelfCheckStatus::Degraded,
+                )
+            }
+        }
         LoadedJournal::Corrupt(err) | LoadedJournal::Unreadable(err) => (
             false,
             None,
@@ -7686,6 +8247,7 @@ fn schedule_auto_antigravity_repair(
     budget: &Arc<Mutex<AutoRepairBudget>>,
     in_flight: &Arc<AtomicBool>,
     coordinator: &CoordinatorHandle,
+    data_dir: &std::path::Path,
     cache_dir: &std::path::Path,
     now: u64,
 ) {
@@ -7697,6 +8259,20 @@ fn schedule_auto_antigravity_repair(
     if !snap.config.auto_repair_antigravity_proxy || !needs_auto_antigravity_repair(status) {
         slot.reset();
         return;
+    }
+    if status.state == AntigravityProxyState::MissingDll {
+        let opted_in = snap.config.last_seen_antigravity_version.is_some()
+            || status.config_present
+            || status.antigravity_dir.as_deref().is_some_and(|dir| {
+                antigravity_proxy_win::has_prior_antigravity_proxy_opt_in(
+                    std::path::Path::new(dir),
+                    data_dir,
+                )
+            });
+        if !opted_in {
+            slot.reset();
+            return;
+        }
     }
     if snap.lifecycle != Lifecycle::Armed
         || snap.protection != ProtectionState::Monitoring
@@ -7857,7 +8433,7 @@ impl BackgroundMonitorHandle {
         let t_flag = stop_flag.clone();
         let t_sig = stop_signal.clone();
         let ag_cache_dir = data_dir.join("antigravity-proxy");
-        let journal = JournalStore::new(data_dir);
+        let journal = JournalStore::new(&data_dir);
 
         let thread = std::thread::Builder::new()
             .name("cg-monitor-loop".to_string())
@@ -8073,6 +8649,7 @@ impl BackgroundMonitorHandle {
                                             CoordinatorEvent::DeepRiskAuditFinished {
                                                 assessment: Box::new(assessment),
                                                 now_secs: now_unix_secs(),
+                                                in_flight: None,
                                                 reply: None,
                                             },
                                         );
@@ -8144,6 +8721,7 @@ impl BackgroundMonitorHandle {
                                                     summary: Box::new(checked),
                                                     component: None,
                                                     now_secs: now_unix_secs(),
+                                                    in_flight: None,
                                                     reply: None,
                                                 });
                                         }
@@ -8158,6 +8736,7 @@ impl BackgroundMonitorHandle {
                             &ag_auto_repair,
                             &ag_auto_repair_in_flight,
                             &coordinator,
+                            &data_dir,
                             &ag_cache_dir,
                             now,
                         );
@@ -8857,6 +9436,7 @@ mod tests {
             until_ts: None,
             limit: Some(50),
             query: Some("丢弃".into()),
+            level: None,
         }) {
             PipeResponse::Logs { entries, total } => {
                 assert!(total >= 1 && !entries.is_empty());
@@ -9131,6 +9711,11 @@ mod tests {
             suspicious_oauth_processes: Vec::new(),
             now_secs: 1_700_000_200,
         });
+        for t in &mut cfg.targets {
+            if t.anchor_kind != crate::protocol::AnchorKind::Reachability {
+                t.expect_regions = vec!["US".into(), "CA".into()];
+            }
+        }
         assert!(matches!(
             coord.dispatch(PipeRequest::SaveConfig {
                 config: cfg.clone()
@@ -9164,6 +9749,7 @@ mod tests {
             until_ts: None,
             limit: Some(1),
             query: None,
+            level: None,
         });
 
         // Telemetry reports `MissingDll` before the paused Launch round finishes.
@@ -9199,6 +9785,7 @@ mod tests {
             until_ts: None,
             limit: Some(1),
             query: None,
+            level: None,
         });
 
         release_tx.send(()).unwrap();
@@ -9434,6 +10021,7 @@ mod tests {
             until_ts: None,
             limit: Some(5),
             query: None,
+            level: None,
         });
 
         let snap = coord.snapshot();
@@ -9563,6 +10151,7 @@ mod tests {
             until_ts: None,
             limit: Some(50),
             query: Some("update".into()),
+            level: None,
         }) {
             PipeResponse::Logs { entries, .. } => {
                 assert!(entries
@@ -9611,6 +10200,7 @@ mod tests {
             until_ts: None,
             limit: Some(1),
             query: None,
+            level: None,
         });
         let after_tel = coord.snapshot();
         assert_eq!(
@@ -10661,7 +11251,7 @@ mod tests {
         release_tx.send(()).unwrap();
 
         match handle.join().unwrap() {
-            PipeResponse::OnboardingProbe { probe } => {
+            PipeResponse::OnboardingProbe { probe, .. } => {
                 assert_eq!(
                     probe.detected_proxy_port, None,
                     "TUN mode without proxy_addr must NOT report fake default proxy port"
@@ -10676,7 +11266,7 @@ mod tests {
         // When all anchors return CN, falls back to CN result so onboarding warns.
         runner.all_cn.store(true, Ordering::Release);
         match coord.dispatch(PipeRequest::ProbeOnboarding) {
-            PipeResponse::OnboardingProbe { probe } => {
+            PipeResponse::OnboardingProbe { probe, .. } => {
                 let p = probe.probe.expect("cn fallback result");
                 assert_eq!(p.country.as_deref(), Some("CN"));
             }
@@ -10891,6 +11481,7 @@ mod tests {
             until_ts: None,
             limit: Some(5),
             query: None,
+            level: None,
         });
 
         let rules_after_msix = driver.fw.enumerate_rules("ClaudeGuard Block").unwrap();
@@ -11041,6 +11632,7 @@ mod tests {
             until_ts: None,
             limit: Some(1),
             query: None,
+            level: None,
         });
         assert!(coord2.snapshot().tripped.is_none());
 
@@ -11069,6 +11661,7 @@ mod tests {
             until_ts: None,
             limit: Some(5),
             query: None,
+            level: None,
         });
         assert!(
             coord2.snapshot().tripped.is_none(),
@@ -11999,6 +12592,192 @@ mod tests {
                 );
             }
             other => panic!("expected Ack from matching US LaunchVault, got {other:?}"),
+        }
+
+        coord.shutdown();
+    }
+
+    #[test]
+    fn suspend_invalidates_checked_at_dedicated_port_hook_and_log_level_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(ControllableDriver::new());
+        let runner = Arc::new(DelayedProbeRunner {
+            gate_tx: None,
+            release_rx: None,
+            pass: Arc::new(AtomicBool::new(true)),
+            ip_on_pass: "198.51.100.88".into(),
+        });
+        let recovery = Arc::new(MockRecoveryExecutor::new(MockRecoveryState::default()));
+        let coord = boot_actor(dir.path(), driver, runner, recovery);
+
+        let mut cfg = make_cfg("US");
+        cfg.vaults.push(crate::protocol::AccountVault {
+            id: "jp-ded".into(),
+            name: "日本专线仓".into(),
+            accent_hex: "#10B981".into(),
+            enabled: true,
+            pinned_regions: vec!["JP".into()],
+            pinned_ips: Vec::new(),
+            pinned_asn: None,
+            dedicated_proxy_port: Some(17891),
+            preferred_mihomo_group: None,
+            preferred_mihomo_node: None,
+            auto_align_mihomo_on_vault_launch: false,
+            min_safety_score: 50,
+            cooldown_after_ip_change_secs: 0,
+            share_ide_extensions: true,
+            msix_isolation_mode: Default::default(),
+        });
+        assert!(matches!(
+            coord.dispatch(PipeRequest::CompleteOnboarding { config: cfg }),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(matches!(
+            coord.dispatch(PipeRequest::RecheckNow { target_id: None }),
+            PipeResponse::Ack { .. }
+        ));
+        assert!(coord.snapshot().checked_at.is_some());
+
+        // 1) SystemSuspending immediately invalidates pre-sleep checked_at so stale pass never leaks post-wake.
+        coord.notify_system_suspending();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while coord.snapshot().checked_at.is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert!(
+            coord.snapshot().checked_at.is_none(),
+            "PBT_APMSUSPEND must clear checked_at immediately"
+        );
+
+        // 2) Dedicated-port vault with fresh valid PortEgressObservation passes fast hook gate even when global checked_at is None.
+        let now = now_unix_secs();
+        let mut ports = std::collections::HashMap::new();
+        ports.insert(
+            17891u16,
+            PortEgressObservation {
+                port: 17891,
+                ip: Some("203.0.113.55".into()),
+                country: Some("JP".into()),
+                observed_at: now,
+                ..Default::default()
+            },
+        );
+        let snap_after_suspend = coord.snapshot();
+        let burst = coord.burst_guard();
+        match crate::coordinator::evaluate_fast_hook_gate_with_ports_at(
+            &snap_after_suspend,
+            &burst,
+            &ports,
+            "claude-code",
+            Some("jp-ded"),
+            Some("UserPromptSubmit"),
+            now,
+            now_unix_millis(),
+        ) {
+            crate::coordinator::FastGateOutcome::Immediate(PipeResponse::FastGateVerdict {
+                allowed,
+                ..
+            }) => {
+                assert!(
+                    allowed,
+                    "dedicated-port vault with fresh valid port observation must pass hook gate"
+                );
+            }
+            other => {
+                panic!("expected fast FastGateVerdict allow for dedicated port, got {other:?}")
+            }
+        }
+
+        // Negative observation (ip: None) must NOT pass dedicated-port hook gate.
+        ports.insert(
+            17891u16,
+            PortEgressObservation {
+                port: 17891,
+                ip: None,
+                observed_at: now,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            crate::coordinator::evaluate_fast_hook_gate_with_ports_at(
+                &snap_after_suspend,
+                &burst,
+                &ports,
+                "claude-code",
+                Some("jp-ded"),
+                Some("UserPromptSubmit"),
+                now,
+                now_unix_millis(),
+            ),
+            crate::coordinator::FastGateOutcome::NeedsSyncProbe,
+            "negative port observation with ip=None must trigger live probe rather than passing"
+        );
+
+        // 3) Persistent WfpPersistentSync WAL reports Healthy (not Degraded) in build_defense_self_check.
+        let wal_dir = tempfile::tempdir().unwrap();
+        let wal = JournalStore::new(wal_dir.path());
+        let mut tx = wal
+            .begin_tx(
+                1,
+                TxKind::Composite,
+                vec![PlannedStep {
+                    step_id: 1,
+                    description: "persistent boot guard".into(),
+                    action: WalAction::WfpPersistentSync {
+                        sublayer_guid: "00000000-0000-0000-0000-000000000001".into(),
+                    },
+                }],
+                BaselineState::default(),
+            )
+            .unwrap();
+        tx.record_step(1, "wfp_persistent_sync", true, "ok");
+        wal.commit_tx(&mut tx).unwrap();
+        let sc_driver = ControllableDriver::new();
+        let sc = build_defense_self_check(
+            &Config::default(),
+            &sc_driver,
+            &wal,
+            true,
+            &AntigravityProxyStatus::default(),
+            now,
+        );
+        assert!(
+            sc.wal_clean,
+            "committed WfpPersistentSync persistent WAL must report wal_clean=true"
+        );
+        let wal_item = sc.items.iter().find(|i| i.id == "wal_journal").unwrap();
+        assert_eq!(wal_item.status, SelfCheckStatus::Healthy);
+
+        // 4) QueryLogs with level filter returns only matching LogLevel entries.
+        let _ = coord.dispatch(PipeRequest::LaunchVault {
+            vault_id: "non-existent-vault".into(),
+            app: VaultAppTarget::ClaudeDesktop,
+            extra_args: Vec::new(),
+        });
+        match coord.dispatch(PipeRequest::QueryLogs {
+            since_ts: None,
+            until_ts: None,
+            limit: Some(50),
+            query: None,
+            level: Some(LogLevel::Info),
+        }) {
+            PipeResponse::Logs { entries, .. } => {
+                assert!(!entries.is_empty());
+                assert!(entries.iter().all(|e| e.level == LogLevel::Info));
+            }
+            other => panic!("expected Logs response, got {other:?}"),
+        }
+        match coord.dispatch(PipeRequest::QueryLogs {
+            since_ts: None,
+            until_ts: None,
+            limit: Some(50),
+            query: None,
+            level: Some(LogLevel::Error),
+        }) {
+            PipeResponse::Logs { entries, .. } => {
+                assert!(entries.iter().all(|e| e.level == LogLevel::Error));
+            }
+            other => panic!("expected Logs response, got {other:?}"),
         }
 
         coord.shutdown();

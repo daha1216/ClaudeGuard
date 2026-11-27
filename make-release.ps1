@@ -1,5 +1,5 @@
-# ClaudeGuard v4 release & Inno Setup staging script.
-# Usage: powershell -ExecutionPolicy Bypass -File make-release.ps1 [-Ver 4.0.0] [-BridgeOnly]
+# ClaudeGuard v5 release & Inno Setup staging script.
+# Usage: pwsh -ExecutionPolicy Bypass -File make-release.ps1 [-Ver 5.0.0] [-BridgeOnly]
 param(
     [string]$Ver = "",
     [switch]$BridgeOnly
@@ -22,14 +22,16 @@ $setup = Join-Path $outDir "ClaudeGuard-v$Ver-setup.exe"
 $portableZip = Join-Path $outDir "ClaudeGuard-v$Ver-portable.zip"
 $upgradeBridge = Join-Path $outDir "ClaudeGuard-v$Ver-upgrade.exe"
 
+$bridgeCargoVer = ([regex]::Match((Get-Content (Join-Path $root "crates\cg-v3-bridge\Cargo.toml") -Raw), '(?m)^version\s*=\s*"([^"]+)"')).Groups[1].Value
+if ($bridgeCargoVer -ne $Ver) { throw "cg-v3-bridge version mismatch: Cargo.toml=$bridgeCargoVer, -Ver=$Ver" }
+
 if (-not $BridgeOnly) {
     $isccCmd = Get-Command iscc.exe -ErrorAction SilentlyContinue
     $isccCandidates = @(
         $(if ($isccCmd) { $isccCmd.Source }),
         (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"),
         "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
-        "C:\Program Files\Inno Setup 6\ISCC.exe",
-        "C:\Users\daha\AppData\Local\Programs\Inno Setup 6\ISCC.exe"
+        "C:\Program Files\Inno Setup 6\ISCC.exe"
     ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $iscc) {
@@ -47,7 +49,11 @@ if (-not $BridgeOnly) {
     if ($LASTEXITCODE -ne 0) { throw "backend release build failed with exit code $LASTEXITCODE" }
 
     Write-Host "Building GUI release binary (target-gui\release)..."
-    $gpuiCargoHome = "F:\_dl\claudeguard-gpui-probe\cargo-home"
+    $gpuiCargoHome = if (-not [string]::IsNullOrWhiteSpace($env:CG_GPUI_CARGO_HOME)) {
+        $env:CG_GPUI_CARGO_HOME
+    } else {
+        "F:\_dl\claudeguard-gpui-probe\cargo-home"
+    }
     $prevCargoHome = $env:CARGO_HOME
     try {
         if (Test-Path $gpuiCargoHome) {
@@ -155,7 +161,7 @@ foreach ($req in @($setup, $portableZip)) {
     if (-not (Test-Path $req)) { throw "required artifact missing: $req" }
 }
 
-Write-Host "Building v3->v4 upgrade bridge (target-bridge\release)..."
+Write-Host "Building upgrade bridge (target-bridge\release)..."
 $prevBridgeSetup = $env:CG_V3_BRIDGE_SETUP_EXE
 try {
     $env:CG_V3_BRIDGE_SETUP_EXE = $setup
@@ -171,6 +177,10 @@ try {
 $bridgeSrc = Join-Path $root "target-bridge\release\claudeguard-v3-bridge.exe"
 if (-not (Test-Path $bridgeSrc)) { throw "missing bridge binary: $bridgeSrc" }
 Copy-Item $bridgeSrc $upgradeBridge -Force
+$bridgeProdVer = (Get-Item $upgradeBridge).VersionInfo.ProductVersion
+if ($bridgeProdVer -ne $Ver) {
+    throw "ClaudeGuard-v$Ver-upgrade.exe ProductVersion='$bridgeProdVer' does not match '$Ver'"
+}
 
 $sumsPath = Join-Path $outDir "SHA256SUMS.txt"
 $sumLines = @(

@@ -518,7 +518,7 @@ fn ensure_staging_dir_in(program_data: Option<PathBuf>) -> Result<PathBuf, Strin
         ));
     }
     if !root_existed {
-        let _ = win_api::apply_secure_staging_dacl(&cg_root);
+        win_api::apply_secure_staging_dacl(&cg_root)?;
     }
     win_api::apply_secure_staging_dacl(&staging)?;
     if has_reparse_point_in_chain(&staging) {
@@ -1131,12 +1131,13 @@ fn run_primary() -> Result<(), String> {
         );
     }
 
-    // Preserve existing v3 settings from `%APPDATA%\ClaudeGuard\config.json` into `%ProgramData%\ClaudeGuard\config.json`.
+    // Harden `%ProgramData%\ClaudeGuard` + `staging` DACL and verify zero reparse points FIRST,
+    // then migrate legacy v3 `%APPDATA%\ClaudeGuard\config.json` into the hardened directory.
     let appdata = non_empty_env_dir("APPDATA");
     let programdata = non_empty_env_dir("ProgramData");
+    let staging = ensure_staging_dir()?;
     let _ = migrate_config_if_absent(appdata.as_deref(), programdata.as_deref());
 
-    let staging = ensure_staging_dir()?;
     let setup_path = write_unique_file(
         &staging,
         &format!("ClaudeGuard-v{APP_VERSION}-setup"),
@@ -1198,7 +1199,11 @@ fn run_primary() -> Result<(), String> {
             let run_res = win_api::run_elevated_setup_and_wait(&setup_path);
             drop(setup_lock);
             remove_file_with_retry(&setup_path);
-            let _ = run_res?;
+            let ok = run_res?;
+            if ok {
+                remove_file_with_retry(&old_exe);
+                win_api::schedule_delete_on_reboot(&cur_exe);
+            }
             Ok(())
         }
         Err(err) => {

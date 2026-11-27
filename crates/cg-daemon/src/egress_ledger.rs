@@ -205,6 +205,7 @@ pub struct EgressLedger {
     data_dir: PathBuf,
     secret: [u8; 32],
     state: Mutex<LedgerDiskState>,
+    io_lock: Mutex<()>,
 }
 
 impl EgressLedger {
@@ -239,7 +240,16 @@ impl EgressLedger {
             data_dir: dir,
             secret,
             state: Mutex::new(state),
+            io_lock: Mutex::new(()),
         }
+    }
+
+    /// Serializes disk persistence strictly in lock order (`io_lock` -> `state`), always writing
+    /// the latest in-memory snapshot so concurrent callers can never clobber newer mutations.
+    fn persist_latest(&self) -> Result<(), String> {
+        let _io = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        save_disk_state(&self.data_dir, &snapshot)
     }
 
     /// Path to `<data_dir>\egress_history.json`.
@@ -279,33 +289,13 @@ impl EgressLedger {
         }
     }
 
-    /// Records a new egress observation (HMAC-hashed), prunes entries older than 7 days,
-    /// evaluates impossible-travel & subnet churn via `cg_core::risk_scorer::evaluate_geo_velocity`,
-    /// updates per-vault cooldown if needed, and atomically persists `egress_history.json`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_and_evaluate(
-        &self,
-        raw_ip: &str,
-        country: &str,
-        city_or_colo: &str,
-        lat_tenths: Option<i16>,
-        lon_tenths: Option<i16>,
-        vault_id: Option<&str>,
+    fn record_and_evaluate_locked(
+        guard: &mut LedgerDiskState,
+        current: &EgressObservation,
         teleport_cooldown_mins: u32,
         now_secs: u64,
     ) -> GeoVelocityEvaluation {
-        let current = self.make_observation(
-            raw_ip,
-            country,
-            city_or_colo,
-            lat_tenths,
-            lon_tenths,
-            vault_id,
-            now_secs,
-        );
-
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        prune_entries(&mut guard, now_secs);
+        prune_entries(guard, now_secs);
 
         // Filter out historical entries predating an explicit user cooldown clear and enforce
         // strict scope isolation (`e.vault_id == current.vault_id`) so concurrent multi-region
@@ -318,7 +308,7 @@ impl EgressLedger {
             .map(EgressObservation::from)
             .collect();
 
-        let eval = evaluate_geo_velocity(&history_for_eval, &current, teleport_cooldown_mins);
+        let eval = evaluate_geo_velocity(&history_for_eval, current, teleport_cooldown_mins);
 
         // Persist observation (deduplicating contiguous identical scope+subnet+country entries).
         if !current.ip_hmac_hex.is_empty() && !current.country.is_empty() {
@@ -375,9 +365,39 @@ impl EgressLedger {
             }
         }
 
-        let snapshot = guard.clone();
-        drop(guard);
-        let _ = save_disk_state(&self.data_dir, &snapshot);
+        eval
+    }
+
+    /// Records a new egress observation (HMAC-hashed), prunes entries older than 7 days,
+    /// evaluates impossible-travel & subnet churn via `cg_core::risk_scorer::evaluate_geo_velocity`,
+    /// updates per-vault cooldown if needed, and atomically persists `egress_history.json`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_and_evaluate(
+        &self,
+        raw_ip: &str,
+        country: &str,
+        city_or_colo: &str,
+        lat_tenths: Option<i16>,
+        lon_tenths: Option<i16>,
+        vault_id: Option<&str>,
+        teleport_cooldown_mins: u32,
+        now_secs: u64,
+    ) -> GeoVelocityEvaluation {
+        let current = self.make_observation(
+            raw_ip,
+            country,
+            city_or_colo,
+            lat_tenths,
+            lon_tenths,
+            vault_id,
+            now_secs,
+        );
+
+        let eval = {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            Self::record_and_evaluate_locked(&mut guard, &current, teleport_cooldown_mins, now_secs)
+        };
+        let _ = self.persist_latest();
         eval
     }
 
@@ -401,48 +421,49 @@ impl EgressLedger {
         let cooldown_mins = cooldown_after_ip_change_secs
             .div_ceil(60)
             .min(u64::from(u32::MAX)) as u32;
-        let prev_subnet = {
-            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let vid_norm = normalize_vault_opt(Some(vault_id));
-            guard
-                .entries
-                .iter()
-                .rev()
-                .find(|e| e.vault_id == vid_norm)
-                .map(|e| (e.subnet_hmac_hex.clone(), e.observed_at))
-        };
-        let (_, new_subnet) = self.hash_ip_and_subnet(ip);
-        let eval = self.record_and_evaluate(
+        let current = self.make_observation(
             ip,
             &cc,
             city,
             lat_tenths,
             lon_tenths,
             Some(vault_id),
-            cooldown_mins.max(1),
             now_secs,
         );
 
-        // Enforce per-vault IP-change cooldown even within the same country if subnet changed recently.
-        if cooldown_after_ip_change_secs > 0 {
-            if let Some((old_sub, old_ts)) = prev_subnet {
-                if old_sub != new_subnet
-                    && now_secs.saturating_sub(old_ts) < cooldown_after_ip_change_secs
-                {
-                    let until = now_secs.saturating_add(cooldown_after_ip_change_secs);
-                    let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(vid) = normalize_vault_opt(Some(vault_id)) {
-                        let prev = guard.vault_cooldowns.get(&vid).copied().unwrap_or(0);
-                        guard.vault_cooldowns.insert(vid, prev.max(until));
+        let alert = {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let vid_norm = current.vault_id.clone();
+            let prev_subnet = guard
+                .entries
+                .iter()
+                .rev()
+                .find(|e| e.vault_id == vid_norm)
+                .map(|e| (e.subnet_hmac_hex.clone(), e.observed_at));
+            let eval = Self::record_and_evaluate_locked(
+                &mut guard,
+                &current,
+                cooldown_mins.max(1),
+                now_secs,
+            );
+            // Enforce per-vault IP-change cooldown even within the same country if subnet changed recently.
+            if cooldown_after_ip_change_secs > 0 {
+                if let Some((old_sub, old_ts)) = prev_subnet {
+                    if old_sub != current.subnet_hmac_hex
+                        && now_secs.saturating_sub(old_ts) < cooldown_after_ip_change_secs
+                    {
+                        let until = now_secs.saturating_add(cooldown_after_ip_change_secs);
+                        if let Some(vid) = vid_norm {
+                            let prev = guard.vault_cooldowns.get(&vid).copied().unwrap_or(0);
+                            guard.vault_cooldowns.insert(vid, prev.max(until));
+                        }
                     }
-                    let snapshot = guard.clone();
-                    drop(guard);
-                    let _ = save_disk_state(&self.data_dir, &snapshot);
                 }
             }
-        }
-
-        eval.alert
+            eval.alert
+        };
+        let _ = self.persist_latest();
+        alert
     }
 
     /// Returns sanitized 7-day observations suitable for feeding into `cg_core::risk_scorer::score_egress_risk`.
@@ -513,12 +534,12 @@ impl EgressLedger {
 
     /// Clears active global and per-vault impossible-travel cooldowns (user confirmed legitimate travel).
     pub fn clear_cooldown(&self, now_secs: u64) -> Result<(), String> {
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        guard.cooldown_cleared_at = Some(now_secs);
-        guard.vault_cooldowns.clear();
-        let snapshot = guard.clone();
-        drop(guard);
-        save_disk_state(&self.data_dir, &snapshot)
+        {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.cooldown_cleared_at = Some(now_secs);
+            guard.vault_cooldowns.clear();
+        }
+        self.persist_latest()
     }
 
     /// Returns remaining cooldown seconds (`0` if clear/expired) for a specific Sovereign Vault.
@@ -543,11 +564,11 @@ impl EgressLedger {
         let Some(vid) = normalize_vault_opt(Some(vault_id)) else {
             return Ok(());
         };
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        guard.vault_cooldowns.insert(vid, cooldown_until);
-        let snapshot = guard.clone();
-        drop(guard);
-        save_disk_state(&self.data_dir, &snapshot)
+        {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.vault_cooldowns.insert(vid, cooldown_until);
+        }
+        self.persist_latest()
     }
 
     /// Returns `(last_active_at, last_country)` recorded for a specific vault, if any.
@@ -601,15 +622,28 @@ fn load_or_init_dpapi_secret(data_dir: &Path) -> Result<[u8; 32], String> {
     }
 
     if key_path.is_file() {
-        if let Ok(cipher) = std::fs::read(&key_path) {
-            if let Ok(plain) = crypto_win::unprotect_bytes(&cipher) {
-                if plain.len() == 32 {
-                    let mut secret = [0u8; 32];
-                    secret.copy_from_slice(&plain);
-                    return Ok(secret);
-                }
-            }
+        let cipher = std::fs::read(&key_path).map_err(|e| {
+            format!(
+                "failed to read existing ledger key {} (refusing to overwrite): {e}",
+                key_path.display()
+            )
+        })?;
+        let plain = crypto_win::unprotect_bytes(&cipher).map_err(|e| {
+            format!(
+                "failed to unprotect existing ledger key {} (refusing to overwrite): {e}",
+                key_path.display()
+            )
+        })?;
+        if plain.len() == 32 {
+            let mut secret = [0u8; 32];
+            secret.copy_from_slice(&plain);
+            return Ok(secret);
         }
+        return Err(format!(
+            "existing ledger key {} has unexpected decrypted length {} (refusing to overwrite)",
+            key_path.display(),
+            plain.len()
+        ));
     }
 
     let mut secret = [0u8; 32];

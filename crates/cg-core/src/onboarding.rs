@@ -34,7 +34,11 @@ pub fn recommend(
     if let Some(p) = &mut enriched_probe
         && p.city.is_none()
         && let Some(colo) = p.colo.as_deref()
-        && let Some(place) = geo::by_colo(colo)
+        && let Some(place) = geo::by_colo(colo).filter(|pl| {
+            p.country
+                .as_deref()
+                .is_none_or(|cc| pl.country.eq_ignore_ascii_case(cc))
+        })
     {
         p.city = Some(place.city.to_string());
     }
@@ -45,6 +49,9 @@ pub fn recommend(
     let is_cn_exit = country
         .as_deref()
         .is_some_and(|code| code.eq_ignore_ascii_case("CN"));
+    let is_blocked_exit = country
+        .as_deref()
+        .is_some_and(crate::risk_scorer::is_unsupported_region);
 
     let standby_notice = if !access_ready {
         Some(if access.is_uncovered() {
@@ -72,6 +79,16 @@ pub fn recommend(
         Some(format!(
             "检测到当前路由出口位于中国大陆直连地址（{exit_desc}），代理分流可能未覆盖目标站点；请切换海外节点或全局代理后重测，切勿直接将 CN 加入白名单。"
         ))
+    } else if is_blocked_exit {
+        let code_up = country.as_deref().unwrap_or("受限区").to_ascii_uppercase();
+        let exit_desc = match (&city, &ip) {
+            (Some(c), Some(addr)) => format!("{code_up} · {c}（{addr}）"),
+            (None, Some(addr)) => format!("{code_up}（{addr}）"),
+            _ => code_up.clone(),
+        };
+        Some(format!(
+            "检测到当前代理出口位于受限封锁地区（{exit_desc}），Anthropic / OpenAI 官方策略禁止该地区访问（10 维安全分将触发清零红线）；请切换至美/日/新等合规节点后重测，切勿直接将该地区加入推荐白名单。"
+        ))
     } else {
         None
     };
@@ -80,7 +97,7 @@ pub fn recommend(
     let mut recommended_strategy = None;
 
     if access_ready
-        && !is_cn_exit
+        && !is_blocked_exit
         && let Some(ref code) = country
     {
         let place_desc = match (&city, &ip) {
@@ -101,7 +118,7 @@ pub fn recommend(
     }
 
     if access_ready
-        && !is_cn_exit
+        && !is_blocked_exit
         && let Some(ref addr) = ip
     {
         let is_rec = recommended_strategy.is_none();
@@ -119,7 +136,7 @@ pub fn recommend(
         });
     }
 
-    let suggested_cidr = if is_cn_exit {
+    let suggested_cidr = if is_blocked_exit {
         Vec::new()
     } else if let Some(norm) = ip.as_deref().and_then(normalize_ip) {
         if let Ok(v4) = norm.parse::<Ipv4Addr>() {
@@ -136,7 +153,7 @@ pub fn recommend(
     } else {
         Vec::new()
     };
-    let suggested_regions = if is_cn_exit {
+    let suggested_regions = if is_blocked_exit {
         Vec::new()
     } else {
         country.into_iter().collect::<Vec<_>>()
@@ -489,5 +506,25 @@ mod tests {
         assert!(notice.contains("CN"));
         assert!(notice.contains("直连"));
         assert!(apply_choice(&Config::default(), &rec, OnboardingChoice::RecommendRegion).is_err());
+
+        // HK / MO / RU unsupported regions must also NEVER be recommended as compliant allowlists!
+        for blocked_cc in ["HK", "MO", "RU"] {
+            let mut blocked_probe = cn_probe.clone();
+            blocked_probe.country = Some(blocked_cc.into());
+            blocked_probe.raw_region = Some(blocked_cc.into());
+            blocked_probe.colo = Some("HKG".into());
+            let blocked_rec = recommend(
+                &access,
+                Some(&blocked_probe),
+                Some(7890),
+                vec!["claude".into()],
+            );
+            assert!(blocked_rec.recommended_strategy.is_none(), "{blocked_cc}");
+            assert!(
+                blocked_rec.options.iter().all(|o| !o.recommended),
+                "{blocked_cc}"
+            );
+            assert!(blocked_rec.standby_notice.is_some(), "{blocked_cc}");
+        }
     }
 }

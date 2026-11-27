@@ -238,6 +238,9 @@ pub struct WfpRuntimePostureSpec {
     pub global_cut_active: bool,
     /// Optional daemon executable excluded from Weight 15 GlobalCut so local IPC/health stays alive.
     pub daemon_self_exe: Option<PathBuf>,
+    /// Optional non-loopback configured proxy endpoint `(ip, port)` permitted at Weight 11 (TCP)
+    /// when `strict_tunnel_only` is active (e.g. LAN gateway / Surge Mac `192.168.1.2:7890`).
+    pub active_proxy_endpoint: Option<(std::net::IpAddr, u16)>,
 }
 
 /// O(1) metadata stored per active WFP `filter_id` for zero-noise kernel event attribution.
@@ -454,6 +457,55 @@ fn protocol_label(ip_proto: u8) -> &'static str {
     }
 }
 
+/// Returns `true` when `path` is a text/batch script shim (`.cmd`, `.bat`, `.ps1`, `.vbs`, `.sh`)
+/// rather than a native PE image, so WFP/COM firewall engines skip script wrappers cleanly.
+pub fn is_non_pe_script_shim(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "cmd" | "bat" | "ps1" | "vbs" | "sh"
+            )
+        })
+}
+
+fn infer_agent_id_from_exe_path(path: &std::path::Path) -> String {
+    let low = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if low.contains("antigravity") || name.starts_with("language_server") || name == "agy.exe" {
+        "antigravity".into()
+    } else if low.contains("claude-code")
+        || low.contains(r"\.local\share\claude\")
+        || low.contains(r"\.local\bin\claude")
+        || low.contains(r"\.claude\")
+    {
+        "claude-code".into()
+    } else if low.contains("claude") {
+        "claude".into()
+    } else if low.contains(r"@openai\codex")
+        || (!low.contains(r"\windowsapps\")
+            && !low.contains(r"\programs\codex\")
+            && name.starts_with("codex"))
+    {
+        "codex".into()
+    } else if low.contains("chatgpt") || low.contains("openai") || low.contains("codex") {
+        "chatgpt".into()
+    } else {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    }
+}
+
 /// Pure classifier identifying Hyper-V / WSL2 virtual adapters (`vEthernet (WSL)`, etc.)
 /// so WFP `strict_tunnel_only` permits localhost-equivalent IDE/LSP/MCP traffic into WSL2.
 pub fn is_wsl_virtual_adapter_name(desc: &str, friendly: &str) -> bool {
@@ -665,9 +717,72 @@ pub mod win_impl {
         }
     }
 
-    /// RAII wrapper for `FWP_BYTE_BLOB` allocated by `FwpmGetAppIdFromFileName0`, automatically
-    /// freed via `FwpmFreeMemory0` on drop.
-    pub struct WfpAppIdBlob(*mut FWP_BYTE_BLOB);
+    enum WfpAppIdStorage {
+        BfeAllocated(*mut FWP_BYTE_BLOB),
+        Synthesized {
+            blob: Box<FWP_BYTE_BLOB>,
+            _bytes: Box<[u8]>,
+        },
+    }
+
+    /// Synthesizes a BFE-compatible lowercase UTF-16LE NUL-terminated NT device path byte buffer
+    /// (`\device\harddiskvolumeN\...\0`) via `QueryDosDeviceW` when `FwpmGetAppIdFromFileName0`
+    /// fails with `ERROR_ACCESS_DENIED` / `ERROR_CANT_ACCESS_FILE` on MSIX `WindowsApps` packages.
+    pub fn synthesize_nt_device_app_id_bytes(dos_path: &Path) -> PlatformResult<Vec<u8>> {
+        use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
+
+        let cleaned = crate::process_win::strip_verbatim_win32_str(&dos_path.to_string_lossy())
+            .replace('/', "\\");
+        let trimmed = cleaned.trim();
+        let bytes = trimmed.as_bytes();
+        if bytes.len() < 3
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || bytes[2] != b'\\'
+        {
+            return Err(PlatformError::InvalidInput(format!(
+                "WFP AppId fallback requires an absolute DOS drive path: {trimmed}"
+            )));
+        }
+        let drive_w: [u16; 3] = [(bytes[0].to_ascii_uppercase()) as u16, b':' as u16, 0];
+        let mut dev_buf = vec![0u16; 1024];
+        let chars =
+            unsafe { QueryDosDeviceW(PCWSTR(drive_w.as_ptr()), Some(&mut dev_buf)) } as usize;
+        if chars == 0 || chars >= dev_buf.len() {
+            return Err(PlatformError::Io(format!(
+                "QueryDosDeviceW failed for drive {}:",
+                bytes[0] as char
+            )));
+        }
+        let end = dev_buf[..chars]
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(chars);
+        let nt_prefix = String::from_utf16_lossy(&dev_buf[..end]);
+        if nt_prefix.trim().is_empty() {
+            return Err(PlatformError::Io(
+                "QueryDosDeviceW returned empty NT device prefix".into(),
+            ));
+        }
+        let rest = &trimmed[3..];
+        let full_nt = format!(
+            "{}\\{}",
+            nt_prefix.trim_end_matches('\\'),
+            rest.trim_start_matches('\\')
+        )
+        .to_lowercase();
+
+        let utf16_le: Vec<u8> = full_nt
+            .encode_utf16()
+            .chain(Some(0u16))
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        Ok(utf16_le)
+    }
+
+    /// RAII wrapper for `FWP_BYTE_BLOB` allocated by `FwpmGetAppIdFromFileName0` (freed via
+    /// `FwpmFreeMemory0` on drop) or synthesized via `QueryDosDeviceW` for restricted MSIX paths.
+    pub struct WfpAppIdBlob(WfpAppIdStorage);
 
     impl WfpAppIdBlob {
         pub fn from_path(path: &Path) -> PlatformResult<Self> {
@@ -678,31 +793,59 @@ pub mod win_impl {
                     "WFP AppId path cannot be empty".into(),
                 ));
             }
+            if is_non_pe_script_shim(&resolved) {
+                return Err(PlatformError::InvalidInput(format!(
+                    "WFP AppId skips non-PE script shim: {}",
+                    resolved.display()
+                )));
+            }
             let wide: Vec<u16> = resolved.as_os_str().encode_wide().chain(Some(0)).collect();
             let mut blob_ptr: *mut FWP_BYTE_BLOB = core::ptr::null_mut();
             let rc = unsafe { FwpmGetAppIdFromFileName0(PCWSTR(wide.as_ptr()), &mut blob_ptr) };
-            if rc != ERROR_SUCCESS.0 || blob_ptr.is_null() {
-                return Err(wfp_err(
-                    rc,
-                    &format!("FwpmGetAppIdFromFileName0({})", resolved.display()),
-                ));
+            if rc == ERROR_SUCCESS.0 && !blob_ptr.is_null() {
+                return Ok(Self(WfpAppIdStorage::BfeAllocated(blob_ptr)));
             }
-            Ok(Self(blob_ptr))
+
+            // Fallback for MSIX `C:\Program Files\WindowsApps\...` conditional ACEs or AppExecLinks
+            // where non-SYSTEM Admin receives ERROR_ACCESS_DENIED (5) or ERROR_CANT_ACCESS_FILE (1920).
+            if let Ok(nt_bytes) = synthesize_nt_device_app_id_bytes(&resolved) {
+                let mut boxed_bytes = nt_bytes.into_boxed_slice();
+                let blob = Box::new(FWP_BYTE_BLOB {
+                    size: boxed_bytes.len() as u32,
+                    data: boxed_bytes.as_mut_ptr(),
+                });
+                return Ok(Self(WfpAppIdStorage::Synthesized {
+                    blob,
+                    _bytes: boxed_bytes,
+                }));
+            }
+
+            Err(wfp_err(
+                rc,
+                &format!("FwpmGetAppIdFromFileName0({})", resolved.display()),
+            ))
         }
 
         pub fn as_ptr(&self) -> *mut FWP_BYTE_BLOB {
-            self.0
+            match &self.0 {
+                WfpAppIdStorage::BfeAllocated(ptr) => *ptr,
+                WfpAppIdStorage::Synthesized { blob, .. } => {
+                    (&**blob as *const FWP_BYTE_BLOB).cast_mut()
+                }
+            }
         }
     }
 
     impl Drop for WfpAppIdBlob {
         fn drop(&mut self) {
-            if !self.0.is_null() {
-                let mut raw: *mut c_void = self.0.cast();
-                unsafe {
-                    FwpmFreeMemory0(&mut raw);
+            if let WfpAppIdStorage::BfeAllocated(ptr) = &mut self.0 {
+                if !ptr.is_null() {
+                    let mut raw: *mut c_void = (*ptr).cast();
+                    unsafe {
+                        FwpmFreeMemory0(&mut raw);
+                    }
+                    *ptr = core::ptr::null_mut();
                 }
-                self.0 = core::ptr::null_mut();
             }
         }
     }
@@ -1602,7 +1745,7 @@ pub mod win_impl {
     }
 
     /// Add the Per-App Split-Permit Sandwich (`ALE_AUTH_CONNECT_V4/V6`):
-    /// - Weight `11`: PERMIT Loopback (`FWP_CONDITION_FLAG_IS_LOOPBACK`)
+    /// - Weight `11`: PERMIT Loopback (`FWP_CONDITION_FLAG_IS_LOOPBACK`) + optional LAN `active_proxy_endpoint`
     /// - Weight `10`: PERMIT Verified Active TUN `NET_LUID` + WSL2 `vEthernet (WSL)` (`!= 53`)
     /// - Weight `9`:  Optional PERMIT RFC1918 LAN (`REMOTE_PORT != 53`)
     /// - Weight `2`:  BLOCK Catch-All Physical NIC Direct Egress (`direct_nic_bypass`)
@@ -1617,7 +1760,130 @@ pub mod win_impl {
         agent_id: &str,
         attributions: &mut HashMap<u64, WfpFilterAttribution>,
     ) -> PlatformResult<Vec<u64>> {
-        let mut created = Vec::with_capacity(7 + wsl_luids.len() * 2);
+        add_app_tunnel_only_sandwich_with_proxy(
+            engine,
+            sublayer_guid,
+            app_blob,
+            active_tun_luid,
+            wsl_luids,
+            allow_lan_dev_servers,
+            None,
+            agent_id,
+            attributions,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_app_tunnel_only_sandwich_with_proxy(
+        engine: HANDLE,
+        sublayer_guid: GUID,
+        app_blob: &WfpAppIdBlob,
+        active_tun_luid: Option<u64>,
+        wsl_luids: &[u64],
+        allow_lan_dev_servers: bool,
+        active_proxy_endpoint: Option<(IpAddr, u16)>,
+        agent_id: &str,
+        attributions: &mut HashMap<u64, WfpFilterAttribution>,
+    ) -> PlatformResult<Vec<u64>> {
+        let mut created = Vec::with_capacity(9 + wsl_luids.len() * 2);
+
+        // (A0) Weight 11: Scoped TCP Permit for non-loopback configured proxy endpoint (e.g. LAN gateway proxy)
+        if let Some((proxy_ip, proxy_port)) = active_proxy_endpoint {
+            if proxy_port > 0 && !proxy_ip.is_loopback() && !proxy_ip.is_unspecified() {
+                match proxy_ip {
+                    IpAddr::V4(v4) => {
+                        let mut mask_v4 = v4_addr_mask(v4, 32);
+                        let mut conds_v4 = [
+                            cond_app_id(app_blob, FWP_MATCH_EQUAL),
+                            cond_ip_protocol(6),
+                            cond_remote_port(proxy_port, FWP_MATCH_EQUAL),
+                            FWPM_FILTER_CONDITION0 {
+                                fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                                matchType: FWP_MATCH_EQUAL,
+                                conditionValue: FWP_CONDITION_VALUE0 {
+                                    r#type: FWP_V4_ADDR_MASK,
+                                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                                        v4AddrMask: &mut mask_v4,
+                                    },
+                                },
+                            },
+                        ];
+                        let fid_v4 = add_filter_raw(
+                            engine,
+                            CLAUDEGUARD_WFP_PROVIDER_GUID,
+                            sublayer_guid,
+                            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                            WFP_WEIGHT_LOOPBACK_PERMIT,
+                            FWP_ACTION_PERMIT,
+                            FWPM_FILTER_FLAG_NONE,
+                            "ClaudeGuard Active Proxy Endpoint Permit (V4)",
+                            &mut conds_v4,
+                        )?;
+                        created.push(fid_v4);
+
+                        // Also permit dual-stack IPv4-mapped IPv6 (`::ffff:a.b.c.d`) sockets
+                        let mut mask_mapped = v6_addr_mask(v4.to_ipv6_mapped(), 128);
+                        let mut conds_mapped = [
+                            cond_app_id(app_blob, FWP_MATCH_EQUAL),
+                            cond_ip_protocol(6),
+                            cond_remote_port(proxy_port, FWP_MATCH_EQUAL),
+                            FWPM_FILTER_CONDITION0 {
+                                fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                                matchType: FWP_MATCH_EQUAL,
+                                conditionValue: FWP_CONDITION_VALUE0 {
+                                    r#type: FWP_V6_ADDR_MASK,
+                                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                                        v6AddrMask: &mut mask_mapped,
+                                    },
+                                },
+                            },
+                        ];
+                        let fid_mapped = add_filter_raw(
+                            engine,
+                            CLAUDEGUARD_WFP_PROVIDER_GUID,
+                            sublayer_guid,
+                            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                            WFP_WEIGHT_LOOPBACK_PERMIT,
+                            FWP_ACTION_PERMIT,
+                            FWPM_FILTER_FLAG_NONE,
+                            "ClaudeGuard Active Proxy Endpoint Permit (Mapped V6)",
+                            &mut conds_mapped,
+                        )?;
+                        created.push(fid_mapped);
+                    }
+                    IpAddr::V6(v6) => {
+                        let mut mask_v6 = v6_addr_mask(v6, 128);
+                        let mut conds_v6 = [
+                            cond_app_id(app_blob, FWP_MATCH_EQUAL),
+                            cond_ip_protocol(6),
+                            cond_remote_port(proxy_port, FWP_MATCH_EQUAL),
+                            FWPM_FILTER_CONDITION0 {
+                                fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                                matchType: FWP_MATCH_EQUAL,
+                                conditionValue: FWP_CONDITION_VALUE0 {
+                                    r#type: FWP_V6_ADDR_MASK,
+                                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                                        v6AddrMask: &mut mask_v6,
+                                    },
+                                },
+                            },
+                        ];
+                        let fid_v6 = add_filter_raw(
+                            engine,
+                            CLAUDEGUARD_WFP_PROVIDER_GUID,
+                            sublayer_guid,
+                            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                            WFP_WEIGHT_LOOPBACK_PERMIT,
+                            FWP_ACTION_PERMIT,
+                            FWPM_FILTER_FLAG_NONE,
+                            "ClaudeGuard Active Proxy Endpoint Permit (V6)",
+                            &mut conds_v6,
+                        )?;
+                        created.push(fid_v6);
+                    }
+                }
+            }
+        }
 
         for (layer, layer_name) in ALE_CONNECT_LAYERS {
             // (A) Weight 11: Permit Loopback (127.0.0.1 proxy, Antigravity LSP, local MCP)
@@ -1825,9 +2091,18 @@ pub mod win_impl {
         app_exes: &[PathBuf],
         event_store: Option<&WfpEventStore>,
     ) -> PlatformResult<usize> {
+        let (count, _) = sync_boot_time_guard_with_attrs(enable, app_exes, event_store)?;
+        Ok(count)
+    }
+
+    fn sync_boot_time_guard_with_attrs(
+        enable: bool,
+        app_exes: &[PathBuf],
+        event_store: Option<&WfpEventStore>,
+    ) -> PlatformResult<(usize, HashMap<u64, WfpFilterAttribution>)> {
         if !enable || app_exes.is_empty() {
             let _ = clear_persistent_filters_native()?;
-            return Ok(0);
+            return Ok((0, HashMap::new()));
         }
 
         let session = WfpSessionHandle::open(false, "ClaudeGuard Boot-Time Guard")?;
@@ -1859,7 +2134,13 @@ pub mod win_impl {
 
             let mut dedup_paths = HashSet::new();
             for raw_exe in app_exes {
+                if is_non_pe_script_shim(raw_exe) {
+                    continue;
+                }
                 let resolved = resolve_program_path_for_firewall(raw_exe);
+                if is_non_pe_script_shim(&resolved) {
+                    continue;
+                }
                 let key = normalize_program_path(&resolved.to_string_lossy());
                 if key.is_empty() || !dedup_paths.insert(key) {
                     continue;
@@ -1867,12 +2148,13 @@ pub mod win_impl {
                 let Ok(blob) = WfpAppIdBlob::from_path(&resolved) else {
                     continue;
                 };
+                let agent_id = infer_agent_id_from_exe_path(&resolved);
                 let ids = add_app_block_filters(
                     engine,
                     CLAUDEGUARD_WFP_PROVIDER_PERSISTENT_GUID,
                     CLAUDEGUARD_WFP_SUBLAYER_PERSISTENT_GUID,
                     &blob,
-                    "",
+                    &agent_id,
                     "boot_time_guard",
                     true,
                     false,
@@ -1887,12 +2169,12 @@ pub mod win_impl {
 
         if let Some(store) = event_store {
             store.remove_filter_ids(&existing);
-            for (fid, attr) in new_attrs {
-                store.insert_filter_meta(fid, attr);
+            for (fid, attr) in &new_attrs {
+                store.insert_filter_meta(*fid, attr.clone());
             }
         }
 
-        Ok(created_ids.len())
+        Ok((created_ids.len(), new_attrs))
     }
 
     // ---- Dynamic Session State & WfpFirewallEngine ----
@@ -1917,6 +2199,7 @@ pub mod win_impl {
         shield_quic_blocked: bool,
         shield_dns_doh_blocked: bool,
         shield_ipv6_blocked: bool,
+        boot_attributions: HashMap<u64, WfpFilterAttribution>,
         boot_time_filters_armed: bool,
         last_error: String,
     }
@@ -1929,6 +2212,9 @@ pub mod win_impl {
 
         fn rebuild_attribution_map(&self) -> HashMap<u64, WfpFilterAttribution> {
             let mut map = HashMap::new();
+            for (fid, attr) in &self.boot_attributions {
+                map.insert(*fid, attr.clone());
+            }
             for entry in &self.rule_entries {
                 for (fid, attr) in &entry.attributions {
                     map.insert(*fid, attr.clone());
@@ -2004,15 +2290,30 @@ pub mod win_impl {
 
             let net_event_subscribed = net_event_sub.is_some();
 
-            // Check read-only whether persistent boot-time filters are currently armed.
-            let boot_time_filters_armed = enumerate_sublayer_filter_ids(
+            // Check read-only whether persistent boot-time filters are currently armed and seed
+            // `boot_attributions` so early boot drops remain attributed across dynamic re-syncs.
+            let boot_ids = enumerate_sublayer_filter_ids(
                 engine,
                 CLAUDEGUARD_WFP_PROVIDER_PERSISTENT_GUID,
                 CLAUDEGUARD_WFP_SUBLAYER_PERSISTENT_GUID,
                 true,
             )
-            .map(|ids| !ids.is_empty())
-            .unwrap_or(false);
+            .unwrap_or_default();
+            let boot_time_filters_armed = !boot_ids.is_empty();
+            let mut boot_attributions = HashMap::with_capacity(boot_ids.len());
+            for fid in boot_ids {
+                boot_attributions.insert(
+                    fid,
+                    WfpFilterAttribution {
+                        agent_id: String::new(),
+                        filter_reason: "boot_time_guard".into(),
+                        layer: String::new(),
+                    },
+                );
+            }
+            if !boot_attributions.is_empty() {
+                events.replace_filter_map(boot_attributions.clone());
+            }
 
             Ok(Self {
                 net_event_sub,
@@ -2031,12 +2332,33 @@ pub mod win_impl {
                     shield_quic_blocked: false,
                     shield_dns_doh_blocked: false,
                     shield_ipv6_blocked: false,
+                    boot_attributions,
                     boot_time_filters_armed,
                     last_error,
                 }),
                 sublayer_registered: true,
                 net_event_subscribed,
             })
+        }
+
+        pub(crate) fn active_rule_specs(&self) -> Vec<FirewallRuleSpec> {
+            let Ok(guard) = self.state.lock() else {
+                return Vec::new();
+            };
+            guard
+                .rule_entries
+                .iter()
+                .map(|e| FirewallRuleSpec {
+                    name: e.record.name.clone(),
+                    program: (!e.record.program.trim().is_empty())
+                        .then(|| PathBuf::from(&e.record.program)),
+                    direction: e.record.direction,
+                    action: e.record.action,
+                    enabled: e.record.enabled,
+                    description: None,
+                    profiles: e.record.profiles,
+                })
+                .collect()
         }
 
         /// Atomically replace the runtime Per-App split-permit sandwich, 4-Vector Leak Shield,
@@ -2063,11 +2385,17 @@ pub mod win_impl {
             let mut new_ids = Vec::new();
             let mut new_attrs = HashMap::new();
             let mut posture_shield_count = 0usize;
+            let mut skipped_exes: Vec<String> = Vec::new();
 
             let txn_result: PlatformResult<()> = (|| {
                 let txn = WfpTransactionGuard::begin(engine)?;
 
+                // Replace BOTH previous posture filters and any standalone `shield_filter_ids` so
+                // Weight-13 Leak Shield filters never duplicate (`2*N`) or survive Pause/Disarm.
                 for &old_id in &guard.posture_filter_ids {
+                    let _ = delete_filter_id_idempotent(engine, old_id)?;
+                }
+                for &old_id in &guard.shield_filter_ids {
                     let _ = delete_filter_id_idempotent(engine, old_id)?;
                 }
 
@@ -2091,13 +2419,23 @@ pub mod win_impl {
                 for (agent_id, exes) in &spec.locked_or_quarantined_apps {
                     let mut seen = HashSet::new();
                     for exe in exes {
+                        if is_non_pe_script_shim(exe) {
+                            continue;
+                        }
                         let resolved = resolve_program_path_for_firewall(exe);
+                        if is_non_pe_script_shim(&resolved) {
+                            continue;
+                        }
                         let norm = normalize_program_path(&resolved.to_string_lossy());
                         if norm.is_empty() || !seen.insert(norm) {
                             continue;
                         }
-                        let Ok(blob) = WfpAppIdBlob::from_path(&resolved) else {
-                            continue;
+                        let blob = match WfpAppIdBlob::from_path(&resolved) {
+                            Ok(b) => b,
+                            Err(_) => {
+                                skipped_exes.push(resolved.display().to_string());
+                                continue;
+                            }
                         };
                         let ids = add_app_block_filters(
                             engine,
@@ -2120,13 +2458,23 @@ pub mod win_impl {
                 for (agent_id, exes) in &spec.guarded_apps {
                     let mut seen = HashSet::new();
                     for exe in exes {
+                        if is_non_pe_script_shim(exe) {
+                            continue;
+                        }
                         let resolved = resolve_program_path_for_firewall(exe);
+                        if is_non_pe_script_shim(&resolved) {
+                            continue;
+                        }
                         let norm = normalize_program_path(&resolved.to_string_lossy());
                         if norm.is_empty() || !seen.insert(norm) {
                             continue;
                         }
-                        let Ok(blob) = WfpAppIdBlob::from_path(&resolved) else {
-                            continue;
+                        let blob = match WfpAppIdBlob::from_path(&resolved) {
+                            Ok(b) => b,
+                            Err(_) => {
+                                skipped_exes.push(resolved.display().to_string());
+                                continue;
+                            }
                         };
 
                         if spec.block_quic_udp443
@@ -2149,13 +2497,14 @@ pub mod win_impl {
                         }
 
                         if spec.strict_tunnel_only {
-                            let sandwich_ids = add_app_tunnel_only_sandwich(
+                            let sandwich_ids = add_app_tunnel_only_sandwich_with_proxy(
                                 engine,
                                 CLAUDEGUARD_WFP_SUBLAYER_DYNAMIC_GUID,
                                 &blob,
                                 effective_tun_luid,
                                 &wsl_luids,
                                 spec.allow_lan_dev_servers,
+                                spec.active_proxy_endpoint,
                                 agent_id,
                                 &mut new_attrs,
                             )?;
@@ -2172,13 +2521,27 @@ pub mod win_impl {
                 return Err(err);
             }
 
+            guard.shield_filter_ids.clear();
+            guard.shield_attributions.clear();
+            guard.shield_quic_blocked = false;
+            guard.shield_dns_doh_blocked = false;
+            guard.shield_ipv6_blocked = false;
+
             guard.posture_filter_ids = new_ids;
             guard.posture_attributions = new_attrs;
             guard.posture_shield_filter_count = posture_shield_count;
             guard.posture_quic_blocked = spec.block_quic_udp443 && posture_shield_count > 0;
             guard.posture_dns_doh_blocked = spec.block_direct_dns_doh && posture_shield_count > 0;
             guard.posture_ipv6_blocked = spec.block_global_ipv6 && posture_shield_count > 0;
-            guard.last_error.clear();
+            if skipped_exes.is_empty() {
+                guard.last_error.clear();
+            } else {
+                guard.last_error = format!(
+                    "部分可执行路径无法生成 WFP AppId（{} 项）：{}",
+                    skipped_exes.len(),
+                    skipped_exes[0]
+                );
+            }
             let full_map = guard.rebuild_attribution_map();
             drop(guard);
 
@@ -2201,6 +2564,13 @@ pub mod win_impl {
                 .map_err(|_| PlatformError::Io("WFP state mutex poisoned".into()))?;
             let engine = self.session.raw();
 
+            // When `sync_tunnel_only_filters` already maintains Weight-13 Leak Shield filters inside
+            // `posture_filter_ids` with the exact same vector flags, avoid installing duplicate rules.
+            let posture_already_covers = guard.posture_shield_filter_count > 0
+                && guard.posture_quic_blocked == block_quic
+                && guard.posture_dns_doh_blocked == block_dns_doh
+                && guard.posture_ipv6_blocked == block_ipv6;
+
             let mut new_ids = Vec::new();
             let mut new_attrs = HashMap::new();
 
@@ -2210,10 +2580,16 @@ pub mod win_impl {
                     let _ = delete_filter_id_idempotent(engine, old_id)?;
                 }
 
-                if block_quic || block_dns_doh || block_ipv6 {
+                if !posture_already_covers && (block_quic || block_dns_doh || block_ipv6) {
                     let mut seen = HashSet::new();
                     for raw_exe in app_paths {
+                        if is_non_pe_script_shim(raw_exe) {
+                            continue;
+                        }
                         let resolved = resolve_program_path_for_firewall(raw_exe);
+                        if is_non_pe_script_shim(&resolved) {
+                            continue;
+                        }
                         let norm = normalize_program_path(&resolved.to_string_lossy());
                         if norm.is_empty() || !seen.insert(norm) {
                             continue;
@@ -2221,11 +2597,7 @@ pub mod win_impl {
                         let Ok(blob) = WfpAppIdBlob::from_path(&resolved) else {
                             continue;
                         };
-                        let agent_id = resolved
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_ascii_lowercase();
+                        let agent_id = infer_agent_id_from_exe_path(&resolved);
                         let ids = add_app_leak_shield_filters(
                             engine,
                             CLAUDEGUARD_WFP_SUBLAYER_DYNAMIC_GUID,
@@ -2341,9 +2713,10 @@ pub mod win_impl {
             guard.shield_dns_doh_blocked = false;
             guard.shield_ipv6_blocked = false;
             guard.last_error.clear();
+            let full_map = guard.rebuild_attribution_map();
             drop(guard);
 
-            self.events.replace_filter_map(HashMap::new());
+            self.events.replace_filter_map(full_map);
             Ok(removed)
         }
 
@@ -2353,9 +2726,13 @@ pub mod win_impl {
             enable: bool,
             app_exes: &[PathBuf],
         ) -> PlatformResult<usize> {
-            let count = sync_boot_time_guard_native(enable, app_exes, Some(&self.events))?;
+            let (count, boot_attrs) = sync_boot_time_guard_with_attrs(enable, app_exes, None)?;
             if let Ok(mut guard) = self.state.lock() {
                 guard.boot_time_filters_armed = count > 0;
+                guard.boot_attributions = boot_attrs;
+                let full_map = guard.rebuild_attribution_map();
+                drop(guard);
+                self.events.replace_filter_map(full_map);
             }
             Ok(count)
         }
@@ -2366,6 +2743,10 @@ pub mod win_impl {
             if let Ok(mut guard) = self.state.lock() {
                 if report.clean() {
                     guard.boot_time_filters_armed = false;
+                    guard.boot_attributions.clear();
+                    let full_map = guard.rebuild_attribution_map();
+                    drop(guard);
+                    self.events.replace_filter_map(full_map);
                 }
             }
             Ok(report)
@@ -2523,12 +2904,30 @@ pub mod win_impl {
                 .map_err(|_| PlatformError::Io("WFP state mutex poisoned".into()))?;
             let engine = self.session.raw();
 
+            // Reconcile tracked rules against live BFE filters so externally purged filters are re-added.
+            if let Ok(live_vec) = enumerate_sublayer_filter_ids(
+                engine,
+                CLAUDEGUARD_WFP_PROVIDER_GUID,
+                CLAUDEGUARD_WFP_SUBLAYER_DYNAMIC_GUID,
+                false,
+            ) {
+                let live_set: HashSet<u64> = live_vec.into_iter().collect();
+                guard.rule_entries.retain(|e| {
+                    !e.filter_ids.is_empty() && e.filter_ids.iter().all(|id| live_set.contains(id))
+                });
+            }
+
             let mut newly_added = Vec::new();
             let mut added_count = 0usize;
+            let mut last_err: Option<PlatformError> = None;
+            let mut pruned_indices: HashSet<usize> = HashSet::new();
 
             {
                 let txn = WfpTransactionGuard::begin(engine)?;
                 for spec in desired {
+                    if spec.program.as_deref().is_some_and(is_non_pe_script_shim) {
+                        continue;
+                    }
                     let norm_prog = spec
                         .program
                         .as_deref()
@@ -2540,13 +2939,18 @@ pub mod win_impl {
                         .unwrap_or_default();
                     let name_lower = spec.name.trim().to_ascii_lowercase();
 
-                    let already_present = guard.rule_entries.iter().any(|e| {
-                        e.record.name.trim().to_ascii_lowercase() == name_lower
-                            && normalize_program_path(&e.record.program) == norm_prog
-                            && e.record.direction == spec.direction
-                            && e.record.action == spec.action
-                            && e.record.enabled == spec.enabled
-                    });
+                    let already_present =
+                        guard
+                            .rule_entries
+                            .iter()
+                            .chain(newly_added.iter())
+                            .any(|e| {
+                                e.record.name.trim().to_ascii_lowercase() == name_lower
+                                    && normalize_program_path(&e.record.program) == norm_prog
+                                    && e.record.direction == spec.direction
+                                    && e.record.action == spec.action
+                                    && e.record.enabled == spec.enabled
+                            });
                     if already_present {
                         continue;
                     }
@@ -2559,14 +2963,15 @@ pub mod win_impl {
                         FWPM_FILTER_FLAG_DISABLED
                     };
                     let mut attrs_map = HashMap::new();
-                    let fids = match (&spec.program, spec.action) {
+                    let fids_res: PlatformResult<Vec<u64>> = (|| match (&spec.program, spec.action)
+                    {
                         (None, RuleAction::Block) => add_global_cut_filters(
                             engine,
                             CLAUDEGUARD_WFP_SUBLAYER_DYNAMIC_GUID,
                             None,
                             reason,
                             &mut attrs_map,
-                        )?,
+                        ),
                         (Some(path), RuleAction::Block) => {
                             let blob = WfpAppIdBlob::from_path(path)?;
                             add_app_block_filters(
@@ -2581,7 +2986,7 @@ pub mod win_impl {
                                 filter_flags,
                                 &spec.name,
                                 &mut attrs_map,
-                            )?
+                            )
                         }
                         (Some(path), RuleAction::Allow) => {
                             let blob = WfpAppIdBlob::from_path(path)?;
@@ -2606,12 +3011,21 @@ pub mod win_impl {
                                 )?;
                                 ids.push(fid);
                             }
-                            ids
+                            Ok(ids)
                         }
-                        (None, RuleAction::Allow) => {
-                            return Err(PlatformError::InvalidInput(
-                                "WFP engine refuses unscoped wildcard Allow rule".into(),
-                            ));
+                        (None, RuleAction::Allow) => Err(PlatformError::InvalidInput(
+                            "WFP engine refuses unscoped wildcard Allow rule".into(),
+                        )),
+                    })();
+
+                    let fids = match fids_res {
+                        Ok(ids) => ids,
+                        Err(PlatformError::InvalidInput(msg)) => {
+                            return Err(PlatformError::InvalidInput(msg));
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                            continue;
                         }
                     };
 
@@ -2639,18 +3053,64 @@ pub mod win_impl {
                     });
                     added_count += 1;
                 }
+
+                // Prune stale upgraded paths sharing managed Quarantine/Lockdown rule names (add-first, zero gap).
+                if last_err.is_none() {
+                    let managed_names: HashSet<String> = desired
+                        .iter()
+                        .map(|s| s.name.trim().to_ascii_lowercase())
+                        .filter(|n| crate::firewall_com::is_prunable_managed_rule_name(n))
+                        .collect();
+                    if !managed_names.is_empty() {
+                        for (idx, entry) in guard.rule_entries.iter().enumerate() {
+                            let rec_name_l = entry.record.name.trim().to_ascii_lowercase();
+                            if managed_names.contains(&rec_name_l)
+                                && !desired.iter().any(|s| {
+                                    crate::firewall_com::rule_matches_spec(&entry.record, s)
+                                })
+                            {
+                                for &fid in &entry.filter_ids {
+                                    let _ = delete_filter_id_idempotent(engine, fid)?;
+                                }
+                                pruned_indices.insert(idx);
+                            }
+                        }
+                    }
+                }
+
                 txn.commit()?;
             }
 
+            if !pruned_indices.is_empty() {
+                let mut idx = 0usize;
+                guard.rule_entries.retain(|_| {
+                    let keep = !pruned_indices.contains(&idx);
+                    idx += 1;
+                    keep
+                });
+            }
             guard.rule_entries.extend(newly_added);
             let full_map = guard.rebuild_attribution_map();
             drop(guard);
             self.events.replace_filter_map(full_map);
 
-            // Readback verify every desired rule against live kernel BFE filters.
+            // Readback verify every desired non-script rule against live kernel BFE filters.
+            let non_script_desired: Vec<FirewallRuleSpec> = desired
+                .iter()
+                .filter(|s| !s.program.as_deref().is_some_and(is_non_pe_script_shim))
+                .cloned()
+                .collect();
             let observed = self.enumerate_rules("").ok();
-            let cov =
-                crate::firewall_com::build_coverage(observed.as_deref(), desired, added_count);
+            let cov = crate::firewall_com::build_coverage(
+                observed.as_deref(),
+                &non_script_desired,
+                added_count,
+            );
+            if !cov.complete() {
+                if let Some(err) = last_err {
+                    return Err(err);
+                }
+            }
             Ok(cov)
         }
 
@@ -2777,38 +3237,6 @@ pub mod win_impl {
         }
     }
 
-    // ---- Routed Active TUN NET_LUID Helper ----
-
-    fn best_if_index_for_ipv4(ip: Ipv4Addr) -> Option<u32> {
-        use windows::Win32::NetworkManagement::IpHelper::GetBestInterfaceEx;
-        use windows::Win32::Networking::WinSock::{
-            AF_INET, IN_ADDR, IN_ADDR_0, SOCKADDR, SOCKADDR_IN,
-        };
-
-        let sin = SOCKADDR_IN {
-            sin_family: AF_INET,
-            sin_port: 0,
-            sin_addr: IN_ADDR {
-                S_un: IN_ADDR_0 {
-                    S_addr: u32::from_ne_bytes(ip.octets()),
-                },
-            },
-            sin_zero: [0; 8],
-        };
-        let mut best_if_index: u32 = 0;
-        let rc = unsafe {
-            GetBestInterfaceEx(
-                (&sin as *const SOCKADDR_IN).cast::<SOCKADDR>(),
-                &mut best_if_index,
-            )
-        };
-        if rc == 0 && best_if_index != 0 {
-            Some(best_if_index)
-        } else {
-            None
-        }
-    }
-
     unsafe fn pwstr_to_string(p: PWSTR) -> String {
         if p.is_null() {
             return String::new();
@@ -2822,8 +3250,8 @@ pub mod win_impl {
             .to_string()
     }
 
-    /// Detect the active Up TUN adapter verified to carry default public IPv4 routing
-    /// (`104.18.0.1` & `1.1.1.1`) and return `(adapter_name, net_luid_u64)`.
+    /// Detect the active Up TUN adapter verified to carry AI / Fake-IP public IPv4 routing
+    /// (`104.18.0.1` + `160.79.104.10` / `1.1.1.1` / `8.8.8.8` / `198.18.0.1`) and return `(adapter_name, net_luid_u64)`.
     pub fn detect_active_tun_luid_native() -> Option<(String, u64)> {
         use windows::Win32::NetworkManagement::IpHelper::{
             GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
@@ -2834,11 +3262,7 @@ pub mod win_impl {
         const FAMILY_UNSPEC: u32 = 0;
         const ERROR_BUFFER_OVERFLOW: u32 = 111;
 
-        let best_104 = best_if_index_for_ipv4(Ipv4Addr::new(104, 18, 0, 1))?;
-        let best_111 = best_if_index_for_ipv4(Ipv4Addr::new(1, 1, 1, 1))?;
-        if best_104 != best_111 {
-            return None;
-        }
+        let probe = crate::access_win::TunRouteProbe::query_os();
 
         let flags = GET_ADAPTERS_ADDRESSES_FLAGS(
             GAA_FLAG_SKIP_ANYCAST.0 | GAA_FLAG_SKIP_MULTICAST.0 | GAA_FLAG_SKIP_DNS_SERVER.0,
@@ -2860,7 +3284,13 @@ pub mod win_impl {
                 while !current.is_null() {
                     let adapter = unsafe { &*current };
                     let if_index = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
-                    if if_index == best_104 && adapter.OperStatus == IfOperStatusUp {
+                    let is_up = adapter.OperStatus == IfOperStatusUp
+                        && unsafe {
+                            crate::access_win::adapter_has_usable_unicast(
+                                adapter.FirstUnicastAddress,
+                            )
+                        };
+                    if is_up && probe.carries_ai_or_fakeip_route(if_index) {
                         let desc = unsafe { pwstr_to_string(adapter.Description) };
                         let friendly = unsafe { pwstr_to_string(adapter.FriendlyName) };
                         if let Some(label) =
@@ -3017,6 +3447,10 @@ impl WfpFirewallEngine {
             "wfp",
             "Windows Filtering Platform is only supported on Windows",
         ))
+    }
+
+    pub(crate) fn active_rule_specs(&self) -> Vec<FirewallRuleSpec> {
+        Vec::new()
     }
 }
 
@@ -3264,11 +3698,74 @@ impl HybridFirewallEngine {
                 drop(guard);
                 return self.wfp_status();
             }
-            // Drop any existing dynamic session first before opening a replacement.
+
+            let was_wfp = guard.wfp.is_some();
+            let migrated_from_wfp: Vec<FirewallRuleSpec> = guard
+                .wfp
+                .as_ref()
+                .map(|w| w.active_rule_specs())
+                .unwrap_or_default();
+            let migrated_from_com: Vec<FirewallRuleSpec> = if !was_wfp && elevated {
+                guard
+                    .com
+                    .enumerate_rules(crate::firewall_com::CG_RULE_PREFIX)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|r| {
+                        !r.name.to_ascii_lowercase().starts_with(
+                            &crate::leak_shield_win::SHIELD_RULE_PREFIX.to_ascii_lowercase(),
+                        )
+                    })
+                    .map(|r| FirewallRuleSpec {
+                        name: r.name,
+                        program: (!r.program.trim().is_empty()).then(|| PathBuf::from(r.program)),
+                        direction: r.direction,
+                        action: r.action,
+                        enabled: r.enabled,
+                        description: None,
+                        profiles: r.profiles,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // When switching WFP -> COM, apply active Quarantine/Lockdown rules to COM BEFORE
+            // closing the dynamic WFP session so there is zero fail-open window.
+            if was_wfp
+                && pref == FirewallBackendPref::ComLegacy
+                && elevated
+                && !migrated_from_wfp.is_empty()
+            {
+                let _ = guard.com.ensure_rules(&migrated_from_wfp);
+            }
+
             guard.wfp = None;
-            let (wfp, active_backend, last_error) = Self::resolve_backend(pref, elevated);
+            let (new_wfp, active_backend, last_error) = Self::resolve_backend(pref, elevated);
+
+            if let Some(ref wfp_eng) = new_wfp {
+                // When switching COM -> WFP, migrate active COM Quarantine/Lockdown specs into WFP
+                // first and then purge persistent COM rules so MpsSvc never retains orphaned blocks.
+                if !migrated_from_com.is_empty() {
+                    let _ = wfp_eng.ensure_rules(&migrated_from_com);
+                }
+                if !was_wfp && elevated {
+                    let _ = guard
+                        .com
+                        .remove_rules_with_prefix(crate::firewall_com::CG_RULE_PREFIX);
+                    let _ = crate::leak_shield_win::clear_leak_shield();
+                }
+            } else if was_wfp
+                && pref != FirewallBackendPref::WfpOnly
+                && elevated
+                && !migrated_from_wfp.is_empty()
+            {
+                // Fallback case (`AutoWfpFirst` failed to reopen WFP): preserve quarantine on COM.
+                let _ = guard.com.ensure_rules(&migrated_from_wfp);
+            }
+
             guard.pref = pref;
-            guard.wfp = wfp;
+            guard.wfp = new_wfp;
             guard.active_backend = active_backend;
             guard.last_error = last_error;
         }
@@ -4102,5 +4599,41 @@ mod tests {
         assert_eq!(events[1].remote_ip, "2606:4700:4700::1111");
         assert_eq!(events[1].remote_port, 443);
         assert_eq!(events[1].layer, "ale_auth_connect_v6");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn synthesized_nt_app_id_and_script_shim_filter_work() {
+        use std::path::Path;
+        assert!(is_non_pe_script_shim(Path::new(
+            r"C:\Users\mjq\AppData\Roaming\npm\claude.cmd"
+        )));
+        assert!(is_non_pe_script_shim(Path::new(
+            r"C:\Users\mjq\AppData\Roaming\npm\codex.ps1"
+        )));
+        assert!(!is_non_pe_script_shim(Path::new(
+            r"C:\Windows\System32\notepad.exe"
+        )));
+        assert!(WfpRuntimePostureSpec::default()
+            .active_proxy_endpoint
+            .is_none());
+
+        let notepad = Path::new(r"C:\Windows\System32\notepad.exe");
+        let synth = win_impl::synthesize_nt_device_app_id_bytes(notepad)
+            .expect("QueryDosDeviceW NT path synthesis");
+        assert!(synth.len() > 4 && synth.len().is_multiple_of(2));
+        assert_eq!(&synth[synth.len() - 2..], &[0, 0]);
+        let words: Vec<u16> = synth[..synth.len() - 2]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .copied()
+            .map(u16::from_le_bytes)
+            .collect();
+        let decoded = String::from_utf16(&words).expect("valid UTF-16LE NT path");
+        assert!(
+            decoded.starts_with(r"\device\") && decoded.ends_with(r"\windows\system32\notepad.exe"),
+            "unexpected synthesized NT appId: {decoded}"
+        );
     }
 }

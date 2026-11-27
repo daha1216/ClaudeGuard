@@ -855,25 +855,33 @@ pub fn render_environment_page(
                 .child(choreo.tile(1, 0).apply(shield_guide))
         }
 
-        EnvSubTab::Antigravity => render_antigravity_proxy_card(
-            ctrl.clone(),
-            AgCardCtx {
-                ag: &ag_proxy,
-                updates: &updates,
-                guard_proxy_port: cfg.proxy_port,
-                require_ag_proxy,
-                auto_repair_ag_proxy,
-                privacy_mask: mask,
-                connected,
-                tripped,
-                can_act,
-                is_rechecking,
-                is_repairing: is_repairing_ag,
-            },
-            choreo,
-            p,
-            cx,
-        ),
+        EnvSubTab::Antigravity => {
+            let ag_running = snap.as_ref().is_some_and(|s| {
+                s.agents
+                    .iter()
+                    .any(|a| a.id == "antigravity" && a.running_count > 0)
+            });
+            render_antigravity_proxy_card(
+                ctrl.clone(),
+                AgCardCtx {
+                    ag: &ag_proxy,
+                    updates: &updates,
+                    guard_proxy_port: cfg.proxy_port,
+                    require_ag_proxy,
+                    auto_repair_ag_proxy,
+                    privacy_mask: mask,
+                    connected,
+                    tripped,
+                    can_act,
+                    is_rechecking,
+                    is_repairing: is_repairing_ag,
+                    ag_running,
+                },
+                choreo,
+                p,
+                cx,
+            )
+        }
 
         EnvSubTab::Timezone => {
             let ctrl_ec = ctrl.clone();
@@ -1114,13 +1122,16 @@ pub fn render_environment_page(
                                     })
                                 })
                                 .child({
-                                    let can_align = connected && !is_aligning_env;
-                                    let do_tz = env_align_tz_on || !env_align_loc_on;
+                                    let do_tz = env_align_tz_on;
                                     let do_loc = env_align_loc_on;
+                                    let can_align =
+                                        connected && !is_aligning_env && (do_tz || do_loc);
                                     action_button(
                                         "env-apply-align-btn",
                                         if is_aligning_env {
                                             "对齐中…"
+                                        } else if !do_tz && !do_loc {
+                                            "请先开启对齐项"
                                         } else {
                                             "立即对齐出口"
                                         },
@@ -1544,6 +1555,9 @@ pub fn render_environment_page(
             let stun = &risk.stun_leak;
             let dns = &risk.dns_coherence;
             let hyg = &risk.electron_hygiene;
+            let dual_split = purity.dual_stack_split_detected;
+            let has_proto_leak = stun.leaked || dns.domestic_resolver_detected || dual_split;
+            let ctrl_fix_ipv6 = ctrl.clone();
             let stun_card = bento_card_bloom(p, 16.0, 14.0, choreo.tile(1, 1))
                 .flex_1()
                 .gap(px(9.))
@@ -1560,12 +1574,14 @@ pub fn render_environment_page(
                                 .child("客户端启动防泄露加固 & DNS/UDP 检测"),
                         )
                         .child(tone_tag(
-                            if stun.leaked || dns.domestic_resolver_detected {
+                            if dual_split {
+                                "双栈分叉风险"
+                            } else if has_proto_leak {
                                 "发现泄露项"
                             } else {
                                 "协议零泄露"
                             },
-                            if stun.leaked || dns.domestic_resolver_detected {
+                            if has_proto_leak {
                                 BadgeTone::Fail
                             } else {
                                 BadgeTone::Pass
@@ -1573,6 +1589,61 @@ pub fn render_environment_page(
                             p,
                         )),
                 )
+                .when(dual_split, |card| {
+                    card.child(
+                        inset_box(p)
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.))
+                            .px(px(10.))
+                            .py(px(6.5))
+                            .bg(rgba(p.badge_fail.bg))
+                            .border_color(rgba(p.hero_tripped.border))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(p.badge_fail.text))
+                                    .child("检测到 IPv4 / IPv6 双栈出口不一致，公网 IPv6 可能绕过代理直连"),
+                            )
+                            .child(
+                                action_button(
+                                    "env-risk-fix-ipv6",
+                                    if ipv6_on {
+                                        "同步 IPv6 护盾"
+                                    } else {
+                                        "一键封堵 IPv6"
+                                    },
+                                    ButtonKind::DangerSoft,
+                                    can_act,
+                                    p,
+                                )
+                                .h(px(24.))
+                                .px(px(8.))
+                                .text_size(px(10.5))
+                                .when(can_act, |b| {
+                                    b.on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            ctrl_fix_ipv6.update(cx, |c, cx| {
+                                                c.save_toggle_patch(
+                                                    "sh-ipv6",
+                                                    true,
+                                                    |x| x.leak_shield_ipv6 = true,
+                                                    "已开启公网 IPv6 防漏阻断并同步规则",
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                    )
+                                }),
+                            ),
+                    )
+                })
                 .child(
                     div()
                         .flex()
@@ -1785,23 +1856,28 @@ pub fn render_environment_page(
                                                                                 | "dual_stack"
                                                                                 | "webrtc_stun"
                                                                                 | "dns_coherence" => {
+                                                                                    let is_stun =
+                                                                                        did == "webrtc_stun";
                                                                                     c.save_config_patch(
-                                                                                        |cfg| {
+                                                                                        move |cfg| {
                                                                                             cfg.leak_shield_quic =
                                                                                                 true;
                                                                                             cfg.leak_shield_dns_doh =
                                                                                                 true;
                                                                                             cfg.leak_shield_ipv6 =
                                                                                                 true;
+                                                                                            if is_stun {
+                                                                                                cfg.enforce_electron_hygiene_flags =
+                                                                                                    true;
+                                                                                                cfg.enable_stun_dns_audit =
+                                                                                                    true;
+                                                                                            }
                                                                                         },
-                                                                                        "已开启四重防漏保护",
-                                                                                        cx,
-                                                                                    );
-                                                                                    c.send_request(
-                                                                                        PipeRequest::SyncLeakShield,
-                                                                                        Some(
-                                                                                            "四重防漏规则已同步生效",
-                                                                                        ),
+                                                                                        if is_stun {
+                                                                                            "已开启四重防漏与 WebRTC/STUN 防护加固"
+                                                                                        } else {
+                                                                                            "已开启四重防漏保护并同步防火墙规则"
+                                                                                        },
                                                                                         cx,
                                                                                     );
                                                                                 }
@@ -2174,13 +2250,15 @@ pub fn render_environment_page(
                                         MouseButton::Left,
                                         cx.listener(move |_, _, _, cx| {
                                             ctrl_uninst_hooks.update(cx, |c, cx| {
+                                                c.dismissed_overview_banner_key =
+                                                    Some("hooks-unconfigured".into());
                                                 c.send_request(
                                                     PipeRequest::ConfigureCliHooks {
                                                         install_claude_code: false,
                                                         install_pwsh_profile: false,
-                                                        sync_all_vaults: false,
+                                                        sync_all_vaults: true,
                                                     },
-                                                    Some("已卸载 CLI 门禁钩子"),
+                                                    Some("已卸载 CLI 门禁钩子并清理全部账号空间配置"),
                                                     cx,
                                                 );
                                             });
@@ -2209,6 +2287,7 @@ pub fn render_environment_page(
                                     MouseButton::Left,
                                     cx.listener(move |_, _, _, cx| {
                                         ctrl_inst_hooks.update(cx, |c, cx| {
+                                            c.dismissed_overview_banner_key = None;
                                             c.send_request(
                                                 PipeRequest::ConfigureCliHooks {
                                                     install_claude_code: true,
@@ -2619,6 +2698,7 @@ struct AgCardCtx<'a> {
     can_act: bool,
     is_rechecking: bool,
     is_repairing: bool,
+    ag_running: bool,
 }
 
 fn render_antigravity_proxy_card(
@@ -2640,8 +2720,11 @@ fn render_antigravity_proxy_card(
         can_act,
         is_rechecking,
         is_repairing,
+        ag_running,
     } = ctx;
     let can_repair = connected && !tripped && ag.installed && !is_repairing;
+    let repair_confirm_armed = ctrl.read(cx).is_confirm_armed("env-ag-repair-running");
+    let ctrl_kill_ag = ctrl.clone();
     let vm = project_antigravity_proxy_card(ag, guard_proxy_port, privacy_mask, now_unix_secs());
     let show_degraded_alert = vm.is_degraded && require_ag_proxy;
     let (pill_label, pill_tone) = if !require_ag_proxy && ag.installed && !ag.is_ready_for_launch()
@@ -2888,6 +2971,57 @@ fn render_antigravity_proxy_card(
                     .text_color(rgb(p.text_muted)),
             )
         })
+        .when(ag_running, |card| {
+            card.child(
+                inset_box(p)
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.))
+                    .px(px(12.))
+                    .py(px(7.))
+                    .bg(rgba(p.badge_warn.bg))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(p.badge_warn.text))
+                            .child("检测到 Antigravity 正在运行，可能锁住 version.dll；建议先关闭后再执行热修复"),
+                    )
+                    .child(
+                        action_button(
+                            "env-ag-close-running",
+                            "先关闭 Antigravity",
+                            ButtonKind::Secondary,
+                            connected,
+                            p,
+                        )
+                        .h(px(25.))
+                        .px(px(9.))
+                        .text_size(px(10.5))
+                        .when(connected, |b| {
+                            b.on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, _, cx| {
+                                    ctrl_kill_ag.update(cx, |c, cx| {
+                                        c.send_request(
+                                            PipeRequest::ForceKillAgent {
+                                                agent_id: Some("antigravity".into()),
+                                                include_cli: false,
+                                            },
+                                            Some("已关闭 Antigravity，现在可安全执行热修复"),
+                                            cx,
+                                        );
+                                    });
+                                }),
+                            )
+                        }),
+                    ),
+            )
+        })
         .child(choreo.inner_bloom(1, 4).apply(guide_box))
         .child(
             div()
@@ -3050,10 +3184,14 @@ fn render_antigravity_proxy_card(
                                     "隔离期暂停"
                                 } else if is_repairing {
                                     "修复中…"
+                                } else if ag_running && repair_confirm_armed {
+                                    "确认仍在运行下修复"
                                 } else {
                                     "下载并热修复"
                                 },
-                                if show_degraded_alert && !tripped {
+                                if ag_running && repair_confirm_armed {
+                                    ButtonKind::DangerSoft
+                                } else if show_degraded_alert && !tripped {
                                     ButtonKind::Primary
                                 } else {
                                     ButtonKind::Secondary
@@ -3067,6 +3205,19 @@ fn render_antigravity_proxy_card(
                                     MouseButton::Left,
                                     cx.listener(move |_, _, _, cx| {
                                         ctrl_repair.update(cx, |c, cx| {
+                                            if ag_running
+                                                && !c.arm_or_consume_confirm(
+                                                    "env-ag-repair-running",
+                                                    cx,
+                                                )
+                                            {
+                                                c.set_toast(
+                                                    "Antigravity 正在运行可能锁住 version.dll，建议先关闭；再点一次强制继续修复",
+                                                    false,
+                                                    cx,
+                                                );
+                                                return;
+                                            }
                                             c.send_request(
                                                 PipeRequest::RepairAntigravityProxy,
                                                 Some("antigravity-proxy 已完成热修复并同步端口"),

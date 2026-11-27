@@ -93,7 +93,7 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "CompanyName", "daha1216\0"
-            VALUE "FileDescription", "ClaudeGuard v3 to v4 Upgrade Bridge\0"
+            VALUE "FileDescription", "ClaudeGuard Upgrade Bridge\0"
             VALUE "FileVersion", "{version_4_str}\0"
             VALUE "InternalName", "ClaudeGuard-upgrade\0"
             VALUE "OriginalFilename", "ClaudeGuard-v{version_str}-upgrade.exe\0"
@@ -131,7 +131,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CG_V3_BRIDGE_SETUP_EXE");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let ver = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "4.0.0".into());
+    let ver = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "5.0.0".into());
 
     let setup_candidate = env::var_os("CG_V3_BRIDGE_SETUP_EXE")
         .map(PathBuf::from)
@@ -169,7 +169,7 @@ fn main() {
     let major: u32 = env::var("CARGO_PKG_VERSION_MAJOR")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
+        .unwrap_or(5);
     let minor: u32 = env::var("CARGO_PKG_VERSION_MINOR")
         .ok()
         .and_then(|s| s.parse().ok())

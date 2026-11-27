@@ -58,17 +58,22 @@
   - 通过托盘隐藏窗口原生 `RegisterHotKey` 注册全局「紧急一键锁死」与「快捷 HUD」热键（零 `SetWindowsHookEx` 钩子、退出自动注销、冲突优雅提示）。
   - 新增零外部依赖纯 Rust 脱敏健康卡（Markdown 文本 + `1200×680` Frost Ceramic / Obsidian 无元数据 PNG 导出），单元测试强约束零 IP、零 Windows 用户名泄露，支持在「防泄露 → 10D 风险雷达」与「审计」页顶栏一键导出。
 
-### 深度安全加固、零误锁网络门禁与全栈交互精修
+### 深度安全加固、生态免配置自动发现与全栈交互精修
 
-- **内核 WFP 与 Session-0 特权边界加固（`wfp_win` / `antigravity_proxy_win` / `cleanroom_win` / `wsl_bridge` / `cg-v3-bridge`）**：
-  - 打通每应用 WFP 隧道分流放行策略（`sync_wfp_tunnel_only`），豁免已核验 TUN 网卡 LUID、本地回环 QUIC、ULA Fake-IP（`fc00::/7`）与 WSL2 虚拟网卡，并在撤防及卸载停服后幂等清零全部动态/持久过滤规则；动态加载 `FwpmNetEventSubscribe4` 兼容 Win10 1809 LTSC。
-  - 移除 `version.dll` 过宽用户写权限并强化缓存 SHA-256 校验，对数据目录、无尘室备份与升级暂存目录强制施加 `SY+BA` 受保护 DACL 及句柄读锁；补齐 Session-0 服务态交互用户目录解析、Windows 凭据管理器模拟登录（`ImpersonateInteractiveUserGuard`）、WSL2 令牌开机前 SID 赋权与 OneDrive `$PROFILE` 标准输入管道透传。
-- **零误判风险门禁、独立端口金库与全量脱敏闭环（`stun_probe` / `ip_intel` / `risk_scorer` / `engine_runtime` / `redact` / `diagnostics`）**：
-  - 严格限定仅在 `TUN` 模式下执行守护进程原始 UDP STUN 探测，消除 `SystemProxy` 用户误锁、Clash 规则分流下 EDNS/Tier-3 归属地污染、Null Island `(0,0)` 缺省坐标引发的同国瞬移误锁及合规跨国 IPv6 双栈误否决；拆分 `--hook-gate` 连接与同步重探超时（`500ms` / `6500ms`）消除冷启动假阻断。
-  - 支持多账号金库 `dedicated_proxy_port` 独立端口出口探测与缓存、完整 `GuardEngine` 启动门禁校验、句柄绑定进程身份终止及重 I/O 管道请求异步线程卸载；补齐 `mask_snapshot` 与诊断压缩包对全部 v5 新增字段的零泄露脱敏。
-- **GPUI 全闭环交互升级与「说人话」体验重塑（`cg-gui`）**：
-  - 升级 `1020×720` 宽屏 7 核心导航坞 + 顶栏工具胶囊；精简总览 Hero 顶栏（移除重复导出按钮、体检评分徽章清爽右对齐），安全启动台保持固定 2×2 核心入口（`Claude`、`Antigravity`、`ChatGPT`、`Code CLI`），受管进程治理与多账号仓精准覆盖 5 大核心受管端（`Claude`、`Claude Code`、`ChatGPT`、`Codex CLI`、`Antigravity`，对齐 Electron 防漏参数注入并通过交互式终端启动 `.cmd`/`.ps1` CLI）。
-  - 10 维体检分、总览提示条与账号仓支持原地一键修复与冷却秒解，快捷 HUD 与系统托盘右键菜单支持多账号仓一键切换启动；防封体检图导出入口统一收口至「防泄露 → 10D 风险雷达」与「审计」页顶栏，修复无尘室末项取消反选与逐项还原加载态，全面落地零术语中文界面文案。
+- **合盖休眠 WFP 内核物理网卡驻留护盾与特权边界加固（`wfp_win` / `service_win` / `ipc_pipe` / `cleanroom_win` / `cg-v3-bridge`）**：
+  - 打通每应用 WFP 隧道分流放行策略（`sync_wfp_tunnel_only`），豁免已核验 TUN 网卡 LUID、本地回环 QUIC、局域网代理端点（`active_proxy_endpoint`）、ULA Fake-IP（`fc00::/7`）与 WSL2 虚拟网卡；接入 `PBT_APMSUSPEND` 预休眠失效与代数计数 20s 唤醒缓冲（`wake_timer_gen`），唤醒重连窗口期间保持 WFP 物理网卡硬阻断（`strict_tunnel_only`）静默拦截直连心跳且零误杀进程；补齐 MSIX `WindowsApps` NT 设备路径（`QueryDosDeviceW`）WFP AppId 合成，并在撤防及卸载停服后幂等清零全部动态/持久过滤规则。
+  - 移除 `version.dll` 过宽用户写权限并强化缓存 SHA-256 校验，对数据目录、无尘室备份与升级暂存目录强制施加 `SY+BA` 受保护 DACL；收紧命名管道 `NotifySystemShutdown` 活动会话鉴权与 30s TTL、管道超时流隔离及 Session-0 交互用户模拟登录（`ImpersonateInteractiveUserGuard`）。
+- **Windows 代理与开发生态免配置自动发现（`mihomo_win` / `antigravity_proxy_win` / `hygiene_win` / `wsl_bridge` / `hook_installer`）**：
+  - 原生支持 Clash Verge Rev v2+ 默认命名管道控制接口（`\\.\pipe\verge-mihomo`，`SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS` 零提权风险）及 FlClash / Mihomo Party / Sparkle 配置解析与本机监听端口雷达（自动发现 `7897`、`10808`/`10809`、`2080` 等端口）；`Meta 2` / `Meta Tunnel` 多路路由核验优先识别全局 TUN。
+  - 兼容 `Ikaros-521/antigravity-launcher`（`AntigravityProxy.exe`）与纯 TUN 模式（首次运行绝不越权强注 `version.dll`，多金库独立端口自动对齐 `config.json`），快捷方式治理覆盖 `%USERPROFILE%\TuckPane` 并完整保留 `--remote-debugging-port` CDP 参数。
+  - WSL2 门禁桥接双栈监听 `127.0.0.1` 与 `vEthernet (WSL)` 宿主机地址，开箱支持默认 Hyper-V NAT 模式 WSL2；新增用户态只读 `.claudeguard-hook-policy.json` 离线策略兜底、`PreToolUse` `Bash` 联网命令护航与 `claudeguard-cli --unhook-all` 卸载全量无痕清理（安装包洁净安装跳过冗余 `sc query` 轮询）。
+- **零误判风险门禁、双栈防漏与全量脱敏闭环（`stun_probe` / `ip_intel` / `risk_scorer` / `engine` / `redact` / `diagnostics`）**：
+  - 补齐未核验出口 `<=35` 分（`F` 级）硬否决门禁、首启向导全量不支持地区（含 `HK`/`MO`/`RU` 等）防误荐、跨境 Anycast `colo` 国家匹配过滤、Cloudflare `XX`/`ZZ`/`T1` 哨兵码精确判定与双栈 IPv4/IPv6 `[::]:0` STUN 泄露探测；拆分 `--hook-gate` 连接与同步重探超时（`500ms` / `6500ms`）并支持独立端口金库快速门禁核验与 `InFlightGuard` 状态提交后释放。
+  - 新增 `mask_config_for_diagnostics`（避免污染前端可编辑白名单草稿）与 `mihomo` / 更新摘要全量脱敏，健康体检卡 PNG 导出支持 OneDrive 桌面重解析点自动回退（`Downloads` / `Exports`）与用户读权限赋权。
+- **旗舰级 GPUI 交互响应与零输入体验重塑（`cg-gui`）**：
+  - 升级 `1020×720` 宽屏 7 核心导航坞 + 顶栏工具胶囊；精简总览 Hero 顶栏（体检评分徽章清爽右对齐，零导出按钮干扰），安全启动台保持固定对称 2×2 核心入口（`Claude`、`Antigravity`、`ChatGPT`、`Code CLI`），受管进程治理、多账号仓与 WFP 实时拦截全面覆盖 5 大核心客户端（`Claude`、`Claude Code`、`ChatGPT`、`Codex CLI`、`Antigravity`）。
+  - 落地细粒度 `ActionScope` 并发模型（后台更新检查、热修复、深度审计与重检绝不冻结「紧急锁死 / 立即封锁出站 / 一键全清 / 切节点 / 暂停」应急控制），无窗口驻留时异常自动回退托盘气泡提示；快捷 HUD 升级高 DPI 中段滚动与固定底栏。
+  - 首启向导新增本机代理端口雷达一键采纳胶囊；多账号金库抽屉内置 Mihomo 策略组/节点 RTT 点选器并打通全局代理「一键切节点并秒启」；补齐无尘室「仅选高危串号项」与运行占用预检、审计日志 `200ms` 防抖服务端级别检索及输入框双击 CIDR/端点选词。
 
 ## [4.1.4] - 2026-11-27
 

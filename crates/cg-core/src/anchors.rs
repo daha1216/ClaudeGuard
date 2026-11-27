@@ -130,6 +130,11 @@ pub fn parse_trace(text: &str) -> Option<ProbeResult> {
     let city = colo
         .as_deref()
         .and_then(geo::by_colo)
+        .filter(|place| {
+            country
+                .as_deref()
+                .is_none_or(|cc| place.country.eq_ignore_ascii_case(cc))
+        })
         .map(|place| place.city.to_string());
     let detail = format!(
         "trace：ip={}，地区={}，节点={}",
