@@ -862,6 +862,43 @@ fn default_ag_capsule_update_status() -> ComponentUpdateStatus {
     }
 }
 
+fn default_cursor_ide_update_status() -> ComponentUpdateStatus {
+    ComponentUpdateStatus {
+        id: "cursor_ide".into(),
+        name: "Cursor IDE".into(),
+        repo: "Anysphere 官方渠道".into(),
+        ..ComponentUpdateStatus::default()
+    }
+}
+
+fn default_windsurf_ide_update_status() -> ComponentUpdateStatus {
+    ComponentUpdateStatus {
+        id: "windsurf_ide".into(),
+        name: "Windsurf IDE".into(),
+        repo: "Codeium 官方渠道".into(),
+        ..ComponentUpdateStatus::default()
+    }
+}
+
+fn default_zed_ide_update_status() -> ComponentUpdateStatus {
+    ComponentUpdateStatus {
+        id: "zed_ide".into(),
+        name: "Zed IDE".into(),
+        repo: "zed-industries/zed".into(),
+        release_url: Some("https://github.com/zed-industries/zed/releases".into()),
+        ..ComponentUpdateStatus::default()
+    }
+}
+
+fn default_trae_ide_update_status() -> ComponentUpdateStatus {
+    ComponentUpdateStatus {
+        id: "trae_ide".into(),
+        name: "Trae IDE".into(),
+        repo: "Trae 官方渠道".into(),
+        ..ComponentUpdateStatus::default()
+    }
+}
+
 /// Aggregated software update and local MSIX / CLI / IDE / plugin package version summary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -886,6 +923,14 @@ pub struct UpdateSummary {
     pub ag_usage_monitor: ComponentUpdateStatus,
     #[serde(default = "default_ag_capsule_update_status")]
     pub ag_capsule: ComponentUpdateStatus,
+    #[serde(default = "default_cursor_ide_update_status")]
+    pub cursor_ide: ComponentUpdateStatus,
+    #[serde(default = "default_windsurf_ide_update_status")]
+    pub windsurf_ide: ComponentUpdateStatus,
+    #[serde(default = "default_zed_ide_update_status")]
+    pub zed_ide: ComponentUpdateStatus,
+    #[serde(default = "default_trae_ide_update_status")]
+    pub trae_ide: ComponentUpdateStatus,
     #[serde(default)]
     pub claude_msix_version: Option<String>,
     #[serde(default)]
@@ -905,6 +950,10 @@ impl Default for UpdateSummary {
             antigravity_cn: default_antigravity_cn_update_status(),
             ag_usage_monitor: default_ag_usage_monitor_update_status(),
             ag_capsule: default_ag_capsule_update_status(),
+            cursor_ide: default_cursor_ide_update_status(),
+            windsurf_ide: default_windsurf_ide_update_status(),
+            zed_ide: default_zed_ide_update_status(),
+            trae_ide: default_trae_ide_update_status(),
             claude_msix_version: None,
             codex_msix_version: None,
         }

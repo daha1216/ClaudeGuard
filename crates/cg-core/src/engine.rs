@@ -272,6 +272,7 @@ impl EngineState {
             feishu: cg_protocol::FeishuStatus::default(),
             leak_shield: cg_protocol::LeakShieldStatus::default(),
             mihomo: cg_protocol::MihomoStatus::default(),
+            ..GuardSnapshot::default()
         }
     }
 }

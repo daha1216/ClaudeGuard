@@ -12,19 +12,25 @@
 
 pub mod access_win;
 pub mod antigravity_proxy_win;
+pub mod cleanroom_win;
 #[cfg(windows)]
 pub(crate) mod com;
 pub mod crypto_win;
 pub mod env_win;
 pub mod firewall_com;
+pub mod hygiene_win;
+pub mod ip_intel;
 pub mod leak_shield_win;
 pub mod mihomo_win;
 pub mod netwatch_win;
 pub mod notify_win;
 pub mod probe_http;
 pub mod process_win;
+pub mod stun_probe;
 pub mod traits;
 pub mod update_check;
+pub mod vault_win;
+pub mod wfp_win;
 pub mod zip_util;
 
 pub use cg_protocol;

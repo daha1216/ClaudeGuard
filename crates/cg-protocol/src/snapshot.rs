@@ -8,10 +8,14 @@ use crate::model::{
     UpdateSummary,
 };
 use crate::state::{Lifecycle, OperationReceipt, ProtectionState, is_legal_state_pair};
+use crate::v5::{
+    BurstGuardStatus, CleanRoomReport, HookIntegrationStatus, HotkeyStatus, RiskAssessment,
+    VaultRuntimeStatus, WfpStatus, WslBridgeStatus,
+};
 use serde::{Deserialize, Serialize};
 
 /// Schema version for [`GuardSnapshot`] payloads over Named Pipe IPC.
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 5;
 
 /// Immutable point-in-time snapshot of the entire guard engine and cached runtime probes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +76,25 @@ pub struct GuardSnapshot {
     pub leak_shield: LeakShieldStatus,
     #[serde(default)]
     pub mihomo: MihomoStatus,
+    // ---- v5 Runtime Telemetry & Sovereign Control Plane ----
+    #[serde(default)]
+    pub wfp: WfpStatus,
+    #[serde(default)]
+    pub risk_assessment: RiskAssessment,
+    #[serde(default)]
+    pub vaults: Vec<VaultRuntimeStatus>,
+    #[serde(default)]
+    pub last_cleanroom_report: Option<CleanRoomReport>,
+    #[serde(default)]
+    pub cleanroom_backup_count: usize,
+    #[serde(default)]
+    pub hooks: HookIntegrationStatus,
+    #[serde(default)]
+    pub wsl_bridge: WslBridgeStatus,
+    #[serde(default)]
+    pub burst_guard: BurstGuardStatus,
+    #[serde(default)]
+    pub hotkeys: HotkeyStatus,
 }
 
 impl GuardSnapshot {

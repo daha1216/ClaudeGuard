@@ -1,16 +1,54 @@
-//! v4 configuration schema and lossless v2/v3 JSON migration parser.
+//! v5 configuration schema and lossless v2/v3/v4 JSON migration parser.
 
 use crate::model::{
     CutMode, PolicyPreset, Target, ThemeMode, default_builtin_targets, default_true,
     ensure_builtin_targets, normalize_ip_or_cidr, normalize_region,
 };
+use crate::v5::{
+    AccountVault, BurstGuardMode, FirewallBackendPref, HookFailMode, is_valid_vault_id,
+};
 use serde::{Deserialize, Serialize};
 
-/// Current config schema version (v4).
-pub const CONFIG_VERSION: u32 = 4;
+/// Current config schema version (v5).
+pub const CONFIG_VERSION: u32 = 5;
 
-/// Known GUI agent identifiers that may appear in `guarded_agents`.
-pub const KNOWN_GUI_AGENT_IDS: [&str; 3] = ["claude", "chatgpt", "antigravity"];
+/// Known GUI agent identifiers that may appear in `guarded_agents` (v5 7-client matrix).
+pub const KNOWN_GUI_AGENT_IDS: [&str; 7] = [
+    "claude",
+    "chatgpt",
+    "antigravity",
+    "cursor",
+    "windsurf",
+    "zed",
+    "trae",
+];
+
+/// Known CLI agent identifiers observed and protected by Pre-Prompt Hook gates.
+pub const KNOWN_CLI_AGENT_IDS: [&str; 4] = ["claude-code", "codex", "gemini", "aider"];
+
+fn default_global_min_score() -> u8 {
+    60
+}
+
+fn default_hook_ttl_secs() -> u64 {
+    45
+}
+
+fn default_burst_warn_rpm() -> u32 {
+    18
+}
+
+fn default_burst_throttle_rpm() -> u32 {
+    30
+}
+
+fn default_panic_chord() -> String {
+    "Ctrl+Alt+Shift+L".into()
+}
+
+fn default_hud_chord() -> String {
+    "Ctrl+Alt+Shift+H".into()
+}
 
 fn default_proxy_host() -> String {
     "127.0.0.1".into()
@@ -174,7 +212,56 @@ pub struct Config {
     #[serde(default)]
     pub last_seen_antigravity_version: Option<String>,
 
-    // ---- Legacy v2/v3 fields: read-only migration inputs, never serialized in v4 ----
+    // ---- v5 Anti-Ban Kernel, Intelligence, Vaults, Hook & Hotkey preferences ----
+    /// M1: Firewall isolation engine preference (default: Dynamic WFP with seamless COM fallback).
+    #[serde(default)]
+    pub firewall_backend: FirewallBackendPref,
+    /// M1: Opt-in persistent early boot-time WFP guard (default `false` to prevent boot surprises).
+    #[serde(default)]
+    pub wfp_boot_guard: bool,
+    /// M2: Global minimum 10D egress safety score (`0..=100`, default `60`).
+    #[serde(default = "default_global_min_score")]
+    pub min_global_safety_score: u8,
+    /// M2: Block launch on impossible-travel cross-country geo-teleportation (`>900 km/h`).
+    #[serde(default = "default_true")]
+    pub enforce_geo_velocity: bool,
+    /// M2: Opt-in hard block when egress ASN is classified as cloud datacenter hosting.
+    #[serde(default)]
+    pub block_datacenter_asn: bool,
+    /// M3: Inject WebRTC / QUIC / DNS-over-proxy anti-leak flags when safe-launching Electron apps.
+    #[serde(default = "default_true")]
+    pub enforce_electron_hygiene_flags: bool,
+    /// M3: Periodically run native RFC 5389 UDP STUN leak & DNS coherence probes.
+    #[serde(default = "default_true")]
+    pub enable_stun_dns_audit: bool,
+    /// M4: Sovereign Multi-Account Isolated Vaults.
+    #[serde(default)]
+    pub vaults: Vec<AccountVault>,
+    /// M6: `FastHookGate` O(1) snapshot freshness TTL in seconds (`10..=300`, default `45`).
+    #[serde(default = "default_hook_ttl_secs")]
+    pub hook_freshness_ttl_secs: u64,
+    /// M6: Hook fallback behavior when daemon service is unreachable.
+    #[serde(default)]
+    pub hook_fail_mode: HookFailMode,
+    /// M6: Enable WSL2 localhost HMAC gate bridge.
+    #[serde(default = "default_true")]
+    pub wsl_bridge_enabled: bool,
+    /// M6: BurstGuard automated rate-burst & robotic cadence guard mode.
+    #[serde(default)]
+    pub burst_guard_mode: BurstGuardMode,
+    #[serde(default = "default_burst_warn_rpm")]
+    pub burst_warn_rpm: u32,
+    #[serde(default = "default_burst_throttle_rpm")]
+    pub burst_throttle_rpm: u32,
+    /// M7: Global emergency hotkeys toggle & chord strings.
+    #[serde(default = "default_true")]
+    pub global_hotkeys_enabled: bool,
+    #[serde(default = "default_panic_chord")]
+    pub hotkey_panic_lockdown: String,
+    #[serde(default = "default_hud_chord")]
+    pub hotkey_quick_hud: String,
+
+    // ---- Legacy v2/v3 fields: read-only migration inputs, never serialized in v5 ----
     #[serde(default, skip_serializing, rename = "cut_network")]
     pub legacy_cut_network: Option<bool>,
     #[serde(default, skip_serializing, rename = "disable_network_adapters")]
@@ -232,6 +319,23 @@ impl Default for Config {
             require_antigravity_proxy: true,
             auto_repair_antigravity_proxy: true,
             last_seen_antigravity_version: None,
+            firewall_backend: FirewallBackendPref::default(),
+            wfp_boot_guard: false,
+            min_global_safety_score: default_global_min_score(),
+            enforce_geo_velocity: true,
+            block_datacenter_asn: false,
+            enforce_electron_hygiene_flags: true,
+            enable_stun_dns_audit: true,
+            vaults: Vec::new(),
+            hook_freshness_ttl_secs: default_hook_ttl_secs(),
+            hook_fail_mode: HookFailMode::default(),
+            wsl_bridge_enabled: true,
+            burst_guard_mode: BurstGuardMode::default(),
+            burst_warn_rpm: default_burst_warn_rpm(),
+            burst_throttle_rpm: default_burst_throttle_rpm(),
+            global_hotkeys_enabled: true,
+            hotkey_panic_lockdown: default_panic_chord(),
+            hotkey_quick_hud: default_hud_chord(),
             legacy_cut_network: None,
             legacy_disable_network_adapters: None,
             allowed_ips: Vec::new(),
@@ -372,6 +476,28 @@ impl Config {
 
         self.interval_secs = self.interval_secs.clamp(5, 3600);
         self.trip_threshold = self.trip_threshold.clamp(1, 5);
+        self.min_global_safety_score = self.min_global_safety_score.min(100);
+        self.hook_freshness_ttl_secs = self.hook_freshness_ttl_secs.clamp(10, 300);
+        self.burst_warn_rpm = self.burst_warn_rpm.clamp(5, 300);
+        self.burst_throttle_rpm = self
+            .burst_throttle_rpm
+            .max(self.burst_warn_rpm.saturating_add(2))
+            .clamp(7, 600);
+        if self.hotkey_panic_lockdown.trim().is_empty() {
+            self.hotkey_panic_lockdown = default_panic_chord();
+        }
+        if self.hotkey_quick_hud.trim().is_empty() {
+            self.hotkey_quick_hud = default_hud_chord();
+        }
+        let mut clean_vaults = Vec::new();
+        for mut v in std::mem::take(&mut self.vaults) {
+            v.normalize();
+            if is_valid_vault_id(&v.id) && !clean_vaults.iter().any(|x: &AccountVault| x.id == v.id)
+            {
+                clean_vaults.push(v);
+            }
+        }
+        self.vaults = clean_vaults;
         self.proxy_host = self.proxy_host.trim().to_string();
         if self.proxy_host.is_empty() {
             self.proxy_host = default_proxy_host();
@@ -567,7 +693,7 @@ mod tests {
             ]
         }"#;
         let cfg = Config::from_json_str(v3).expect("parse v3");
-        assert_eq!(cfg.version, 4);
+        assert_eq!(cfg.version, CONFIG_VERSION);
         assert_eq!(cfg.targets.len(), 5);
         assert_eq!(
             cfg.target("custom1").unwrap().expect_ips,

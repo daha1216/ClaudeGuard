@@ -4,6 +4,10 @@ use crate::config::Config;
 use crate::model::{LogEntry, OnboardingProbeResult, PolicyPreset};
 use crate::snapshot::GuardSnapshot;
 use crate::state::OperationReceipt;
+use crate::v5::{
+    AccountVault, CleanRoomBackupMeta, CleanRoomReport, CleanRoomScope, HookDecision,
+    SanitizedHealthCard, VaultAppTarget,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -121,6 +125,78 @@ pub enum PipeRequest {
     ExportDiagnostics,
     /// Hint from interactive tray/session (`WM_QUERYENDSESSION` / `WM_ENDSESSION`) that OS shutdown/reboot has started.
     NotifySystemShutdown,
+    // ---- v5 Requests (M1–M7) ----
+    /// M6: Sub-2ms O(1) Pre-Prompt CLI / IDE Hook gate evaluation.
+    FastHookGate {
+        agent_id: String,
+        #[serde(default)]
+        vault_id: Option<String>,
+        #[serde(default)]
+        hook_event: Option<String>,
+    },
+    /// M4: Create or update a Sovereign Account Vault and initialize its isolated directory & machine-id seed.
+    UpsertVault {
+        vault: AccountVault,
+    },
+    /// M4: Remove a Sovereign Account Vault from config (`purge_disk_data = false` preserves disk state safely).
+    DeleteVault {
+        vault_id: String,
+        #[serde(default)]
+        purge_disk_data: bool,
+    },
+    /// M4: Execute 6-step atomic orchestration and safe-launch an app inside the specified vault.
+    LaunchVault {
+        vault_id: String,
+        app: VaultAppTarget,
+        #[serde(default)]
+        extra_args: Vec<String>,
+    },
+    /// M4: Stop all running processes owned by a specific Sovereign Account Vault.
+    StopVault {
+        vault_id: String,
+    },
+    /// M4: Generate desktop `.lnk` direct-launch shortcuts & PowerShell profile helpers for a vault.
+    GenerateVaultShortcuts {
+        vault_id: String,
+    },
+    /// M5: Run 100% read-only local anti-correlation residue audit.
+    ScanCleanRoom {
+        #[serde(default)]
+        scope: CleanRoomScope,
+    },
+    /// M5: Create encrypted `.cgbak` backup then sanitize selected local correlation vectors.
+    ExecuteCleanRoom {
+        scope: CleanRoomScope,
+        #[serde(default)]
+        selected_finding_ids: Vec<String>,
+    },
+    /// M5: List local encrypted clean-room backup snapshots.
+    ListCleanRoomBackups,
+    /// M5: Restore credentials and state files from an encrypted `.cgbak` backup.
+    RestoreCleanRoomBackup {
+        backup_id: String,
+    },
+    /// M6: One-click install/uninstall Claude Code `settings.json` Hook & PowerShell `$PROFILE` wrappers.
+    ConfigureCliHooks {
+        install_claude_code: bool,
+        install_pwsh_profile: bool,
+        sync_all_vaults: bool,
+    },
+    /// M6: Sync WSL2 loopback HMAC gate shim to installed distros.
+    SyncWslBridge,
+    /// M7: Emergency panic lockdown triggered by global hotkey (`Ctrl+Alt+Shift+L`).
+    TriggerPanicLockdown,
+    /// M1: Clear the in-memory WFP blocked-packet event ring buffer.
+    ClearWfpBlockedEvents,
+    /// M2/M3: Trigger an immediate full 10D ban-risk audit (ASN purity, STUN, DNS coherence, hygiene).
+    RunDeepRiskAudit,
+    /// M2: Manually clear an active impossible-travel cooldown lock after user confirms legitimate travel.
+    ClearGeoVelocityCooldown,
+    /// M7: Build a desensitized shareable Pre-Flight Health Card (optional PNG export).
+    BuildHealthCard {
+        #[serde(default)]
+        export_png: bool,
+    },
 }
 
 /// Responses sent from the daemon back to GUI/CLI clients over the Named Pipe.
@@ -155,6 +231,27 @@ pub enum PipeResponse {
         message: String,
         #[serde(default)]
         receipt: Option<OperationReceipt>,
+    },
+    // ---- v5 Responses (M5–M7) ----
+    /// M6: Ultra-compact `<256B` response for `FastHookGate`.
+    FastGateVerdict {
+        allowed: bool,
+        decision: HookDecision,
+        safety_score: u8,
+        reason: String,
+        latency_path: String,
+    },
+    /// M5: Read-only clean-room scan report.
+    CleanRoomScan {
+        report: Box<CleanRoomReport>,
+    },
+    /// M5: List of available encrypted `.cgbak` backups.
+    CleanRoomBackups {
+        backups: Vec<CleanRoomBackupMeta>,
+    },
+    /// M7: Desensitized shareable health card payload.
+    HealthCard {
+        card: Box<SanitizedHealthCard>,
     },
 }
 
